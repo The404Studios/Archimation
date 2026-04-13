@@ -8,6 +8,7 @@ pkgdesc="Windows PE executable loader with DLL stub libraries for native .exe ex
 arch=('x86_64')
 url="https://github.com/ai-arch-linux/pe-loader"
 license=('GPL-3.0-or-later')
+options=('!debug')
 depends=('glibc' 'libx11')
 makedepends=('gcc' 'make')
 optdepends=(

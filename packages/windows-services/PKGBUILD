@@ -8,6 +8,7 @@ pkgdesc="Windows Service Control Manager daemon, driver framework, and anti-chea
 arch=('x86_64')
 url="https://github.com/ai-arch-linux/windows-services"
 license=('GPL-3.0-or-later')
+options=('!debug')
 depends=('glibc' 'pe-loader')
 makedepends=('gcc' 'make')
 optdepends=(

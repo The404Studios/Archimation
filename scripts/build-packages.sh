@@ -67,9 +67,12 @@ _clean_stale_versions() {
         seen_names+=("$name")
 
         # Find all versions of this package, keep only the newest (by mtime)
+        # Use ${name}-[0-9]* to match only version strings, not package names
+        # that happen to be prefixed by another package name (e.g., pe-loader-debug
+        # is a DIFFERENT package from pe-loader, not a stale version of it).
         local latest
-        latest=$(ls -t "$REPO_DIR/${name}-"*.pkg.tar.zst 2>/dev/null | head -1)
-        for old in "$REPO_DIR/${name}-"*.pkg.tar.zst; do
+        latest=$(ls -t "$REPO_DIR/${name}-"[0-9]*.pkg.tar.zst 2>/dev/null | head -1)
+        for old in "$REPO_DIR/${name}-"[0-9]*.pkg.tar.zst; do
             [ -f "$old" ] || continue
             if [ "$old" != "$latest" ]; then
                 echo "    Removing stale: $(basename "$old")"

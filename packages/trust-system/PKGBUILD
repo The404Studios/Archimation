@@ -8,6 +8,7 @@ pkgdesc="Root of Trust kernel module and libtrust userspace library"
 arch=('x86_64')
 url="https://github.com/ai-arch-linux/trust-system"
 license=('GPL-3.0-or-later')
+options=('!debug')
 depends=('glibc')
 makedepends=('gcc' 'make' 'linux-headers')
 optdepends=(

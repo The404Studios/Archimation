@@ -10456,8 +10456,11 @@ class InstallerApp(Adw.Application):
             return
 
         # Check if running from live ISO
-        is_live = os.path.isdir("/run/archiso") or \
-                  "archiso" in open("/proc/cmdline").read()
+        try:
+            is_live = os.path.isdir("/run/archiso") or \
+                      "archiso" in open("/proc/cmdline").read()
+        except (OSError, IOError):
+            is_live = os.path.isdir("/run/archiso")
         if not is_live:
             dialog = Gtk.MessageDialog(
                 message_type=Gtk.MessageType.WARNING,
@@ -11401,7 +11404,7 @@ class InstallerApp(Adw.Application):
         """Start the installation in a background thread."""
         self._install_cancelled = False
         self._install_thread = threading.Thread(
-            target=self._install_worker, daemon=True
+            target=self._install_worker, daemon=False
         )
         self._install_thread.start()
 
@@ -11471,9 +11474,12 @@ class InstallerApp(Adw.Application):
             self._set_step("partition", "active")
 
             # Unmount any existing partitions on this device
+            # (handles re-runs after a previous failed installation)
             self._log("Unmounting any existing partitions on the target device...")
             self._run_cmd(f"umount -R {MOUNT_ROOT} 2>/dev/null || true", check=False)
-            self._run_cmd(f"swapoff {p_prefix}* 2>/dev/null || true", check=False)
+            self._run_cmd(f"swapoff -a 2>/dev/null || true", check=False)
+            # Also unmount any partitions from this specific disk
+            self._run_cmd(f"umount {p_prefix}* 2>/dev/null || true", check=False)
 
             # Wipe existing partition table signatures
             self._run_cmd(f"wipefs -af {disk}",
@@ -11663,19 +11669,24 @@ class InstallerApp(Adw.Application):
                 f.write(f"::1         localhost\n")
                 f.write(f"127.0.1.1   {hostname}.localdomain  {hostname}\n")
 
-            # Root password — write directly to chroot to avoid shell quoting issues
-            self._run_cmd(
-                f"echo 'root:{password}' | arch-chroot {MOUNT_ROOT} chpasswd",
-                desc="Setting root password")
+            # Root password — pipe to chpasswd stdin to avoid shell quoting issues
+            # (passwords with single quotes, $, backticks would break echo-pipe)
+            self._log(">>> Setting root password")
+            subprocess.run(
+                ["arch-chroot", MOUNT_ROOT, "chpasswd"],
+                input=f"root:{password}\n", text=True, check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             # Create user
             self._chroot(
                 f"useradd -m -G wheel,video,audio,input,network,storage,games,users "
                 f"-s /bin/bash {username}",
                 desc=f"Creating user {username}")
-            self._run_cmd(
-                f"echo '{username}:{password}' | arch-chroot {MOUNT_ROOT} chpasswd",
-                desc=f"Setting password for {username}")
+            self._log(f">>> Setting password for {username}")
+            subprocess.run(
+                ["arch-chroot", MOUNT_ROOT, "chpasswd"],
+                input=f"{username}:{password}\n", text=True, check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             # Sudo access
             os.makedirs(f"{MOUNT_ROOT}/etc/sudoers.d", exist_ok=True)
@@ -11690,12 +11701,15 @@ class InstallerApp(Adw.Application):
                 for item in os.listdir(skel_src):
                     src = os.path.join(skel_src, item)
                     dst = os.path.join(user_home, item)
-                    if os.path.isdir(src):
-                        if os.path.exists(dst):
-                            shutil.rmtree(dst)
-                        shutil.copytree(src, dst, symlinks=True)
-                    else:
-                        shutil.copy2(src, dst)
+                    try:
+                        if os.path.isdir(src):
+                            if os.path.exists(dst):
+                                shutil.rmtree(dst)
+                            shutil.copytree(src, dst, symlinks=True)
+                        else:
+                            shutil.copy2(src, dst)
+                    except (OSError, shutil.Error) as e:
+                        self._log(f"  WARNING: Could not copy {item}: {e}")
                 self._chroot(f"chown -R {username}:{username} /home/{username}")
 
             self._set_step("users", "done")
@@ -11848,12 +11862,33 @@ class InstallerApp(Adw.Application):
             lightdm_conf = f"{MOUNT_ROOT}/etc/lightdm/lightdm.conf"
             os.makedirs(os.path.dirname(lightdm_conf), exist_ok=True)
             with open(lightdm_conf, "w") as f:
-                f.write(f"""[Seat:*]
+                f.write(f"""[LightDM]
+run-directory=/run/lightdm
+
+[Seat:*]
 autologin-user={username}
 autologin-session=xfce
 user-session=xfce
 greeter-session=lightdm-gtk-greeter
+autologin-user-timeout=0
+session-wrapper=/etc/lightdm/Xsession
 """)
+
+            # Ensure Xsession wrapper exists (critical for LightDM to launch sessions)
+            xsession = f"{MOUNT_ROOT}/etc/lightdm/Xsession"
+            if not os.path.exists(xsession):
+                with open(xsession, "w") as f:
+                    f.write("#!/bin/sh\n"
+                            "[ -f /etc/profile ] && . /etc/profile\n"
+                            "[ -f \"$HOME/.xprofile\" ] && . \"$HOME/.xprofile\"\n"
+                            "[ -f \"$HOME/.profile\" ] && . \"$HOME/.profile\"\n"
+                            "if [ -z \"$XDG_RUNTIME_DIR\" ]; then\n"
+                            "    XDG_RUNTIME_DIR=\"/run/user/$(id -u)\"\n"
+                            "    export XDG_RUNTIME_DIR\n"
+                            "fi\n"
+                            "exec $@\n")
+                os.chmod(xsession, 0o755)
+                self._log("  Created /etc/lightdm/Xsession wrapper")
 
             # Configure LightDM GTK greeter
             greeter_conf = f"{MOUNT_ROOT}/etc/lightdm/lightdm-gtk-greeter.conf"
@@ -11871,7 +11906,7 @@ background=/usr/share/backgrounds/ai-arch/default.svg
             binfmt_conf = os.path.join(binfmt_dir, "pe-loader.conf")
             if not os.path.exists(binfmt_conf):
                 with open(binfmt_conf, "w") as f:
-                    f.write(":PE:M::MZ::/usr/bin/pe-loader:OCF\n")
+                    f.write(":PE:M::MZ::/usr/bin/peloader:OCF\n")
 
             # SSH config
             ssh_dir = f"{MOUNT_ROOT}/etc/ssh/sshd_config.d"
@@ -11883,8 +11918,11 @@ background=/usr/share/backgrounds/ai-arch/default.svg
 
             # Remove the installer desktop shortcut from installed system
             installer_desktop = f"{MOUNT_ROOT}/home/{username}/Desktop/Install-AI-Arch.desktop"
-            if os.path.exists(installer_desktop):
-                os.remove(installer_desktop)
+            try:
+                if os.path.exists(installer_desktop):
+                    os.remove(installer_desktop)
+            except OSError:
+                pass  # Non-critical: shortcut left on desktop
 
             # Sync and unmount
             self._run_cmd("sync", desc="Syncing filesystems")
@@ -11908,7 +11946,9 @@ background=/usr/share/backgrounds/ai-arch/default.svg
             GLib.idle_add(self._show_complete_success)
 
         except Exception as e:
+            import traceback
             self._log(f"\nERROR: Installation failed: {e}")
+            self._log(traceback.format_exc())
             self._set_progress(current_step / total_steps,
                               f"Installation failed!")
             # Mark current step as error

@@ -1468,4 +1468,22 @@ echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash vt.global_cursor_default=0 loglev
 
 echo "Quiet boot parameters configured"
 
+# --- Copy custom packages to local repo for the installer ---
+# The disk installer's pacstrap needs these packages. Create a local
+# repo at /var/lib/pe-compat/repo/ so pacman can find them.
+REPO_SRC="/var/cache/pacman/pkg"
+REPO_DST="/var/lib/pe-compat/repo"
+mkdir -p "$REPO_DST"
+# Copy our custom .pkg.tar.zst files from the package cache
+for pkg in pe-loader trust-system trust-dkms pe-compat-dkms ai-control-daemon ai-firewall windows-services ai-desktop-config ai-first-boot-wizard; do
+    cp "$REPO_SRC/${pkg}-"*.pkg.tar.zst "$REPO_DST/" 2>/dev/null || true
+done
+# Build repo database
+if command -v repo-add &>/dev/null && ls "$REPO_DST"/*.pkg.tar.zst &>/dev/null; then
+    repo-add "$REPO_DST/pe-compat.db.tar.gz" "$REPO_DST"/*.pkg.tar.zst 2>/dev/null || true
+    echo "Local pe-compat repo created at $REPO_DST"
+else
+    echo "WARNING: Could not create local pe-compat repo"
+fi
+
 echo "=== Customization complete ==="

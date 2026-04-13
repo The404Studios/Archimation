@@ -10253,6 +10253,7 @@ from gi.repository import Gtk, Adw, GLib, Gdk, Pango
 
 os.environ.setdefault("GDK_BACKEND", "x11")
 os.environ.setdefault("GSK_RENDERER", "cairo")
+os.environ["GDK_DPI_SCALE"] = "0.5"
 
 # ---------------------------------------------------------------------------
 # Constants

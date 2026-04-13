@@ -276,7 +276,7 @@ echo "arch:arch" | chpasswd
 # Include NVIDIA modules for early KMS (RTX 5070 / Blackwell needs nvidia-open)
 cat > /etc/mkinitcpio.conf <<'INITCPIO'
 # mkinitcpio.conf for AI Arch Linux Live ISO
-MODULES=(amdgpu nouveau nvidia nvidia_modeset nvidia_uvm nvidia_drm)
+MODULES=(amdgpu nouveau i915)
 BINARIES=()
 FILES=()
 HOOKS=(base udev plymouth ai-persist archiso archiso_loop_mnt modconf block filesystems keyboard)
@@ -358,24 +358,21 @@ ExecStart=
 ExecStart=/usr/bin/plymouth quit --retain-splash
 PLYRETAIN
 
-# --- NVIDIA pacman hook: rebuild initramfs on driver updates ---
+# --- Pacman hook: rebuild initramfs on kernel updates ---
 mkdir -p /etc/pacman.d/hooks
-cat > /etc/pacman.d/hooks/nvidia.hook <<'NVHOOK'
+cat > /etc/pacman.d/hooks/kernel-initramfs.hook <<'KRNHOOK'
 [Trigger]
 Operation=Install
 Operation=Upgrade
-Operation=Remove
 Type=Package
-Target=nvidia-open-dkms
 Target=linux
 
 [Action]
-Description=Rebuilding initramfs after NVIDIA driver update...
+Description=Rebuilding initramfs after kernel update...
 Depends=mkinitcpio
 When=PostTransaction
-NeedsTargets
-Exec=/bin/sh -c 'while read -r trg; do case $trg in linux*) exit 0;; esac; done; /usr/bin/mkinitcpio -P'
-NVHOOK
+Exec=/usr/bin/mkinitcpio -P
+KRNHOOK
 
 # --- AMD Ryzen 7 9800X3D / Zen 5 optimizations ---
 # Set CPU governor to performance via a oneshot service (runs early in boot).
@@ -951,50 +948,13 @@ HandleLidSwitchDocked=ignore
 LID
 echo "Laptop lid suspend policy configured"
 
-# --- NVIDIA modprobe options (module parameters via modprobe.d) ---
+# --- GPU modprobe options ---
+# nouveau is the default NVIDIA driver (works on ALL GPUs from NV04 to Blackwell).
+# Users who want nvidia-open-dkms can install it post-install; it will
+# blacklist nouveau automatically via nvidia-utils.
 mkdir -p /etc/modprobe.d
-cat > /etc/modprobe.d/nvidia.conf <<'NVMODPROBE'
-# NVIDIA module options for RTX 5070 (Blackwell)
-# Framebuffer device for console rendering (simpledrm replacement)
-options nvidia_drm modeset=1 fbdev=1
-# Preserve VRAM across suspend/resume cycles
-options nvidia NVreg_PreserveVideoMemoryAllocations=1
-# Enable Dynamic Boost for improved thermal/power management
-options nvidia NVreg_DynamicPowerManagement=0x02
-NVMODPROBE
-echo "NVIDIA modprobe options written to /etc/modprobe.d/nvidia.conf"
-
-# --- NVIDIA/nouveau GPU-generation auto-select ---
-# nvidia-utils ships /usr/lib/modprobe.d/nvidia-utils.conf which blacklists nouveau.
-# Override: allow nouveau on pre-Turing GPUs where nvidia-open doesn't work.
-cat > /etc/modprobe.d/nvidia-nouveau-compat.conf <<'NVCOMPAT'
-# Override nvidia-utils blacklist: allow nouveau on older GPUs.
-# nvidia-open-dkms only supports Turing (NV160/TU*) and newer.
-# Fermi (0x06cX-0x0eXX), Kepler (0x0fXX-0x11XX), Maxwell (0x13XX-0x17XX),
-# Pascal (0x15XX-0x1dXX) need nouveau.
-# The softdep ensures nvidia loads first IF available; nouveau is fallback.
-softdep nvidia pre: nouveau
-# Do NOT blacklist nouveau — let udev pick the right driver.
-NVCOMPAT
-
-# Udev rule: load nvidia-drm only on Turing+ (device ID >= 0x1e00)
-# On older GPUs, nouveau auto-loads via kernel PCI matching.
-mkdir -p /etc/udev/rules.d
-cat > /etc/udev/rules.d/80-nvidia-nouveau-select.rules <<'NVUDEV'
-# NVIDIA Turing+ (TU10x 1e00+, GA10x 2200+, AD10x 2600+, GB20x 2700+):
-# Bind nvidia-drm. Older GPUs fall through to nouveau.
-ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", \
-  ATTR{class}=="0x030000", \
-  ATTR{device}=="0x1e[0-9a-f][0-9a-f]|0x1f[0-9a-f][0-9a-f]|0x2[0-9a-f][0-9a-f][0-9a-f]", \
-  RUN+="/sbin/modprobe nvidia-drm"
-
-# For pre-Turing NVIDIA GPUs: ensure nouveau is not blocked
-ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", \
-  ATTR{class}=="0x030000", \
-  ATTR{device}!="0x1e[0-9a-f][0-9a-f]|0x1f[0-9a-f][0-9a-f]|0x2[0-9a-f][0-9a-f][0-9a-f]", \
-  RUN+="/sbin/modprobe nouveau"
-NVUDEV
-echo "NVIDIA/nouveau GPU-generation auto-select rules installed"
+echo "# nouveau is the default NVIDIA driver for the live ISO" > /etc/modprobe.d/gpu.conf
+echo "GPU driver: nouveau (open-source, universal NVIDIA support)"
 
 # --- MangoHud config (copy to arch home explicitly) ---
 mkdir -p /home/arch/.config/MangoHud

@@ -52,15 +52,14 @@ mesa-utils
 # libva-mesa-driver  # merged into mesa package
 libva-intel-driver
 
-# NVIDIA drivers (RTX 5070 Blackwell — Ryzen 7 9800X3D has no iGPU, NVIDIA is sole GPU)
-nvidia-open-dkms
-nvidia-utils
-lib32-nvidia-utils
-nvidia-settings
-# nvidia-prime  # Only for Optimus (dual Intel+NVIDIA GPU) laptops; breaks single-GPU systems
+# NVIDIA — use nouveau (open-source, supports ALL NVIDIA GPUs from NV04 to Blackwell)
+# nvidia-open-dkms only supports Maxwell+ (SM 5.0+) and blacklists nouveau,
+# breaking older GPUs. Users can install nvidia-open-dkms post-install if needed.
+# nvidia-open-dkms
+# nvidia-utils
+# lib32-nvidia-utils
+# nvidia-settings
 egl-wayland
-libva-nvidia-driver
-# opencl-nvidia  # Requires nvidia driver at runtime; crashes on nouveau fallback
 
 # Steam + Gaming
 steam

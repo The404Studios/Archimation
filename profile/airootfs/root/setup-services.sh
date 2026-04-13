@@ -82,11 +82,15 @@ if [ -f /usr/lib/systemd/system/scm-daemon.service ]; then
         "$WANTS_DIR/scm-daemon.service"
 fi
 
-# DKMS first-boot - build kernel modules before systemd-modules-load
-if [ -f /usr/lib/systemd/system/dkms-first-boot.service ]; then
-    ln -sf /usr/lib/systemd/system/dkms-first-boot.service \
-        "$SYSINIT_WANTS/dkms-first-boot.service"
-fi
+# DKMS first-boot — DISABLED on live ISO.
+# DKMS module compilation takes 3+ minutes and blocks multi-user.target,
+# preventing LightDM and the desktop from starting. Trust/pe-compat
+# modules are optional on the live ISO. The disk installer enables
+# dkms-first-boot on installed systems where it runs once at first boot.
+# if [ -f /usr/lib/systemd/system/dkms-first-boot.service ]; then
+#     ln -sf /usr/lib/systemd/system/dkms-first-boot.service \
+#         "$SYSINIT_WANTS/dkms-first-boot.service"
+# fi
 
 # First-boot wizard — runs via XDG autostart in XFCE session, NOT as a
 # systemd service (which hangs on graphical systems due to symlink detection).

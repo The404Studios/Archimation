@@ -1,23 +1,17 @@
 #!/bin/bash
-# display-setup.sh - Auto-detect display DPI for LightDM greeter
-# Called by LightDM before the greeter starts.
-# Sets Xft.dpi via xrdb so the greeter renders at the right scale.
+# display-setup.sh - Called by LightDM when X starts.
+# 1. Forces VT switch to VT7 (where X runs) so the desktop is visible.
+#    Without this, the console stays on VT1 after Plymouth quits.
+# 2. Deactivates Plymouth if still running (seamless splash → desktop).
+# 3. Sets Xft.dpi for the greeter.
 
-if ! command -v xrandr &>/dev/null; then
-    exit 0
+# Force switch to VT7 where X is running
+chvt 7 2>/dev/null || true
+
+# Tell Plymouth to release the display if it's still active
+if command -v plymouth &>/dev/null && plymouth --ping 2>/dev/null; then
+    plymouth deactivate 2>/dev/null || true
 fi
 
-# Get the vertical resolution of the primary/first connected display
-SCREEN_H=$(xrandr 2>/dev/null | grep -oP '\d+x\K\d+(?=\+)' | sort -rn | head -1)
-
-if [ -z "$SCREEN_H" ]; then
-    exit 0
-fi
-
-# Use consistent 96 DPI across all resolutions — GDK_DPI_SCALE=0.5
-# in the session handles the actual scaling. This prevents the greeter
-# from rendering at oversized DPI on HiDPI screens.
-DPI=96
-
-# Apply DPI to the X server for the greeter session
-echo "Xft.dpi: $DPI" | xrdb -merge 2>/dev/null || true
+# Set DPI (96 base — GDK_DPI_SCALE=0.5 in session handles HiDPI)
+echo "Xft.dpi: 96" | xrdb -merge 2>/dev/null || true

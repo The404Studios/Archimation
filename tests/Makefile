@@ -58,7 +58,7 @@ filesystem-tests:
 
 # --- Integration ---
 qemu-test:
-	bash integration/test_qemu.sh --headless
+	bash ../scripts/test-qemu.sh
 
 clean:
 	rm -f pe-loader/test_trust pe-loader/hello_mingw.exe

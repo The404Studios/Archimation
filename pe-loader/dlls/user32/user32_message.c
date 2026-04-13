@@ -426,7 +426,7 @@ WINAPI_EXPORT BOOL GetMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT 
     (void)wMsgFilterMax;
 
     if (!lpMsg)
-        return -1;
+        return FALSE;
 
     /* If quit was posted and queue is empty, deliver WM_QUIT */
     if (g_quit_posted && msg_queue_empty()) {

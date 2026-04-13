@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""
+pe-status - AI Arch Linux System Diagnostics
+
+Quick health check across all 5 architecture layers:
+  Layer 0: Kernel (trust.ko, binfmt_pe)
+  Layer 1: Object Broker (pe-objectd)
+  Layer 2: PE Runtime (peloader, DLL stubs, DXVK)
+  Layer 3: Service Fabric (scm-daemon, anti-cheat)
+  Layer 4: AI Cortex (daemon, event bus, autonomy)
+  + Desktop and system health
+
+Usage:
+  pe-status          Interactive colored output
+  pe-status --json   Machine-readable JSON output
+  pe-status --brief  One-line summary only
+"""
+
+import asyncio
+import json
+import sys
+import os
+
+# Allow running from source tree or installed
+script_dir = os.path.dirname(os.path.abspath(__file__))
+daemon_dir = os.path.join(os.path.dirname(script_dir), "ai-control", "daemon")
+if os.path.isdir(daemon_dir):
+    sys.path.insert(0, daemon_dir)
+
+from diagnostics import run_full_diagnostics, format_diagnostics
+
+
+async def main():
+    report = await run_full_diagnostics()
+
+    if "--json" in sys.argv:
+        print(json.dumps(report, indent=2))
+    elif "--brief" in sys.argv:
+        s = report["summary"]
+        icon = {"ok": "OK", "warning": "WARN", "error": "FAIL"}.get(
+            report["overall"], "??")
+        print(f"[{icon}] {s['ok']}/{s['total']} checks passed, "
+              f"{s['warnings']} warnings, {s['errors']} errors")
+    else:
+        print(format_diagnostics(report))
+
+    # Exit code: 0=ok, 1=warnings, 2=errors
+    if report["overall"] == "error":
+        sys.exit(2)
+    elif report["overall"] == "warning":
+        sys.exit(1)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,0 +1,579 @@
+# Maintainer: AI Arch Linux Project
+# PKGBUILD for pe-loader - Windows PE binary loader and compatibility layer
+
+pkgname=pe-loader
+pkgver=0.1.0
+pkgrel=2
+pkgdesc="Windows PE executable loader with DLL stub libraries for native .exe execution on Linux"
+arch=('x86_64')
+url="https://github.com/ai-arch-linux/pe-loader"
+license=('GPL-3.0-or-later')
+depends=('glibc' 'libx11')
+makedepends=('gcc' 'make')
+optdepends=(
+    'dkms: kernel module for PE process support'
+    'linux-headers: building the kernel module'
+    'curl: WinHTTP/WinINet HTTPS support via libcurl'
+    'libpulse: DirectSound/XAudio2 audio via PulseAudio'
+    'vulkan-driver: DXVK/VKD3D-Proton graphics (e.g. mesa, nvidia)'
+    'dxvk: Direct3D 9/10/11 to Vulkan translation'
+    'gamescope: HDR gaming compositor (pe-run-game-hdr)'
+    'mangohud: FPS/performance overlay for games'
+    'libarchive: MSI installer CAB extraction'
+)
+provides=('pe-loader' 'peloader')
+install=pe-loader.install
+backup=('etc/binfmt.d/pe-loader.conf')
+source=()
+
+# Use the project source tree directly (local build)
+_srcdir="${startdir}/../../pe-loader"
+
+build() {
+    cd "$_srcdir"
+    make clean
+    make all
+}
+
+package() {
+    cd "$_srcdir"
+    make install DESTDIR="$pkgdir"
+
+    # Install binfmt_misc configuration — kernel-level .exe association
+    install -Dm644 /dev/stdin "$pkgdir/etc/binfmt.d/pe-loader.conf" <<'EOF'
+:PE:M::MZ::/usr/bin/peloader:OCF
+EOF
+
+    # Create standard directories for PE compat
+    install -d "$pkgdir/usr/lib/pe-compat"
+    install -d "$pkgdir/usr/lib/pe-compat/dxvk"
+    install -d "$pkgdir/var/lib/pe-compat"
+    install -d "$pkgdir/var/log/pe-compat"
+
+    # --- Desktop integration: .desktop entry ---
+    install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/pe-loader.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Windows Application
+GenericName=Windows Executable
+Comment=Run Windows .exe files natively with PE Loader
+Exec=/usr/bin/pe-run-game %f
+Icon=application-x-executable
+MimeType=application/x-msdos-program;application/x-dosexec;application/x-msdownload;application/x-ms-dos-executable;application/vnd.microsoft.portable-executable;
+Terminal=false
+Categories=System;Emulator;
+NoDisplay=true
+StartupNotify=true
+DESKTOP
+
+    # --- Desktop integration: MIME type for .exe files ---
+    install -Dm644 /dev/stdin "$pkgdir/usr/share/mime/packages/pe-loader.xml" <<'MIME'
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-msdos-program">
+    <comment>Windows Executable</comment>
+    <comment xml:lang="en">Windows Application</comment>
+    <glob pattern="*.exe"/>
+    <glob pattern="*.EXE"/>
+    <magic priority="60">
+      <match type="string" offset="0" value="MZ"/>
+    </magic>
+    <icon name="application-x-ms-dos-executable"/>
+    <generic-icon name="application-x-executable"/>
+  </mime-type>
+  <mime-type type="application/x-ms-dos-executable">
+    <comment>Windows Executable</comment>
+    <sub-class-of type="application/x-msdos-program"/>
+    <glob pattern="*.exe"/>
+  </mime-type>
+  <mime-type type="application/vnd.microsoft.portable-executable">
+    <comment>Windows PE Executable</comment>
+    <sub-class-of type="application/x-msdos-program"/>
+    <glob pattern="*.exe"/>
+  </mime-type>
+</mime-info>
+MIME
+
+    # --- Desktop integration: .exe file icon ---
+    # Install a simple .exe icon (we'll use an SVG)
+    install -Dm644 /dev/stdin "$pkgdir/usr/share/icons/hicolor/scalable/mimetypes/application-x-ms-dos-executable.svg" <<'ICON'
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <rect x="8" y="4" width="32" height="40" rx="2" fill="#4a90d9" stroke="#2d5f8a" stroke-width="1.5"/>
+  <rect x="12" y="8" width="24" height="16" rx="1" fill="#fff" opacity="0.9"/>
+  <text x="24" y="20" text-anchor="middle" fill="#2d5f8a" font-family="sans-serif" font-size="10" font-weight="bold">EXE</text>
+  <rect x="12" y="28" width="24" height="3" rx="1" fill="#fff" opacity="0.5"/>
+  <rect x="12" y="33" width="18" height="3" rx="1" fill="#fff" opacity="0.4"/>
+  <rect x="12" y="38" width="12" height="3" rx="1" fill="#fff" opacity="0.3"/>
+</svg>
+ICON
+
+    # --- Game launcher wrapper script ---
+    install -Dm755 /dev/stdin "$pkgdir/usr/bin/pe-run-game" <<'LAUNCHER'
+#!/bin/bash
+# pe-run-game - Smart Windows game/application launcher
+#
+# Automatically sets up DXVK, Vulkan, audio, and input for
+# running Windows .exe files natively on AI Arch Linux.
+#
+# Usage: pe-run-game <file.exe> [args...]
+#        pe-run-game --config <file.exe>   (configure game settings)
+#        pe-run-game --diag <file.exe>     (run with diagnostics)
+
+set -euo pipefail
+
+EXE_PATH=""
+DIAG_MODE=0
+TRACE_MODE=0
+CONFIG_MODE=0
+EXTRA_ARGS=()
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --diag)    DIAG_MODE=1; shift ;;
+        --trace)   TRACE_MODE=1; shift ;;
+        --hdr)     exec pe-run-game-hdr "${@:2}" ;;
+        --config)  CONFIG_MODE=1; shift ;;
+        --help|-h)
+            echo "pe-run-game - Run Windows applications natively"
+            echo ""
+            echo "Usage: pe-run-game [options] <file.exe> [args...]"
+            echo ""
+            echo "Options:"
+            echo "  --diag     Show diagnostic info (unresolved imports, etc.)"
+            echo "  --trace    Enable API call tracing"
+            echo "  --hdr      Launch with HDR via gamescope (AMD RDNA 2+ recommended)"
+            echo "  --config   Open configuration dialog for this game"
+            echo "  --help     Show this help"
+            exit 0
+            ;;
+        *.exe|*.EXE)
+            EXE_PATH="$1"; shift
+            EXTRA_ARGS=("$@")
+            break
+            ;;
+        *)
+            if [[ -z "$EXE_PATH" && -f "$1" ]]; then
+                EXE_PATH="$1"; shift
+                EXTRA_ARGS=("$@")
+                break
+            else
+                EXTRA_ARGS+=("$1"); shift
+            fi
+            ;;
+    esac
+done
+
+if [[ -z "$EXE_PATH" ]]; then
+    # If launched from file manager with no .exe, show error
+    if command -v zenity &>/dev/null; then
+        zenity --error --title="PE Loader" \
+            --text="No .exe file specified.\n\nDrag and drop a Windows .exe file or right-click → Open With → Windows Application."
+    else
+        echo "Error: No .exe file specified" >&2
+        echo "Usage: pe-run-game <file.exe> [args...]" >&2
+    fi
+    exit 1
+fi
+
+# Resolve full path
+if [[ ! "$EXE_PATH" = /* ]]; then
+    EXE_PATH="$(cd "$(dirname "$EXE_PATH")" && pwd)/$(basename "$EXE_PATH")"
+fi
+
+if [[ ! -f "$EXE_PATH" ]]; then
+    if command -v zenity &>/dev/null; then
+        zenity --error --title="PE Loader" --text="File not found: $EXE_PATH"
+    else
+        echo "Error: File not found: $EXE_PATH" >&2
+    fi
+    exit 1
+fi
+
+# Ensure the .exe is executable (browsers download without +x permission)
+if [[ ! -x "$EXE_PATH" ]]; then
+    chmod +x "$EXE_PATH" 2>/dev/null || true
+fi
+
+# --- Setup PE Compat environment ---
+export PE_COMPAT_PREFIX="${PE_COMPAT_PREFIX:-$HOME/.pe-compat}"
+mkdir -p "$PE_COMPAT_PREFIX/drives/c/Windows/System32"
+mkdir -p "$PE_COMPAT_PREFIX/drives/c/Program Files"
+mkdir -p "$PE_COMPAT_PREFIX/drives/c/Users/$USER/AppData/Local"
+mkdir -p "$PE_COMPAT_PREFIX/drives/c/Users/$USER/AppData/Roaming"
+mkdir -p "$PE_COMPAT_PREFIX/drives/c/Users/$USER/Documents"
+mkdir -p "$PE_COMPAT_PREFIX/drives/c/Users/$USER/Desktop"
+
+# --- DXVK setup ---
+# Look for DXVK DLLs in standard locations
+DXVK_PATHS=(
+    "/usr/lib/dxvk"
+    "/usr/lib/pe-compat/dxvk"
+    "/usr/share/dxvk"
+    "$PE_COMPAT_PREFIX/dxvk"
+)
+DXVK_DIR=""
+for p in "${DXVK_PATHS[@]}"; do
+    if [[ -f "$p/d3d9.dll" || -f "$p/d3d11.dll" ]]; then
+        DXVK_DIR="$p"
+        break
+    fi
+done
+
+# VKD3D-Proton (D3D12 → Vulkan)
+VKD3D_PATHS=(
+    "/usr/lib/vkd3d-proton"
+    "/usr/lib/pe-compat/vkd3d-proton"
+    "$PE_COMPAT_PREFIX/vkd3d"
+)
+VKD3D_DIR=""
+for p in "${VKD3D_PATHS[@]}"; do
+    if [[ -f "$p/d3d12.dll" ]]; then
+        VKD3D_DIR="$p"
+        break
+    fi
+done
+
+# Build DLL search path for LoadLibraryA: exe dir, DXVK, VKD3D-Proton
+EXE_DIR="$(dirname "$EXE_PATH")"
+export PE_COMPAT_DLL_PATH="$EXE_DIR"
+[[ -n "$DXVK_DIR" ]] && PE_COMPAT_DLL_PATH="$PE_COMPAT_DLL_PATH:$DXVK_DIR"
+[[ -n "$VKD3D_DIR" ]] && PE_COMPAT_DLL_PATH="$PE_COMPAT_DLL_PATH:$VKD3D_DIR"
+
+# Ensure .so DLL stubs are discoverable by dlopen
+export LD_LIBRARY_PATH="/usr/lib/pe-compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# --- Vulkan setup ---
+# Prefer radeon > intel > nouveau > lavapipe (software)
+if [[ -z "${VK_ICD_FILENAMES:-}" ]]; then
+    for icd in \
+        /usr/share/vulkan/icd.d/nvidia_icd.x86_64.json \
+        /usr/share/vulkan/icd.d/radeon_icd.x86_64.json \
+        /usr/share/vulkan/icd.d/intel_icd.x86_64.json \
+        /usr/share/vulkan/icd.d/nouveau_icd.x86_64.json \
+        /usr/share/vulkan/icd.d/lvp_icd.x86_64.json; do
+        if [[ -f "$icd" ]]; then
+            export VK_ICD_FILENAMES="$icd"
+            break
+        fi
+    done
+fi
+
+# --- Audio setup ---
+# PipeWire should be running; ensure PULSE_SERVER is set
+if [[ -z "${PULSE_SERVER:-}" ]]; then
+    if [[ -S "/run/user/$(id -u)/pulse/native" ]]; then
+        export PULSE_SERVER="unix:/run/user/$(id -u)/pulse/native"
+    fi
+fi
+
+# --- Display setup ---
+if [[ -z "${DISPLAY:-}" ]]; then
+    export DISPLAY=":0"
+fi
+
+# --- Build peloader command ---
+PELOADER_CMD=("/usr/bin/peloader")
+if [[ $DIAG_MODE -eq 1 ]]; then
+    PELOADER_CMD+=("--diag")
+fi
+if [[ $TRACE_MODE -eq 1 ]]; then
+    PELOADER_CMD+=("--trace")
+fi
+PELOADER_CMD+=("$EXE_PATH")
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+    PELOADER_CMD+=("${EXTRA_ARGS[@]}")
+fi
+
+# --- Config mode: show settings dialog ---
+if [[ $CONFIG_MODE -eq 1 ]]; then
+    if command -v zenity &>/dev/null; then
+        zenity --info --title="Game Configuration" \
+            --text="Game: $(basename "$EXE_PATH")\nDirectory: $EXE_DIR\nDXVK: ${DXVK_DIR:-not found}\nVulkan: ${VK_ICD_FILENAMES:-auto}\nDLL Path: $PE_COMPAT_DLL_PATH"
+    fi
+    exit 0
+fi
+
+# --- Log start ---
+LOGDIR="$PE_COMPAT_PREFIX/logs"
+mkdir -p "$LOGDIR"
+LOGFILE="$LOGDIR/$(basename "$EXE_PATH" .exe)-$(date +%Y%m%d-%H%M%S).log"
+
+echo "[$(date)] Launching: ${PELOADER_CMD[*]}" | tee "$LOGFILE"
+echo "[$(date)] DLL Path: $PE_COMPAT_DLL_PATH" | tee -a "$LOGFILE"
+echo "[$(date)] Vulkan ICD: ${VK_ICD_FILENAMES:-auto}" | tee -a "$LOGFILE"
+
+# --- Launch ---
+"${PELOADER_CMD[@]}" 2>&1 | tee -a "$LOGFILE"
+exit ${PIPESTATUS[0]}
+LAUNCHER
+
+    # --- Game shortcut creator script ---
+    install -Dm755 /dev/stdin "$pkgdir/usr/bin/pe-create-shortcut" <<'SHORTCUT'
+#!/bin/bash
+# pe-create-shortcut - Create a desktop shortcut for a Windows .exe
+#
+# Usage: pe-create-shortcut <file.exe> [name] [icon]
+
+EXE_PATH="$1"
+NAME="${2:-$(basename "$EXE_PATH" .exe)}"
+ICON="${3:-application-x-ms-dos-executable}"
+
+if [[ -z "$EXE_PATH" ]]; then
+    echo "Usage: pe-create-shortcut <file.exe> [name] [icon]" >&2
+    exit 1
+fi
+
+# Resolve full path
+if [[ ! "$EXE_PATH" = /* ]]; then
+    EXE_PATH="$(cd "$(dirname "$EXE_PATH")" && pwd)/$(basename "$EXE_PATH")"
+fi
+
+DESKTOP_DIR="${XDG_DESKTOP_DIR:-$HOME/Desktop}"
+mkdir -p "$DESKTOP_DIR"
+
+# Sanitize NAME for filesystem use (replace slashes and control chars)
+SAFE_NAME="${NAME//\//_}"
+DESKTOP_FILE="$DESKTOP_DIR/${SAFE_NAME}.desktop"
+
+cat > "$DESKTOP_FILE" <<EOF
+[Desktop Entry]
+Type=Application
+Name=$NAME
+Comment=Windows Application - $NAME
+Exec=/usr/bin/pe-run-game "$EXE_PATH"
+Icon=$ICON
+Terminal=false
+Categories=Game;
+StartupNotify=true
+EOF
+
+chmod +x "$DESKTOP_FILE"
+
+# Trust the .desktop file for XFCE (avoid "untrusted launcher" warning)
+if command -v gio &>/dev/null; then
+    gio set "$DESKTOP_FILE" metadata::trusted true 2>/dev/null || true
+fi
+
+echo "Created shortcut: $DESKTOP_FILE"
+
+# Notify desktop
+if command -v notify-send &>/dev/null; then
+    notify-send "Shortcut Created" "Desktop shortcut for $NAME created." \
+        --icon=application-x-ms-dos-executable
+fi
+SHORTCUT
+
+    # --- Steam compatibility tool integration ---
+    local _steamdir="$pkgdir/usr/share/steam/compatibilitytools.d/peloader"
+    install -d "$_steamdir"
+
+    install -Dm644 /dev/stdin "$_steamdir/toolmanifest.vdf" <<'VDFEOF'
+"manifest"
+{
+  "version" "2"
+  "commandline" "/proton %verb%"
+  "require_tool_appid" ""
+}
+VDFEOF
+
+    install -Dm755 /dev/stdin "$_steamdir/proton" <<'PROTONEOF'
+#!/bin/bash
+# PE Loader - Steam Compatibility Tool
+VERB="$1"
+shift
+case "$VERB" in
+    waitforexitandrun|run)
+        export DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-warn}"
+        # Enable HDR if running under gamescope
+        if [[ -n "${GAMESCOPE_WAYLAND_DISPLAY:-}" ]]; then
+            export DXVK_HDR=1
+            export ENABLE_GAMESCOPE_WSI=1
+        fi
+        PE_HOME="$HOME/.pe-compat"
+        mkdir -p "$PE_HOME/drives/c/windows/system32"
+        mkdir -p "$PE_HOME/drives/c/users/$USER/AppData/Local"
+        GAME_DIR="$(dirname "$1")"
+        cd "$GAME_DIR"
+        exec /usr/bin/peloader "$@"
+        ;;
+    getcompatpath) echo "$STEAM_COMPAT_DATA_PATH" ;;
+    getnativepath) echo "$1" ;;
+    *) echo "PE Loader: Unknown verb '$VERB'" >&2; exit 1 ;;
+esac
+PROTONEOF
+
+    install -Dm644 /dev/stdin "$_steamdir/compatibilitytool.vdf" <<'CTEOF'
+"compatibilitytools"
+{
+  "compat_tools"
+  {
+    "peloader"
+    {
+      "install_path" "."
+      "display_name" "PE Loader (Native)"
+      "from_oslist" "windows"
+      "to_oslist" "linux"
+    }
+  }
+}
+CTEOF
+
+    # --- HDR game launcher (wraps in gamescope with HDR) ---
+    install -Dm755 /dev/stdin "$pkgdir/usr/bin/pe-run-game-hdr" <<'HDRLAUNCHER'
+#!/bin/bash
+# pe-run-game-hdr - Launch Windows games with HDR via gamescope
+#
+# Uses gamescope compositor for HDR10 output.
+# Works best with AMD RDNA 2+ GPUs (RX 6000/7000/9000 series).
+# NVIDIA requires driver 570+ with Wayland.
+#
+# Usage: pe-run-game-hdr <game.exe> [args...]
+#        pe-run-game-hdr --sdr-nits 250 <game.exe>
+#        pe-run-game-hdr --no-hdr <game.exe>   (gamescope only, no HDR)
+
+set -euo pipefail
+
+# Defaults
+HDR_ENABLED=1
+SDR_NITS=203
+ITM_ENABLE=1
+WIDTH=""
+HEIGHT=""
+FULLSCREEN=1
+EXTRA_GS_ARGS=()
+EXE_ARGS=()
+EXE_PATH=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --no-hdr)     HDR_ENABLED=0; shift ;;
+        --sdr-nits)   SDR_NITS="$2"; shift 2 ;;
+        --no-itm)     ITM_ENABLE=0; shift ;;
+        --width|-W)   WIDTH="$2"; shift 2 ;;
+        --height|-H)  HEIGHT="$2"; shift 2 ;;
+        --windowed)   FULLSCREEN=0; shift ;;
+        --mangohud)   EXTRA_GS_ARGS+=(--mangoapp); shift ;;
+        --help|-h)
+            echo "pe-run-game-hdr - Launch Windows games with HDR"
+            echo ""
+            echo "Usage: pe-run-game-hdr [options] <game.exe> [args...]"
+            echo ""
+            echo "Options:"
+            echo "  --no-hdr       Use gamescope without HDR"
+            echo "  --sdr-nits N   SDR content brightness (default: 203)"
+            echo "  --no-itm       Disable inverse tone mapping"
+            echo "  --width N      Override width"
+            echo "  --height N     Override height"
+            echo "  --windowed     Run windowed instead of fullscreen"
+            echo "  --mangohud     Enable MangoHud overlay"
+            echo ""
+            echo "Requires: gamescope, AMD GPU (RDNA 2+ recommended)"
+            echo "          Set DXVK_HDR=1 for game-side HDR support"
+            exit 0
+            ;;
+        *.exe|*.EXE)
+            EXE_PATH="$1"; shift
+            EXE_ARGS=("$@")
+            break
+            ;;
+        *)
+            if [[ -z "$EXE_PATH" && -f "$1" ]]; then
+                EXE_PATH="$1"; shift
+                EXE_ARGS=("$@")
+                break
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$EXE_PATH" ]]; then
+    echo "Error: No .exe file specified" >&2
+    echo "Usage: pe-run-game-hdr <game.exe>" >&2
+    exit 1
+fi
+
+# Check gamescope
+if ! command -v gamescope &>/dev/null; then
+    echo "Warning: gamescope not found, falling back to pe-run-game (no HDR)" >&2
+    exec pe-run-game "$EXE_PATH" "${EXE_ARGS[@]}"
+fi
+
+# Build gamescope command
+GS_CMD=(gamescope)
+
+if [[ $HDR_ENABLED -eq 1 ]]; then
+    GS_CMD+=(--hdr-enabled)
+    if [[ $ITM_ENABLE -eq 1 ]]; then
+        GS_CMD+=(--hdr-itm-enable)
+    fi
+    GS_CMD+=(--hdr-sdr-content-nits "$SDR_NITS")
+fi
+
+if [[ -n "$WIDTH" ]]; then
+    GS_CMD+=(-W "$WIDTH")
+fi
+if [[ -n "$HEIGHT" ]]; then
+    GS_CMD+=(-H "$HEIGHT")
+fi
+if [[ $FULLSCREEN -eq 1 ]]; then
+    GS_CMD+=(-f)
+fi
+
+GS_CMD+=(--hide-cursor-delay 3000)
+GS_CMD+=(--fade-out-duration 200)
+GS_CMD+=("${EXTRA_GS_ARGS[@]}")
+GS_CMD+=(--)
+
+# Set HDR environment for DXVK
+export DXVK_HDR=1
+export ENABLE_GAMESCOPE_WSI=1
+
+# Launch through gamescope → pe-run-game
+echo "[HDR] Launching: ${GS_CMD[*]} pe-run-game $EXE_PATH ${EXE_ARGS[*]}"
+exec "${GS_CMD[@]}" pe-run-game "$EXE_PATH" "${EXE_ARGS[@]}"
+HDRLAUNCHER
+
+    # --- Firefox policy: handle .exe downloads with PE Loader ---
+    install -Dm644 /dev/stdin "$pkgdir/usr/lib/firefox/distribution/policies.json" <<'FFPOLICY'
+{
+  "policies": {
+    "Handlers": {
+      "mimeTypes": {
+        "application/x-msdos-program": {
+          "action": "useSystemDefault",
+          "ask": false
+        },
+        "application/x-dosexec": {
+          "action": "useSystemDefault",
+          "ask": false
+        },
+        "application/x-msdownload": {
+          "action": "useSystemDefault",
+          "ask": false
+        },
+        "application/x-ms-dos-executable": {
+          "action": "useSystemDefault",
+          "ask": false
+        },
+        "application/vnd.microsoft.portable-executable": {
+          "action": "useSystemDefault",
+          "ask": false
+        }
+      },
+      "extensions": {
+        "exe": {
+          "action": "useSystemDefault",
+          "ask": false
+        }
+      }
+    }
+  }
+}
+FFPOLICY
+
+    # Install documentation stub
+    install -d "$pkgdir/usr/share/doc/$pkgname"
+}

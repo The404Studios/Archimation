@@ -1,0 +1,42 @@
+# Maintainer: AI Arch Linux Project
+# PKGBUILD for trust-system - Root of Trust kernel module and userspace library
+
+pkgname=trust-system
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Root of Trust kernel module and libtrust userspace library"
+arch=('x86_64')
+url="https://github.com/ai-arch-linux/trust-system"
+license=('GPL-3.0-or-later')
+depends=('glibc')
+makedepends=('gcc' 'make' 'linux-headers')
+optdepends=(
+    'trust-dkms: kernel module with DKMS auto-rebuild on kernel updates'
+)
+provides=('libtrust' 'trust-system')
+source=()
+
+_srcdir="${startdir}/../../trust"
+
+build() {
+    cd "$_srcdir"
+
+    # Build userspace library only (kernel module needs running kernel headers)
+    make -C lib clean
+    make -C lib all
+}
+
+package() {
+    cd "$_srcdir"
+
+    # Install userspace library
+    make -C lib install DESTDIR="$pkgdir"
+
+    # Install headers
+    install -Dm644 include/trust_types.h "$pkgdir/usr/include/trust/trust_types.h"
+    install -Dm644 include/trust_ioctl.h "$pkgdir/usr/include/trust/trust_ioctl.h"
+    install -Dm644 include/trust_uapi.h "$pkgdir/usr/include/trust/trust_uapi.h"
+
+    # Kernel source and DKMS integration is handled by the trust-dkms package.
+    # trust-system provides only the userspace library and headers.
+}

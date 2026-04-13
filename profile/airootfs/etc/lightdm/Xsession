@@ -1,0 +1,32 @@
+#!/bin/sh
+# LightDM Xsession wrapper for Arch Linux
+# This script is invoked by LightDM as: /etc/lightdm/Xsession <session-command>
+# It sets up the environment and then exec's the session (e.g., startxfce4).
+#
+# CRITICAL: lightdm.conf has session-wrapper=/etc/lightdm/Xsession.
+# If this file is missing, LightDM cannot launch any session and the user
+# sees a blank screen or greeter loop instead of XFCE.
+
+# Source system-wide profile
+if [ -f /etc/profile ]; then
+    . /etc/profile
+fi
+
+# Source user .xprofile (LightDM convention)
+if [ -f "$HOME/.xprofile" ]; then
+    . "$HOME/.xprofile"
+fi
+
+# Source user .profile as fallback
+if [ -f "$HOME/.profile" ]; then
+    . "$HOME/.profile"
+fi
+
+# Ensure XDG_RUNTIME_DIR is set (required by PipeWire, dbus, etc.)
+if [ -z "$XDG_RUNTIME_DIR" ]; then
+    XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    export XDG_RUNTIME_DIR
+fi
+
+# Launch the session command passed by LightDM
+exec $@

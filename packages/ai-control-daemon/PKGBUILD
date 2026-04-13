@@ -1,0 +1,130 @@
+# Maintainer: AI Arch Linux Project
+# PKGBUILD for ai-control-daemon - Full system control daemon with REST API
+
+pkgname=ai-control-daemon
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="AI control daemon providing full system access via REST API (screen, keyboard, mouse, filesystem, processes)"
+arch=('any')
+url="https://github.com/ai-arch-linux/ai-control-daemon"
+license=('GPL-3.0-or-later')
+depends=(
+    'python'
+    'python-fastapi'
+    'uvicorn'
+    'python-httptools'
+    'python-starlette'
+    'python-websockets'
+    'python-evdev'
+    'python-pillow'
+    'python-pydantic'
+    'python-psutil'
+    'nftables'
+)
+optdepends=(
+    'python-sdnotify: systemd READY=1 notification'
+    'windows-services: Windows SCM service management'
+    'llama-cpp-python: local LLM inference support'
+)
+provides=('ai-control-daemon')
+backup=(
+    'etc/ai-control-daemon/config.toml'
+    'etc/pe-compat/cortex.toml'
+)
+source=()
+
+# Use the project source tree directly (local build)
+_srcdir="${startdir}/../../ai-control"
+
+package() {
+    cd "$_srcdir"
+
+    # Install daemon Python modules
+    install -d "$pkgdir/usr/lib/ai-control-daemon"
+    install -Dm644 daemon/*.py "$pkgdir/usr/lib/ai-control-daemon/"
+    # Ensure __init__.py is installed (may be missed by glob on some systems)
+    if [ -f daemon/__init__.py ]; then
+        install -Dm644 daemon/__init__.py "$pkgdir/usr/lib/ai-control-daemon/__init__.py"
+    fi
+
+    # Install configuration
+    install -Dm644 config/ai-control.toml "$pkgdir/etc/ai-control-daemon/config.toml"
+    install -Dm644 config/cortex.toml "$pkgdir/etc/pe-compat/cortex.toml"
+
+    # Install systemd service
+    install -Dm644 config/ai-control.service "$pkgdir/usr/lib/systemd/system/ai-control.service"
+
+    # Create runtime directories
+    install -d "$pkgdir/var/lib/ai-control-daemon"
+    install -d "$pkgdir/var/lib/ai-control/patterns"
+    install -d "$pkgdir/var/lib/ai-control/signatures"
+    install -d "$pkgdir/var/lib/ai-control/win-api-db"
+    install -d "$pkgdir/var/log/ai-control-daemon"
+    install -d "$pkgdir/run/ai-control-daemon"
+    install -d "$pkgdir/tmp/generated-stubs"
+
+    # Install a launcher script
+    install -Dm755 /dev/stdin "$pkgdir/usr/bin/ai-control-daemon" <<'LAUNCHER'
+#!/bin/bash
+# AI Control Daemon launcher
+exec /usr/bin/python3 /usr/lib/ai-control-daemon/main.py \
+    --config /etc/ai-control-daemon/config.toml "$@"
+LAUNCHER
+
+    # AI Cortex (the brain)
+    install -dm755 "$pkgdir/usr/lib/ai-control-daemon/cortex"
+    install -Dm644 cortex/*.py "$pkgdir/usr/lib/ai-control-daemon/cortex/"
+    # Ensure __init__.py is installed for cortex package
+    if [ -f cortex/__init__.py ]; then
+        install -Dm644 cortex/__init__.py "$pkgdir/usr/lib/ai-control-daemon/cortex/__init__.py"
+    fi
+
+    # AI Cortex launcher script
+    install -Dm755 /dev/stdin "$pkgdir/usr/bin/ai-cortex" <<'LAUNCHER'
+#!/bin/bash
+cd /usr/lib/ai-control-daemon
+exec python3 -m cortex "$@"
+LAUNCHER
+
+    # pe-status diagnostic tool
+    install -Dm755 /dev/stdin "$pkgdir/usr/bin/pe-status" <<'PESTATUS'
+#!/bin/bash
+# pe-status - AI Arch Linux System Diagnostics
+cd /usr/lib/ai-control-daemon
+exec python3 -c "
+import asyncio, sys; sys.path.insert(0, '.')
+from diagnostics import run_full_diagnostics, format_diagnostics
+report = asyncio.run(run_full_diagnostics())
+if '--json' in sys.argv:
+    import json; print(json.dumps(report, indent=2))
+elif '--brief' in sys.argv:
+    s=report['summary']
+    icon={'ok':'OK','warning':'WARN','error':'FAIL'}.get(report['overall'],'??')
+    print(f'[{icon}] {s[\"ok\"]}/{s[\"total\"]} checks passed, {s[\"warnings\"]} warnings, {s[\"errors\"]} errors')
+else:
+    print(format_diagnostics(report))
+sys.exit(2 if report['overall']=='error' else 1 if report['overall']=='warning' else 0)
+" "$@"
+PESTATUS
+
+    # AI Cortex systemd service
+    install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/system/ai-cortex.service" <<'EOF'
+[Unit]
+Description=AI Cortex - System Orchestrator
+After=pe-objectd.service systemd-modules-load.service ai-control.service
+Wants=pe-objectd.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/mkdir -p /run/pe-compat /var/lib/pe-compat/trust-history
+ExecStart=/usr/bin/ai-cortex
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}

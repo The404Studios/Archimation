@@ -1,0 +1,18 @@
+# Kbuild - WDM Host kernel module
+#
+# Loads and hosts Windows .sys driver binaries inside a Linux kernel module.
+# Provides WDM/WDF kernel API stubs, IRP dispatch, device namespace, and
+# PnP manager emulation.
+
+obj-m := wdm_host.o
+
+wdm_host-y := wdm_host_main.o \
+              wdm_host_loader.o \
+              wdm_host_irp.o \
+              wdm_host_device.o \
+              wdm_host_thunk.o \
+              wdm_host_dma.o \
+              wdm_host_pnp.o \
+              wdm_host_registry.o
+
+ccflags-y := -DWDM_HOST_MODULE -I$(src)/../stubs

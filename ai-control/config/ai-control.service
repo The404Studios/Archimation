@@ -1,0 +1,45 @@
+[Unit]
+Description=AI Control Daemon - Full System Control
+# Start after basic networking is available. Do NOT use network-online.target
+# because it can hang indefinitely if NetworkManager hasn't established a
+# connection (common in QEMU/first-boot). The daemon doesn't need full
+# network connectivity to start — it binds to localhost:8420.
+After=network.target
+# Start after persistence cleanup to avoid stale state
+After=ai-persist-cleanup.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ai-control-daemon
+StandardOutput=journal
+StandardError=journal
+# Run as root for full system access
+User=root
+Group=root
+# Working directory
+WorkingDirectory=/usr/lib/ai-control-daemon
+# Environment — do NOT set DISPLAY here. The daemon auto-detects the
+# session type (Wayland/X11/headless) at startup. Setting DISPLAY=:0
+# when X isn't running yet causes compositor/screen modules to fail.
+# XAUTHORITY is also auto-detected from /run/lightdm, ~/.Xauthority, etc.
+Environment=PYTHONUNBUFFERED=1
+# Directories
+RuntimeDirectory=ai-control-daemon
+StateDirectory=ai-control-daemon
+LogsDirectory=ai-control-daemon
+# Restart policy — restart on failure, but also on abnormal exit/watchdog
+Restart=on-failure
+RestartSec=3
+StartLimitIntervalSec=60
+StartLimitBurst=5
+# Fail fast if the daemon can't start within 30s (missing deps, port in use)
+TimeoutStartSec=30
+# No restrictions - AI has full access
+ProtectSystem=false
+ProtectHome=false
+PrivateTmp=false
+NoNewPrivileges=false
+# Full capabilities (root default - no restrictions)
+
+[Install]
+WantedBy=multi-user.target

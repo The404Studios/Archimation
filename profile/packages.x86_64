@@ -1,0 +1,280 @@
+# Base system
+base
+linux
+linux-firmware
+amd-ucode
+intel-ucode
+mkinitcpio
+mkinitcpio-archiso
+
+# Boot
+grub
+efibootmgr
+syslinux
+plymouth
+
+# Desktop environment
+xfce4
+xfce4-goodies
+xfce4-session
+xfce4-whiskermenu-plugin
+lightdm
+lightdm-gtk-greeter
+dbus
+
+# X11 / display
+xorg-server
+xorg-xinit
+xorg-xrandr
+xorg-xdpyinfo
+xorg-xauth
+xf86-video-intel
+xf86-video-nouveau
+xf86-input-libinput
+mesa
+scrot
+brightnessctl
+
+# Explicit provider choices (avoid interactive prompts)
+iptables-nft
+pipewire-jack
+
+# Vulkan / GPU drivers (gaming)
+vulkan-icd-loader
+vulkan-radeon
+vulkan-intel
+vulkan-nouveau
+vulkan-swrast
+vulkan-tools
+vulkan-mesa-layers
+mesa-utils
+# libva-mesa-driver  # merged into mesa package
+libva-intel-driver
+
+# NVIDIA drivers (RTX 5070 Blackwell — Ryzen 7 9800X3D has no iGPU, NVIDIA is sole GPU)
+nvidia-open-dkms
+nvidia-utils
+lib32-nvidia-utils
+nvidia-settings
+# nvidia-prime  # Only for Optimus (dual Intel+NVIDIA GPU) laptops; breaks single-GPU systems
+egl-wayland
+libva-nvidia-driver
+# opencl-nvidia  # Requires nvidia driver at runtime; crashes on nouveau fallback
+
+# Steam + Gaming
+steam
+gamemode
+# lib32-gamemode  # AUR-only, not in official repos
+gamescope
+mangohud
+# lib32-mangohud  # AUR-only, not in official repos
+lib32-mesa
+lib32-glibc
+lib32-gcc-libs
+lib32-libx11
+lib32-alsa-lib
+lib32-libpulse
+lib32-openal
+lib32-vulkan-icd-loader
+lib32-vulkan-radeon
+lib32-vulkan-intel
+# lib32-vulkan-nouveau  # Not in official repos
+
+# D3D Translation support (DXVK/VKD3D installed via customize_airootfs.sh)
+# lib32-vulkan-mesa-layers  # Not in official repos
+
+# Wine (Win32 API translation layer — backend for PE loader complex apps)
+wine
+wine-mono
+wine-gecko
+# lib32-gst-plugins-base  # AUR-only (does not exist in multilib)
+# lib32-gst-plugins-good  # AUR-only (does not exist in multilib)
+winetricks
+
+# Network
+networkmanager
+network-manager-applet
+networkmanager-openvpn
+iwd
+wpa_supplicant
+wireless_tools
+iw
+dhcpcd
+openssl
+
+# Bluetooth
+bluez
+bluez-utils
+blueman
+
+# Audio
+pipewire
+pipewire-pulse
+pipewire-alsa
+libpulse
+wireplumber
+pavucontrol
+alsa-utils
+sof-firmware
+sox
+
+# CLI tools
+git
+vim
+nano
+htop
+fastfetch
+wget
+curl
+unzip
+nodejs
+npm
+pacman-contrib
+
+# AI development
+python-pip
+openssh
+rsync
+lsof
+bash-completion
+
+# GUI applications
+firefox
+thunar
+thunar-volman
+tumbler
+terminator
+zenity
+file-roller
+# discord -- installed via direct download in customize_airootfs.sh (AUR-only package)
+
+# Desktop automation tools (for AI control)
+xdotool
+wmctrl
+xclip
+xsel
+conky
+
+# Python stack
+python
+python-pip
+python-fastapi
+uvicorn
+python-httptools
+python-starlette
+python-evdev
+python-pillow
+python-pydantic
+python-websockets
+python-psutil
+python-requests
+python-aiohttp
+python-tomli
+
+# Build tools
+base-devel
+gcc
+make
+dkms
+linux-headers
+
+# System utilities
+dpkg
+rpm-tools
+nftables
+conntrack-tools
+libnotify
+nss
+libxss
+at-spi2-core
+polkit
+gvfs
+gvfs-mtp
+udisks2
+ntfs-3g
+7zip
+dosfstools
+e2fsprogs
+arch-install-scripts
+gparted
+parted
+xdg-utils
+xdg-user-dirs
+shared-mime-info
+desktop-file-utils
+acpi
+man-db
+man-pages
+
+# GTK / UI libraries
+gtk3
+gtk4
+libadwaita
+python-gobject
+
+# PE loader runtime dependencies (dlopen'd)
+libarchive
+
+# Theming
+papirus-icon-theme
+adwaita-icon-theme
+
+# Fonts
+terminus-font
+ttf-dejavu
+noto-fonts
+noto-fonts-emoji
+ttf-liberation
+ttf-jetbrains-mono
+ttf-fira-sans
+ttf-cascadia-code
+
+# Custom packages (from pe-compat local repo)
+pe-loader
+trust-system
+trust-dkms
+pe-compat-dkms
+ai-control-daemon
+ai-firewall
+windows-services
+ai-desktop-config
+ai-first-boot-wizard
+
+# Windows 11 visual stack
+picom
+dunst
+# ttf-inter → not in official repos; using ttf-dejavu/noto-fonts/ttf-liberation (listed above)
+# arc-gtk-theme → not in official repos (AUR only)
+xss-lock
+i3lock
+
+# Gaming backend - Proton/Wine ecosystem
+lutris
+# bottles → not in official repos (AUR)
+# faudio / lib32-faudio → pulled in by wine as dependencies; standalone pkg removed from repos
+cabextract
+python-magic
+python-yaml
+
+# Media codecs (game cutscenes, audio)
+gst-plugins-bad
+gst-plugins-ugly
+gst-plugin-pipewire
+
+# Qt theming (many games use Qt)
+kvantum
+kvantum-qt5
+qt5ct
+qt6ct
+
+# Portal (needed by launchers/sandboxed apps)
+xdg-desktop-portal
+xdg-desktop-portal-gtk
+
+# Laptop power management (ThinkPad)
+acpid
+tlp
+xorg-xbacklight
+
+# Extra gaming tools
+# vkbasalt → not in official repos (AUR)

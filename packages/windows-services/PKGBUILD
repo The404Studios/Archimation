@@ -1,0 +1,97 @@
+# Maintainer: AI Arch Linux Project
+# PKGBUILD for windows-services - Windows Service Control Manager and driver tools
+
+pkgname=windows-services
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Windows Service Control Manager daemon, driver framework, and anti-cheat compatibility layer"
+arch=('x86_64')
+url="https://github.com/ai-arch-linux/windows-services"
+license=('GPL-3.0-or-later')
+depends=('glibc' 'pe-loader')
+makedepends=('gcc' 'make')
+optdepends=(
+    'dkms: kernel driver host module'
+    'linux-headers: building the kernel driver host'
+)
+provides=('windows-services' 'scm-daemon' 'devcon')
+source=()
+
+# Use the project source tree directly (local build)
+_srcdir="${startdir}/../../services"
+
+build() {
+    cd "$_srcdir"
+    make clean
+    make all
+}
+
+package() {
+    cd "$_srcdir"
+
+    # Install SCM daemon and sc command
+    install -Dm755 scm/scm_daemon "$pkgdir/usr/bin/scm_daemon"
+    install -Dm755 scm/sc "$pkgdir/usr/bin/sc"
+
+    # Install devcon (device console) tool
+    install -Dm755 drivers/userspace/devcon "$pkgdir/usr/bin/devcon"
+
+    # Install anti-cheat compatibility library
+    install -Dm755 anticheat/libpe_anticheat.so "$pkgdir/usr/lib/pe-compat/libpe_anticheat.so"
+
+    # Install driver stub shared libraries
+    install -d "$pkgdir/usr/lib/pe-compat/drivers"
+    for so in drivers/stubs/*.so; do
+        [ -f "$so" ] && install -Dm755 "$so" "$pkgdir/usr/lib/pe-compat/drivers/$(basename "$so")"
+    done
+
+    # Create SCM state directories
+    install -d "$pkgdir/var/lib/pe-compat/services"
+    install -d "$pkgdir/var/log/pe-compat"
+
+    # Object broker daemon
+    install -Dm755 objectd/pe-objectd "$pkgdir/usr/bin/pe-objectd"
+
+    # pe-objectd systemd service
+    install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/system/pe-objectd.service" <<'EOF'
+[Unit]
+Description=PE Compatibility Object Broker
+Before=ai-cortex.service scm-daemon.service
+After=network.target
+# Skip if binary was not installed (build failure, etc.)
+ConditionPathExists=/usr/bin/pe-objectd
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/mkdir -p /run/pe-compat
+ExecStart=/usr/bin/pe-objectd
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Install systemd service for SCM daemon
+    install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/system/scm-daemon.service" <<'SERVICE'
+[Unit]
+Description=Windows Service Control Manager Daemon
+After=network.target pe-objectd.service
+# Skip if binary was not installed (build failure, etc.)
+ConditionPathExists=/usr/bin/scm_daemon
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/mkdir -p /run/pe-compat/services
+ExecStart=/usr/bin/scm_daemon
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+}

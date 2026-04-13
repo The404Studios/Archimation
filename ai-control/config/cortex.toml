@@ -1,0 +1,40 @@
+# AI Cortex Configuration
+# The cortex is the AI brain — SENSE/DECIDE/ACT orchestration loop
+
+[general]
+log_level = "INFO"
+
+[sockets]
+# Unix domain sockets for inter-process communication
+event_socket = "/run/pe-compat/events.sock"
+command_socket = "/run/pe-compat/cortex-cmd.sock"
+broker_socket = "/run/pe-compat/objects.sock"
+scm_socket = "/run/pe-compat/scm.sock"
+
+[trust]
+# Path to the trust kernel device
+device = "/dev/trust"
+# Initial trust score for new subjects (0-100)
+initial_score = 50
+
+[llm]
+# Path to GGUF model for LLM-tier decision making (optional)
+# Leave empty to use policy+heuristics only (tiers 1-2)
+model_path = ""
+
+[autonomy]
+# Per-domain autonomy ceilings (0=OBSERVE, 1=ADVISE, 2=ACT+REPORT, 3=AUTONOMOUS)
+# Level 3 is the hard maximum. SOVEREIGN (4) was removed as a safety measure.
+process_management = 2
+network_access = 1
+trust_modification = 1
+hardware_control = 2
+pe_execution = 2
+service_management = 2
+security_response = 3
+system_configuration = 1
+
+[api]
+# Optional REST API for cortex status/control
+enabled = true
+port = 8421

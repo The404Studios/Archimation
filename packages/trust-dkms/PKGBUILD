@@ -1,0 +1,92 @@
+# Maintainer: AI Arch Linux Project
+# PKGBUILD for trust-dkms - Root of Authority trust kernel module (DKMS)
+
+pkgname=trust-dkms
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Root of Authority trust kernel module (DKMS) - dynamic trust enforcement at kernel level"
+arch=('x86_64')
+url="https://github.com/ai-arch-linux/trust-system"
+license=('GPL-3.0-or-later')
+depends=(
+    'dkms'
+    'trust-system'
+)
+makedepends=('linux-headers')
+provides=('trust-dkms')
+conflicts=()
+install=trust-dkms.install
+source=()
+
+# Use the trust source tree directly
+_srcdir="${startdir}/../../trust"
+_modname=trust
+
+package() {
+    local _dkms_dir="$pkgdir/usr/src/${_modname}-${pkgver}"
+    install -d "$_dkms_dir"
+    install -d "$_dkms_dir/include"
+
+    # ── Kernel source files ───────────────────────────────────────────
+    # Must match all .o targets in Kbuild: trust_core, trust_tlb, trust_risc,
+    # trust_fbc, trust_dna_gate, trust_ape, trust_chromosome, trust_token,
+    # trust_lifecycle, trust_dispatch, trust_memory, trust_syscall
+    for src in \
+        trust_core.c trust_tlb.c trust_risc.c trust_fbc.c \
+        trust_dna_gate.c trust_ape.c trust_chromosome.c \
+        trust_token.c trust_lifecycle.c trust_dispatch.c \
+        trust_memory.c trust_memory.h trust_internal.h \
+        trust_syscall.c trust_syscall.h; do
+        install -Dm644 "$_srcdir/kernel/$src" "$_dkms_dir/$src"
+    done
+
+    # Kbuild (module build rules)
+    install -Dm644 "$_srcdir/kernel/Kbuild" "$_dkms_dir/Kbuild"
+
+    # Headers that Kbuild references via -I$(src)/../include
+    install -Dm644 "$_srcdir/include/trust_types.h"  "$_dkms_dir/include/trust_types.h"
+    install -Dm644 "$_srcdir/include/trust_ioctl.h"  "$_dkms_dir/include/trust_ioctl.h"
+    install -Dm644 "$_srcdir/include/trust_uapi.h"   "$_dkms_dir/include/trust_uapi.h"
+
+    # ── DKMS configuration ────────────────────────────────────────────
+    install -Dm644 /dev/stdin "$_dkms_dir/dkms.conf" <<DKMS
+PACKAGE_NAME="${_modname}"
+PACKAGE_VERSION="${pkgver}"
+BUILT_MODULE_NAME[0]="${_modname}"
+BUILT_MODULE_LOCATION[0]="."
+DEST_MODULE_LOCATION[0]="/extra"
+AUTOINSTALL="yes"
+DKMS
+
+    # ── Auto-load on boot ─────────────────────────────────────────────
+    install -Dm644 /dev/stdin "$pkgdir/etc/modules-load.d/trust.conf" <<'EOF'
+# Root of Authority trust kernel module
+# Dash prefix: don't fail boot if module isn't built yet (DKMS builds on first boot)
+-trust
+EOF
+
+    # ── udev rule: /dev/trust accessible by root + wheel group ────────
+    install -Dm644 /dev/stdin "$pkgdir/usr/lib/udev/rules.d/99-trust.rules" <<'EOF'
+# Root of Authority trust kernel module device node
+KERNEL=="trust", MODE="0660", GROUP="wheel"
+EOF
+
+    # ── Pacman hook: rebuild when a new kernel is installed ───────────
+    install -d "$pkgdir/usr/share/libalpm/hooks"
+    install -Dm644 /dev/stdin "$pkgdir/usr/share/libalpm/hooks/70-trust-dkms.hook" <<'EOF'
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = linux
+Target = linux-lts
+Target = linux-hardened
+Target = linux-zen
+
+[Action]
+Description = Rebuilding trust kernel module for new kernel...
+When = PostTransaction
+Exec = /usr/bin/dkms autoinstall --no-depmod
+Depends = dkms
+EOF
+}

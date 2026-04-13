@@ -1,0 +1,90 @@
+# PE-Compat Windows-Style Firewall Configuration
+# Managed by pe-compat firewall service
+# Location: /etc/pe-compat/firewall/firewall.toml
+
+[general]
+# Master firewall enable/disable
+enabled = true
+
+# Active network profile: "public", "private", or "domain"
+default_profile = "private"
+
+# Log blocked connections to journal/syslog
+log_blocked = true
+
+# Log allowed connections (verbose - only for debugging)
+log_allowed = false
+
+# Default action for traffic with no matching rule
+default_inbound_action = "block"
+default_outbound_action = "allow"
+
+[notifications]
+# Show desktop notifications when connections are blocked
+enabled = true
+
+# Minimum interval between notifications (seconds) to prevent spam
+rate_limit_seconds = 5
+
+# Maximum notifications per minute (0 = unlimited)
+max_per_minute = 12
+
+# Show notification for blocked inbound connections
+notify_inbound = true
+
+# Show notification for blocked outbound connections
+notify_outbound = true
+
+[monitor]
+# Connection monitor refresh interval (seconds)
+interval = 2
+
+# Track per-application network usage
+track_app_usage = true
+
+# Connection history retention (hours, 0 = no history)
+history_retention_hours = 24
+
+[logging]
+# Log file path (empty = journal only)
+log_file = "/var/log/pe-compat/firewall.log"
+
+# Log level: "debug", "info", "warning", "error"
+log_level = "info"
+
+# Maximum log file size in MB (0 = unlimited)
+max_log_size_mb = 50
+
+# Number of rotated log files to keep
+log_rotate_count = 5
+
+[nftables]
+# nftables table name used by this firewall
+table_name = "pe_compat_firewall"
+
+# Flush existing rules on startup
+flush_on_start = true
+
+# Path to nft binary
+nft_binary = "/usr/sbin/nft"
+
+[rules]
+# Path to persistent rules database
+rules_db = "/var/lib/pe-compat/firewall/rules.db"
+
+# Path to default rules JSON (loaded on first run)
+default_rules = "/etc/pe-compat/firewall/default-rules.json"
+
+# Auto-save rules when modified via GUI/CLI
+auto_save = true
+
+[gui]
+# GTK theme preference: "system", "dark", "light"
+theme = "system"
+
+# Window dimensions
+default_width = 1000
+default_height = 700
+
+# Show system tray icon
+tray_icon = true

@@ -1,0 +1,67 @@
+#!/bin/bash
+# pe-compat-dkms.install — DKMS lifecycle hooks for the pe_compat kernel module
+
+_mod=pe_compat
+_ver=0.1.0
+
+# Arch Linux linux-headers omits include/generated/autoconf.h.
+# Generate it from include/config/auto.conf so DKMS can compile.
+_gen_autoconf() {
+    for kver in $(ls /usr/lib/modules/ 2>/dev/null); do
+        local kbuild="/usr/lib/modules/$kver/build"
+        local autoconf="$kbuild/include/generated/autoconf.h"
+        local auto_conf="$kbuild/include/config/auto.conf"
+        [ -f "$auto_conf" ] || continue
+        [ -f "$autoconf" ] && continue
+        echo ">>> Generating $autoconf from auto.conf..."
+        mkdir -p "$kbuild/include/generated"
+        awk '
+            /^[[:space:]]*#/ { next }
+            /^CONFIG_[A-Z0-9_]+=y$/ {
+                sub(/=y$/, ""); printf "#define %s 1\n", $0; next
+            }
+            /^CONFIG_[A-Z0-9_]+=m$/ {
+                sub(/=m$/, ""); printf "#define %s_MODULE 1\n", $0; next
+            }
+            /^CONFIG_[A-Z0-9_]+=$/ {
+                # Empty value (e.g. CONFIG_BUILD_SALT=) — treat as empty string
+                sub(/=$/, ""); printf "#define %s \"\"\n", $0; next
+            }
+            /^CONFIG_[A-Z0-9_]+=/ {
+                n = index($0, "=")
+                key = substr($0, 1, n-1)
+                val = substr($0, n+1)
+                printf "#define %s %s\n", key, val
+            }
+        ' "$auto_conf" > "$autoconf"
+    done
+}
+
+post_install() {
+    _gen_autoconf
+
+    echo ">>> Registering ${_mod}/${_ver} with DKMS..."
+    dkms add "${_mod}/${_ver}" --no-depmod 2>/dev/null || true
+
+    echo ">>> Building ${_mod}/${_ver} for running kernel..."
+    if dkms build "${_mod}/${_ver}" --no-depmod; then
+        dkms install "${_mod}/${_ver}" --no-depmod
+        depmod -a
+        echo ">>> pe_compat.ko installed — load with: modprobe pe_compat"
+    else
+        echo ">>> Build failed (no kernel headers?). Module will be built on next kernel install."
+    fi
+}
+
+post_upgrade() {
+    local _old_ver="$1"
+    echo ">>> Removing old ${_mod}/${_old_ver} from DKMS..."
+    dkms remove "${_mod}/${_old_ver}" --all 2>/dev/null || true
+
+    post_install
+}
+
+pre_remove() {
+    echo ">>> Removing ${_mod}/${_ver} from DKMS..."
+    dkms remove "${_mod}/${_ver}" --all 2>/dev/null || true
+}

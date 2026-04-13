@@ -1,0 +1,27 @@
+#!/bin/bash
+# mkinitcpio install hook for ai-persist
+
+build() {
+    add_runscript
+    # Binaries used by the hook script
+    add_binary sed
+    add_binary sleep
+    add_binary mkdir
+    add_binary mount
+    add_binary umount
+    add_binary rm
+    add_binary blkid
+    add_binary findmnt
+}
+
+help() {
+    cat <<HELPEOF
+This hook provides graceful fallback when the persistence partition
+(specified by cow_label= kernel parameter) is not found on the USB drive.
+
+Instead of dropping to a recovery shell after a 30-second timeout,
+the system boots in RAM-only mode using tmpfs for the copy-on-write layer.
+
+Must be placed BEFORE 'archiso' and 'archiso_loop_mnt' in the HOOKS array.
+HELPEOF
+}

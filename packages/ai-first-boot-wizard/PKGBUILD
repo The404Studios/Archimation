@@ -1,0 +1,458 @@
+# Maintainer: AI Arch Linux Project
+# PKGBUILD for ai-first-boot-wizard - First boot setup wizard (stub)
+
+pkgname=ai-first-boot-wizard
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="First boot setup wizard for AI Arch Linux - configures user, network, and AI control settings"
+arch=('any')
+url="https://github.com/ai-arch-linux/ai-first-boot-wizard"
+license=('GPL-3.0-or-later')
+depends=(
+    'python'
+    'python-gobject'
+    'gtk4'
+    'libadwaita'
+    'networkmanager'
+)
+optdepends=(
+    'ai-control-daemon: AI control integration'
+)
+provides=('ai-first-boot-wizard')
+source=()
+
+package() {
+    # Install wizard stub script
+    install -Dm755 /dev/stdin "$pkgdir/usr/bin/ai-first-boot-wizard" <<'WIZARD'
+#!/usr/bin/env python3
+"""
+AI Arch Linux - First Boot Setup Wizard
+
+GTK4/Adwaita wizard that runs on first boot to configure:
+  1. Welcome + system overview
+  2. User account creation
+  3. Timezone and locale
+  4. AI control preferences (autonomy level)
+  5. Summary + finish
+"""
+
+import gi, sys, os, subprocess, json, threading
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Gtk, Adw, GLib, Gio, Gdk
+
+MARKER = "/var/lib/ai-arch/first-boot-done"
+TIMEZONES = [
+    "America/New_York", "America/Chicago", "America/Denver",
+    "America/Los_Angeles", "America/Anchorage", "Pacific/Honolulu",
+    "Europe/London", "Europe/Paris", "Europe/Berlin", "Europe/Moscow",
+    "Asia/Tokyo", "Asia/Shanghai", "Asia/Kolkata", "Asia/Dubai",
+    "Australia/Sydney", "Pacific/Auckland", "UTC",
+]
+AUTONOMY_LEVELS = [
+    ("Observer", "AI watches but never acts. You control everything."),
+    ("Advisor", "AI suggests actions. You approve each one."),
+    ("Act & Report", "AI acts on routine tasks and reports after."),
+    ("Autonomous", "AI handles most decisions independently."),
+    ("Sovereign", "Full AI autonomy. Use with caution."),
+]
+
+
+def _is_compact_screen():
+    """Return True if the screen is small (<=900p) and UI should be compact."""
+    try:
+        display = Gdk.Display.get_default()
+        if display:
+            monitors = display.get_monitors()
+            if monitors.get_n_items() > 0:
+                return monitors.get_item(0).get_geometry().height <= 900
+    except Exception:
+        pass
+    return True
+
+
+class WizardApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="org.ai_arch.first_boot_wizard")
+        self.connect("activate", self.on_activate)
+        self.username = "arch"
+        self.timezone = "UTC"
+        self.autonomy = 2  # Default: Act & Report
+
+    def on_activate(self, app):
+        if os.path.exists(MARKER):
+            # Need a transient parent for the dialog; create a hidden window
+            stub = Adw.ApplicationWindow(application=app)
+            dialog = Adw.MessageDialog(transient_for=stub)
+            dialog.set_heading("Already Configured")
+            dialog.set_body(
+                "First boot setup was already completed.\n"
+                "Delete /var/lib/ai-arch/first-boot-done to re-run."
+            )
+            dialog.add_response("ok", "OK")
+            dialog.connect("response", lambda d, r: app.quit())
+            dialog.present()
+            return
+
+        self._compact = _is_compact_screen()
+        if self._compact:
+            try:
+                _css = Gtk.CssProvider()
+                _css.load_from_data(b"headerbar.compact{min-height:32px;padding:2px 0}headerbar.compact button{min-height:24px;padding:2px 6px}")
+                Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), _css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            except Exception:
+                pass
+
+        self.win = Adw.ApplicationWindow(application=app)
+        self.win.set_title("AI Arch Linux Setup")
+        _ww = 600 if self._compact else 700
+        _wh = 450 if self._compact else 520
+        self.win.set_default_size(_ww, _wh)
+        self.win.set_resizable(False)
+
+        self.carousel = Adw.Carousel()
+        self.carousel.set_vexpand(True)
+        self.carousel.set_allow_long_swipes(False)
+        self.carousel.set_allow_mouse_drag(False)
+
+        # Build pages
+        self.carousel.append(self._page_welcome())
+        self.carousel.append(self._page_user())
+        self.carousel.append(self._page_timezone())
+        self.carousel.append(self._page_autonomy())
+        self.carousel.append(self._page_summary())
+
+        # Navigation bar
+        nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8 if self._compact else 12)
+        nav_box.set_halign(Gtk.Align.END)
+        nav_box.set_margin_end(12 if self._compact else 24)
+        nav_box.set_margin_bottom(8 if self._compact else 16)
+        nav_box.set_margin_top(4 if self._compact else 8)
+
+        self.back_btn = Gtk.Button(label="Back")
+        self.back_btn.connect("clicked", self._go_back)
+        self.back_btn.set_sensitive(False)
+        nav_box.append(self.back_btn)
+
+        self.next_btn = Gtk.Button(label="Next")
+        self.next_btn.add_css_class("suggested-action")
+        self.next_btn.connect("clicked", self._go_next)
+        nav_box.append(self.next_btn)
+
+        # Dots indicator
+        dots = Adw.CarouselIndicatorDots(carousel=self.carousel)
+        dots.set_halign(Gtk.Align.CENTER)
+        dots.set_margin_bottom(8)
+
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        main.append(self.carousel)
+        main.append(dots)
+        main.append(nav_box)
+        self.win.set_content(main)
+        self.win.present()
+
+    def _go_back(self, btn):
+        pos = int(self.carousel.get_position())
+        if pos > 0:
+            target = pos - 1
+            page = self.carousel.get_nth_page(target)
+            self.carousel.scroll_to(page, True)
+            self.back_btn.set_sensitive(target > 0)
+            self.next_btn.set_label("Next")
+
+    def _go_next(self, btn):
+        pos = int(self.carousel.get_position())
+        n_pages = self.carousel.get_n_pages()
+        if pos >= n_pages - 1:
+            self._finish()
+            return
+        page = self.carousel.get_nth_page(pos + 1)
+        self.carousel.scroll_to(page, True)
+        self.back_btn.set_sensitive(True)
+        if pos + 1 >= n_pages - 1:
+            self.next_btn.set_label("Finish")
+            self._update_summary()
+
+    def _page_welcome(self):
+        page = Adw.StatusPage(
+            title="Welcome to AI Arch Linux",
+            description=(
+                "This wizard will help you set up your system.\n\n"
+                "AI Arch Linux combines a full Arch Linux desktop with\n"
+                "native Windows PE execution, a biologically-inspired\n"
+                "trust system, and an autonomous AI control daemon.\n\n"
+                "Let's configure a few things to get started."
+            ),
+            icon_name="computer-symbolic",
+        )
+        return page
+
+    def _page_user(self):
+        _m = 24 if self._compact else 48
+        _t = 16 if self._compact else 32
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8 if self._compact else 16)
+        page.set_margin_start(_m)
+        page.set_margin_end(_m)
+        page.set_margin_top(_t)
+
+        title = Gtk.Label(label="User Account")
+        title.add_css_class("title-1")
+        page.append(title)
+
+        desc = Gtk.Label(
+            label="The default user 'arch' is pre-configured with autologin.\n"
+                  "You can change the display name below.",
+            wrap=True,
+        )
+        desc.set_margin_bottom(16)
+        page.append(desc)
+
+        group = Adw.PreferencesGroup(title="Account Settings")
+        row_user = Adw.EntryRow(title="Username")
+        row_user.set_text("arch")
+        row_user.set_editable(False)
+        group.add(row_user)
+
+        row_name = Adw.EntryRow(title="Display Name")
+        row_name.set_text("AI Arch User")
+        self.display_name_row = row_name
+        group.add(row_name)
+
+        page.append(group)
+        return page
+
+    def _page_timezone(self):
+        _m = 24 if self._compact else 48
+        _t = 16 if self._compact else 32
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8 if self._compact else 16)
+        page.set_margin_start(_m)
+        page.set_margin_end(_m)
+        page.set_margin_top(_t)
+
+        title = Gtk.Label(label="Timezone")
+        title.add_css_class("title-1")
+        page.append(title)
+
+        group = Adw.PreferencesGroup(title="Select Your Timezone")
+        self.tz_combo = Adw.ComboRow(title="Timezone")
+
+        tz_list = Gtk.StringList()
+        for tz in TIMEZONES:
+            tz_list.append(tz)
+        self.tz_combo.set_model(tz_list)
+        self.tz_combo.set_selected(TIMEZONES.index("UTC"))
+        group.add(self.tz_combo)
+        page.append(group)
+        return page
+
+    def _page_autonomy(self):
+        _m = 24 if self._compact else 48
+        _t = 16 if self._compact else 32
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8 if self._compact else 16)
+        page.set_margin_start(_m)
+        page.set_margin_end(_m)
+        page.set_margin_top(_t)
+
+        title = Gtk.Label(label="AI Autonomy Level")
+        title.add_css_class("title-1")
+        page.append(title)
+
+        desc = Gtk.Label(
+            label="Choose how much control the AI has over your system.\n"
+                  "You can change this anytime from the AI Control Panel.",
+            wrap=True,
+        )
+        desc.set_margin_bottom(8)
+        page.append(desc)
+
+        group = Adw.PreferencesGroup(title="Default Autonomy")
+        self.autonomy_rows = []
+        check_group = None
+
+        for i, (name, detail) in enumerate(AUTONOMY_LEVELS):
+            row = Adw.ActionRow(title=f"Level {i}: {name}", subtitle=detail)
+            radio = Gtk.CheckButton()
+            if check_group is None:
+                check_group = radio
+            else:
+                radio.set_group(check_group)
+            if i == 2:
+                radio.set_active(True)
+            radio.connect("toggled", self._on_autonomy_changed, i)
+            row.add_prefix(radio)
+            row.set_activatable_widget(radio)
+            group.add(row)
+            self.autonomy_rows.append(row)
+
+        page.append(group)
+        return page
+
+    def _on_autonomy_changed(self, btn, level):
+        if btn.get_active():
+            self.autonomy = level
+
+    def _page_summary(self):
+        _m = 24 if self._compact else 48
+        _t = 16 if self._compact else 32
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8 if self._compact else 16)
+        page.set_margin_start(_m)
+        page.set_margin_end(_m)
+        page.set_margin_top(_t)
+
+        title = Gtk.Label(label="Ready to Go!")
+        title.add_css_class("title-1")
+        page.append(title)
+
+        self.summary_label = Gtk.Label(wrap=True, selectable=True)
+        self.summary_label.set_halign(Gtk.Align.START)
+        page.append(self.summary_label)
+        return page
+
+    def _update_summary(self):
+        tz_idx = self.tz_combo.get_selected()
+        tz = TIMEZONES[tz_idx] if tz_idx < len(TIMEZONES) else "UTC"
+        level_name = AUTONOMY_LEVELS[self.autonomy][0]
+        name = self.display_name_row.get_text() or "AI Arch User"
+        self.summary_label.set_markup(
+            f"<b>Configuration Summary:</b>\n\n"
+            f"  User: arch ({name})\n"
+            f"  Timezone: {tz}\n"
+            f"  AI Autonomy: Level {self.autonomy} ({level_name})\n"
+            f"  Desktop: XFCE4\n"
+            f"  AI Daemon: port 8420\n"
+            f"  Firewall: enabled\n\n"
+            f"Click <b>Finish</b> to apply these settings."
+        )
+
+    def _finish(self):
+        tz_idx = self.tz_combo.get_selected()
+        tz = TIMEZONES[tz_idx] if tz_idx < len(TIMEZONES) else "UTC"
+        display_name = self.display_name_row.get_text()
+        autonomy = self.autonomy
+
+        # Disable buttons during apply
+        self.next_btn.set_sensitive(False)
+        self.back_btn.set_sensitive(False)
+
+        def _apply_settings():
+            # Apply timezone (blocking, runs in thread)
+            try:
+                subprocess.run(
+                    ["timedatectl", "set-timezone", tz],
+                    capture_output=True, timeout=10,
+                )
+            except Exception:
+                pass
+
+            # Set AI autonomy via API
+            try:
+                import urllib.request
+                for domain in ["PROCESS", "NETWORK", "SERVICE", "PE_EXECUTION"]:
+                    data = json.dumps({"level": autonomy}).encode()
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:8420/autonomy/{domain}",
+                        data=data, method="POST",
+                        headers={"Content-Type": "application/json"},
+                    )
+                    urllib.request.urlopen(req, timeout=3)
+            except Exception:
+                pass
+
+            # Mark first boot complete
+            marker_data = json.dumps({
+                "timezone": tz,
+                "autonomy": autonomy,
+                "display_name": display_name,
+            })
+            try:
+                os.makedirs(os.path.dirname(MARKER), exist_ok=True)
+                with open(MARKER, "w") as f:
+                    f.write(marker_data)
+            except PermissionError:
+                # Fallback: arch user has NOPASSWD sudo
+                try:
+                    subprocess.run(
+                        ["sudo", "mkdir", "-p", os.path.dirname(MARKER)],
+                        capture_output=True, timeout=5,
+                    )
+                    subprocess.run(
+                        ["sudo", "tee", MARKER],
+                        input=marker_data.encode(),
+                        capture_output=True, timeout=5,
+                    )
+                except Exception:
+                    pass
+
+            # Schedule UI update on main thread
+            GLib.idle_add(self._show_complete_dialog)
+
+        threading.Thread(target=_apply_settings, daemon=True).start()
+
+    def _show_complete_dialog(self):
+        dialog = Adw.MessageDialog(transient_for=self.win)
+        dialog.set_heading("Setup Complete!")
+        dialog.set_body(
+            "Your AI Arch Linux system is ready.\n"
+            "Open the AI Control Panel anytime to adjust settings."
+        )
+        dialog.add_response("ok", "Get Started")
+        dialog.set_default_response("ok")
+        dialog.connect("response", lambda d, r: self.quit())
+        dialog.present()
+        return GLib.SOURCE_REMOVE
+
+
+def main():
+    has_display = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    explicit_headless = "--headless" in sys.argv
+    if explicit_headless or not has_display:
+        # CLI fallback -- only write marker if explicitly requested
+        print("=" * 50)
+        print("  AI Arch Linux - First Boot Setup")
+        print("=" * 50)
+        print()
+        print("System pre-configured with defaults:")
+        print("  User: arch (autologin)")
+        print("  AI Autonomy: Level 2 (Act & Report)")
+        print("  Desktop: XFCE4")
+        print("  AI Daemon: port 8420")
+        if explicit_headless:
+            os.makedirs(os.path.dirname(MARKER), exist_ok=True)
+            with open(MARKER, "w") as f:
+                f.write('{"timezone":"UTC","autonomy":2}\n')
+            print("\nSetup complete. Marker written.")
+        else:
+            print("\nNo display found. Run with --headless to apply defaults,")
+            print("or start a graphical session for the setup wizard.")
+        return
+
+    app = WizardApp()
+    app.run(sys.argv)
+
+
+if __name__ == "__main__":
+    main()
+WIZARD
+
+    # NOTE: No systemd service — the wizard runs via XDG autostart in the
+    # XFCE session. A systemd service would hang on graphical systems because
+    # display-manager.service is a symlink (ConditionPathExists doesn't follow
+    # symlinks reliably). Headless systems can run manually:
+    #   ai-first-boot-wizard --headless
+
+    # Install autostart desktop entry (runs in XFCE session)
+    install -Dm644 /dev/stdin "$pkgdir/etc/xdg/autostart/ai-first-boot-wizard.desktop" <<'DESKTOP'
+[Desktop Entry]
+Name=AI Arch Linux Setup
+Comment=First boot configuration wizard
+Exec=sh -c '[ -f /var/lib/ai-arch/first-boot-done ] || /usr/bin/ai-first-boot-wizard'
+Terminal=false
+Type=Application
+Categories=System;Settings;
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+DESKTOP
+
+    # Create state directory (world-writable + sticky so user session can write marker)
+    install -d -m 1777 "$pkgdir/var/lib/ai-arch"
+}

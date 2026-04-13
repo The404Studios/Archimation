@@ -1,0 +1,66 @@
+# AI Control Daemon Configuration
+
+[server]
+host = "127.0.0.1"
+port = 8420
+
+[auth]
+# Enable token-based authentication on all endpoints
+enabled = true
+# Auto-generate a bootstrap token on first boot for the AI agent
+# Stored at /var/lib/ai-control-daemon/bootstrap-token
+auto_bootstrap = true
+
+[logging]
+level = "INFO"
+file = "/var/log/ai-control-daemon/daemon.log"
+
+[screen]
+# auto, x11, wayland, framebuffer
+capture_method = "auto"
+
+[input]
+# uinput (recommended), xdotool
+method = "uinput"
+
+[audit]
+# All AI actions are logged here
+log = "/var/log/ai-control-daemon/audit.log"
+
+[trust]
+# Trust observer polling interval (seconds)
+poll_interval = 1.0
+# Window for detecting trust score oscillation (seconds)
+oscillation_window = 10.0
+# Number of oscillations before auto-freeze
+oscillation_threshold = 4
+# Duration to freeze an oscillating subject (seconds)
+freeze_duration = 30.0
+
+[automation]
+# Full automation mode: AI daemon has unrestricted system access
+# This is the intended mode for the AI-controlled Arch Linux system
+full_access = true
+# Auto-start trust observer monitoring on daemon startup
+auto_observe = true
+
+[scanner]
+# Trust Memory Scanner: pattern matching for PE memory analysis
+enabled = true
+patterns_dir = "/var/lib/ai-control/patterns"
+stub_log_path = "/tmp/pe-stub-calls.jsonl"
+auto_scan_on_pe_load = true
+max_scan_size_mb = 64
+
+[analysis]
+# PE analysis engines: Win API DB, stub generator, binary signatures,
+# syscall monitor, and behavioral model
+enabled = true
+win_api_db_path = "/var/lib/ai-control/win-api-db"
+signatures_path = "/var/lib/ai-control/signatures"
+generated_stubs_path = "/tmp/generated-stubs"
+auto_analyze_on_pe_load = true
+# Syscall monitor tuning
+syscall_poll_interval = 2.0
+syscall_process_ttl = 300.0
+syscall_max_processes = 512

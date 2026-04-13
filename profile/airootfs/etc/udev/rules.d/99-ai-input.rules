@@ -1,0 +1,11 @@
+# udev rules for AI input device access
+#
+# Allow uinput access for the AI control daemon.
+# The daemon creates virtual input devices (keyboard, mouse)
+# to provide programmatic control of the desktop.
+
+# Grant uinput device access to root and input group
+KERNEL=="uinput", MODE="0660", GROUP="input"
+
+# Ensure /dev/input/event* devices are accessible
+SUBSYSTEM=="input", MODE="0660", GROUP="input"

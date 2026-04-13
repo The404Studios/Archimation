@@ -1,0 +1,84 @@
+# Maintainer: AI Arch Linux Project
+# PKGBUILD for ai-firewall - Windows-style firewall with GTK4 GUI and nftables backend
+
+pkgname=ai-firewall
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Windows-style firewall with GTK4 GUI, CLI, and nftables backend for AI Arch Linux"
+arch=('any')
+url="https://github.com/ai-arch-linux/ai-firewall"
+license=('GPL-3.0-or-later')
+depends=(
+    'python'
+    'python-gobject'
+    'gtk4'
+    'libadwaita'
+    'nftables'
+)
+optdepends=(
+    'python-dbus-next: D-Bus integration for desktop notifications'
+)
+provides=('ai-firewall' 'pe-compat-firewall')
+backup=(
+    'etc/pe-compat/firewall/firewall.toml'
+    'etc/pe-compat/firewall/default-rules.json'
+)
+source=()
+
+# Use the project source tree directly (local build)
+_srcdir="${startdir}/../../firewall"
+
+package() {
+    cd "$_srcdir"
+
+    # Install backend Python modules
+    install -d "$pkgdir/usr/lib/pe-compat/firewall/backend"
+    install -m644 backend/*.py "$pkgdir/usr/lib/pe-compat/firewall/backend/"
+
+    # Install GUI modules
+    install -d "$pkgdir/usr/lib/pe-compat/firewall/gui"
+    install -m644 gui/*.py "$pkgdir/usr/lib/pe-compat/firewall/gui/"
+
+    # Install CLI
+    install -d "$pkgdir/usr/lib/pe-compat/firewall/cli"
+    install -m644 cli/*.py "$pkgdir/usr/lib/pe-compat/firewall/cli/"
+
+    # Install configuration files
+    install -Dm644 config/firewall.toml "$pkgdir/etc/pe-compat/firewall/firewall.toml"
+    install -Dm644 config/default-rules.json "$pkgdir/etc/pe-compat/firewall/default-rules.json"
+
+    # Install systemd service
+    install -Dm644 config/firewall.service "$pkgdir/usr/lib/systemd/system/pe-compat-firewall.service"
+
+    # Create state and log directories
+    install -d "$pkgdir/var/lib/pe-compat/firewall"
+    install -d "$pkgdir/var/log/pe-compat"
+    install -d "$pkgdir/run/pe-compat"
+
+    # Install CLI launcher
+    install -Dm755 /dev/stdin "$pkgdir/usr/bin/winfw" <<'LAUNCHER'
+#!/bin/bash
+# Windows Firewall CLI (winfw) launcher
+exec /usr/bin/python3 /usr/lib/pe-compat/firewall/cli/winfw.py "$@"
+LAUNCHER
+
+    # Install GUI launcher
+    install -Dm755 /dev/stdin "$pkgdir/usr/bin/firewall-gui" <<'LAUNCHER'
+#!/bin/bash
+# Windows Firewall GUI launcher
+exec /usr/bin/python3 /usr/lib/pe-compat/firewall/gui/main_window.py "$@"
+LAUNCHER
+
+    # Install desktop entry for GUI
+    install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/ai-firewall.desktop" <<'DESKTOP'
+[Desktop Entry]
+Name=Windows Firewall
+Comment=Windows-style firewall management
+Exec=/usr/bin/firewall-gui
+Icon=preferences-system-firewall
+Terminal=false
+Type=Application
+Categories=System;Security;Settings;
+Keywords=firewall;network;security;nftables;
+DESKTOP
+}

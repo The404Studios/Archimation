@@ -1,0 +1,85 @@
+# Maintainer: AI Arch Linux Project
+# PKGBUILD for pe-compat-dkms - PE compatibility kernel module (DKMS)
+
+pkgname=pe-compat-dkms
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="PE compatibility kernel module (DKMS) - binfmt, ioctl, and process tracking for Windows PE executables"
+arch=('x86_64')
+url="https://github.com/ai-arch-linux/pe-loader"
+license=('GPL-2.0-only')
+depends=(
+    'dkms'
+)
+makedepends=('linux-headers')
+provides=('pe-compat-dkms')
+conflicts=()
+install=pe-compat-dkms.install
+source=()
+
+# Use the pe-loader source tree directly
+_srcdir="${startdir}/../../pe-loader"
+_modname=pe_compat
+
+package() {
+    local _dkms_dir="$pkgdir/usr/src/${_modname}-${pkgver}"
+    install -d "$_dkms_dir"
+    install -d "$_dkms_dir/include/compat"
+
+    # ── Kernel source files ───────────────────────────────────────────
+    for src in \
+        pe_compat_main.c pe_compat_binfmt.c pe_compat_syscall.c \
+        pe_compat_memory.c pe_compat_ioctl.c pe_compat_process.c \
+        pe_compat_internal.h; do
+        install -Dm644 "$_srcdir/kernel/$src" "$_dkms_dir/$src"
+    done
+
+    # Kbuild (module build rules)
+    install -Dm644 "$_srcdir/kernel/Kbuild" "$_dkms_dir/Kbuild"
+
+    # Headers that Kbuild references via -I$(src)/../include
+    install -Dm644 "$_srcdir/include/compat/pe_compat_ioctl.h" \
+        "$_dkms_dir/include/compat/pe_compat_ioctl.h"
+
+    # ── DKMS configuration ────────────────────────────────────────────
+    install -Dm644 /dev/stdin "$_dkms_dir/dkms.conf" <<DKMS
+PACKAGE_NAME="${_modname}"
+PACKAGE_VERSION="${pkgver}"
+BUILT_MODULE_NAME[0]="${_modname}"
+BUILT_MODULE_LOCATION[0]="."
+DEST_MODULE_LOCATION[0]="/extra"
+AUTOINSTALL="yes"
+DKMS
+
+    # ── Auto-load on boot ─────────────────────────────────────────────
+    install -Dm644 /dev/stdin "$pkgdir/etc/modules-load.d/pe_compat.conf" <<'EOF'
+# PE compatibility kernel module
+# Dash prefix: don't fail boot if module isn't built yet (DKMS builds on first boot)
+-pe_compat
+EOF
+
+    # ── udev rule: /dev/pe_compat accessible by root + wheel group ────
+    install -Dm644 /dev/stdin "$pkgdir/usr/lib/udev/rules.d/99-pe-compat.rules" <<'EOF'
+# PE compatibility kernel module device node
+KERNEL=="pe_compat", MODE="0660", GROUP="wheel"
+EOF
+
+    # ── Pacman hook: rebuild when a new kernel is installed ───────────
+    install -d "$pkgdir/usr/share/libalpm/hooks"
+    install -Dm644 /dev/stdin "$pkgdir/usr/share/libalpm/hooks/70-pe-compat-dkms.hook" <<'EOF'
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = linux
+Target = linux-lts
+Target = linux-hardened
+Target = linux-zen
+
+[Action]
+Description = Rebuilding pe_compat kernel module for new kernel...
+When = PostTransaction
+Exec = /usr/bin/dkms autoinstall --no-depmod
+Depends = dkms
+EOF
+}

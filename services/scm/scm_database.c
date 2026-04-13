@@ -1,0 +1,274 @@
+/*
+ * scm_database.c - Service database management
+ *
+ * Load/save/query service configurations from the on-disk database
+ * at /var/lib/pe-compat/services/
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <errno.h>
+#include <strings.h>
+#include <unistd.h>
+
+#include "scm.h"
+
+static service_entry_t g_services[MAX_SERVICES];
+static int g_service_count = 0;
+
+static void ensure_db_dir(void)
+{
+    mkdir("/var/lib/pe-compat", 0755);
+    mkdir(SCM_DB_PATH, 0755);
+}
+
+/* Parse a .svc config file into a service entry */
+static int parse_service_file(const char *filepath, service_entry_t *svc)
+{
+    FILE *f = fopen(filepath, "r");
+    if (!f) return -1;
+
+    memset(svc, 0, sizeof(*svc));
+    svc->state = SERVICE_STOPPED;
+    svc->start_type = SERVICE_DEMAND_START;
+    svc->type = SERVICE_WIN32_OWN_PROCESS;
+    svc->restart_policy = RESTART_ON_FAILURE;
+
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        /* Remove newline */
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        nl = strchr(line, '\r');
+        if (nl) *nl = '\0';
+
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = line;
+        char *val = eq + 1;
+
+        if (strcmp(key, "name") == 0)
+            strncpy(svc->name, val, sizeof(svc->name) - 1);
+        else if (strcmp(key, "display_name") == 0 || strcmp(key, "display") == 0)
+            strncpy(svc->display_name, val, sizeof(svc->display_name) - 1);
+        else if (strcmp(key, "binary_path") == 0 || strcmp(key, "binary") == 0)
+            strncpy(svc->binary_path, val, sizeof(svc->binary_path) - 1);
+        else if (strcmp(key, "type") == 0)
+            svc->type = atoi(val);
+        else if (strcmp(key, "start_type") == 0 || strcmp(key, "start") == 0)
+            svc->start_type = atoi(val);
+        else if (strcmp(key, "dependencies") == 0 || strcmp(key, "depends") == 0)
+            strncpy(svc->dependencies, val, sizeof(svc->dependencies) - 1);
+        else if (strcmp(key, "restart_policy") == 0)
+            svc->restart_policy = atoi(val);
+        else if (strcmp(key, "restart_delay_ms") == 0)
+            svc->restart_delay_ms = atoi(val);
+        else if (strcmp(key, "max_restarts") == 0)
+            svc->max_restarts = atoi(val);
+    }
+
+    /* Apply defaults for restart policy if not set */
+    if (svc->restart_delay_ms == 0)
+        svc->restart_delay_ms = DEFAULT_RESTART_DELAY_MS;
+    if (svc->max_restarts == 0)
+        svc->max_restarts = DEFAULT_MAX_RESTARTS;
+
+    fclose(f);
+    svc->loaded = 1;
+    return 0;
+}
+
+int scm_db_load(void)
+{
+    ensure_db_dir();
+    g_service_count = 0;
+
+    DIR *d = opendir(SCM_DB_PATH);
+    if (!d) return -1;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL && g_service_count < MAX_SERVICES) {
+        /* Only process .svc files */
+        const char *ext = strrchr(ent->d_name, '.');
+        if (!ext || strcmp(ext, ".svc") != 0)
+            continue;
+
+        char filepath[4096];
+        snprintf(filepath, sizeof(filepath), "%s/%s", SCM_DB_PATH, ent->d_name);
+
+        if (parse_service_file(filepath, &g_services[g_service_count]) == 0) {
+            fprintf(stderr, "[scm_db] Loaded service: %s (type=%d, start=%d)\n",
+                    g_services[g_service_count].name,
+                    g_services[g_service_count].type,
+                    g_services[g_service_count].start_type);
+            g_service_count++;
+        }
+    }
+
+    closedir(d);
+    fprintf(stderr, "[scm_db] Loaded %d services\n", g_service_count);
+    return g_service_count;
+}
+
+/* Validate service name: only allow [a-zA-Z0-9_\-.] to prevent path injection */
+static int validate_service_name(const char *name) {
+    if (!name || !name[0]) return 0;
+    for (const char *p = name; *p; p++) {
+        if (!(*p >= 'a' && *p <= 'z') && !(*p >= 'A' && *p <= 'Z') &&
+            !(*p >= '0' && *p <= '9') && *p != '_' && *p != '-' && *p != '.') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int scm_db_save_service(const service_entry_t *svc)
+{
+    if (!validate_service_name(svc->name)) {
+        fprintf(stderr, "[scm_db] Invalid service name for save: '%s'\n",
+                svc->name ? svc->name : "(null)");
+        return -1;
+    }
+
+    ensure_db_dir();
+
+    char filepath[4096];
+    snprintf(filepath, sizeof(filepath), "%s/%s.svc", SCM_DB_PATH, svc->name);
+
+    FILE *f = fopen(filepath, "w");
+    if (!f) return -1;
+
+    fprintf(f, "name=%s\n", svc->name);
+    if (svc->display_name[0])
+        fprintf(f, "display_name=%s\n", svc->display_name);
+    fprintf(f, "type=%d\n", svc->type);
+    fprintf(f, "start_type=%d\n", svc->start_type);
+    if (svc->binary_path[0])
+        fprintf(f, "binary_path=%s\n", svc->binary_path);
+    if (svc->dependencies[0])
+        fprintf(f, "dependencies=%s\n", svc->dependencies);
+    if (svc->restart_policy != RESTART_NEVER)
+        fprintf(f, "restart_policy=%d\n", svc->restart_policy);
+    if (svc->restart_delay_ms != DEFAULT_RESTART_DELAY_MS)
+        fprintf(f, "restart_delay_ms=%d\n", svc->restart_delay_ms);
+    if (svc->max_restarts != DEFAULT_MAX_RESTARTS)
+        fprintf(f, "max_restarts=%d\n", svc->max_restarts);
+
+    fclose(f);
+    return 0;
+}
+
+int scm_db_delete_service(const char *name)
+{
+    if (!validate_service_name(name)) {
+        fprintf(stderr, "[scm_db] Invalid service name for delete: '%s'\n",
+                name ? name : "(null)");
+        return -1;
+    }
+
+    /* Stop the service if it is still running to avoid leaking a child PID */
+    for (int i = 0; i < g_service_count; i++) {
+        if (strcmp(g_services[i].name, name) == 0 &&
+            g_services[i].state == SERVICE_RUNNING && g_services[i].pid > 0) {
+            fprintf(stderr, "[scm_db] Stopping running service '%s' before delete\n", name);
+            g_services[i].manually_stopped = 1;
+            g_services[i].crash_handled = 1;
+            if (kill(g_services[i].pid, SIGTERM) == 0) {
+                /* Brief wait for graceful exit */
+                for (int w = 0; w < 10; w++) {
+                    if (kill(g_services[i].pid, 0) != 0) break;
+                    usleep(100000);
+                }
+                if (kill(g_services[i].pid, 0) == 0)
+                    kill(g_services[i].pid, SIGKILL);
+                waitpid(g_services[i].pid, NULL, WNOHANG);
+            }
+            g_services[i].state = SERVICE_STOPPED;
+            g_services[i].pid = 0;
+            break;
+        }
+    }
+
+    char filepath[4096];
+    snprintf(filepath, sizeof(filepath), "%s/%s.svc", SCM_DB_PATH, name);
+
+    if (unlink(filepath) < 0)
+        return -1;
+
+    /* Remove status file */
+    char status_path[4096];
+    snprintf(status_path, sizeof(status_path), "%s/%s.status", SCM_RUN_PATH, name);
+    unlink(status_path);
+
+    /* Remove from in-memory list */
+    for (int i = 0; i < g_service_count; i++) {
+        if (strcmp(g_services[i].name, name) == 0) {
+            memmove(&g_services[i], &g_services[i + 1],
+                    (g_service_count - i - 1) * sizeof(service_entry_t));
+            g_service_count--;
+            break;
+        }
+    }
+
+    return 0;
+}
+
+service_entry_t *scm_db_find(const char *name)
+{
+    for (int i = 0; i < g_service_count; i++) {
+        if (strcasecmp(g_services[i].name, name) == 0)
+            return &g_services[i];
+    }
+    return NULL;
+}
+
+int scm_db_count(void)
+{
+    return g_service_count;
+}
+
+service_entry_t *scm_db_get(int index)
+{
+    if (index < 0 || index >= g_service_count)
+        return NULL;
+    return &g_services[index];
+}
+
+int scm_db_install(const char *name, const char *display_name,
+                   const char *binary_path, int type, int start_type,
+                   const char *dependencies)
+{
+    if (scm_db_find(name))
+        return -1; /* Already exists */
+
+    if (g_service_count >= MAX_SERVICES)
+        return -2;
+
+    service_entry_t *svc = &g_services[g_service_count];
+    memset(svc, 0, sizeof(*svc));
+
+    strncpy(svc->name, name, sizeof(svc->name) - 1);
+    if (display_name)
+        strncpy(svc->display_name, display_name, sizeof(svc->display_name) - 1);
+    if (binary_path)
+        strncpy(svc->binary_path, binary_path, sizeof(svc->binary_path) - 1);
+    svc->type = type;
+    svc->start_type = start_type;
+    svc->state = SERVICE_STOPPED;
+    svc->restart_policy = RESTART_ON_FAILURE;
+    svc->restart_delay_ms = DEFAULT_RESTART_DELAY_MS;
+    svc->max_restarts = DEFAULT_MAX_RESTARTS;
+    if (dependencies)
+        strncpy(svc->dependencies, dependencies, sizeof(svc->dependencies) - 1);
+    svc->loaded = 1;
+
+    g_service_count++;
+
+    return scm_db_save_service(svc);
+}

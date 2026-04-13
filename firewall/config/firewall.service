@@ -1,0 +1,49 @@
+[Unit]
+Description=PE-Compat Windows-Style Firewall
+Documentation=man:pe-compat-firewall(8)
+After=network.target nftables.service
+Wants=nftables.service
+Conflicts=ufw.service firewalld.service
+# Skip entirely if nft binary is missing (package not installed)
+ConditionPathExists=/usr/sbin/nft
+
+[Service]
+Type=simple
+# Ensure nf_tables kernel module is loaded before applying rules.
+# Prefix with - so failure is non-fatal (module may be built-in).
+ExecStartPre=-/usr/sbin/modprobe -q nf_tables
+ExecStart=/usr/bin/python3 /usr/lib/pe-compat/firewall/backend/nft_manager.py --daemon
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+KillMode=mixed
+
+# Run as root for nftables access
+User=root
+Group=root
+
+# Security hardening
+ProtectSystem=strict
+ReadWritePaths=/var/lib/pe-compat/firewall /var/log/pe-compat /run/pe-compat
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# Runtime directory for socket/pid
+RuntimeDirectory=pe-compat
+RuntimeDirectoryMode=0755
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pe-compat-firewall
+
+[Install]
+WantedBy=multi-user.target

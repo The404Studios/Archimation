@@ -1,0 +1,132 @@
+#!/usr/bin/ash
+# ai-persist: Graceful fallback when persistence partition is missing
+# Must be listed BEFORE 'archiso' and 'archiso_loop_mnt' in HOOKS
+#
+# If cow_label is set in kernel cmdline but the device doesn't exist,
+# this hook masks cow_label so archiso falls back to tmpfs (RAM mode)
+# instead of dropping to a recovery shell.
+#
+# If 'copytoram' is in the kernel cmdline, this hook does nothing —
+# archiso handles copy-to-RAM natively and no cow device is needed.
+
+_ai_cow_masked=0
+
+run_hook() {
+    local cow_label_val=""
+    local has_copytoram=0
+    local param
+
+    # Parse kernel command line
+    for param in $(cat /proc/cmdline); do
+        case "$param" in
+            cow_label=*)
+                cow_label_val="${param#cow_label=}"
+                ;;
+            copytoram|copytoram=*)
+                has_copytoram=1
+                ;;
+        esac
+    done
+
+    # Copy-to-RAM mode: archiso copies the squashfs to RAM and
+    # uses tmpfs for cowspace. Nothing for us to do.
+    if [ "$has_copytoram" = "1" ]; then
+        msg ":: ai-persist: Copy-to-RAM mode, skipping persistence setup."
+        return 0
+    fi
+
+    # No cow_label at all: nothing to do (shouldn't happen with our
+    # boot entries, but be safe).
+    [ -z "$cow_label_val" ] && return 0
+
+    local cow_dev="/dev/disk/by-label/$cow_label_val"
+    local max_wait=10
+    local tries=0
+
+    # Detect boot medium type to avoid pointless waits on non-USB boots.
+    # USB enumeration can be slow, so we wait up to 10s only for USB.
+    # CD-ROM and virtual disks cannot host a writable partition — skip immediately.
+    local archisolabel_val=""
+    for param in $(cat /proc/cmdline); do
+        case "$param" in
+            archisolabel=*) archisolabel_val="${param#archisolabel=}" ;;
+        esac
+    done
+
+    if [ -n "$archisolabel_val" ]; then
+        local boot_dev_link="/dev/disk/by-label/$archisolabel_val"
+        # Wait briefly (1s) for the boot device symlink to appear
+        [ ! -e "$boot_dev_link" ] && sleep 1
+        if [ -e "$boot_dev_link" ]; then
+            local boot_real boot_base boot_blk blk_type
+            boot_real=$(readlink -f "$boot_dev_link")        # e.g. /dev/sr0, /dev/sda1
+            boot_base="${boot_real##*/}"                      # basename: sr0, sda1, nvme0n1p1
+            # Resolve parent block device via sysfs (handles NVMe, virtio, SCSI)
+            if [ -d "/sys/class/block/$boot_base" ]; then
+                boot_blk=$(basename "$(readlink -f "/sys/class/block/$boot_base/..")")
+                # If parent is "block", this IS the whole-disk device (e.g. sr0)
+                [ "$boot_blk" = "block" ] && boot_blk="$boot_base"
+            else
+                # Fallback: use the device basename (may include partition suffix)
+                boot_blk="$boot_base"
+            fi
+
+            # CD-ROM devices: /sys/block/sr*/device/type == 5
+            if [ -f "/sys/block/$boot_blk/device/type" ]; then
+                blk_type=$(cat "/sys/block/$boot_blk/device/type")
+                if [ "$blk_type" = "5" ]; then
+                    msg ":: ai-persist: Boot medium is CD-ROM ($boot_blk), skipping persistence wait."
+                    max_wait=0
+                fi
+            fi
+
+            # Virtual/non-removable disks (QEMU virtio, IDE, NVMe): removable == 0
+            if [ "$max_wait" -gt 0 ] && [ -f "/sys/block/$boot_blk/removable" ]; then
+                local removable
+                removable=$(cat "/sys/block/$boot_blk/removable")
+                if [ "$removable" = "0" ]; then
+                    msg ":: ai-persist: Boot device '$boot_blk' is non-removable, skipping persistence wait."
+                    max_wait=0
+                fi
+            fi
+        fi
+    fi
+
+    # Wait up to max_wait seconds for the persistence device to appear
+    while [ ! -b "$cow_dev" ] && [ "$tries" -lt "$max_wait" ]; do
+        sleep 1
+        tries=$((tries + 1))
+    done
+
+    if [ -b "$cow_dev" ]; then
+        msg ":: ai-persist: Persistence partition '$cow_label_val' found."
+        return 0
+    fi
+
+    msg ":: WARNING: Persistence partition '$cow_label_val' not found after ${tries}s."
+    msg ":: Booting in RAM-only mode. Changes will NOT persist across reboots."
+    msg ":: To enable persistence, run: mkfs.ext4 -L $cow_label_val <partition>"
+
+    # Mask cow_label and cow_flags so archiso falls back to tmpfs cowspace.
+    # mkinitcpio's getarg() reads from /tmp/cmdline (cached), NOT /proc/cmdline.
+    # We must modify BOTH for complete coverage.
+    local filtered
+    filtered=$(sed -e 's/cow_label=[^ ]*//g' -e 's/cow_flags=[^ ]*//g' /proc/cmdline)
+
+    # 1. Overwrite the cached cmdline that getarg() reads
+    mkdir -p /tmp
+    printf '%s\n' "$filtered" > /tmp/cmdline
+
+    # 2. Also bind-mount over /proc/cmdline for any code that reads it directly
+    printf '%s\n' "$filtered" > /tmp/.ai_cmdline
+    mount --bind /tmp/.ai_cmdline /proc/cmdline
+    _ai_cow_masked=1
+}
+
+run_latehook() {
+    # Restore original /proc/cmdline after archiso has mounted everything
+    if [ "$_ai_cow_masked" = "1" ]; then
+        umount /proc/cmdline 2>/dev/null
+        rm -f /tmp/.ai_cmdline
+    fi
+}

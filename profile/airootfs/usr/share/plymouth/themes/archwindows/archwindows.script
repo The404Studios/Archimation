@@ -1,0 +1,422 @@
+# ArchWindows Plymouth Boot Splash Script
+# Premium dark boot experience with Tokyo Night palette
+#
+# Palette:
+#   Background  #1a1b26  (0.102, 0.106, 0.149)
+#   Accent      #7aa2f7  (0.478, 0.635, 0.969)
+#   Text        #c0caf5  (0.753, 0.792, 0.961)
+#   Subtle      #565f89  (0.337, 0.373, 0.537)
+#   Glow        #bb9af7  (0.733, 0.604, 0.969)  -- purple highlight
+#   Dark BG     #13141e  (0.075, 0.078, 0.118)
+
+# ──────────────────────────────────────────────────────────────
+# Background: Tokyo Night deep dark gradient
+# ──────────────────────────────────────────────────────────────
+Window.SetBackgroundTopColor(0.102, 0.106, 0.149);    # #1a1b26
+Window.SetBackgroundBottomColor(0.075, 0.078, 0.118);  # #13141e
+
+# ──────────────────────────────────────────────────────────────
+# Screen geometry
+# ──────────────────────────────────────────────────────────────
+screen_width  = Window.GetWidth();
+screen_height = Window.GetHeight();
+center_x = screen_width  / 2;
+center_y = screen_height / 2;
+
+# ──────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────
+PI  = 3.14159265;
+TAU = 6.28318530;
+
+# ──────────────────────────────────────────────────────────────
+# Global animation state
+# ──────────────────────────────────────────────────────────────
+global.time          = 0;
+global.boot_progress = 0;
+global.boot_started  = 0;
+global.fade_in_done  = 0;
+global.fade_out      = 0;
+global.fade_alpha    = 0;      # ramps 0 -> 1 during fade-in
+global.quit_opacity  = 1;      # ramps 1 -> 0 during fade-out
+global.quit_time     = 0;
+global.msg_opacity   = 0;
+global.msg_target    = 0;
+global.msg_text      = "";
+
+# ──────────────────────────────────────────────────────────────
+# Title: "ArchWindows"
+# Large, bright, Tokyo Night text color
+# ──────────────────────────────────────────────────────────────
+title_image  = Image.Text("ArchWindows", 0.753, 0.792, 0.961, 1, "Sans Bold 52");
+title_sprite = Sprite(title_image);
+title_sprite.SetX(center_x - title_image.GetWidth() / 2);
+title_sprite.SetY(center_y - 80);
+title_sprite.SetZ(10);
+title_sprite.SetOpacity(0);
+
+# ──────────────────────────────────────────────────────────────
+# Subtitle: "AI-Powered Linux"
+# Subtle muted color
+# ──────────────────────────────────────────────────────────────
+subtitle_image  = Image.Text("AI-Powered Linux", 0.337, 0.373, 0.537, 1, "Sans 18");
+subtitle_sprite = Sprite(subtitle_image);
+subtitle_sprite.SetX(center_x - subtitle_image.GetWidth() / 2);
+subtitle_sprite.SetY(center_y - 20);
+subtitle_sprite.SetZ(10);
+subtitle_sprite.SetOpacity(0);
+
+# ──────────────────────────────────────────────────────────────
+# Accent line: thin horizontal separator between title and spinner
+# Rendered as a narrow colored text block (widest available glyph)
+# ──────────────────────────────────────────────────────────────
+accent_str = "";
+for (i = 0; i < 40; i++)
+    accent_str += "_";
+accent_image  = Image.Text(accent_str, 0.478, 0.635, 0.969, 0.35, "Sans 2");
+accent_sprite = Sprite(accent_image);
+accent_sprite.SetX(center_x - accent_image.GetWidth() / 2);
+accent_sprite.SetY(center_y + 5);
+accent_sprite.SetZ(10);
+accent_sprite.SetOpacity(0);
+
+# ──────────────────────────────────────────────────────────────
+# Spinner: 8 dots orbiting in a circle (Windows 11 style)
+# Each dot trails behind the lead with decreasing opacity
+# ──────────────────────────────────────────────────────────────
+global.num_dots    = 8;
+global.dot_radius  = 22;
+global.dot_sprites = [];
+global.dot_y       = center_y + 55;
+
+for (i = 0; i < global.num_dots; i++) {
+    global.dot_sprites[i] = Sprite();
+    global.dot_sprites[i].SetZ(12);
+}
+
+# ──────────────────────────────────────────────────────────────
+# Glow ring: pulsing circle behind spinner dots
+# ──────────────────────────────────────────────────────────────
+global.glow_sprite = Sprite();
+global.glow_sprite.SetZ(8);  # Behind dots (dots are Z=12)
+
+# ──────────────────────────────────────────────────────────────
+# Progress bar: thin accent-colored bar near bottom
+# Built from multiple narrow segments for gradient effect
+# ──────────────────────────────────────────────────────────────
+global.bar_width  = Math.Int(screen_width * 0.30);
+global.bar_x      = center_x - global.bar_width / 2;
+global.bar_y      = Math.Int(screen_height * 0.78);
+global.num_segs   = 30;
+global.seg_sprites = [];
+
+# Track bar background
+bar_bg_str = "";
+for (i = 0; i < 50; i++)
+    bar_bg_str += "_";
+bar_bg_image  = Image.Text(bar_bg_str, 0.337, 0.373, 0.537, 0.15, "Sans 2");
+bar_bg_sprite = Sprite(bar_bg_image);
+bar_bg_sprite.SetX(center_x - bar_bg_image.GetWidth() / 2);
+bar_bg_sprite.SetY(global.bar_y);
+bar_bg_sprite.SetZ(9);
+bar_bg_sprite.SetOpacity(0);
+
+# Create segment sprites for progress fill
+for (i = 0; i < global.num_segs; i++) {
+    global.seg_sprites[i] = Sprite();
+    global.seg_sprites[i].SetZ(11);
+    global.seg_sprites[i].SetOpacity(0);
+}
+
+# ──────────────────────────────────────────────────────────────
+# Progress percentage text
+# ──────────────────────────────────────────────────────────────
+global.pct_sprite = Sprite();
+global.pct_sprite.SetZ(10);
+global.pct_sprite.SetOpacity(0);
+
+# ──────────────────────────────────────────────────────────────
+# Status message text (below progress bar)
+# ──────────────────────────────────────────────────────────────
+global.message_sprite = Sprite();
+global.message_sprite.SetZ(10);
+global.message_sprite.SetOpacity(0);
+
+# ──────────────────────────────────────────────────────────────
+# Copyright / branding at very bottom
+# ──────────────────────────────────────────────────────────────
+brand_image  = Image.Text("archwindows", 0.337, 0.373, 0.537, 0.4, "Sans 10");
+brand_sprite = Sprite(brand_image);
+brand_sprite.SetX(center_x - brand_image.GetWidth() / 2);
+brand_sprite.SetY(screen_height - 40);
+brand_sprite.SetZ(10);
+brand_sprite.SetOpacity(0);
+
+
+# ==============================================================
+#  REFRESH CALLBACK -- called every frame (~60 fps)
+# ==============================================================
+fun refresh_callback() {
+    global.time += 0.016;   # ~60 fps tick
+
+    # ── Fade-in ramp (first 1.5 seconds) ──────────────────────
+    if (global.fade_alpha < 1) {
+        global.fade_alpha += 0.011;  # ~1.5s to reach 1.0
+        if (global.fade_alpha > 1)
+            global.fade_alpha = 1;
+    }
+
+    # ── Fade-out ramp (when quit is triggered) ────────────────
+    master_alpha = global.fade_alpha;
+    if (global.fade_out) {
+        global.quit_opacity -= 0.025;   # ~0.65s fade-out
+        if (global.quit_opacity < 0)
+            global.quit_opacity = 0;
+        master_alpha = global.quit_opacity;
+    }
+
+    # ── Title: sine-wave pulse on opacity ─────────────────────
+    pulse = Math.Sin(global.time * 1.8);               # slow sine
+    title_op = 0.80 + 0.20 * ((pulse + 1.0) / 2.0);   # range 0.80 .. 1.0
+    title_sprite.SetOpacity(title_op * master_alpha);
+
+    # ── Subtitle: slightly delayed and more subtle ────────────
+    sub_pulse = Math.Sin(global.time * 1.8 - 0.5);
+    sub_op = 0.50 + 0.20 * ((sub_pulse + 1.0) / 2.0);
+    subtitle_sprite.SetOpacity(sub_op * master_alpha);
+
+    # ── Accent line: steady at low opacity ────────────────────
+    accent_sprite.SetOpacity(0.35 * master_alpha);
+
+    # ── Branding: steady ──────────────────────────────────────
+    brand_sprite.SetOpacity(0.4 * master_alpha);
+
+    # ── Bar background: steady ────────────────────────────────
+    bar_bg_sprite.SetOpacity(0.15 * master_alpha);
+
+    # ── Spinner dots: trailing opacity ring ───────────────────
+    spin_speed = 2.4;
+    base_angle = global.time * spin_speed;
+
+    for (i = 0; i < global.num_dots; i++) {
+        # Each dot is evenly spaced, trailing behind the lead
+        trail_frac = i / global.num_dots;       # 0.0 = lead, 1.0 = last
+        angle = base_angle - trail_frac * 2.0;  # staggered behind leader
+
+        dx = Math.Int(Math.Sin(angle) * global.dot_radius);
+        dy = Math.Int(Math.Cos(angle) * global.dot_radius * 0.40);  # elliptical
+
+        # Opacity: lead dot = 1.0, trailing dots fade out
+        dot_op = 1.0 - trail_frac * 0.85;
+        if (dot_op < 0.12)
+            dot_op = 0.12;
+
+        # Blend accent and glow color based on trail position
+        r = 0.478 + trail_frac * (0.733 - 0.478);  # accent -> glow
+        g = 0.635 + trail_frac * (0.604 - 0.635);
+        b = 0.969;
+
+        dot_img = Image.Text("o", r, g, b, 1, "Sans Bold 10");
+        global.dot_sprites[i].SetImage(dot_img);
+        global.dot_sprites[i].SetX(center_x + dx - dot_img.GetWidth() / 2);
+        global.dot_sprites[i].SetY(global.dot_y + dy - dot_img.GetHeight() / 2);
+        global.dot_sprites[i].SetOpacity(dot_op * master_alpha);
+    }
+
+    # ── Glow ring: subtle pulsing circle around spinner ───────
+    glow_pulse = Math.Sin(global.time * 1.2);
+    glow_op = 0.08 + 0.06 * ((glow_pulse + 1.0) / 2.0);
+    glow_scale = 1.0 + 0.05 * ((glow_pulse + 1.0) / 2.0);
+
+    glow_img = Image.Text("O", 0.478, 0.635, 0.969, 1, "Sans 60");
+    global.glow_sprite.SetImage(glow_img);
+    global.glow_sprite.SetX(center_x - glow_img.GetWidth() / 2);
+    global.glow_sprite.SetY(global.dot_y - glow_img.GetHeight() / 2 + 5);
+    global.glow_sprite.SetOpacity(glow_op * master_alpha);
+
+    # ── Progress bar segments ─────────────────────────────────
+    if (global.boot_progress > 0) {
+        filled_count = Math.Int(global.boot_progress * global.num_segs);
+        seg_width = Math.Int(global.bar_width / global.num_segs);
+
+        for (j = 0; j < global.num_segs; j++) {
+            if (j < filled_count) {
+                # Gradient: left segments slightly purple, right segments blue
+                frac = j / global.num_segs;
+                seg_r = 0.478 + (1 - frac) * 0.15;
+                seg_g = 0.635 - (1 - frac) * 0.05;
+                seg_b = 0.969;
+
+                # Shimmer effect on the leading edge
+                shimmer = 0;
+                if (j == filled_count - 1) {
+                    shimmer = Math.Sin(global.time * 6.0);
+                    shimmer = 0.15 * ((shimmer + 1.0) / 2.0);
+                }
+
+                seg_img = Image.Text("|", seg_r + shimmer, seg_g + shimmer, seg_b, 1, "Sans Bold 6");
+                global.seg_sprites[j].SetImage(seg_img);
+                global.seg_sprites[j].SetX(global.bar_x + j * seg_width);
+                global.seg_sprites[j].SetY(global.bar_y);
+                global.seg_sprites[j].SetOpacity((0.7 + frac * 0.3) * master_alpha);
+            } else {
+                global.seg_sprites[j].SetOpacity(0);
+            }
+        }
+
+        # Percentage text
+        pct_val = Math.Int(global.boot_progress * 100);
+        pct_str = "" + pct_val + "%";
+        pct_img = Image.Text(pct_str, 0.337, 0.373, 0.537, 1, "Sans 11");
+        global.pct_sprite.SetImage(pct_img);
+        global.pct_sprite.SetX(center_x - pct_img.GetWidth() / 2);
+        global.pct_sprite.SetY(global.bar_y + 14);
+        global.pct_sprite.SetOpacity(0.5 * master_alpha);
+    }
+
+    # ── Message text: smooth opacity transition ───────────────
+    if (global.msg_opacity < global.msg_target) {
+        global.msg_opacity += 0.04;
+        if (global.msg_opacity > global.msg_target)
+            global.msg_opacity = global.msg_target;
+    }
+    if (global.msg_opacity > global.msg_target) {
+        global.msg_opacity -= 0.04;
+        if (global.msg_opacity < global.msg_target)
+            global.msg_opacity = global.msg_target;
+    }
+    global.message_sprite.SetOpacity(global.msg_opacity * master_alpha);
+}
+
+Plymouth.SetRefreshFunction(refresh_callback);
+
+
+# ==============================================================
+#  BOOT PROGRESS CALLBACK
+# ==============================================================
+fun boot_progress_callback(duration, progress) {
+    global.boot_progress = progress;
+    global.boot_started  = 1;
+
+    # Show stage-appropriate messages based on boot progress
+    if (progress < 0.15)
+        message_callback("Initializing kernel modules...");
+    else if (progress < 0.30)
+        message_callback("Starting system services...");
+    else if (progress < 0.50)
+        message_callback("Loading AI control daemon...");
+    else if (progress < 0.70)
+        message_callback("Configuring trust system...");
+    else if (progress < 0.85)
+        message_callback("Preparing desktop environment...");
+    else if (progress < 0.95)
+        message_callback("Almost ready...");
+    else
+        message_callback("Welcome to ArchWindows");
+}
+
+Plymouth.SetBootProgressFunction(boot_progress_callback);
+
+
+# ==============================================================
+#  MESSAGE CALLBACK -- status text with fade transition
+# ==============================================================
+fun message_callback(text) {
+    if (text == "" || text == NULL) {
+        global.msg_target = 0;
+        return;
+    }
+
+    # If the message changed, fade out first then update
+    if (text != global.msg_text) {
+        global.msg_text = text;
+        msg_img = Image.Text(text, 0.337, 0.373, 0.537, 1, "Sans 12");
+        global.message_sprite.SetImage(msg_img);
+        global.message_sprite.SetX(center_x - msg_img.GetWidth() / 2);
+        global.message_sprite.SetY(Math.Int(screen_height * 0.84));
+        global.msg_opacity = 0;   # restart fade-in for new text
+    }
+    global.msg_target = 0.7;
+}
+
+Plymouth.SetMessageFunction(message_callback);
+
+
+# ==============================================================
+#  QUIT CALLBACK -- triggers fade-out to desktop
+# ==============================================================
+fun quit_callback() {
+    global.fade_out = 1;
+}
+
+Plymouth.SetQuitFunction(quit_callback);
+
+
+# ==============================================================
+#  PASSWORD PROMPT (encrypted disk unlock)
+# ==============================================================
+global.password_sprite        = Sprite();
+global.password_bullet_sprite = Sprite();
+global.password_box_sprite    = Sprite();
+global.password_entry         = "";
+
+fun password_dialog_setup(prompt_text, num_bullets) {
+    # Prompt label
+    prompt_img = Image.Text(prompt_text, 0.753, 0.792, 0.961, 1, "Sans 16");
+    global.password_sprite.SetImage(prompt_img);
+    global.password_sprite.SetX(center_x - prompt_img.GetWidth() / 2);
+    global.password_sprite.SetY(center_y + 80);
+    global.password_sprite.SetZ(20);
+    global.password_sprite.SetOpacity(1);
+
+    # Input field box (underline indicator)
+    box_str = "";
+    for (k = 0; k < 30; k++)
+        box_str += "_";
+    box_img = Image.Text(box_str, 0.478, 0.635, 0.969, 0.5, "Sans 12");
+    global.password_box_sprite.SetImage(box_img);
+    global.password_box_sprite.SetX(center_x - box_img.GetWidth() / 2);
+    global.password_box_sprite.SetY(center_y + 130);
+    global.password_box_sprite.SetZ(20);
+    global.password_box_sprite.SetOpacity(1);
+
+    # Bullet characters for password length
+    bullets = "";
+    for (bi = 0; bi < num_bullets; bi++)
+        bullets += "*";
+
+    if (bullets != "") {
+        bullet_img = Image.Text(bullets, 0.753, 0.792, 0.961, 1, "Sans Mono 22");
+        global.password_bullet_sprite.SetImage(bullet_img);
+        global.password_bullet_sprite.SetX(center_x - bullet_img.GetWidth() / 2);
+        global.password_bullet_sprite.SetY(center_y + 115);
+        global.password_bullet_sprite.SetZ(21);
+        global.password_bullet_sprite.SetOpacity(1);
+    } else {
+        global.password_bullet_sprite.SetOpacity(0);
+    }
+}
+
+fun display_password_callback(prompt, num_bullets) {
+    password_dialog_setup(prompt, num_bullets);
+}
+
+Plymouth.SetDisplayPasswordFunction(display_password_callback);
+
+fun display_normal_callback() {
+    global.password_sprite.SetOpacity(0);
+    global.password_bullet_sprite.SetOpacity(0);
+    global.password_box_sprite.SetOpacity(0);
+}
+
+Plymouth.SetDisplayNormalFunction(display_normal_callback);
+
+
+# ==============================================================
+#  QUESTION CALLBACK (fsck prompts etc.)
+# ==============================================================
+fun display_question_callback(prompt, entry) {
+    password_dialog_setup(prompt, 0);
+}
+
+Plymouth.SetDisplayQuestionFunction(display_question_callback);

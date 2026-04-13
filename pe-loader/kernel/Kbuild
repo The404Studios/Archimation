@@ -1,0 +1,4 @@
+obj-m := pe_compat.o
+pe_compat-objs := pe_compat_main.o pe_compat_binfmt.o pe_compat_syscall.o pe_compat_memory.o pe_compat_ioctl.o pe_compat_process.o
+
+ccflags-y := -I$(src)/../include

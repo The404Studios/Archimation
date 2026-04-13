@@ -1,0 +1,17 @@
+post_install() {
+    update-mime-database /usr/share/mime &>/dev/null || true
+    update-desktop-database /usr/share/applications &>/dev/null || true
+    gtk-update-icon-cache -f /usr/share/icons/hicolor &>/dev/null || true
+
+    # Enable the system update checker timer for all users
+    echo ":: Enabling ai-update-checker.timer for user sessions..."
+    systemctl --global enable ai-update-checker.timer 2>/dev/null || true
+}
+
+post_upgrade() {
+    post_install
+}
+
+post_remove() {
+    post_install
+}

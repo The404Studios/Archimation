@@ -274,7 +274,7 @@ echo "arch:arch" | chpasswd
 # Include NVIDIA modules for early KMS (RTX 5070 / Blackwell needs nvidia-open)
 cat > /etc/mkinitcpio.conf <<'INITCPIO'
 # mkinitcpio.conf for AI Arch Linux Live ISO
-MODULES=(amdgpu nouveau i915)
+MODULES=(i915 amdgpu)
 BINARIES=()
 FILES=()
 HOOKS=(base udev plymouth ai-persist archiso archiso_loop_mnt modconf block filesystems keyboard)

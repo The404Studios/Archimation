@@ -1,6 +1,6 @@
 .PHONY: all trust-lib trust-kernel pe-loader services ai-control firewall packages iso clean test test-qemu
 
-all: trust-lib trust-kernel pe-loader services
+all: trust-lib pe-loader services
 
 trust-lib:
 	$(MAKE) -C trust/lib

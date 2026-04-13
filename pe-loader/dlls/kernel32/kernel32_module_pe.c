@@ -99,7 +99,7 @@ static int find_dll_file(const char *name, char *result, size_t result_size)
     const char *env_path = getenv("PE_COMPAT_DLL_PATH");
     if (env_path) {
         char *paths = strdup(env_path);
-        if (!paths) return NULL;
+        if (!paths) return -1;
         char *tok = strtok(paths, ":");
         while (tok) {
             snprintf(path, sizeof(path), "%s/%s", tok, name);

@@ -29,8 +29,9 @@ xorg-xrandr
 xorg-xdpyinfo
 xorg-xauth
 libx11
-xf86-video-intel
-xf86-video-nouveau
+# xf86-video-intel   # Legacy DDX — modesetting (built into Xorg) is preferred
+# xf86-video-nouveau  # Legacy DDX — modesetting handles nouveau KMS natively
+# Using modesetting DDX avoids dual-GPU conflicts on Optimus laptops
 xf86-input-libinput
 mesa
 scrot

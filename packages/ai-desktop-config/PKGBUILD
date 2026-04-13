@@ -11569,7 +11569,7 @@ class InstallerApp(Adw.Application):
                 "xfce4 xfce4-goodies lightdm lightdm-gtk-greeter "
                 "xorg-server xorg-xinit xorg-xrandr "
                 "pipewire pipewire-pulse pipewire-alsa wireplumber "
-                "mesa vulkan-icd-loader xf86-video-nouveau "
+                "mesa vulkan-icd-loader "
                 "base-devel gcc make dkms linux-headers "
                 "git vim nano htop wget curl openssh "
                 "networkmanager network-manager-applet iwd "

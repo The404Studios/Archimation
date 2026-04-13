@@ -308,16 +308,11 @@ if command -v plymouth-set-default-theme &>/dev/null; then
 fi
 
 # --- Plymouth-to-LightDM seamless handoff ---
-# plymouth-quit-wait.service blocks until Plymouth daemon exits. Order it after
-# the display manager so Plymouth stays visible while LightDM starts X.
-# Boot flow: Plymouth animation → LightDM starts X → plymouth-quit fires →
-#            Plymouth exits → X/XFCE takes over VT → desktop visible.
+# NOTE: Do NOT add After=display-manager.service here — lightdm has built-in
+# After=plymouth-quit.service, so adding reverse ordering creates a cycle.
+# The --retain-splash flag on plymouth-quit handles the visual transition.
 mkdir -p /etc/systemd/system/plymouth-quit-wait.service.d
 cat > /etc/systemd/system/plymouth-quit-wait.service.d/timeout.conf <<'PLYQUIT'
-[Unit]
-After=display-manager.service
-Wants=display-manager.service
-
 [Service]
 # Safety timeout: if Plymouth hangs (headless/QEMU), don't block boot forever
 TimeoutStartSec=15
@@ -340,16 +335,12 @@ PLYQUIT2
 # The greeter background color (#1a1b26) matches Plymouth, so even if the
 # greeter briefly appears (e.g., session lookup delay), there's no visual flash.
 
-# (a) Delay plymouth-quit.service until after LightDM has started X, so
-#     Plymouth stays on screen until the X server takes over the framebuffer.
-cat > /etc/systemd/system/plymouth-quit.service.d/after-lightdm.conf <<'PLYLDM'
-[Unit]
-After=lightdm.service
-PLYLDM
+# NOTE: Do NOT add After=lightdm.service to plymouth-quit — it creates a
+# dependency cycle because lightdm.service has built-in After=plymouth-quit.
+# Instead, --retain-splash keeps the framebuffer image visible until X takes over.
 
-# (b) Override plymouth-quit to use --retain-splash: keeps the framebuffer
-#     image visible until another process (X server) takes over the VT.
-#     This eliminates any black-screen gap between Plymouth and XFCE.
+# Override plymouth-quit to use --retain-splash: keeps the framebuffer
+# image visible until another process (X server) takes over the VT.
 cat > /etc/systemd/system/plymouth-quit.service.d/retain-splash.conf <<'PLYRETAIN'
 [Service]
 ExecStart=

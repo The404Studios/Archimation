@@ -104,6 +104,36 @@ cat > /etc/NetworkManager/conf.d/wifi-powersave.conf <<'NM_PS'
 wifi.powersave=2
 NM_PS
 
+# Ensure WiFi radio is ON by default (some systems soft-block it)
+cat > /etc/NetworkManager/conf.d/wifi-enable.conf <<'NM_WIFI'
+[connectivity]
+enabled=true
+
+[main]
+# Ensure WiFi is enabled on startup
+autoconnect-retries-default=3
+NM_WIFI
+
+# Unblock WiFi via rfkill on boot (some laptops have WiFi soft-blocked)
+cat > /usr/lib/systemd/system/rfkill-unblock-wifi.service <<'RFKILL_SVC'
+[Unit]
+Description=Unblock WiFi radio on boot
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/rfkill unblock wifi
+ExecStart=/usr/bin/nmcli radio wifi on
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+RFKILL_SVC
+# Enable the service
+ln -sf /usr/lib/systemd/system/rfkill-unblock-wifi.service \
+    /etc/systemd/system/multi-user.target.wants/rfkill-unblock-wifi.service
+
 # --- WiFi regulatory domain ---
 # Set regulatory domain to US (ensures 5 GHz channels are available).
 # Users can change via `iw reg set XX` at runtime.

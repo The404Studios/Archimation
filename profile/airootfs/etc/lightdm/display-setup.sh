@@ -14,13 +14,10 @@ if [ -z "$SCREEN_H" ]; then
     exit 0
 fi
 
-if [ "$SCREEN_H" -ge 2160 ]; then
-    DPI=192
-elif [ "$SCREEN_H" -ge 1440 ]; then
-    DPI=120
-else
-    DPI=96
-fi
+# Use consistent 96 DPI across all resolutions — GDK_DPI_SCALE=0.5
+# in the session handles the actual scaling. This prevents the greeter
+# from rendering at oversized DPI on HiDPI screens.
+DPI=96
 
 # Apply DPI to the X server for the greeter session
 echo "Xft.dpi: $DPI" | xrdb -merge 2>/dev/null || true

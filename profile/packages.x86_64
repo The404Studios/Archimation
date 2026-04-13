@@ -28,6 +28,7 @@ xorg-xinit
 xorg-xrandr
 xorg-xdpyinfo
 xorg-xauth
+libx11
 xf86-video-intel
 xf86-video-nouveau
 xf86-input-libinput

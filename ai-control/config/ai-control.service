@@ -5,8 +5,8 @@ Description=AI Control Daemon - Full System Control
 # connection (common in QEMU/first-boot). The daemon doesn't need full
 # network connectivity to start — it binds to localhost:8420.
 After=network.target
-# Start after persistence cleanup to avoid stale state
-After=ai-persist-cleanup.service
+# Start after systemd basic targets are up
+After=local-fs.target
 
 [Service]
 Type=simple

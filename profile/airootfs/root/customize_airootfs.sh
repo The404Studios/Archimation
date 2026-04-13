@@ -649,52 +649,43 @@ fi
 # Export the tier so GTK4 apps can read it for responsive layout
 export AI_DISPLAY_TIER="${_scale_tier:-small}"
 
+# Always use GDK_DPI_SCALE=0.5 — keeps UI compact and readable on all displays.
+# GDK_SCALE=1 with DPI_SCALE=0.5 halves the effective DPI, giving smaller
+# text/widgets so you can see more on screen. Panel/icon sizes are tuned
+# per resolution tier to complement this base scale.
+export GDK_DPI_SCALE=0.5
+export QT_AUTO_SCREEN_SCALE_FACTOR=0
+
 case "$_scale_tier" in
     4k)
-        export GDK_SCALE=2
-        export GDK_DPI_SCALE=0.5
-        export QT_SCALE_FACTOR=2
-        export QT_AUTO_SCREEN_SCALE_FACTOR=0
-        xfconf-query -c xsettings -p /Gdk/WindowScalingFactor -s 2 2>/dev/null
-        xfconf-query -c xsettings -p /Xft/DPI -s 192 2>/dev/null
-        xfconf-query -c xfce4-panel -p /panels/panel-1/size -s 56 2>/dev/null
-        xfconf-query -c xfce4-panel -p /panels/panel-1/icon-size -s 32 2>/dev/null
-        xfconf-query -c xfce4-desktop -p /desktop-icons/icon-size -s 96 2>/dev/null
-        ;;
-    1440p)
         export GDK_SCALE=1
-        export GDK_DPI_SCALE=1.25
-        export QT_SCALE_FACTOR=1.25
-        export QT_AUTO_SCREEN_SCALE_FACTOR=0
-        xfconf-query -c xsettings -p /Xft/DPI -s 120 2>/dev/null
-        xfconf-query -c xfce4-panel -p /panels/panel-1/size -s 44 2>/dev/null
-        xfconf-query -c xfce4-panel -p /panels/panel-1/icon-size -s 24 2>/dev/null
-        xfconf-query -c xfce4-desktop -p /desktop-icons/icon-size -s 56 2>/dev/null
-        ;;
-    1080p)
-        export GDK_SCALE=1
-        export GDK_DPI_SCALE=1
-        export QT_AUTO_SCREEN_SCALE_FACTOR=1
+        export QT_SCALE_FACTOR=1
+        xfconf-query -c xsettings -p /Gdk/WindowScalingFactor -s 1 2>/dev/null
         xfconf-query -c xsettings -p /Xft/DPI -s 96 2>/dev/null
         xfconf-query -c xfce4-panel -p /panels/panel-1/size -s 36 2>/dev/null
         xfconf-query -c xfce4-panel -p /panels/panel-1/icon-size -s 22 2>/dev/null
         xfconf-query -c xfce4-desktop -p /desktop-icons/icon-size -s 48 2>/dev/null
         ;;
-    900p)
-        # 1600x900, 1440x900 — compact UI
+    1440p)
         export GDK_SCALE=1
-        export GDK_DPI_SCALE=1
-        export QT_AUTO_SCREEN_SCALE_FACTOR=1
+        export QT_SCALE_FACTOR=1
+        xfconf-query -c xsettings -p /Xft/DPI -s 96 2>/dev/null
+        xfconf-query -c xfce4-panel -p /panels/panel-1/size -s 34 2>/dev/null
+        xfconf-query -c xfce4-panel -p /panels/panel-1/icon-size -s 20 2>/dev/null
+        xfconf-query -c xfce4-desktop -p /desktop-icons/icon-size -s 44 2>/dev/null
+        ;;
+    1080p)
+        export GDK_SCALE=1
+        export QT_SCALE_FACTOR=1
         xfconf-query -c xsettings -p /Xft/DPI -s 96 2>/dev/null
         xfconf-query -c xfce4-panel -p /panels/panel-1/size -s 32 2>/dev/null
-        xfconf-query -c xfce4-panel -p /panels/panel-1/icon-size -s 20 2>/dev/null
+        xfconf-query -c xfce4-panel -p /panels/panel-1/icon-size -s 18 2>/dev/null
         xfconf-query -c xfce4-desktop -p /desktop-icons/icon-size -s 40 2>/dev/null
         ;;
     *)
-        # 768p, QEMU, small screens — minimal UI
+        # 900p, 768p, QEMU, small screens
         export GDK_SCALE=1
-        export GDK_DPI_SCALE=1
-        export QT_AUTO_SCREEN_SCALE_FACTOR=1
+        export QT_SCALE_FACTOR=1
         xfconf-query -c xsettings -p /Xft/DPI -s 96 2>/dev/null
         xfconf-query -c xfce4-panel -p /panels/panel-1/size -s 28 2>/dev/null
         xfconf-query -c xfce4-panel -p /panels/panel-1/icon-size -s 16 2>/dev/null

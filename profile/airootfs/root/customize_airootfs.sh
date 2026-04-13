@@ -60,13 +60,15 @@ cat > /usr/lib/systemd/system/dkms-first-boot.service <<'DKMS_FB'
 [Unit]
 Description=Build DKMS kernel modules on first boot
 DefaultDependencies=no
-Before=systemd-modules-load.service
+Before=systemd-modules-load.service display-manager.service
 After=local-fs.target
 ConditionPathExists=!/var/lib/dkms-first-boot-done
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'dkms autoinstall && depmod -a && touch /var/lib/dkms-first-boot-done'
+# nvidia-open-dkms compilation can take 3-5 minutes; give it time
+ExecStart=/bin/bash -c 'dkms autoinstall 2>&1 | tail -5; depmod -a; touch /var/lib/dkms-first-boot-done'
+TimeoutStartSec=600
 RemainAfterExit=yes
 
 [Install]
@@ -384,17 +386,14 @@ cat > /usr/lib/systemd/system/amd-pstate-performance.service <<'AMD_GOV_SVC'
 [Unit]
 Description=Set AMD P-State CPU governor to performance (Ryzen 9800X3D)
 After=sysinit.target systemd-modules-load.service
-# Wait for cpufreq to appear — amd-pstate driver may load late
-ConditionPathIsDirectory=/sys/devices/system/cpu/cpu0
+# Only run if cpufreq actually exists (skip on live ISO / non-AMD / QEMU)
+ConditionPathIsDirectory=/sys/devices/system/cpu/cpu0/cpufreq
 
 [Service]
 Type=oneshot
-# Wait up to 10s for cpufreq to appear (driver may load after sysinit)
-ExecStartPre=/bin/bash -c 'for i in $(seq 1 20); do [ -d /sys/devices/system/cpu/cpu0/cpufreq ] && exit 0; sleep 0.5; done; echo "cpufreq not available, skipping"; exit 0'
 ExecStart=-/bin/bash -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -f "$g" ] && echo performance > "$g" 2>/dev/null; done'
-# Also set the energy_performance_preference to performance if amd-pstate EPP is active
 ExecStart=-/bin/bash -c 'for p in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do [ -f "$p" ] && echo performance > "$p" 2>/dev/null; done'
-TimeoutStartSec=30
+TimeoutStartSec=10
 RemainAfterExit=yes
 
 [Install]
@@ -1444,15 +1443,20 @@ chmod +x /usr/bin/ai-boot-chime
 cat > /usr/lib/systemd/system/ai-boot-chime.service <<'CHIMESVC'
 [Unit]
 Description=AI Arch Linux Boot Chime
-After=sound.target pulseaudio.service pipewire.service
+After=sound.target pipewire.service
 Wants=sound.target
+# Non-critical: don't block boot if audio isn't ready
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
 
 [Service]
-Type=oneshot
-ExecStart=/usr/bin/ai-boot-chime
+Type=simple
+ExecStart=/bin/bash -c 'timeout 10 /usr/bin/ai-boot-chime || true'
 StandardOutput=null
 StandardError=null
-RemainAfterExit=no
+TimeoutStartSec=15
+TimeoutStopSec=5
 
 [Install]
 WantedBy=graphical.target

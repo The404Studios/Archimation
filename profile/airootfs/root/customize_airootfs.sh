@@ -59,20 +59,18 @@ fi
 cat > /usr/lib/systemd/system/dkms-first-boot.service <<'DKMS_FB'
 [Unit]
 Description=Build DKMS kernel modules on first boot
-DefaultDependencies=no
-Before=systemd-modules-load.service display-manager.service
 After=local-fs.target
 ConditionPathExists=!/var/lib/dkms-first-boot-done
+# Do NOT use Before=display-manager — blocks desktop for minutes!
 
 [Service]
 Type=oneshot
-# nvidia-open-dkms compilation can take 3-5 minutes; give it time
-ExecStart=/bin/bash -c 'dkms autoinstall 2>&1 | tail -5; depmod -a; touch /var/lib/dkms-first-boot-done'
-TimeoutStartSec=600
+ExecStart=/bin/bash -c 'dkms autoinstall 2>&1 | tail -5; depmod -a; touch /var/lib/dkms-first-boot-done || true'
+TimeoutStartSec=120
 RemainAfterExit=yes
 
 [Install]
-WantedBy=sysinit.target
+WantedBy=multi-user.target
 DKMS_FB
 
 # --- NetworkManager WiFi configuration ---

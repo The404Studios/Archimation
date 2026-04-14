@@ -11524,8 +11524,21 @@ class InstallerApp(Adw.Application):
                 root_part = f"{p_prefix}2"
 
             # Wait for kernel to update partition table
-            self._run_cmd("partprobe " + disk, check=False)
-            self._run_cmd("sleep 2", check=False)
+            self._run_cmd(f"partprobe {disk}", check=False)
+            self._run_cmd("udevadm settle --timeout=10", check=False)
+            self._run_cmd("sleep 3", check=False)
+
+            # Verify partitions exist before proceeding
+            self._log(f"Verifying partitions: EFI={efi_part} Root={root_part}")
+            for attempt in range(5):
+                if os.path.exists(root_part) and os.path.exists(efi_part):
+                    break
+                self._log(f"  Waiting for partitions to appear (attempt {attempt+1}/5)...")
+                time.sleep(2)
+
+            if not os.path.exists(root_part):
+                raise RuntimeError(f"Partition {root_part} did not appear after partitioning. "
+                                   f"Check if {disk} was partitioned correctly.")
 
             self._set_step("partition", "done")
 
@@ -11535,7 +11548,7 @@ class InstallerApp(Adw.Application):
 
             self._run_cmd(f"mkfs.fat -F32 {efi_part}",
                           desc="Formatting EFI partition (FAT32)")
-            self._run_cmd(f"mkfs.ext4 -F {root_part}",
+            self._run_cmd(f"mkfs.ext4 -F -L AIArch {root_part}",
                           desc="Formatting root partition (ext4)")
             if swap_part:
                 self._run_cmd(f"mkswap {swap_part}",

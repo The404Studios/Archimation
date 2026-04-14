@@ -1076,10 +1076,9 @@ import urllib.error
 import os
 
 # GTK4 rendering fallbacks for older/incompatible GPUs (e.g., GT218M nouveau).
-# Force X11 backend (Wayland may not be available) and Cairo renderer
-# (avoids requiring GPU-accelerated GSK which needs working GL 3.2+/Vulkan).
 os.environ.setdefault("GDK_BACKEND", "x11")
 os.environ.setdefault("GSK_RENDERER", "cairo")
+os.environ.setdefault("GDK_DPI_SCALE", "0.5")
 
 API_BASE = "http://127.0.0.1:8420"
 
@@ -2916,8 +2915,8 @@ NOTIFYD
       <property name="&lt;Primary&gt;&lt;Alt&gt;Delete" type="string" value="xfce4-taskmanager"/>
       <!-- Ctrl+Shift+Escape = System monitor -->
       <property name="&lt;Primary&gt;&lt;Shift&gt;Escape" type="string" value="xfce4-taskmanager"/>
-      <!-- Alt+F2 = App runner -->
-      <property name="&lt;Alt&gt;F2" type="string" value="xfce4-appfinder"/>
+      <!-- Super+R = App runner (Alt+F2 used for workspace switching) -->
+      <property name="&lt;Super&gt;F2" type="string" value="xfce4-appfinder"/>
       <!-- Super+A = AI Chat Assistant -->
       <property name="&lt;Super&gt;a" type="string" value="/usr/bin/ai-chat"/>
       <!-- Super+S = AI Screenshot (capture + notify) -->
@@ -2955,6 +2954,10 @@ NOTIFYD
       <property name="&lt;Super&gt;2" type="string" value="workspace_2_key"/>
       <property name="&lt;Super&gt;3" type="string" value="workspace_3_key"/>
       <property name="&lt;Super&gt;4" type="string" value="workspace_4_key"/>
+      <!-- Alt+F1..F3 = Switch to workspace 1-3 -->
+      <property name="&lt;Alt&gt;F1" type="string" value="workspace_1_key"/>
+      <property name="&lt;Alt&gt;F2" type="string" value="workspace_2_key"/>
+      <property name="&lt;Alt&gt;F3" type="string" value="workspace_3_key"/>
       <!-- Ctrl+Alt+Left/Right = Switch workspaces -->
       <property name="&lt;Primary&gt;&lt;Alt&gt;Left" type="string" value="left_workspace_key"/>
       <property name="&lt;Primary&gt;&lt;Alt&gt;Right" type="string" value="right_workspace_key"/>
@@ -6833,6 +6836,7 @@ import urllib.request, urllib.error
 
 os.environ.setdefault("GDK_BACKEND", "x11")
 os.environ.setdefault("GSK_RENDERER", "cairo")
+os.environ.setdefault("GDK_DPI_SCALE", "0.5")
 
 API = "http://127.0.0.1:8420"
 MACROS_PATH = os.path.expanduser("~/.config/contusion/macros.json")

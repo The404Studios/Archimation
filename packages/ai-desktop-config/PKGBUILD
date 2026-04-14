@@ -11809,7 +11809,7 @@ class InstallerApp(Adw.Application):
 
             # Write mkinitcpio.conf for installed system
             mkinitcpio_conf = (
-                "MODULES=(amdgpu nouveau nvidia nvidia_modeset nvidia_uvm nvidia_drm)\n"
+                "MODULES=(i915 amdgpu)\n"
                 "BINARIES=()\n"
                 "FILES=()\n"
                 "HOOKS=(base udev plymouth autodetect modconf "

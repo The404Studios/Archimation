@@ -11611,7 +11611,7 @@ class InstallerApp(Adw.Application):
                             break
 
             self._run_cmd(
-                f"pacstrap -K {MOUNT_ROOT} {base_pkgs}",
+                f"pacstrap -K --noconfirm {MOUNT_ROOT} {base_pkgs}",
                 desc="Installing base system packages via pacstrap")
 
             # Install custom packages from our local repo
@@ -11619,7 +11619,7 @@ class InstallerApp(Adw.Application):
             custom_pkgs = " ".join(CUSTOM_PACKAGES)
             self._log("Installing custom AI Arch packages...")
             rc, _ = self._run_cmd(
-                f"pacstrap -K {MOUNT_ROOT} --config {pacman_conf} {custom_pkgs}",
+                f"pacstrap -K --noconfirm {MOUNT_ROOT} --config {pacman_conf} {custom_pkgs}",
                 desc="Installing AI Arch custom packages",
                 check=False)
             if rc != 0:

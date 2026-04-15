@@ -273,7 +273,15 @@ int objectd_registry_handle(uint8_t req_type, const void *payload,
             return 0;
         }
 
-        /* Build response: reg_enum_key_response_t + name */
+        /* Build response: reg_enum_key_response_t + name.
+         * Clamp name_size so we never read past name_buf (registry_enum_key
+         * is expected to honour the size cap, but a misbehaving backend
+         * could set name_size == sizeof(name_buf) leaving no room for the
+         * trailing NUL we memcpy below). */
+        if (name_size >= sizeof(name_buf))
+            name_size = sizeof(name_buf) - 1;
+        name_buf[name_size] = '\0';
+
         reg_enum_key_response_t ek_resp;
         ek_resp.name_len = name_size;
 
@@ -318,6 +326,15 @@ int objectd_registry_handle(uint8_t req_type, const void *payload,
             *resp_len = sizeof(objectd_response_t);
             return 0;
         }
+
+        /* Clamp name_size / val_data_size so we never read past our stack
+         * buffers.  If the registry backend mis-reports, the subsequent
+         * memcpys would overflow name_buf or val_data. */
+        if (name_size >= sizeof(name_buf))
+            name_size = sizeof(name_buf) - 1;
+        name_buf[name_size] = '\0';
+        if (val_data_size > sizeof(val_data))
+            val_data_size = sizeof(val_data);
 
         /* Build response: reg_enum_value_response_t + name + data */
         reg_enum_value_response_t ev_resp;

@@ -6,6 +6,11 @@
  * select, closesocket, getaddrinfo, gethostbyname, etc.
  */
 
+/* Needed for gethostbyname_r / gethostbyaddr_r on glibc (GNU-specific). */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -365,6 +370,14 @@ WINAPI_EXPORT int ws2_send(SOCKET_WIN s, const char *buf, int len, int flags)
         wsa_last_error = WSANOTINITIALISED;
         return SOCKET_ERROR_WIN;
     }
+    /* Guard against negative lengths — int→size_t cast otherwise produces
+     * a near-SIZE_MAX value that send() would interpret as a gigantic buffer,
+     * triggering EFAULT or worse (kernel range-check on the user pointer).
+     * Windows Winsock returns WSAEFAULT for negative len. */
+    if (len < 0) {
+        wsa_last_error = WSAEFAULT;
+        return SOCKET_ERROR_WIN;
+    }
     TRUST_CHECK_RET(TRUST_GATE_NET_CONNECT, "send", SOCKET_ERROR_WIN);
     ssize_t ret = send((int)s, buf, (size_t)len, flags);
     if (ret < 0) {
@@ -378,6 +391,10 @@ WINAPI_EXPORT int ws2_recv(SOCKET_WIN s, char *buf, int len, int flags)
 {
     if (!wsa_is_initialized()) {
         wsa_last_error = WSANOTINITIALISED;
+        return SOCKET_ERROR_WIN;
+    }
+    if (len < 0) {
+        wsa_last_error = WSAEFAULT;
         return SOCKET_ERROR_WIN;
     }
     ssize_t ret = recv((int)s, buf, (size_t)len, flags);
@@ -559,18 +576,31 @@ WINAPI_EXPORT int ws2_getpeername(SOCKET_WIN s, struct sockaddr *name, int *name
 
 /* --- Name resolution --- */
 
+/* Windows gethostbyname/gethostbyaddr returns a pointer to a per-thread
+ * internal buffer. glibc's gethostbyname uses a process-wide static that
+ * races between threads (torn aliases/addrs when two PE threads call
+ * concurrently — a real, observed hang in IRC bots / game matchmakers).
+ * Use the _r variants with a per-thread buffer so each caller gets stable
+ * storage. */
+static __thread struct hostent ws2_hostent_tls;
+static __thread char           ws2_hostent_buf_tls[2048];
+static __thread int            ws2_hostent_herr_tls;
+
 WINAPI_EXPORT struct hostent *ws2_gethostbyname(const char *name)
 {
     if (!wsa_is_initialized()) {
         wsa_last_error = WSANOTINITIALISED;
         return NULL;
     }
-    struct hostent *h = gethostbyname(name);
-    if (!h) {
+    struct hostent *result = NULL;
+    int rc = gethostbyname_r(name, &ws2_hostent_tls,
+                             ws2_hostent_buf_tls, sizeof(ws2_hostent_buf_tls),
+                             &result, &ws2_hostent_herr_tls);
+    if (rc != 0 || !result) {
         wsa_last_error = WSAHOST_NOT_FOUND;
         return NULL;
     }
-    return h;
+    return result;
 }
 
 WINAPI_EXPORT struct hostent *ws2_gethostbyaddr(const char *addr, int len, int type)
@@ -579,12 +609,19 @@ WINAPI_EXPORT struct hostent *ws2_gethostbyaddr(const char *addr, int len, int t
         wsa_last_error = WSANOTINITIALISED;
         return NULL;
     }
-    struct hostent *h = gethostbyaddr(addr, (socklen_t)len, type);
-    if (!h) {
+    if (len < 0) {
+        wsa_last_error = WSAEFAULT;
+        return NULL;
+    }
+    struct hostent *result = NULL;
+    int rc = gethostbyaddr_r(addr, (socklen_t)len, type, &ws2_hostent_tls,
+                             ws2_hostent_buf_tls, sizeof(ws2_hostent_buf_tls),
+                             &result, &ws2_hostent_herr_tls);
+    if (rc != 0 || !result) {
         wsa_last_error = WSAHOST_NOT_FOUND;
         return NULL;
     }
-    return h;
+    return result;
 }
 
 WINAPI_EXPORT int ws2_gethostname(char *name, int namelen)

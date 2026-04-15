@@ -99,7 +99,9 @@ static int find_dll_file(const char *name, char *result, size_t result_size)
     /* 1. App directory */
     snprintf(path, sizeof(path), "%s/%s", g_app_dir, name);
     if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
-        strncpy(result, path, result_size - 1);
+        /* strncpy does NOT NUL-terminate when src fills the destination;
+         * use snprintf so callers never read stale bytes past result_size-1. */
+        snprintf(result, result_size, "%s", path);
         return 0;
     }
 
@@ -113,7 +115,7 @@ static int find_dll_file(const char *name, char *result, size_t result_size)
         while (tok) {
             snprintf(path, sizeof(path), "%s/%s", tok, name);
             if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
-                strncpy(result, path, result_size - 1);
+                snprintf(result, result_size, "%s", path);
                 free(paths);
                 return 0;
             }
@@ -126,7 +128,7 @@ static int find_dll_file(const char *name, char *result, size_t result_size)
     for (int i = 0; i < g_dll_search_path_count; i++) {
         snprintf(path, sizeof(path), "%s/%s", g_dll_search_paths[i], name);
         if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
-            strncpy(result, path, result_size - 1);
+            snprintf(result, result_size, "%s", path);
             return 0;
         }
     }
@@ -136,7 +138,7 @@ static int find_dll_file(const char *name, char *result, size_t result_size)
     if (home) {
         snprintf(path, sizeof(path), "%s/.pe-compat/drives/c/windows/system32/%s", home, name);
         if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
-            strncpy(result, path, result_size - 1);
+            snprintf(result, result_size, "%s", path);
             return 0;
         }
     }
@@ -144,7 +146,7 @@ static int find_dll_file(const char *name, char *result, size_t result_size)
     /* 5. CWD */
     snprintf(path, sizeof(path), "./%s", name);
     if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
-        strncpy(result, path, result_size - 1);
+        snprintf(result, result_size, "%s", path);
         return 0;
     }
 

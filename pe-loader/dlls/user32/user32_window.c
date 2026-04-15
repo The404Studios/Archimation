@@ -788,6 +788,11 @@ WINAPI_EXPORT HWND CreateWindowExW(
  * DestroyWindow
  * -------------------------------------------------------------------------- */
 
+/* Defined in user32_message.c.  Cancels all timers whose hwnd == hWnd so a
+ * subsequent timer fire doesn't invoke the stale wndproc or post WM_TIMER
+ * to a freed window (use-after-free). */
+extern void user32_kill_timers_for_hwnd(HWND hWnd);
+
 WINAPI_EXPORT BOOL DestroyWindow(HWND hWnd)
 {
     hwnd_entry_t *entry = hwnd_lookup(hWnd);
@@ -800,6 +805,12 @@ WINAPI_EXPORT BOOL DestroyWindow(HWND hWnd)
     if (entry->wndproc) {
         entry->wndproc(hWnd, WM_DESTROY, 0, 0);
     }
+
+    /* Reap any timers still pointing at this window before we free it --
+     * otherwise user32_check_timers() will later fire a TIMERPROC with a
+     * stale HWND or queue a WM_TIMER the app dispatches to a destroyed
+     * window (UAF). */
+    user32_kill_timers_for_hwnd(hWnd);
 
     gfx_backend_t *backend = gfx_get_backend();
     if (entry->gfx_win) {

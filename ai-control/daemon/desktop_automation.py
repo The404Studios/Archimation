@@ -673,6 +673,7 @@ StartupNotify=true
         # so we use the raw command string (not shell-quoted).
         entry = f"{schedule} {command}"
         import tempfile
+        tmp_path = None
         try:
             # Get existing crontab
             existing = await _run_exec(["crontab", "-l"])
@@ -682,10 +683,18 @@ StartupNotify=true
                 tmp.write(new_crontab)
                 tmp_path = tmp.name
             r = await _run_exec(["crontab", tmp_path])
-            os.unlink(tmp_path)
             return {"success": r["returncode"] == 0}
         except Exception as e:
             return {"success": False, "error": str(e)}
+        finally:
+            # Always unlink — if _run_exec raised or crontab(1) was killed,
+            # the delete=False temp file would otherwise leak into /tmp
+            # (~80 bytes each, but unbounded over a long-running daemon).
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     # ==========================================
     # System Theme / Appearance

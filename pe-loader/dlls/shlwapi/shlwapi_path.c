@@ -374,9 +374,16 @@ WINAPI_EXPORT BOOL PathCanonicalizeA(LPSTR pszDest, LPCSTR pszSrc)
     }
 
     for (int i = 0; i < count; i++) {
-        pos += snprintf(pszDest + pos, MAX_PATH - pos, "%s%s",
-                        (i > 0) ? "\\" : "", components[i]);
-        if (pos >= MAX_PATH) { pszDest[MAX_PATH - 1] = '\0'; return TRUE; }
+        /* Guard against pos >= MAX_PATH before subtracting: (MAX_PATH - pos)
+         * is a signed int and would cast to SIZE_MAX when negative, allowing
+         * snprintf to write past the caller's MAX_PATH buffer. */
+        if (pos >= MAX_PATH - 1) { pszDest[MAX_PATH - 1] = '\0'; return TRUE; }
+        int rem = MAX_PATH - pos;
+        int n = snprintf(pszDest + pos, (size_t)rem, "%s%s",
+                         (i > 0) ? "\\" : "", components[i]);
+        if (n < 0) { pszDest[MAX_PATH - 1] = '\0'; return FALSE; }
+        pos += (n >= rem) ? rem - 1 : n;
+        if (pos >= MAX_PATH - 1) { pszDest[MAX_PATH - 1] = '\0'; return TRUE; }
     }
 
     if (pszDest[0] == '\0')
@@ -425,6 +432,9 @@ WINAPI_EXPORT int StrCmpNIA(LPCSTR psz1, LPCSTR psz2, int nChar)
     if (!psz1) return -1;
     if (!psz2) return 1;
 
+    /* Guard: negative nChar must not cast to a huge size_t, which would
+     * read past both buffers. Windows' StrCmpNI treats negative as 0. */
+    if (nChar <= 0) return 0;
     return strncasecmp(psz1, psz2, (size_t)nChar);
 }
 
@@ -654,9 +664,15 @@ WINAPI_EXPORT BOOL PathCanonicalizeW(uint16_t *pszDest, LPCWSTR pszSrc)
         dst[0] = '\0';
     }
     for (int i = 0; i < np; i++) {
-        pos += snprintf(dst + pos, sizeof(dst) - pos, "%s%s",
-                        (i > 0) ? "\\" : "", parts[i]);
-        if (pos >= (int)sizeof(dst)) { dst[sizeof(dst) - 1] = '\0'; break; }
+        /* Guard: pos can exceed sizeof(dst) if a component was truncated,
+         * making (sizeof(dst) - pos) wrap to SIZE_MAX. Cap defensively. */
+        if (pos >= (int)sizeof(dst) - 1) { dst[sizeof(dst) - 1] = '\0'; break; }
+        int rem = (int)sizeof(dst) - pos;
+        int n = snprintf(dst + pos, (size_t)rem, "%s%s",
+                         (i > 0) ? "\\" : "", parts[i]);
+        if (n < 0) { dst[sizeof(dst) - 1] = '\0'; break; }
+        pos += (n >= rem) ? rem - 1 : n;
+        if (pos >= (int)sizeof(dst) - 1) { dst[sizeof(dst) - 1] = '\0'; break; }
     }
     if (!dst[0]) strcpy(dst, ".");
     /* pszDest is contractually MAX_PATH wide chars; cap copy to that. */
@@ -694,6 +710,7 @@ WINAPI_EXPORT int StrCmpIW(LPCWSTR psz1, LPCWSTR psz2)
 WINAPI_EXPORT int StrCmpNIW(LPCWSTR psz1, LPCWSTR psz2, int nChar)
 {
     char a[4096]={0}, b[4096]={0};
+    if (nChar <= 0) return 0;
     w_to_narrow(psz1, a, sizeof(a));
     w_to_narrow(psz2, b, sizeof(b));
     return strncasecmp(a, b, (size_t)nChar);
@@ -701,6 +718,9 @@ WINAPI_EXPORT int StrCmpNIW(LPCWSTR psz1, LPCWSTR psz2, int nChar)
 
 WINAPI_EXPORT int wnsprintfW(uint16_t *pszDest, int cchDest, LPCWSTR pszFmt, ...)
 {
+    /* Guard: cchDest<=0 would cast to a huge size_t in narrow_to_w and
+     * overrun caller's buffer (narrow_to_w does bufsz-1 in its loop). */
+    if (!pszDest || cchDest <= 0) return -1;
     /* Narrow-convert format, use ms_abi_vformat, convert back */
     char fmt[2048]={0}; w_to_narrow(pszFmt, fmt, sizeof(fmt));
     char out[4096]={0};
@@ -713,6 +733,7 @@ WINAPI_EXPORT int wnsprintfW(uint16_t *pszDest, int cchDest, LPCWSTR pszFmt, ...
 
 WINAPI_EXPORT int wvnsprintfW(uint16_t *pszDest, int cchDest, LPCWSTR pszFmt, __builtin_ms_va_list arglist)
 {
+    if (!pszDest || cchDest <= 0) return -1;
     char fmt[2048]={0}; w_to_narrow(pszFmt, fmt, sizeof(fmt));
     char out[4096]={0};
     ms_abi_vformat(NULL, out, sizeof(out), fmt, arglist);

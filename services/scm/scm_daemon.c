@@ -226,9 +226,19 @@ static void reap_and_restart(void)
 
         /* Restart outside the lock to avoid fork-with-mutex UB.
          * Re-verify under the lock after the backoff sleep so a user-
-         * initiated stop or delete during the window is honored. */
+         * initiated stop or delete during the window is honored.
+         *
+         * POSIX mandates usleep() arg < 1_000_000; the exponential-backoff
+         * ceiling is HEALTH_MAX_BACKOFF_SEC*1000 ms = 60_000_000 us which
+         * exceeds the limit and is UB on strict POSIX systems. Split into
+         * whole-seconds sleep() + sub-second usleep(). */
         if (restart_name[0]) {
-            usleep((useconds_t)delay_ms * 1000);
+            int secs = delay_ms / 1000;
+            int us = (delay_ms % 1000) * 1000;
+            for (int s = 0; s < secs && g_running; s++)
+                sleep(1);
+            if (us > 0 && g_running)
+                usleep((useconds_t)us);
             if (!g_running) continue;
             pthread_mutex_lock(&g_lock);
             service_entry_t *svc2 = scm_db_find(restart_name);
@@ -315,7 +325,14 @@ static void *health_monitor_thread(void *arg)
          * may have stopped or deleted the service, or another thread may
          * have restarted it. Re-verify under the lock before respawning. */
         for (int i = 0; i < restart_count; i++) {
-            usleep((useconds_t)restart_delays[i] * 1000);
+            /* Split into sleep(secs)+usleep(us); see reap_and_restart() for
+             * rationale (usleep UB when arg >= 1_000_000). */
+            int secs = restart_delays[i] / 1000;
+            int us   = (restart_delays[i] % 1000) * 1000;
+            for (int s = 0; s < secs && g_running; s++)
+                sleep(1);
+            if (us > 0 && g_running)
+                usleep((useconds_t)us);
             if (!g_running) break;
             pthread_mutex_lock(&g_lock);
             service_entry_t *svc = scm_db_find(restart_names[i]);
@@ -781,13 +798,31 @@ static void handle_client(int client_fd)
     (void)setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     (void)setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
+    /* Loop the read: commands are short but SOCK_STREAM delivers bytes
+     * not records, so a very long "install" command (binary path + flags)
+     * can arrive in multiple TCP segments.  Previously we processed a
+     * truncated command and returned "unknown command" to the user.
+     * Stop on newline (commands are newline-terminated) or buffer full. */
     char buf[CMD_BUFSIZE];
-    ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
-    if (n <= 0) {
+    size_t total = 0;
+    while (total < sizeof(buf) - 1) {
+        ssize_t rn = read(client_fd, buf + total, sizeof(buf) - 1 - total);
+        if (rn < 0) {
+            if (errno == EINTR) continue;
+            /* SO_RCVTIMEO fires as EAGAIN/EWOULDBLOCK; treat as "done" */
+            break;
+        }
+        if (rn == 0) break;  /* EOF */
+        total += (size_t)rn;
+        /* Early exit once we've seen a command terminator */
+        if (memchr(buf, '\n', total)) break;
+    }
+    if (total == 0) {
         close(client_fd);
         return;
     }
-    buf[n] = '\0';
+    buf[total] = '\0';
+    ssize_t n = (ssize_t)total;
 
     /* Strip trailing newline */
     while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))

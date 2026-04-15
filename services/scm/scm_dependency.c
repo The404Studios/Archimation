@@ -268,11 +268,24 @@ int scm_start_with_deps(const char *name)
  * temporarily drops g_lock (see scm_api.c) and another thread could call
  * scm_db_delete_service which memmoves g_services[] and invalidates any
  * service_entry_t pointer we still hold. Names are safer than indices. */
-static int stop_with_deps_impl(const char *name, int depth)
+/* Per-call visited set so a diamond dependency (A depends on B and C,
+ * both of which depend on X) doesn't double-stop X and emit duplicate
+ * SVC_EVT_STOP events. Passed through the recursion. NULL at depth 0. */
+static int stop_with_deps_impl(const char *name, int depth,
+                               char (*stopped)[256], int *stopped_count,
+                               int stopped_cap)
 {
     if (depth > 16) {
         fprintf(stderr, "[scm_dep] Max recursion depth reached stopping: %s\n", name);
         return -1;
+    }
+
+    /* De-dupe: already stopped this name via another branch? */
+    if (stopped && stopped_count) {
+        for (int q = 0; q < *stopped_count; q++) {
+            if (strcmp(stopped[q], name) == 0)
+                return 0;
+        }
     }
 
     if (depth == 0)
@@ -301,14 +314,23 @@ static int stop_with_deps_impl(const char *name, int depth)
     }
 
     for (int k = 0; k < dependent_count; k++)
-        stop_with_deps_impl(dependent_names[k], depth + 1);
+        stop_with_deps_impl(dependent_names[k], depth + 1,
+                            stopped, stopped_count, stopped_cap);
 
-    return scm_stop_service(name);
+    int rc = scm_stop_service(name);
+    if (stopped && stopped_count && *stopped_count < stopped_cap) {
+        strncpy(stopped[*stopped_count], name, 255);
+        stopped[*stopped_count][255] = '\0';
+        (*stopped_count)++;
+    }
+    return rc;
 }
 
 int scm_stop_with_deps(const char *name)
 {
-    return stop_with_deps_impl(name, 0);
+    char stopped[MAX_SERVICES][256];
+    int stopped_count = 0;
+    return stop_with_deps_impl(name, 0, stopped, &stopped_count, MAX_SERVICES);
 }
 
 /*

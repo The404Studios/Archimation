@@ -271,18 +271,23 @@ static void ensure_null_term(char *buf, size_t size)
 /*
  * Record that this client now holds a reference to the given object handle.
  * Called after a successful create or open.
+ *
+ * Returns 0 on success, -1 on table overflow. Callers MUST roll back
+ * the underlying ref_count increment on overflow, otherwise the object
+ * leaks forever because disconnect cleanup only walks the tracked list.
  */
-static void client_track_handle(client_state_t *cl, uint32_t handle)
+static int client_track_handle(client_state_t *cl, uint32_t handle)
 {
     if (!cl)
-        return;
+        return -1;
     if (cl->obj_handle_count >= MAX_CLIENT_HANDLES) {
         fprintf(stderr, "[objectd] Client fd=%d exceeded max handle tracking "
-                "(%d), handle %u will NOT be auto-released on disconnect\n",
+                "(%d), handle %u rejected (ref rolled back)\n",
                 cl->fd, MAX_CLIENT_HANDLES, handle);
-        return;
+        return -1;
     }
     cl->obj_handles[cl->obj_handle_count++] = handle;
+    return 0;
 }
 
 /*
@@ -317,17 +322,26 @@ static int hkey_is_predefined(uint64_t hk)
     return (hk >= 0x80000000ULL && hk < 0x80000100ULL) || hk == 0;
 }
 
-static void client_track_hkey(client_state_t *cl, uint64_t hkey)
+/*
+ * Record a non-predefined HKEY this client holds.
+ * Returns 0 on success (or when hkey is predefined and intentionally skipped),
+ * -1 on tracking-table overflow.  Callers must close the HKEY themselves
+ * and fail the request on -1, otherwise the registry handle leaks.
+ */
+static int client_track_hkey(client_state_t *cl, uint64_t hkey)
 {
-    if (!cl || hkey_is_predefined(hkey))
-        return;
+    if (!cl)
+        return -1;
+    if (hkey_is_predefined(hkey))
+        return 0;  /* Predefined HKEYs are shared and never tracked */
     if (cl->hkey_handle_count >= MAX_CLIENT_HKEYS) {
         fprintf(stderr, "[objectd] Client fd=%d exceeded max hkey tracking "
-                "(%d), HKEY 0x%llx will NOT be auto-closed on disconnect\n",
+                "(%d), HKEY 0x%llx rejected (closing)\n",
                 cl->fd, MAX_CLIENT_HKEYS, (unsigned long long)hkey);
-        return;
+        return -1;
     }
     cl->hkey_handles[cl->hkey_handle_count++] = hkey;
+    return 0;
 }
 
 static void client_untrack_hkey(client_state_t *cl, uint64_t hkey)
@@ -390,8 +404,18 @@ static void handle_object_request(client_state_t *cl,
                                  req->pid, &status, &shm_fd);
         resp->status = status;
         if (idx >= 0) {
-            resp->handle = (uint32_t)idx;
-            client_track_handle(cl, (uint32_t)idx);
+            if (client_track_handle(cl, (uint32_t)idx) < 0) {
+                /* Tracking overflow: roll back the ref_count increment
+                 * performed by objects_create.  Without this, ref_count
+                 * leaks and the object is never destroyed. */
+                uint8_t close_status;
+                objects_close((uint32_t)idx, &close_status);
+                shm_fd = -1;  /* Do NOT pass the fd to the client */
+                resp->status = OBJ_STATUS_FULL;
+                resp->handle = 0;
+            } else {
+                resp->handle = (uint32_t)idx;
+            }
         }
         break;
     }
@@ -407,8 +431,15 @@ static void handle_object_request(client_state_t *cl,
         int idx = objects_open(p->name, p->type, &status, &shm_fd);
         resp->status = status;
         if (idx >= 0) {
-            resp->handle = (uint32_t)idx;
-            client_track_handle(cl, (uint32_t)idx);
+            if (client_track_handle(cl, (uint32_t)idx) < 0) {
+                uint8_t close_status;
+                objects_close((uint32_t)idx, &close_status);
+                shm_fd = -1;
+                resp->status = OBJ_STATUS_FULL;
+                resp->handle = 0;
+            } else {
+                resp->handle = (uint32_t)idx;
+            }
         }
         break;
     }
@@ -463,7 +494,15 @@ static void handle_object_request(client_state_t *cl,
             uint64_t hk_val;
             memcpy(&hk_val, (uint8_t *)resp_buf + sizeof(objectd_response_t),
                    sizeof(hk_val));
-            client_track_hkey(cl, hk_val);
+            if (client_track_hkey(cl, hk_val) < 0) {
+                /* Tracking full: close the HKEY we just opened so registry
+                 * state doesn't leak.  Report FULL to the client. */
+                registry_close_key((void *)(uintptr_t)hk_val);
+                r->status = OBJ_STATUS_FULL;
+                r->handle = 0;
+                r->payload_len = 0;
+                resp_len = sizeof(objectd_response_t);
+            }
         }
         send_response(cl->fd, resp_buf, resp_len, -1);
         return;
@@ -507,6 +546,43 @@ static void handle_object_request(client_state_t *cl,
     case OBJ_REQ_REG_ENUM_KEY:
     case OBJ_REQ_REG_ENUM_VALUE: {
         /* These payloads contain no string fields needing null-termination */
+
+        /*
+         * For REG_CLOSE, verify the client actually opened this HKEY before
+         * dispatching.  Without this check any client could close any
+         * other client's HKEY, causing UAF in the registry handle table
+         * and spurious disconnect-time double-close attempts.  Predefined
+         * HKEYs (HKLM, HKCU, etc.) are shared and always permitted.
+         */
+        if (req->request_type == OBJ_REQ_REG_CLOSE &&
+            payload_len >= sizeof(uint64_t)) {
+            uint64_t hk_val;
+            memcpy(&hk_val, payload, sizeof(hk_val));
+            if (!hkey_is_predefined(hk_val)) {
+                int owns = 0;
+                for (int ci = 0; ci < cl->hkey_handle_count; ci++) {
+                    if (cl->hkey_handles[ci] == hk_val) { owns = 1; break; }
+                }
+                if (!owns) {
+                    fprintf(stderr,
+                            "[objectd] Client fd=%d pid=%d attempted to close "
+                            "unowned HKEY 0x%llx; rejecting\n",
+                            cl->fd, (int)cl->verified_pid,
+                            (unsigned long long)hk_val);
+                    objectd_response_t *rej = (objectd_response_t *)resp_buf;
+                    memset(rej, 0, sizeof(*rej));
+                    rej->magic    = OBJECTD_MAGIC;
+                    rej->version  = OBJECTD_VERSION;
+                    rej->sequence = req->sequence;
+                    rej->shm_fd   = -1;
+                    rej->status   = OBJ_STATUS_INVALID;
+                    send_response(cl->fd, resp_buf,
+                                  sizeof(objectd_response_t), -1);
+                    return;
+                }
+            }
+        }
+
         objectd_registry_handle(req->request_type, payload, payload_len,
                                 req->pid, req->sequence,
                                 resp_buf, sizeof(resp_buf), &resp_len);

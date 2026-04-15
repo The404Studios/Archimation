@@ -232,6 +232,10 @@ int scm_db_save_service(const service_entry_t *svc)
     FILE *f = fopen(filepath, "w");
     if (!f) return -1;
 
+    /* Track I/O errors: fprintf() returns negative on error but we
+     * previously ignored it, so an ENOSPC mid-write would leave a
+     * truncated .svc file that scm_db_load would re-parse as a
+     * service with default fields. Detect via ferror() + fclose() rc. */
     fprintf(f, "name=%s\n", svc->name);
     if (svc->display_name[0])
         fprintf(f, "display_name=%s\n", svc->display_name);
@@ -248,7 +252,16 @@ int scm_db_save_service(const service_entry_t *svc)
     if (svc->max_restarts != DEFAULT_MAX_RESTARTS)
         fprintf(f, "max_restarts=%d\n", svc->max_restarts);
 
-    fclose(f);
+    int write_err = ferror(f);
+    int close_rc = fclose(f);
+    if (write_err || close_rc != 0) {
+        /* Remove the partial file so a later load doesn't resurrect
+         * a half-written service entry with garbage fields. */
+        unlink(filepath);
+        fprintf(stderr, "[scm_db] I/O error writing '%s' (errno=%d); file removed\n",
+                filepath, errno);
+        return -1;
+    }
     return 0;
 }
 

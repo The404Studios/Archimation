@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <dlfcn.h>
 
 #include "common/dll_common.h"
@@ -292,9 +293,21 @@ WINAPI_EXPORT BOOL CryptProtectData(
         return FALSE;
     }
 
+    /* Guard against NULL pbData with non-zero cbData (callers sometimes pass
+     * caller-allocated DATA_BLOBs that weren't populated yet). */
+    if (pDataIn->cbData > 0 && !pDataIn->pbData) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
     CRYPT32_TRACE("[crypt32] CryptProtectData(%u bytes)\n", pDataIn->cbData);
 
-    /* Output = header + plaintext */
+    /* Output = header + plaintext. Guard against integer overflow: cbData is
+     * DWORD (up to 4GB) and on 32-bit size_t this addition can wrap. */
+    if (pDataIn->cbData > (DWORD)(SIZE_MAX - sizeof(dpapi_header_t))) {
+        set_last_error(ERROR_OUTOFMEMORY);
+        return FALSE;
+    }
     size_t out_len = sizeof(dpapi_header_t) + pDataIn->cbData;
     BYTE *out = (BYTE *)malloc(out_len);
     if (!out) {
@@ -335,8 +348,9 @@ WINAPI_EXPORT BOOL CryptUnprotectData(
     if (ppszDataDescr)
         *ppszDataDescr = NULL;
 
-    /* Verify our header */
-    if (pDataIn->cbData < sizeof(dpapi_header_t)) {
+    /* Verify our header. NULL pbData with sufficient cbData would NULL-deref
+     * when we cast to dpapi_header_t* below. Reject cleanly. */
+    if (pDataIn->cbData < sizeof(dpapi_header_t) || !pDataIn->pbData) {
         set_last_error(ERROR_INVALID_DATA);
         return FALSE;
     }

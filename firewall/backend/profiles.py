@@ -739,17 +739,39 @@ class ProfileManager:
                 logger.warning("Failed to load known networks: %s", exc)
 
     def save_profiles(self) -> None:
-        """Persist profile configurations to disk."""
+        """Persist profile configurations to disk atomically.
+
+        Writes to a .tmp sibling and os.replace()'s over the target.  A
+        direct ``open(path, 'w')`` truncates the file *before* writing;
+        a crash (or power loss, OOM kill, systemd SIGKILL during
+        shutdown) between truncate and flush leaves an empty or
+        half-written JSON that _load_config() silently ignores, losing
+        all user-configured profile overrides.
+        """
         os.makedirs(self._config_dir, exist_ok=True)
         data = [p.to_dict() for p in self._profiles.values()]
-        with open(self._profiles_file, "w") as fh:
+        tmp = self._profiles_file + ".tmp"
+        with open(tmp, "w") as fh:
             json.dump(data, fh, indent=2)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, self._profiles_file)
         logger.info("Saved profiles to %s", self._profiles_file)
 
     def _save_known_networks(self) -> None:
-        """Persist known networks to disk."""
+        """Persist known networks to disk atomically (see save_profiles)."""
         os.makedirs(self._config_dir, exist_ok=True)
         data = [n.to_dict() for n in self._known_networks]
-        with open(self._known_networks_file, "w") as fh:
+        tmp = self._known_networks_file + ".tmp"
+        with open(tmp, "w") as fh:
             json.dump(data, fh, indent=2)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, self._known_networks_file)
         logger.info("Saved known networks to %s", self._known_networks_file)

@@ -137,26 +137,31 @@ int trust_events_read(trust_event_t *ev, int max_events)
 	if (max_events > 128)
 		max_events = 128;
 
+	/* Snapshot the fd under the lock, then release it BEFORE read(). The
+	 * read can block for the configured kernel poll interval; previously
+	 * we held g_evt_lock across it, which deadlocked trust_events_close()
+	 * and serialized every reader thread. The kernel guarantees atomic
+	 * record-sized reads on the event fd, so concurrent readers just see
+	 * interleaved record batches — which is semantically fine because
+	 * each record is self-contained. */
 	pthread_mutex_lock(&g_evt_lock);
 	fd = g_evt_fd;
+	pthread_mutex_unlock(&g_evt_lock);
 	if (fd < 0) {
-		pthread_mutex_unlock(&g_evt_lock);
 		errno = EBADF;
 		return -1;
 	}
 
 	want = (size_t)max_events * sizeof(trust_event_packed_t);
 	n = read(fd, buf, want);
-	if (n < 0) {
-		int saved = errno;
-		pthread_mutex_unlock(&g_evt_lock);
-		errno = saved;
+	if (n < 0)
 		return -1;
-	}
 	/* Discard partial record tail — keep the reader aligned. */
 	n -= n % (ssize_t)sizeof(trust_event_packed_t);
 	{
 		int got = (int)(n / (ssize_t)sizeof(trust_event_packed_t));
+		/* Re-acquire the lock only to mutate the shared cursor. */
+		pthread_mutex_lock(&g_evt_lock);
 		for (i = 0; i < got; i++) {
 			if (buf[i].flags & TRUST_EVF_TS_ROLLOVER) {
 				/* Kernel signaled cursor resync; re-base to

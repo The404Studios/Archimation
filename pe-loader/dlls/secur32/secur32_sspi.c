@@ -411,7 +411,13 @@ WINAPI_EXPORT int32_t LsaLookupAuthenticationPackage(void *LsaHandle,
 
 WINAPI_EXPORT int32_t LsaFreeReturnBuffer(void *Buffer)
 {
-    free(Buffer);
+    /* We never return heap-allocated buffers from the LSA stubs above
+     * (LsaLookupAuthenticationPackage, LsaConnectUntrusted, etc. only
+     * write scalar out-params or NULL). free() on a caller-provided
+     * stack/static pointer would crash, so this must be a no-op.
+     * If we ever start returning malloc'd LSA buffers, this needs to
+     * check a magic-tagged header before freeing. */
+    (void)Buffer;
     return 0;
 }
 

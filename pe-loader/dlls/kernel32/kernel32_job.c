@@ -208,7 +208,9 @@ WINAPI_EXPORT HANDLE CreateJobObjectA(LPSECURITY_ATTRIBUTES lpJobAttributes,
     }
 
     HANDLE h = handle_alloc((handle_type_t)HANDLE_TYPE_JOB, -1, jd);
-    if (!h) {
+    /* handle_alloc returns INVALID_HANDLE_VALUE on failure, NOT NULL.
+     * The prior check (!h) left jd leaked when handle table was full. */
+    if (!h || h == INVALID_HANDLE_VALUE) {
         pthread_mutex_destroy(&jd->lock);
         free(jd);
         set_last_error(ERROR_NOT_ENOUGH_MEMORY);

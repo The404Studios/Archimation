@@ -4220,6 +4220,20 @@ async def start_server(app, host: str, port: int, ready_event=None):
             while not server.started:
                 await asyncio.sleep(0.05)
             ready_event.set()
-        asyncio.create_task(_signal_when_started())
-
-    await server.serve()
+        # Keep a strong reference to the task; bare asyncio.create_task()
+        # returns a weakly-held Task that the GC can collect mid-flight
+        # (CPython RuntimeWarning: "Task was destroyed but it is pending!"),
+        # leaving ready_event permanently unset and systemd hanging on
+        # Type=notify. Cancel it on shutdown so a stuck poll doesn't linger.
+        _ready_signal_task = asyncio.create_task(_signal_when_started())
+        try:
+            await server.serve()
+        finally:
+            if not _ready_signal_task.done():
+                _ready_signal_task.cancel()
+                try:
+                    await _ready_signal_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+    else:
+        await server.serve()

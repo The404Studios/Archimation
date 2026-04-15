@@ -531,6 +531,12 @@ WINAPI_EXPORT uintptr_t _beginthreadex(
     pthread_attr_destroy(&attr);
 
     if (ret != 0) {
+        /* Destroy the pthread primitives we just initialized so each
+         * failed _beginthreadex doesn't leak a mutex+cond pair. */
+        pthread_mutex_destroy(&tdata->suspend_lock);
+        pthread_cond_destroy(&tdata->suspend_cond);
+        pthread_mutex_destroy(&tdata->finish_lock);
+        pthread_cond_destroy(&tdata->finish_cond);
         free(data);
         free(tdata);
         return 0;
@@ -601,6 +607,12 @@ WINAPI_EXPORT uintptr_t _beginthread(
     pthread_attr_destroy(&attr);
 
     if (ret != 0) {
+        /* Destroy the pthread primitives we just initialized so each
+         * failed _beginthread doesn't leak a mutex+cond pair. */
+        pthread_mutex_destroy(&tdata->suspend_lock);
+        pthread_cond_destroy(&tdata->suspend_cond);
+        pthread_mutex_destroy(&tdata->finish_lock);
+        pthread_cond_destroy(&tdata->finish_cond);
         free(data);
         free(tdata);
         return (uintptr_t)-1;

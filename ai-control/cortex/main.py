@@ -1473,9 +1473,23 @@ async def _run_api_server(
                     # avoids a late-arriving ready signal racing a stop.
                     raise
 
-            asyncio.create_task(_signal_when_started())
+            # Strong reference — otherwise the GC can collect this task
+            # mid-flight (CPython issues a "Task was destroyed but it is
+            # pending!" warning, and the ready_event is silently never set,
+            # leaving systemd waiting on READY=1 until watchdog timeout).
+            _ready_signal_task = asyncio.create_task(_signal_when_started())
+        else:
+            _ready_signal_task = None
 
-        await server.serve()
+        try:
+            await server.serve()
+        finally:
+            if _ready_signal_task is not None and not _ready_signal_task.done():
+                _ready_signal_task.cancel()
+                try:
+                    await _ready_signal_task
+                except (asyncio.CancelledError, Exception):
+                    pass
     except ImportError:
         logger.warning("uvicorn not installed -- REST API disabled")
     except asyncio.CancelledError:

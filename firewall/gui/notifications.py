@@ -209,7 +209,15 @@ class NotificationManager:
     def _send_notify_send(title: str, body: str) -> None:
         """Fallback: send via notify-send subprocess."""
         try:
-            subprocess.Popen(
+            # subprocess.run() waits for completion so the child is reaped
+            # inline; the previous fire-and-forget Popen leaked a zombie
+            # per notification (the GUI has no SIGCHLD=SIG_IGN handler, so
+            # <defunct> entries accumulate).  notify-send exits in <50ms,
+            # so blocking the caller briefly is acceptable -- and in any
+            # case it was already being invoked from a handler that can
+            # tolerate it.  Capped at 2s in case the notification daemon
+            # is wedged.
+            subprocess.run(
                 [
                     "notify-send",
                     "--urgency=normal",
@@ -220,9 +228,13 @@ class NotificationManager:
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                timeout=2.0,
+                check=False,
             )
         except FileNotFoundError:
             logger.warning("notify-send not found; desktop notification skipped")
+        except subprocess.TimeoutExpired:
+            logger.warning("notify-send timed out; notification may not have appeared")
         except Exception as exc:
             logger.error("notify-send failed: %s", exc)
 

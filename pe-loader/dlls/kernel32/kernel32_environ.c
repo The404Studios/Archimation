@@ -110,7 +110,10 @@ WINAPI_EXPORT DWORD GetEnvironmentVariableA(LPCSTR lpName, LPSTR lpBuffer, DWORD
     }
 
     size_t len = strlen(val);
-    if ((DWORD)(len + 1) > nSize) {
+    /* If caller passes NULL buffer OR a buffer too small, return required size
+     * (incl. NUL).  Guards against strcpy into NULL when nSize > 0 but the
+     * caller gave no buffer — a valid real-Windows probing pattern. */
+    if (!lpBuffer || (DWORD)(len + 1) > nSize) {
         return (DWORD)(len + 1);
     }
 
@@ -143,7 +146,9 @@ WINAPI_EXPORT DWORD GetEnvironmentVariableW(LPCWSTR lpName, LPWSTR lpBuffer, DWO
     }
 
     size_t len = strlen(val);
-    if ((DWORD)(len + 1) > nSize)
+    /* NULL buffer probing: return required length (incl. NUL) instead of
+     * writing into a NULL pointer. */
+    if (!lpBuffer || (DWORD)(len + 1) > nSize)
         return (DWORD)(len + 1);
 
     for (DWORD j = 0; j < (DWORD)len; j++)

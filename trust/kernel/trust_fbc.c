@@ -167,6 +167,35 @@ int trust_policy_add_rule(const trust_policy_rule_t *rule)
     return ret;
 }
 
+/*
+ * trust_policy_cleanup - Free the RCU-published policy snapshot on module
+ * unload.  Paired with trust_policy_init_defaults() which publishes the
+ * first snapshot.  Without this, the snapshot allocated in init (and any
+ * subsequent republishes from trust_policy_add_rule) leaks ~16 bytes per
+ * module load cycle.
+ *
+ * Callable only from module exit (synchronous unload context): readers
+ * must have already drained and no new writers can appear.
+ */
+void trust_policy_cleanup(void)
+{
+    trust_policy_snapshot_t *snap;
+
+    mutex_lock(&g_trust_policy_write_lock);
+    snap = rcu_dereference_protected(g_trust_policy_rcu,
+                lockdep_is_held(&g_trust_policy_write_lock));
+    rcu_assign_pointer(g_trust_policy_rcu, NULL);
+    mutex_unlock(&g_trust_policy_write_lock);
+
+    if (snap) {
+        /* synchronize_rcu + kfree is safe in module_exit; kfree_rcu is
+         * also fine but we want the free to complete before the module
+         * text disappears. */
+        synchronize_rcu();
+        kfree(snap);
+    }
+}
+
 /* --- TRUST_POLICY_EVAL --- */
 int trust_fbc_policy_eval(u32 subject_id, u32 action, u32 *matching_rule_idx)
 {

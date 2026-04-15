@@ -243,7 +243,11 @@ static int compute_file_hash(const char *path, unsigned char *out_hash, size_t h
     if (!path || !out_hash || hash_len < SHA256_DIGEST_LEN)
         return -1;
 
-    f = fopen(path, "rb");
+    /* "e" mode opens with O_CLOEXEC so the fd does not leak across any
+     * subsequent fork/exec the game or the PE loader may perform. Without
+     * this, a stream of module hash queries silently bleeds read fds into
+     * every child process. */
+    f = fopen(path, "rbe");
     if (!f) {
         fprintf(stderr, ACG_LOG_PREFIX "Cannot open file for hashing: %s\n", path);
         return -1;

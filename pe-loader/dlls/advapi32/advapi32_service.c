@@ -232,7 +232,14 @@ WINAPI_EXPORT SC_HANDLE OpenSCManagerA(
     data->is_scm = 1;
 
     fprintf(stderr, "[advapi32] OpenSCManagerA() -> handle allocated\n");
-    return handle_alloc(HANDLE_TYPE_SERVICE, -1, data); /* Custom type */
+    HANDLE h = handle_alloc(HANDLE_TYPE_SERVICE, -1, data); /* Custom type */
+    if (!h || h == (HANDLE)-1) {
+        /* handle table exhausted: free the calloc'd data to avoid leak */
+        free(data);
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    return h;
 }
 
 WINAPI_EXPORT SC_HANDLE OpenSCManagerW(
@@ -333,7 +340,16 @@ WINAPI_EXPORT SC_HANDLE CreateServiceA(
     strncpy(data->name, lpServiceName, sizeof(data->name) - 1);
     data->is_scm = 0;
 
-    return handle_alloc(HANDLE_TYPE_SERVICE, -1, data);
+    HANDLE h = handle_alloc(HANDLE_TYPE_SERVICE, -1, data);
+    if (!h || h == (HANDLE)-1) {
+        /* handle table exhausted after .svc file and registry mirror were
+         * written -- leave the persistent artifacts (DeleteService can clean
+         * up later) but don't leak the heap object. */
+        free(data);
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    return h;
 }
 
 WINAPI_EXPORT SC_HANDLE OpenServiceA(
@@ -378,7 +394,13 @@ WINAPI_EXPORT SC_HANDLE OpenServiceA(
     data->is_scm = 0;
 
     fprintf(stderr, "[advapi32] OpenServiceA('%s')\n", lpServiceName);
-    return handle_alloc(HANDLE_TYPE_SERVICE, -1, data);
+    HANDLE h = handle_alloc(HANDLE_TYPE_SERVICE, -1, data);
+    if (!h || h == (HANDLE)-1) {
+        free(data);
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    return h;
 }
 
 WINAPI_EXPORT SC_HANDLE OpenServiceW(

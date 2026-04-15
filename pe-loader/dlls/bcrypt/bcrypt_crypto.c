@@ -329,7 +329,10 @@ WINAPI_EXPORT int32_t BCryptDuplicateHash(void *hHash, void **phNewHash,
     if (!dst) return STATUS_NO_MEMORY;
     dst->magic = BCRYPT_HASH_MAGIC;
     dst->alg = src->alg;
-    if (src->hash_data_len > 0) {
+    /* Guard: hash_data_len > 0 but src->hash_data == NULL is a torn state
+     * (can occur if a failed BCryptHashData realloc left len non-zero in
+     * an older codepath). Duplicate as empty rather than dereferencing NULL. */
+    if (src->hash_data_len > 0 && src->hash_data) {
         dst->hash_data = malloc(src->hash_data_len);
         if (!dst->hash_data) { free(dst); return STATUS_NO_MEMORY; }
         memcpy(dst->hash_data, src->hash_data, src->hash_data_len);

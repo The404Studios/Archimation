@@ -271,6 +271,8 @@ int pe_diag_report(const char *exe_path)
     missing_entry_t *missing_list = (missing_entry_t *)
         calloc(MAX_MISSING, sizeof(missing_entry_t));
     int missing_count = 0;
+    /* If calloc failed, cap missing_count so we never dereference missing_list */
+    int missing_cap = missing_list ? MAX_MISSING : 0;
 
     /* Walk each imported DLL */
     for (; desc->name_rva != 0; desc++) {
@@ -303,7 +305,7 @@ int pe_diag_report(const char *exe_path)
 
         if (image.is_pe32plus) {
             uint64_t *ilt = (uint64_t *)DIAG_RVA(ilt_rva);
-            if (!ilt) continue;
+            if (!ilt) { if (lib) dlclose(lib); continue; }
 
             for (int i = 0; ilt[i] != 0; i++) {
                 total_imports++;
@@ -318,7 +320,7 @@ int pe_diag_report(const char *exe_path)
                         total_resolved++;
                     } else {
                         total_missing++;
-                        if (missing_count < MAX_MISSING) {
+                        if (missing_count < missing_cap) {
                             strncpy(missing_list[missing_count].dll, dll_name, MAX_DLL_NAME - 1);
                             snprintf(missing_list[missing_count].func, MAX_FUNC_NAME,
                                      "ordinal#%u", ordinal);
@@ -339,7 +341,7 @@ int pe_diag_report(const char *exe_path)
                         total_resolved++;
                     } else {
                         total_missing++;
-                        if (missing_count < MAX_MISSING) {
+                        if (missing_count < missing_cap) {
                             strncpy(missing_list[missing_count].dll, dll_name, MAX_DLL_NAME - 1);
                             strncpy(missing_list[missing_count].func, func_name, MAX_FUNC_NAME - 1);
                             missing_count++;
@@ -350,7 +352,7 @@ int pe_diag_report(const char *exe_path)
         } else {
             /* 32-bit */
             uint32_t *ilt = (uint32_t *)DIAG_RVA(ilt_rva);
-            if (!ilt) continue;
+            if (!ilt) { if (lib) dlclose(lib); continue; }
 
             for (int i = 0; ilt[i] != 0; i++) {
                 total_imports++;
@@ -363,7 +365,7 @@ int pe_diag_report(const char *exe_path)
                         total_resolved++;
                     } else {
                         total_missing++;
-                        if (missing_count < MAX_MISSING) {
+                        if (missing_count < missing_cap) {
                             strncpy(missing_list[missing_count].dll, dll_name, MAX_DLL_NAME - 1);
                             snprintf(missing_list[missing_count].func, MAX_FUNC_NAME,
                                      "ordinal#%u", ordinal);
@@ -384,7 +386,7 @@ int pe_diag_report(const char *exe_path)
                         total_resolved++;
                     } else {
                         total_missing++;
-                        if (missing_count < MAX_MISSING) {
+                        if (missing_count < missing_cap) {
                             strncpy(missing_list[missing_count].dll, dll_name, MAX_DLL_NAME - 1);
                             strncpy(missing_list[missing_count].func, func_name, MAX_FUNC_NAME - 1);
                             missing_count++;

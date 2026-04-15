@@ -331,12 +331,26 @@ WINAPI_EXPORT int ToUnicode(UINT wVirtKey, UINT wScanCode, const BYTE *lpKeyStat
     if (!pwszBuff || cchBuff <= 0)
         return 0;
 
+    /* pwszBuff is LPWSTR (4-byte wchar_t on Linux) but represents Windows'
+     * 2-byte WCHAR -- callers expect uint16_t slots.  Write through a
+     * uint16_t* to avoid the wchar_t (4) vs uint16_t (2) size mismatch. */
+    uint16_t *out = (uint16_t *)pwszBuff;
     WORD ch;
     int result = ToAscii(wVirtKey, wScanCode, lpKeyState, &ch, 0);
     if (result > 0) {
-        pwszBuff[0] = (WCHAR)ch;
+        out[0] = (uint16_t)ch;
+        /* Windows leaves the buffer non-terminated after N chars; however,
+         * many callers expect a trailing NUL when cchBuff > result to safely
+         * use the buffer as a C string.  Write a terminator when space
+         * permits. */
+        if (cchBuff > 1)
+            out[1] = 0;
         return 1;
     }
+    /* No chars produced: ensure caller can't read uninitialized memory if
+     * they treat pwszBuff as a string. */
+    if (cchBuff > 0)
+        out[0] = 0;
     return 0;
 }
 

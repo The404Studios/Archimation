@@ -399,6 +399,9 @@ static char *tag_to_str(uint32_t tag, char buf[5])
 __attribute__((ms_abi, visibility("default")))
 PVOID windrv_pool_alloc(POOL_TYPE pool_type, SIZE_T size, ULONG tag)
 {
+    /* Guard against integer overflow on sizeof(pool_header_t) + size */
+    if (size > (SIZE_MAX - sizeof(pool_header_t)))
+        return NULL;
     pool_header_t *hdr = (pool_header_t *)calloc(1, sizeof(pool_header_t) + size);
     if (!hdr)
         return NULL;
@@ -714,8 +717,12 @@ NTSTATUS windrv_create_device(
     (void)device_characteristics;
     (void)exclusive;
 
-    /* Allocate device + extension in one block */
-    size_t alloc_size = sizeof(DEVICE_OBJECT) + device_extension_size;
+    /* Allocate device + extension in one block (guard against overflow).
+     * device_extension_size is ULONG (32-bit) so no practical overflow on
+     * 64-bit size_t, but cap at a sane ceiling to reject garbage. */
+    if (device_extension_size > 0x40000000u)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    size_t alloc_size = sizeof(DEVICE_OBJECT) + (size_t)device_extension_size;
     PDEVICE_OBJECT dev = (PDEVICE_OBJECT)calloc(1, alloc_size);
     if (!dev)
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -1109,8 +1116,17 @@ void windrv_init_event(PKEVENT event, EVENT_TYPE type, BOOLEAN initial_state)
         return;
     }
 
-    pthread_mutex_init(&he->mutex, NULL);
-    pthread_cond_init(&he->cond, NULL);
+    if (pthread_mutex_init(&he->mutex, NULL) != 0) {
+        free(he);
+        memset(event, 0, sizeof(KEVENT));
+        return;
+    }
+    if (pthread_cond_init(&he->cond, NULL) != 0) {
+        pthread_mutex_destroy(&he->mutex);
+        free(he);
+        memset(event, 0, sizeof(KEVENT));
+        return;
+    }
     he->signaled = initial_state ? 1 : 0;
     he->auto_reset = (type == SynchronizationEvent) ? 1 : 0;
 
@@ -1211,7 +1227,12 @@ void windrv_init_spinlock(PKSPIN_LOCK lock)
     pthread_spinlock_t *sl = (pthread_spinlock_t *)calloc(
         1, sizeof(pthread_spinlock_t));
     if (sl) {
-        pthread_spin_init(sl, PTHREAD_PROCESS_PRIVATE);
+        /* If init fails, free the allocation to avoid destroy-on-uninit and leak. */
+        if (pthread_spin_init(sl, PTHREAD_PROCESS_PRIVATE) != 0) {
+            free((void *)sl);
+            *lock = 0;
+            return;
+        }
         *lock = (KSPIN_LOCK)(uintptr_t)sl;
     } else {
         *lock = 0;

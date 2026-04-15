@@ -638,6 +638,10 @@ static char *wchar_to_utf8(const uint16_t *wstr)
     if (!wstr) return NULL;
     size_t len = 0;
     while (wstr[len]) len++;
+    /* Overflow-safe buffer sizing: len*4+1 can wrap on 32-bit size_t for
+     * huge inputs.  Cap at SIZE_MAX/4-1 so the multiplication is safe and
+     * the final +1 cannot overflow either. */
+    if (len > (SIZE_MAX / 4) - 1) return NULL;
     char *buf = malloc(len * 4 + 1);
     if (!buf) return NULL;
     size_t pos = 0;
@@ -808,6 +812,10 @@ WINAPI_EXPORT uint16_t *_wfullpath(uint16_t *absPath, const uint16_t *relPath, s
 {
     char *rel = wchar_to_utf8(relPath);
     if (!rel) return NULL;
+    /* Mirror _fullpath's maxLength==0 guard: with a caller buffer and zero
+     * length, the "maxLength - 1" arithmetic below underflows to SIZE_MAX
+     * and we'd happily write past the caller's buffer. */
+    if (absPath && maxLength == 0) { free(rel); return NULL; }
     char resolved[PATH_MAX];
     char *result = _fullpath(resolved, rel, sizeof(resolved));
     free(rel);

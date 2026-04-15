@@ -83,13 +83,18 @@ static int handle_cleanup_stale(void)
                 free(g_handles[i].data);
                 g_handles[i].data = NULL;
             }
-            /* Guard against closing stdin/stdout/stderr */
-            if (g_handles[i].fd > 2) {
-                close(g_handles[i].fd);
-            }
+            /* Capture fd and neutralise the slot BEFORE calling close(2).
+             * close() can block (waits for TCP linger on net fds, sleeps
+             * on named-pipe peers); if a second path into this code runs
+             * before close() returns, we must not see the same fd again. */
+            int fd_to_close = g_handles[i].fd;
             memset(&g_handles[i], 0, sizeof(g_handles[i]));
             g_handles[i].type = HANDLE_TYPE_INVALID;
             g_handles[i].fd = -1;
+            /* Guard against closing stdin/stdout/stderr */
+            if (fd_to_close > 2) {
+                close(fd_to_close);
+            }
             cleaned++;
         }
     }
@@ -185,13 +190,18 @@ int handle_close(HANDLE h)
             free(g_handles[idx].data);
             g_handles[idx].data = NULL;
         }
-        /* Guard against closing stdin/stdout/stderr if an allocator ever
-         * passed fd 0/1/2.  objectd itself uses those for its journal. */
-        if (g_handles[idx].fd > 2) {
-            close(g_handles[idx].fd);
-        }
+        /* Capture fd and zero the slot before close(2), same reasoning
+         * as handle_cleanup_stale() above.  Prevents a concurrent
+         * handle_alloc() retry from observing a type==INVALID slot that
+         * still carries a live fd about to be closed. */
+        int fd_to_close = g_handles[idx].fd;
         memset(&g_handles[idx], 0, sizeof(handle_entry_t));
         g_handles[idx].fd = -1;  /* 0 is a valid fd (stdin); use -1 for "none" */
+        /* Guard against closing stdin/stdout/stderr if an allocator ever
+         * passed fd 0/1/2.  objectd itself uses those for its journal. */
+        if (fd_to_close > 2) {
+            close(fd_to_close);
+        }
     }
     pthread_mutex_unlock(&g_handle_lock);
     return 0;

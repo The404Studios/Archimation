@@ -64,22 +64,50 @@ static int scm_send_command(const char *action, const char *name)
     if ((size_t)cmd_len >= sizeof(cmd_buf))
         cmd_len = (int)sizeof(cmd_buf) - 1;
 
-    if (write(fd, cmd_buf, cmd_len) != cmd_len) {
-        fprintf(stderr, "[SC] Failed to send command\n");
-        close(fd);
-        return 1;
+    /* Loop the write: AF_UNIX SOCK_STREAM can return short writes under
+     * SO_SNDBUF pressure.  Report error only on hard failure (EPIPE/EINTR
+     * after retry).  A prior single-call write() dropped bytes silently
+     * for cmd_len > MSS on some kernels. */
+    {
+        ssize_t sent = 0;
+        while (sent < cmd_len) {
+            ssize_t wn = write(fd, cmd_buf + sent, cmd_len - sent);
+            if (wn < 0) {
+                if (errno == EINTR) continue;
+                fprintf(stderr, "[SC] Failed to send command: %s\n", strerror(errno));
+                close(fd);
+                return 1;
+            }
+            if (wn == 0) {
+                fprintf(stderr, "[SC] Short write: peer closed mid-send\n");
+                close(fd);
+                return 1;
+            }
+            sent += wn;
+        }
     }
 
-    /* Read response */
+    /* Read response: loop until EOF or buffer full.  A single read() can
+     * return a short fragment (e.g., header arrives before body for large
+     * list payloads); previously we truncated and printed partial JSON. */
     char resp[8192];
-    ssize_t n = read(fd, resp, sizeof(resp) - 1);
+    size_t total = 0;
+    while (total < sizeof(resp) - 1) {
+        ssize_t n = read(fd, resp + total, sizeof(resp) - 1 - total);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;  /* EOF -- daemon closed after sending full response */
+        total += (size_t)n;
+    }
     close(fd);
 
-    if (n <= 0) {
+    if (total == 0) {
         fprintf(stderr, "[SC] No response from SCM daemon\n");
         return 1;
     }
-    resp[n] = '\0';
+    resp[total] = '\0';
 
     /* Print the response */
     printf("%s", resp);

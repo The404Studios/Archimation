@@ -335,6 +335,13 @@ WINAPI_EXPORT HANDLE CreateThread(
     pthread_attr_destroy(&attr);
 
     if (ret != 0) {
+        /* Destroy pthread primitives we just initialized, otherwise each
+         * failed CreateThread leaks a mutex + condvar pair (glibc keeps
+         * per-mutex metadata including robust-list pointers). */
+        pthread_mutex_destroy(&data->suspend_lock);
+        pthread_cond_destroy(&data->suspend_cond);
+        pthread_mutex_destroy(&data->finish_lock);
+        pthread_cond_destroy(&data->finish_cond);
         free(data);
         set_last_error(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;

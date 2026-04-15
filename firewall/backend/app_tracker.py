@@ -135,7 +135,21 @@ class AppTracker:
         # cgroup membership is sticky for the lifetime of the process
         # unless something external moves it, so one successful move
         # per (pid,app) is enough.
+        #
+        # Periodically pruned to avoid two problems:
+        #   (1) unbounded growth -- on a long-running daemon with high PID
+        #       turnover (containers, build farms) this set grows without
+        #       bound because entries are never removed when the PID exits.
+        #   (2) PID reuse -- once a PID is recycled by the kernel for a
+        #       different process, the stale entry would cause us to skip
+        #       cgroup scoping even though the new process needs it.
+        # _cgrouped_prune_interval is wall-clock seconds between prune
+        # passes; _cgrouped_prune_last is the monotonic timestamp of the
+        # last prune.  Prune is O(live entries) and triggered lazily from
+        # _maybe_scope_pid, so idle daemons pay nothing.
         self._cgrouped_pids: set[tuple[int, str]] = set()
+        self._cgrouped_prune_interval: float = 60.0
+        self._cgrouped_prune_last: float = 0.0
         # Set of app path prefixes we want to auto-scope.  The firewall
         # frontend populates this via register_rule_target() when a
         # per-app rule is added.  Empty set == no scoping attempted.
@@ -345,6 +359,20 @@ class AppTracker:
         # missing and both schedule a cgroup move (a wasted write into
         # cgroup.procs that can also log a noisy warning for each).
         with self._lock:
+            # Prune stale entries (dead PIDs) at most once per
+            # _cgrouped_prune_interval.  Without this the set grows
+            # without bound on long-running systems and, worse, a
+            # recycled PID collides with a stale entry and we skip
+            # scoping a brand-new process that needs it.
+            now = time.monotonic()
+            if now - self._cgrouped_prune_last > self._cgrouped_prune_interval:
+                self._cgrouped_prune_last = now
+                # /proc/<pid> existence is the cheapest liveness probe;
+                # avoids shelling out and needs no extra syscalls.
+                self._cgrouped_pids = {
+                    (p, a) for (p, a) in self._cgrouped_pids
+                    if os.path.isdir(f"/proc/{p}")
+                }
             if key in self._cgrouped_pids:
                 return
             # Mark as attempted BEFORE the call so a persistent failure

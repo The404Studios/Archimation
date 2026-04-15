@@ -484,6 +484,7 @@ void trust_dna_gate_init(void);
 /* --- Policy management --- */
 int  trust_policy_add_rule(const trust_policy_rule_t *rule);
 void trust_policy_init_defaults(void);
+void trust_policy_cleanup(void);
 
 /* --- Dependency graph operations (trust_fbc.c) --- */
 void trust_dep_graph_init(void);

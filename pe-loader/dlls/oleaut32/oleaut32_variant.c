@@ -59,7 +59,9 @@ WINAPI_EXPORT void *SysAllocStringLen(const void *strIn, uint32_t ui)
 
 WINAPI_EXPORT void *SysAllocStringByteLen(const char *psz, uint32_t len)
 {
-    uint8_t *block = malloc(4 + len + 2);
+    /* Overflow: 4 + len + 2 can wrap uint32 / size_t on huge inputs. */
+    if (len > UINT32_MAX - 6) return NULL;
+    uint8_t *block = malloc((size_t)4 + len + 2);
     if (!block) return NULL;
 
     memcpy(block, &len, 4);
@@ -753,6 +755,7 @@ WINAPI_EXPORT HRESULT VarBstrFromI4(int32_t lIn, uint32_t lcid, uint32_t dwFlags
 {
     (void)lcid; (void)dwFlags;
     if (!pbstrOut) return 0x80070057;
+    *pbstrOut = NULL;
     char buf[32];
     snprintf(buf, sizeof(buf), "%d", lIn);
     /* Convert to BSTR (UTF-16) */
@@ -760,8 +763,10 @@ WINAPI_EXPORT HRESULT VarBstrFromI4(int32_t lIn, uint32_t lcid, uint32_t dwFlags
     uint16_t *wbuf = malloc((len + 1) * 2);
     if (!wbuf) return 0x8007000E;
     for (size_t i = 0; i <= len; i++) wbuf[i] = (uint16_t)buf[i];
-    *pbstrOut = SysAllocStringLen(wbuf, (uint32_t)len);
+    void *bstr = SysAllocStringLen(wbuf, (uint32_t)len);
     free(wbuf);
+    if (!bstr) return 0x8007000E; /* Previously returned S_OK with NULL out */
+    *pbstrOut = bstr;
     return 0;
 }
 

@@ -443,7 +443,10 @@ WINAPI_EXPORT LONG RegGetValueA(
                 need_close = 1;
             } else if (ret == OBJ_STATUS_NOT_FOUND) {
                 return ERROR_FILE_NOT_FOUND;
-            } else {
+            }
+            /* Broker error other than NOT_FOUND: sub_handle was NOT opened
+             * (open failed), so no close needed -- fall through to local. */
+            else {
                 goto local_fallback;
             }
         }
@@ -452,8 +455,12 @@ WINAPI_EXPORT LONG RegGetValueA(
         uint32_t len = pcbData ? *pcbData : 0;
         int ret = objectd_reg_get_value(key_handle, lpValue, &type, pvData, &len);
 
-        if (need_close)
+        /* Close sub_handle BEFORE any error return so it can't leak on the
+         * broker-error path that falls through to local_fallback. */
+        if (need_close) {
             objectd_reg_close(sub_handle);
+            need_close = 0;
+        }
 
         if (ret == OBJ_STATUS_OK) {
             if (pdwType) *pdwType = type;

@@ -943,6 +943,21 @@ WINAPI_EXPORT BOOL KillTimer(HWND hWnd, UINT_PTR uIDEvent)
     return FALSE;
 }
 
+/* Called from DestroyWindow (user32_window.c).  Cancels every timer slot
+ * whose owning HWND matches, preventing user32_check_timers() from firing
+ * a TIMERPROC with a dangling hwnd (UAF) or posting WM_TIMER that the app
+ * dispatches to freed window state. */
+void user32_kill_timers_for_hwnd(HWND hWnd)
+{
+    if (!hWnd) return;
+    pthread_mutex_lock(&g_timer_lock);
+    for (int i = 0; i < MAX_TIMERS; i++) {
+        if (g_timers[i].used && g_timers[i].hwnd == hWnd)
+            g_timers[i].used = 0;
+    }
+    pthread_mutex_unlock(&g_timer_lock);
+}
+
 /* --------------------------------------------------------------------------
  * Clipboard
  * Simple in-process clipboard backed by malloc'd buffers.

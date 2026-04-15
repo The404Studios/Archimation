@@ -29,18 +29,30 @@
  * required because the kernel ioctl itself is the synchronization
  * point.
  */
-static int g_trust_fd = -1;
+static int g_trust_fd_raw = -1;
 static pthread_mutex_t g_trust_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static inline int trust_fd_load(void)
 {
-    return __atomic_load_n(&g_trust_fd, __ATOMIC_RELAXED);
+    return __atomic_load_n(&g_trust_fd_raw, __ATOMIC_RELAXED);
 }
 
 static inline void trust_fd_store(int fd)
 {
-    __atomic_store_n(&g_trust_fd, fd, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_trust_fd_raw, fd, __ATOMIC_RELAXED);
 }
+
+/* Every FBC-path function below formerly did:
+ *     if (g_trust_fd < 0) return ...;
+ *     ... ioctl(g_trust_fd, ...) ...
+ * which is *two* separate reads of the fd. A racing trust_cleanup() could
+ * close the fd between the check and the ioctl, causing us to pass a
+ * stale/closed fd into the kernel (EBADF at best, UAF of a recycled fd at
+ * worst). We now alias g_trust_fd to a single per-expression snapshot via
+ * a GCC statement expression so each textual use loads once with the
+ * published atomic ordering. The expression evaluates to an int rvalue
+ * exactly like the original variable reference. */
+#define g_trust_fd  (trust_fd_load())
 
 /*
  * trust_fd_snapshot - Hidden inter-module helper for libtrust_batch.c

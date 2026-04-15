@@ -1639,11 +1639,6 @@ int trust_cmd_submit(const trust_ioc_cmd_submit_t __user *arg)
 	/* Initialize batch result */
 	memset(&batch_result, 0, sizeof(batch_result));
 
-	/* Reset per-CPU predicate register: stale state from a previous
-	 * submit (possibly from another thread that got migrated here)
-	 * must NOT leak into this batch's predicated instructions. */
-	trust_isa_pred_reset();
-
 	/* Detect VARLEN wire format up front. */
 	{
 		int is_varlen = (header.flags & TRUST_CMDBUF_VARLEN) ? 1 : 0;
@@ -1662,6 +1657,13 @@ int trust_cmd_submit(const trust_ioc_cmd_submit_t __user *arg)
 	 * ONLY here.  The companion _exit() call sits on both success
 	 * and failure paths below (see goto writeback / atomic_fail). */
 	trust_ctx_batch_enter();
+
+	/* Reset per-CPU predicate register AFTER pinning the CPU via
+	 * trust_ctx_batch_enter() (migrate_disable).  If we reset before
+	 * pinning, a migration between reset and the first dispatched
+	 * command would let the new CPU's stale predicate register from
+	 * a prior batch leak into this batch's predicated instructions. */
+	trust_isa_pred_reset();
 
 	for (i = 0; i < header.cmd_count; i++) {
 		trust_cmd_entry_t entry;

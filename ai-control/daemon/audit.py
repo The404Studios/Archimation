@@ -104,14 +104,26 @@ class AuditLogger:
             self._fd = None
             backup = self._log_file + ".1"
             try:
-                if os.path.exists(backup):
+                # os.replace() atomically overwrites an existing backup without
+                # an exists()+remove() TOCTOU window. Using the old
+                # exists()+remove()+rename() sequence, a concurrent process
+                # (or another thread that went through rotation fast) could
+                # recreate the backup between exists() and rename(), causing
+                # rename() to fail on some filesystems. os.replace is also
+                # ~1 syscall instead of 3.
+                try:
                     os.remove(backup)
+                except FileNotFoundError:
+                    pass
                 os.rename(self._log_file, backup)
             except OSError:
                 # If rename fails, truncate in-place so the log doesn't grow
-                # without bound.
+                # without bound.  Use a with-block rather than
+                # open(...).close() so the fd is released promptly even
+                # if close() raises (rare, but ResourceWarning-worthy).
                 try:
-                    open(self._log_file, "w").close()
+                    with open(self._log_file, "w"):
+                        pass
                 except OSError:
                     pass
             # Reopen fresh.

@@ -606,8 +606,17 @@ WINAPI_EXPORT BOOL DuplicateToken(HANDLE ExistingTokenHandle, int ImpersonationL
                                    HANDLE *DuplicateTokenHandle)
 {
     (void)ExistingTokenHandle; (void)ImpersonationLevel;
-    if (DuplicateTokenHandle)
-        *DuplicateTokenHandle = handle_alloc(HANDLE_TYPE_FILE, -1, NULL);
+    if (!DuplicateTokenHandle) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    HANDLE h = handle_alloc(HANDLE_TYPE_FILE, -1, NULL);
+    if (!h || h == (HANDLE)-1) {
+        *DuplicateTokenHandle = NULL;
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+    *DuplicateTokenHandle = h;
     return TRUE;
 }
 
@@ -617,8 +626,17 @@ WINAPI_EXPORT BOOL DuplicateTokenEx(HANDLE hExistingToken, DWORD dwDesiredAccess
 {
     (void)hExistingToken; (void)dwDesiredAccess;
     (void)lpTokenAttributes; (void)ImpersonationLevel; (void)tokenType;
-    if (phNewToken)
-        *phNewToken = handle_alloc(HANDLE_TYPE_FILE, -1, NULL);
+    if (!phNewToken) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    HANDLE h = handle_alloc(HANDLE_TYPE_FILE, -1, NULL);
+    if (!h || h == (HANDLE)-1) {
+        *phNewToken = NULL;
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+    *phNewToken = h;
     return TRUE;
 }
 

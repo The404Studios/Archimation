@@ -512,11 +512,21 @@ static font_entry_t *stock_font_entry_ensure(HGDIOBJ stock_handle, int stock_id)
     ensure_font_table_init();
     if (!stock_handle) return NULL;
 
+    /* Session 30 made font_alloc/font_delete thread-safe but left this
+     * function walking g_font_table without the lock -- concurrent
+     * SelectObject(stock) / CreateFont / DeleteFont could return an entry
+     * just as its slot was being cleared, or double-install the same
+     * stock handle into two slots.  Take the font_table lock for the
+     * entire find-or-allocate. */
+    pthread_mutex_lock(&g_font_table_lock);
+
     /* Reuse existing entry for this handle if already materialised. */
     for (int i = 0; i < MAX_FONT_HANDLES; i++) {
         if (g_font_table[i].used &&
             g_font_table[i].handle == (HFONT)stock_handle) {
-            return &g_font_table[i];
+            font_entry_t *e = &g_font_table[i];
+            pthread_mutex_unlock(&g_font_table_lock);
+            return e;
         }
     }
 
@@ -535,9 +545,12 @@ static font_entry_t *stock_font_entry_ensure(HGDIOBJ stock_handle, int stock_id)
             g_font_table[i].avg_width = (h > 2) ? (h * 2) / 3 : 8;
             if (g_font_table[i].avg_width < 1)
                 g_font_table[i].avg_width = 8;
-            return &g_font_table[i];
+            font_entry_t *e = &g_font_table[i];
+            pthread_mutex_unlock(&g_font_table_lock);
+            return e;
         }
     }
+    pthread_mutex_unlock(&g_font_table_lock);
     return NULL;  /* Table full */
 }
 

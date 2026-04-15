@@ -24,6 +24,19 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <pthread.h>
+
+/*
+ * Anti-cheats almost always have a background worker thread probing modules
+ * while the main thread is registering freshly-loaded DLLs. Previously this
+ * module had zero synchronization: two threads racing into
+ * integrity_check_module() would both read num_modules==k, both write slot
+ * k, and corrupt the hash. Worse, integrity_fake_signature() returns a
+ * cert pointer into modules[idx]; if a racing check_module grows the table
+ * and rewrites that slot the caller gets torn cert strings. A single
+ * coarse mutex is adequate because these are cold paths compared to e.g.
+ * the ACG access-check hot path. */
+static pthread_mutex_t g_integrity_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define INTEGRITY_LOG_PREFIX    "[anticheat/integrity] "
 #define MAX_MODULES             256
@@ -378,18 +391,22 @@ int integrity_check_module(const char *module_name, const char *module_path)
 
     fprintf(stderr, INTEGRITY_LOG_PREFIX "Module integrity check: %s\n", module_name);
 
+    pthread_mutex_lock(&g_integrity_lock);
+
     /* O(1) hash lookup instead of linear scan.  Modules are typically
      * re-checked many times during anti-cheat lifecycle. */
     int existing = mod_hash_lookup(module_name);
     if (existing >= 0) {
+        int ok = g_integrity.modules[existing].integrity_ok;
+        pthread_mutex_unlock(&g_integrity_lock);
         fprintf(stderr, INTEGRITY_LOG_PREFIX "  Module already registered, "
-                "integrity=%s\n",
-                g_integrity.modules[existing].integrity_ok ? "OK" : "FAIL");
-        return g_integrity.modules[existing].integrity_ok;
+                "integrity=%s\n", ok ? "OK" : "FAIL");
+        return ok;
     }
 
     /* Register new module */
     if (g_integrity.num_modules >= MAX_MODULES) {
+        pthread_mutex_unlock(&g_integrity_lock);
         fprintf(stderr, INTEGRITY_LOG_PREFIX "  Module table full, "
                 "reporting as valid anyway\n");
         return 1;
@@ -413,8 +430,11 @@ int integrity_check_module(const char *module_name, const char *module_path)
     g_integrity.num_modules++;
     mod_hash_insert(mod->name, new_idx);
 
+    int registered_count = g_integrity.num_modules;
+    pthread_mutex_unlock(&g_integrity_lock);
+
     fprintf(stderr, INTEGRITY_LOG_PREFIX "  Registered module #%d: %s -> VALID\n",
-            g_integrity.num_modules, module_name);
+            registered_count, module_name);
 
     return 1;
 }
@@ -441,39 +461,47 @@ int integrity_fake_signature(const char *module_name, char *subject,
         return 0;
     }
 
-    const fake_cert_info_t *cert = NULL;
+    /* Snapshot the cert under the lock; never hand a pointer back into the
+     * shared table because a racing integrity_check_module() can rewrite
+     * that slot under us (we would then strncpy from torn cert strings).
+     * Copy into a local, release the lock, then do the output copies and
+     * logging. Also guarantees NUL termination in the caller's buffers,
+     * which strncpy() alone does not. */
+    fake_cert_info_t snap;
 
+    pthread_mutex_lock(&g_integrity_lock);
     if (!module_name) {
-        /* Return process-level certificate */
-        cert = &g_integrity.process_cert;
-        fprintf(stderr, INTEGRITY_LOG_PREFIX "Signature query for main process\n");
+        snap = g_integrity.process_cert;
     } else {
-        /* O(1) hash lookup instead of linear scan */
         int idx = mod_hash_lookup(module_name);
-        if (idx >= 0) {
-            cert = &g_integrity.modules[idx].cert;
-            fprintf(stderr, INTEGRITY_LOG_PREFIX "Signature query for module: %s\n",
-                    module_name);
-        } else {
-            fprintf(stderr, INTEGRITY_LOG_PREFIX "Signature query for unknown "
-                    "module: %s, using default\n", module_name);
-            cert = &g_integrity.process_cert;
-        }
+        if (idx >= 0)
+            snap = g_integrity.modules[idx].cert;
+        else
+            snap = g_integrity.process_cert;
+    }
+    pthread_mutex_unlock(&g_integrity_lock);
+
+    if (subject) {
+        strncpy(subject, snap.subject, 255);
+        subject[255] = '\0';
+    }
+    if (issuer) {
+        strncpy(issuer, snap.issuer, 255);
+        issuer[255] = '\0';
+    }
+    if (thumbprint) {
+        strncpy(thumbprint, snap.thumbprint, 63);
+        thumbprint[63] = '\0';
     }
 
-    if (subject)
-        strncpy(subject, cert->subject, 255);
-    if (issuer)
-        strncpy(issuer, cert->issuer, 255);
-    if (thumbprint)
-        strncpy(thumbprint, cert->thumbprint, 63);
-
-    fprintf(stderr, INTEGRITY_LOG_PREFIX "  Subject: %s\n", cert->subject);
-    fprintf(stderr, INTEGRITY_LOG_PREFIX "  Issuer:  %s\n", cert->issuer);
+    fprintf(stderr, INTEGRITY_LOG_PREFIX "Signature query for %s\n",
+            module_name ? module_name : "main process");
+    fprintf(stderr, INTEGRITY_LOG_PREFIX "  Subject: %s\n", snap.subject);
+    fprintf(stderr, INTEGRITY_LOG_PREFIX "  Issuer:  %s\n", snap.issuer);
     fprintf(stderr, INTEGRITY_LOG_PREFIX "  Valid:   %s\n",
-            cert->valid ? "YES" : "NO");
+            snap.valid ? "YES" : "NO");
 
-    return cert->valid;
+    return snap.valid;
 }
 
 /*

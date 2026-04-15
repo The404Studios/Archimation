@@ -979,6 +979,12 @@ static void __exit trust_exit(void)
     class_destroy(trust_class);
     cdev_del(&trust_cdev);
     unregister_chrdev_region(trust_dev, 1);
+    /* Release the RCU-published policy snapshot allocated by
+     * trust_policy_init_defaults (and any republish from
+     * trust_policy_add_rule).  Must happen after the decay timer is
+     * shut down (no more softirq readers) and after the chrdev is
+     * torn down (no more ioctl paths will call into policy). */
+    trust_policy_cleanup();
     trust_tlb_cleanup();
     pr_info("trust: Root of Authority module unloaded\n");
 }

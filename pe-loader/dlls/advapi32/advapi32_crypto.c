@@ -151,7 +151,20 @@ WINAPI_EXPORT BOOL CryptAcquireContextW(HANDLE *phProv, LPCWSTR szContainer,
 
 WINAPI_EXPORT BOOL CryptReleaseContext(HANDLE hProv, DWORD dwFlags)
 {
-    (void)hProv; (void)dwFlags;
+    /* Session 36 fix: validate handle. Real Windows sets ERROR_INVALID_HANDLE
+     * and returns FALSE if hProv is not a valid provider.  Also dwFlags must
+     * be 0 per MSDN -- non-zero is ERROR_INVALID_PARAMETER.
+     * We do NOT clear g_crypt_prov here: the provider is a process-wide
+     * singleton that other callers may still hold.  The last caller's
+     * release is effectively free since there's no refcounted resource. */
+    if (dwFlags != 0) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (!hProv || (g_crypt_prov && hProv != g_crypt_prov)) {
+        set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
     return TRUE;
 }
 

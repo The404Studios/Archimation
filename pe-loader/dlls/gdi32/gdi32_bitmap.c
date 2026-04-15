@@ -187,6 +187,14 @@ WINAPI_EXPORT HBITMAP CreateBitmap(int nWidth, int nHeight, UINT nPlanes,
     if (nWidth <= 0 || nHeight <= 0)
         return NULL;
 
+    /* Reject insanely-large requests early to avoid integer overflow inside
+     * calc_stride() (width * bpp overflows int) and size (stride * height
+     * overflows size_t on 32-bit or produces a bogus tiny allocation that
+     * the pixel writes then overrun).  256 Mpx × 32 bpp = 1 GB upper bound. */
+    int eff_bpp = nBitCount ? (int)nBitCount : 32;
+    if (eff_bpp <= 0 || eff_bpp > 32) return NULL;
+    if (nWidth  > 32767 || nHeight > 32767) return NULL;
+
     int slot = alloc_bitmap_slot();
     if (slot < 0)
         return NULL;
@@ -194,10 +202,10 @@ WINAPI_EXPORT HBITMAP CreateBitmap(int nWidth, int nHeight, UINT nPlanes,
     bitmap_data_t *bmp = &g_bitmaps[slot].bmp;
     bmp->width = nWidth;
     bmp->height = nHeight;
-    bmp->bpp = nBitCount ? nBitCount : 32;
+    bmp->bpp = eff_bpp;
     bmp->stride = calc_stride(nWidth, bmp->bpp);
 
-    size_t size = (size_t)bmp->stride * nHeight;
+    size_t size = (size_t)bmp->stride * (size_t)nHeight;
     bmp->data = calloc(1, size);
     if (!bmp->data) {
         g_bitmaps[slot].used = 0;
@@ -252,6 +260,12 @@ WINAPI_EXPORT HBITMAP CreateDIBSection(HDC hdc, const BITMAPINFO *pbmi,
     if (height == 0)
         return NULL;
 
+    /* Bound dimensions so calc_stride() (width * bpp) can't overflow and
+     * stride * height fits in size_t.  Matches CreateBitmap() check. */
+    int eff_bpp = bpp ? bpp : 32;
+    if (eff_bpp <= 0 || eff_bpp > 32) return NULL;
+    if (width > 32767 || height > 32767) return NULL;
+
     int slot = alloc_bitmap_slot();
     if (slot < 0)
         return NULL;
@@ -259,11 +273,11 @@ WINAPI_EXPORT HBITMAP CreateDIBSection(HDC hdc, const BITMAPINFO *pbmi,
     bitmap_data_t *bmp = &g_bitmaps[slot].bmp;
     bmp->width = width;
     bmp->height = height;
-    bmp->bpp = bpp ? bpp : 32;
+    bmp->bpp = eff_bpp;
     bmp->stride = calc_stride(width, bmp->bpp);
     bmp->is_dib = 1;
 
-    size_t size = (size_t)bmp->stride * height;
+    size_t size = (size_t)bmp->stride * (size_t)height;
     bmp->data = calloc(1, size);
     if (!bmp->data) {
         g_bitmaps[slot].used = 0;

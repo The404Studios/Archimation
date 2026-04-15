@@ -507,10 +507,16 @@ WINAPI_EXPORT int _snprintf_s(char *buffer, size_t sizeOfBuffer, size_t count,
 /* _vsnprintf is in msvcrt_stdio.c */
 
 WINAPI_EXPORT int _vsnprintf_s(char *buffer, size_t sizeOfBuffer, size_t count,
-                                const char *format, va_list argptr)
+                                const char *format, __builtin_ms_va_list argptr)
 {
+    /* ms_abi variadic: va_list from a PE caller is __builtin_ms_va_list
+     * (char*); libc vsnprintf expects sysv va_list (24-byte struct).
+     * Forwarding the raw pointer would misread arg slots.  Route through
+     * the ms_abi-safe engine. */
     size_t max = count < sizeOfBuffer ? count : sizeOfBuffer;
-    return vsnprintf(buffer, max, format, argptr);
+    if (!buffer || max == 0)
+        return ms_abi_vformat(NULL, NULL, 0, format, argptr);
+    return ms_abi_vformat(NULL, buffer, max, format, argptr);
 }
 
 WINAPI_EXPORT int _vscprintf(const char *format, __builtin_ms_va_list argptr)

@@ -142,7 +142,11 @@ StartLimitIntervalSec=60
 StartLimitBurst=3
 
 [Service]
-Type=simple
+# Session 36: cortex now sends READY=1 + periodic WATCHDOG=1 via stdlib
+# AF_UNIX datagram to NOTIFY_SOCKET (same pattern as ai-control), and
+# STOPPING=1 on shutdown. No AUR-only python-sdnotify dependency.
+Type=notify
+NotifyAccess=main
 ExecStartPre=/usr/bin/mkdir -p /run/pe-compat /var/lib/pe-compat/trust-history
 ExecStart=/usr/bin/ai-cortex
 Restart=on-failure
@@ -156,14 +160,9 @@ TimeoutStopSec=10
 KillMode=mixed
 KillSignal=SIGTERM
 Environment=PYTHONUNBUFFERED=1
-# TODO: if cortex/main.py begins sending WATCHDOG=1 via the same
-# NOTIFY_SOCKET path ai-control uses, flip this on.  cortex currently
-# relies on python-sdnotify (optional) for READY=1 only.
-# Conversion plan: switch cortex to Type=notify once main.py sends
-# READY=1 via the stdlib _notify_systemd() pattern, then enable:
-# Type=notify
-# NotifyAccess=main
-# WatchdogSec=60
+# Heartbeat posted every 30s from _watchdog_heartbeat_loop() -- half the
+# WatchdogSec value per systemd's recommendation.
+WatchdogSec=60
 
 [Install]
 WantedBy=multi-user.target

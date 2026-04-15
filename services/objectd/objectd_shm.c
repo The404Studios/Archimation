@@ -41,27 +41,25 @@ int shm_alloc(const char *shm_name, int *out_fd, void **out_ptr)
         return -1;
     }
 
-    /* Create shared memory object (O_CLOEXEC prevents fd leak to children) */
+    /* Create shared memory object (O_CLOEXEC prevents fd leak to children).
+     *
+     * The /pe-compat-obj-N namespace is broker-owned: the slot index is
+     * assigned by us and uniquely identifies the segment for this broker
+     * instance.  If a previous broker crashed leaving a stale segment
+     * behind, re-using it would silently inherit corrupt futex state from
+     * that prior run, which can produce classic ABA-style wake-ups on
+     * mutexes/events in newly launched PE processes.
+     *
+     * Unlink any stale name first, then create fresh with O_EXCL.  If
+     * O_EXCL still fails with EEXIST after unlink, a concurrent broker
+     * is running (should never happen under systemd's single-instance
+     * unit) -- bail out rather than silently share state. */
+    shm_unlink(shm_name);  /* ignore ENOENT */
     fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL | O_CLOEXEC, 0666);
     if (fd < 0) {
-        if (errno == EEXIST) {
-            /*
-             * Already exists -- open without O_EXCL and do NOT truncate,
-             * since another process may be using the existing region.
-             */
-            fd = shm_open(shm_name, O_RDWR | O_CLOEXEC, 0666);
-            if (fd < 0) {
-                fprintf(stderr, "[objectd] shm_open(%s) failed: %s\n",
-                        shm_name, strerror(errno));
-                return -1;
-            }
-            /* Skip ftruncate -- use existing size */
-            goto do_mmap;
-        } else {
-            fprintf(stderr, "[objectd] shm_open(%s) failed: %s\n",
-                    shm_name, strerror(errno));
-            return -1;
-        }
+        fprintf(stderr, "[objectd] shm_open(%s) failed: %s\n",
+                shm_name, strerror(errno));
+        return -1;
     }
     we_created = 1;
 
@@ -74,7 +72,6 @@ int shm_alloc(const char *shm_name, int *out_fd, void **out_ptr)
         return -1;
     }
 
-do_mmap:
     /* Map into broker's address space */
     ptr = mmap(NULL, SHM_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (ptr == MAP_FAILED) {

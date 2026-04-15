@@ -57,15 +57,36 @@ int scm_start_service(const char *name)
         return -1;
     }
 
+    /* Validate state transition: only STOPPED / START_PENDING are legal
+     * starting points. Reject STOP_PENDING/PAUSED/etc. so a racing restart
+     * cannot resurrect a service that's on its way down. */
     if (svc->state == SERVICE_RUNNING) {
         fprintf(stderr, "[scm_api] Service already running: %s\n", name);
         return 0;
     }
+    if (svc->state != SERVICE_STOPPED &&
+        svc->state != SERVICE_START_PENDING) {
+        fprintf(stderr, "[scm_api] Illegal start from state %d: %s\n",
+                svc->state, name);
+        return -1;
+    }
+
+    /* If a user manually stopped this service, a racing auto-restart must
+     * not override the user's intent. The manually_stopped flag is cleared
+     * in handle_service_crash only when the crash is processed, so a clean
+     * manual stop leaves it set. */
+    if (svc->manually_stopped) {
+        fprintf(stderr, "[scm_api] Refusing auto-restart of manually stopped: %s\n",
+                name);
+        return -1;
+    }
 
     svc->state = SERVICE_START_PENDING;
-    svc->manually_stopped = 0;
     svc->crash_handled = 0;  /* Reset so next crash can be handled */
-    svc->restart_count = 0;  /* Reset on manual start */
+    /* Do NOT zero svc->restart_count here: the SIGCHLD-triggered restart
+     * path reaches this function too, and handle_service_crash has already
+     * incremented restart_count to schedule the retry. Zeroing it defeats
+     * max_restarts. Manual starts reset via scm_start_service_manual(). */
     fprintf(stderr, "[scm_api] Starting service: %s (type=%d, binary='%s')\n",
             name, svc->type, svc->binary_path);
 
@@ -185,9 +206,22 @@ int scm_stop_service(const char *name)
         return -1;
     }
 
-    if (svc->state != SERVICE_RUNNING) {
-        fprintf(stderr, "[scm_api] Service not running: %s\n", name);
+    /* Legal stop-from states: RUNNING, PAUSED, START_PENDING (abort-start).
+     * STOPPED/STOP_PENDING are no-ops. Paused services must be resumed
+     * logically (we treat paused as stoppable since Windows SCM does too). */
+    if (svc->state == SERVICE_STOPPED || svc->state == SERVICE_STOP_PENDING) {
+        fprintf(stderr, "[scm_api] Service not running (state=%d): %s\n",
+                svc->state, name);
+        /* Still mark manually_stopped so an in-flight restart is suppressed. */
+        svc->manually_stopped = 1;
         return 0;
+    }
+    if (svc->state != SERVICE_RUNNING &&
+        svc->state != SERVICE_PAUSED &&
+        svc->state != SERVICE_START_PENDING) {
+        fprintf(stderr, "[scm_api] Illegal stop from state %d: %s\n",
+                svc->state, name);
+        return -1;
     }
 
     svc->state = SERVICE_STOP_PENDING;

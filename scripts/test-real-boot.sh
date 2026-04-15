@@ -1,6 +1,9 @@
 #!/bin/bash
 # Test REAL boot path - diagnose syslinux failure
-set -e
+# -u catches typo'd vars (we have an `$i` loop below that would silently
+# expand to empty without this), pipefail ensures `mount | grep` style chains
+# don't hide early failures in diagnostic output.
+set -euo pipefail
 
 ISO="/mnt/c/Users/wilde/Downloads/arch-linux-with-full-ai-control/output/archwindows-2026.04.12-x86_64.iso"
 SERIAL="/tmp/qemu-real-boot.log"

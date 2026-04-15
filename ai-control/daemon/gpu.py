@@ -383,9 +383,12 @@ def build_router(controller: Optional[GPUController] = None):
     async def list_gpus(refresh: bool = Query(False)):
         try:
             devs = ctrl.enumerate(force_refresh=refresh)
-        except Exception as e:
+        except Exception:
+            # Don't echo the raw exception to the caller; it can include
+            # DRM device paths, PCI addresses, and sysfs leaf names that
+            # leak internals. Full trace goes to the daemon log.
             logger.exception("GPU enumerate failed")
-            raise HTTPException(status_code=500, detail=f"enumerate failed: {e}")
+            raise HTTPException(status_code=500, detail="enumerate failed")
         return {"count": len(devs), "gpus": devs}
 
     @router.get("/primary")
@@ -411,10 +414,12 @@ def build_router(controller: Optional[GPUController] = None):
         try:
             env = ctrl.select_env(mode)
         except ValueError as e:
+            # ValueError here comes from known validation paths ("unknown
+            # mode") — safe to echo.
             raise HTTPException(status_code=400, detail=str(e))
-        except Exception as e:
+        except Exception:
             logger.exception("gpu-select failed")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail="gpu-select failed")
         return {"mode": mode, "env": env}
 
     @router.get("/vulkan")

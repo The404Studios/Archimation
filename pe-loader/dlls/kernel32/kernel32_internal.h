@@ -57,7 +57,11 @@ typedef struct {
 } timer_data_t;
 
 /* ---------- Thread ---------- */
-typedef DWORD (*LPTHREAD_START_ROUTINE)(LPVOID);
+/* PE-side callback: Windows LPTHREAD_START_ROUTINE is WINAPI (ms_abi).
+ * Even though the loader invokes start routines via abi_call_win64_1(),
+ * the type must carry ms_abi so direct invocations via this pointer do
+ * not silently use sysv_abi. */
+typedef DWORD (__attribute__((ms_abi)) *LPTHREAD_START_ROUTINE)(LPVOID);
 
 typedef struct {
     LPTHREAD_START_ROUTINE start_routine;

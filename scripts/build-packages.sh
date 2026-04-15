@@ -43,7 +43,19 @@ _check_tmp_space
 # changed.  Pass --force or set FORCE_REBUILD=1 to bypass this check.
 # ────────────────────────────────────────────────────────────────────────────
 FORCE_REBUILD="${FORCE_REBUILD:-0}"
-[[ "${1:-}" = "--force" ]] && FORCE_REBUILD=1
+DRY_RUN=0
+for arg in "$@"; do
+    case "$arg" in
+        --force)   FORCE_REBUILD=1 ;;
+        --dry-run) DRY_RUN=1 ;;
+        --help|-h)
+            echo "Usage: $0 [--force] [--dry-run]"
+            echo "  --force    rebuild every package even if hashes match"
+            echo "  --dry-run  list what would be built and exit"
+            exit 0
+            ;;
+    esac
+done
 
 _check_rebuild_needed() {
     local pkg_name="$1"
@@ -60,9 +72,36 @@ _check_rebuild_needed() {
             return 1  # No rebuild needed
         fi
     fi
-    echo "$current_hash" > "$hash_file"
+    # NOTE: Do NOT write the hash here. If we write the hash before the build
+    # succeeds, a failed makepkg poisons the cache — re-running the script
+    # skips the broken package because the hash matches but no .pkg.tar.zst
+    # exists in the repo. The caller must invoke _mark_rebuild_done AFTER
+    # a successful _run_makepkg.
     return 0  # Rebuild needed
 }
+
+# Record the successful build hash — call this only after _run_makepkg returns 0.
+_mark_rebuild_done() {
+    local pkg_name="$1"
+    local pkg_dir="$2"
+    local hash_file="$HASH_DIR/${pkg_name}.md5"
+    find "$pkg_dir" -maxdepth 1 -type f | sort | xargs md5sum 2>/dev/null | md5sum | cut -d' ' -f1 > "$hash_file"
+}
+
+# Handle --dry-run now that _check_rebuild_needed is defined.
+if [ "$DRY_RUN" = "1" ]; then
+    echo "=== DRY RUN: packages that would be (re)built ==="
+    for pkg_dir in "$PROJECT_DIR"/packages/*/; do
+        pkg_name=$(basename "$pkg_dir")
+        [ -f "$pkg_dir/PKGBUILD" ] || continue
+        if _check_rebuild_needed "$pkg_name" "$pkg_dir"; then
+            echo "  BUILD   $pkg_name"
+        else
+            echo "  skip    $pkg_name (unchanged)"
+        fi
+    done
+    exit 0
+fi
 
 # ── Stale version cleanup ──────────────────────────────────────────────────
 # Remove old .pkg.tar.zst files from the repo, keeping only the newest for
@@ -168,12 +207,20 @@ if [ "$(id -u)" = "0" ]; then
         # We don't override COMPRESSZST here — the *final* .pkg.tar.zst compression
         # wants to stay strong because these ship in the ISO. Parallel makepkg is
         # controlled by MAKEFLAGS (propagated in the enclosing env).
+        # pipefail inside the inner bash is REQUIRED — otherwise `makepkg | tail`
+        # swallows makepkg's non-zero exit status and the outer script treats a
+        # failed build as success (silently ships broken packages into the ISO).
         runuser -u buildpkg --preserve-environment -- bash -c "
+            set -o pipefail
             cd '$bld_pkg' && \
             MAKEFLAGS='${MAKEFLAGS}' \
             PKGDEST='$bld_pkg' \
-            makepkg -f --nodeps --noconfirm 2>&1 | tail -10
-        "
+            makepkg -f --nodeps --noconfirm 2>&1 | tail -40
+        " || {
+            echo "ERROR: makepkg failed for '$pkg_name' (see tail above)." >&2
+            echo "       to fix: inspect $bld_pkg/PKGBUILD or rerun with FORCE_REBUILD=1 bash scripts/build-packages.sh --force" >&2
+            return 1
+        }
 
         # Copy the resulting package tarball back to the source dir and repo
         cp -f "$bld_pkg"/*.pkg.tar.zst "$src_pkg/" 2>/dev/null || true
@@ -181,8 +228,25 @@ if [ "$(id -u)" = "0" ]; then
 else
     _run_makepkg() {
         local pkg_name="$1"
-        (cd "$PROJECT_DIR/packages/$pkg_name" && \
-            MAKEFLAGS="${MAKEFLAGS}" makepkg -f --nodeps --noconfirm 2>&1 | tail -10)
+        local src_pkg="$PROJECT_DIR/packages/$pkg_name"
+        # Defensive CRLF strip: git core.autocrlf=true on Windows re-injects CRLF
+        # into PKGBUILD on every checkout. makepkg errors with "PKGBUILD contains
+        # CRLF" rather than a helpful diagnostic, so we neutralise it here too.
+        # (Same fix as the root branch — keep both in sync.)
+        for f in "$src_pkg/PKGBUILD" "$src_pkg"/*.install "$src_pkg"/*.hook; do
+            [ -f "$f" ] && sed -i 's/\r$//' "$f" 2>/dev/null || true
+        done
+        # Parent's set -o pipefail is inherited into the subshell, so `| tail`
+        # will NOT mask makepkg failures here — but be explicit for clarity.
+        (
+            set -o pipefail
+            cd "$PROJECT_DIR/packages/$pkg_name" && \
+                MAKEFLAGS="${MAKEFLAGS}" makepkg -f --nodeps --noconfirm 2>&1 | tail -40
+        ) || {
+            echo "ERROR: makepkg failed for '$pkg_name'." >&2
+            echo "       to fix: cd packages/$pkg_name && makepkg -f --nodeps 2>&1 | less" >&2
+            return 1
+        }
     }
 fi
 
@@ -206,6 +270,7 @@ for pkg_name in "${BUILD_ORDER[@]}"; do
             # -n: only add new packages (skip already-indexed versions)
             # -R: remove old versions of this package from repo (incremental cleanup)
             repo-add -n -R -q "$REPO_DIR/pe-compat.db.tar.gz" "$REPO_DIR"/${pkg_name}-*.pkg.tar.zst 2>/dev/null || true
+            _mark_rebuild_done "$pkg_name" "$pkg_dir"
         else
             echo "  Skipping (unchanged): $pkg_name"
         fi
@@ -236,6 +301,7 @@ for pkg_dir in "$PROJECT_DIR"/packages/*/; do
         rm -f "$REPO_DIR/${pkg_name}-"*.pkg.tar.zst 2>/dev/null || true
         cp -f "$pkg_dir"/*.pkg.tar.zst "$REPO_DIR/" 2>/dev/null || true
         repo-add "$REPO_DIR/pe-compat.db.tar.gz" "$REPO_DIR"/${pkg_name}-*.pkg.tar.zst 2>/dev/null || true
+        _mark_rebuild_done "$pkg_name" "$pkg_dir"
     else
         echo "  Skipping (unchanged): $pkg_name"
     fi

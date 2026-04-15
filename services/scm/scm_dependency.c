@@ -233,9 +233,18 @@ int scm_start_with_deps(const char *name)
     }
     start_count = g_order_counter;
 
-    /* Start in order (dependencies first) */
+    /* Start in order (dependencies first).
+     * This function is the user-initiated entry point: zero restart_count
+     * and clear manually_stopped so prior lockouts don't block a fresh
+     * manual start. The SIGCHLD/health-monitor restart path calls
+     * scm_start_service() directly and must NOT reset these. */
     for (int i = 0; i < start_count; i++) {
         if (!start_order[i]) continue;  /* Skip gaps in order sequence */
+        service_entry_t *svc = scm_db_find(start_order[i]);
+        if (svc) {
+            svc->restart_count = 0;
+            svc->manually_stopped = 0;
+        }
         fprintf(stderr, "[scm_dep] Starting dependency [%d/%d]: %s\n",
                 i + 1, start_count, start_order[i]);
         int ret = scm_start_service(start_order[i]);
@@ -250,7 +259,15 @@ int scm_start_with_deps(const char *name)
     return 0;
 }
 
-/* Stop a service and all services that depend on it (with depth limit) */
+/* Stop a service and all services that depend on it (with depth limit).
+ *
+ * The graph is only built at depth==0; recursive calls must not rebuild it
+ * because build_graph() resets g_nodes[] (wiping visited state and shifting
+ * indices) and would corrupt the outer iteration. We also copy the dependent
+ * names into a local buffer before recursing, because scm_stop_service
+ * temporarily drops g_lock (see scm_api.c) and another thread could call
+ * scm_db_delete_service which memmoves g_services[] and invalidates any
+ * service_entry_t pointer we still hold. Names are safer than indices. */
 static int stop_with_deps_impl(const char *name, int depth)
 {
     if (depth > 16) {
@@ -258,28 +275,34 @@ static int stop_with_deps_impl(const char *name, int depth)
         return -1;
     }
 
-    build_graph();
+    if (depth == 0)
+        build_graph();
 
-    /* Find all services that depend on 'name' (reverse deps) */
     fprintf(stderr, "[scm_dep] Stopping service and dependents: %s\n", name);
 
-    /* First pass: find dependents (O(1) via rebuilt hash) */
     int target = dep_hash_lookup(name);
-
     if (target < 0) return -1;
 
-    /* Stop dependents first (reverse order) */
-    for (int i = 0; i < g_node_count; i++) {
+    /* Snapshot dependent names before recursing -- the recursive stop drops
+     * g_lock and the graph can become stale. */
+    char dependent_names[MAX_SERVICES][256];
+    int dependent_count = 0;
+    for (int i = 0; i < g_node_count && dependent_count < MAX_SERVICES; i++) {
         for (int j = 0; j < g_nodes[i].dep_count; j++) {
             if (g_nodes[i].deps[j] == target) {
-                /* This service depends on target - stop it first */
-                stop_with_deps_impl(g_nodes[i].name, depth + 1);
+                strncpy(dependent_names[dependent_count],
+                        g_nodes[i].name,
+                        sizeof(dependent_names[0]) - 1);
+                dependent_names[dependent_count][sizeof(dependent_names[0]) - 1] = '\0';
+                dependent_count++;
                 break;
             }
         }
     }
 
-    /* Now stop the target */
+    for (int k = 0; k < dependent_count; k++)
+        stop_with_deps_impl(dependent_names[k], depth + 1);
+
     return scm_stop_service(name);
 }
 
@@ -397,6 +420,13 @@ int scm_parallel_auto_start(void)
             }
 
             fprintf(stderr, "[scm_dep]   Starting: %s\n", g_nodes[i].name);
+            {
+                service_entry_t *svc = scm_db_find(g_nodes[i].name);
+                if (svc) {
+                    svc->restart_count = 0;
+                    svc->manually_stopped = 0;
+                }
+            }
             int ret = scm_start_service(g_nodes[i].name);
             if (ret < 0) {
                 fprintf(stderr, "[scm_dep]   FAILED: %s\n", g_nodes[i].name);

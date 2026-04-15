@@ -137,6 +137,7 @@ class CortexHandlers:
             "memory_pattern": 0,
             "memory_stub": 0,
             "memory_map": 0,
+            "memory_protect": 0,
         }
 
     # -- Helpers --------------------------------------------------------------
@@ -172,6 +173,8 @@ class CortexHandlers:
                 self._action_counts["memory_stub"] += 1
             elif action_taken.startswith("map:"):
                 self._action_counts["memory_map"] += 1
+            elif action_taken.startswith("protect:"):
+                self._action_counts["memory_protect"] += 1
 
     @property
     def recent_events(self) -> list[dict]:
@@ -644,6 +647,30 @@ class CortexHandlers:
 
         self._record_event(event, f"pattern:{pattern_id}")
 
+    async def handle_memory_protect(self, event: Event) -> None:
+        """Handle memory-protection-change events from the TMS.
+
+        The DecisionEngine carries two heuristics keyed on MEMORY_PROTECT --
+        RWX-heap injection (QUARANTINE) and IAT-write hook (ESCALATE).
+        Before this handler was added, no subscriber was registered for
+        MEMORY_PROTECT, so the dispatcher never routed it to
+        _check_decision_engine() and those heuristics were dead code
+        (handle_all() fired, but it only logs -- it never consults the
+        engine).  This closes that observability gap.
+        """
+        if self._decision_engine:
+            result = self._check_decision_engine(event)
+            if result and self._apply_engine_verdict(event, result):
+                return
+
+        payload = self._get_payload_dict(event)
+        logger.debug(
+            "Memory protect PID %d: VA %#x new_prot=%s tag=%s",
+            event.pid, payload.get("va", 0),
+            payload.get("new_prot", ""), payload.get("tag", ""),
+        )
+        self._record_event(event, f"protect:{payload.get('new_prot', '?')}")
+
     async def handle_stub_called(self, event: Event) -> None:
         """Handle stub call events -- an unimplemented function was called."""
         payload = self._get_payload_dict(event)
@@ -881,6 +908,7 @@ def register_handlers(bus: EventBus, handlers: CortexHandlers) -> None:
     bus.on(SourceLayer.RUNTIME, PeEventType.MEMORY_MAP, handlers.handle_memory_map)
     bus.on(SourceLayer.RUNTIME, PeEventType.MEMORY_ANOMALY, handlers.handle_memory_anomaly)
     bus.on(SourceLayer.RUNTIME, PeEventType.MEMORY_PATTERN, handlers.handle_memory_pattern)
+    bus.on(SourceLayer.RUNTIME, PeEventType.MEMORY_PROTECT, handlers.handle_memory_protect)
     bus.on(SourceLayer.RUNTIME, PeEventType.STUB_CALLED, handlers.handle_stub_called)
 
     # Global audit handler
@@ -1153,32 +1181,39 @@ async def main(argv: Optional[list[str]] = None) -> None:
     # systemd-visible "active" state (when/if Type=notify) truly means
     # "REST surface is accepting HTTP".
 
+    # Stdlib helper: send any state string to NOTIFY_SOCKET. Mirrors
+    # ai-control/daemon/main.py._notify_systemd so cortex has no AUR-only
+    # sdnotify dependency for the watchdog path.
+    def _notify_systemd(state: str) -> bool:
+        notify_sock = os.environ.get("NOTIFY_SOCKET")
+        if not notify_sock:
+            return False
+        try:
+            import socket as _sock_mod
+            addr = (
+                "\x00" + notify_sock[1:]
+                if notify_sock.startswith("@") else notify_sock
+            )
+            _s = _sock_mod.socket(_sock_mod.AF_UNIX, _sock_mod.SOCK_DGRAM)
+            try:
+                _s.settimeout(2.0)
+                _s.connect(addr)
+                _s.sendall(state.encode("utf-8"))
+                return True
+            finally:
+                _s.close()
+        except OSError as _exc:
+            logger.debug("NOTIFY_SOCKET send (%r) failed: %s", state, _exc)
+            return False
+
     try:
         import sdnotify  # type: ignore[import-untyped]
         n = sdnotify.SystemdNotifier()
         n.notify("READY=1")
         logger.info("Sent READY=1 to systemd (Type=notify if configured)")
     except ImportError:
-        # sdnotify is AUR-only; fall back to stdlib AF_UNIX datagram to
-        # NOTIFY_SOCKET.  Mirrors ai-control/daemon/main.py._notify_systemd.
-        notify_sock = os.environ.get("NOTIFY_SOCKET")
-        if notify_sock:
-            try:
-                import socket as _sock_mod
-                addr = (
-                    "\x00" + notify_sock[1:]
-                    if notify_sock.startswith("@") else notify_sock
-                )
-                _s = _sock_mod.socket(_sock_mod.AF_UNIX, _sock_mod.SOCK_DGRAM)
-                try:
-                    _s.settimeout(2.0)
-                    _s.connect(addr)
-                    _s.sendall(b"READY=1")
-                    logger.info("Sent READY=1 to systemd via stdlib fallback")
-                finally:
-                    _s.close()
-            except OSError as _exc:
-                logger.debug("NOTIFY_SOCKET send failed: %s", _exc)
+        if _notify_systemd("READY=1"):
+            logger.info("Sent READY=1 to systemd via stdlib fallback")
 
     logger.info(
         "AI Cortex ready. Autonomy ceiling: Level %d (%s). "
@@ -1253,8 +1288,29 @@ async def main(argv: Optional[list[str]] = None) -> None:
             except Exception:
                 logger.exception("Pending expiry sweep failed")
 
+    async def _watchdog_heartbeat_loop() -> None:
+        """Session 36: periodic WATCHDOG=1 ping.
+
+        Unit file declares WatchdogSec=60, so we ping every 30s (half-interval,
+        systemd-recommended). No-op if NOTIFY_SOCKET is unset (non-systemd run
+        or Type=simple). Exits on shutdown_event.
+        """
+        if "NOTIFY_SOCKET" not in os.environ:
+            return
+        logger.info("Watchdog heartbeat task started (interval=30s)")
+        while not shutdown_event.is_set():
+            try:
+                if not await _interruptible_sleep(30):
+                    return
+                _notify_systemd("WATCHDOG=1")
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("Watchdog heartbeat failed")
+
     dead_man_task = asyncio.create_task(_dead_man_check_loop())
     expiry_task = asyncio.create_task(_pending_expiry_loop())
+    watchdog_task = asyncio.create_task(_watchdog_heartbeat_loop())
 
     # -- Run until shutdown ---------------------------------------------------
 
@@ -1262,6 +1318,10 @@ async def main(argv: Optional[list[str]] = None) -> None:
         await shutdown_event.wait()
     except asyncio.CancelledError:
         pass
+
+    # Notify systemd we're stopping so it stops enforcing WatchdogSec during
+    # the graceful shutdown window.
+    _notify_systemd("STOPPING=1")
 
     dead_man_task.cancel()
     try:
@@ -1272,6 +1332,12 @@ async def main(argv: Optional[list[str]] = None) -> None:
     expiry_task.cancel()
     try:
         await expiry_task
+    except asyncio.CancelledError:
+        pass
+
+    watchdog_task.cancel()
+    try:
+        await watchdog_task
     except asyncio.CancelledError:
         pass
 

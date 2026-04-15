@@ -206,6 +206,20 @@ rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
 _step_end
 
+# Pre-flight: mkarchiso needs root. Validate sudo works non-interactively so we
+# fail fast rather than hang waiting for a password prompt in CI. `sudo -n true`
+# returns non-zero if sudo would prompt; we downgrade that to a warning so local
+# interactive runs (where the user expects to type a password) still succeed.
+if ! command -v mkarchiso >/dev/null 2>&1; then
+    echo "ERROR: mkarchiso not found on PATH." >&2
+    echo "       to fix: pacman -S --needed archiso" >&2
+    exit 1
+fi
+if ! sudo -n true 2>/dev/null; then
+    echo "NOTE: sudo will prompt for your password (non-interactive sudo unavailable)." >&2
+    echo "      In CI, pre-authorise with: echo '<user> ALL=(ALL) NOPASSWD: /usr/bin/mkarchiso' >/etc/sudoers.d/mkarchiso" >&2
+fi
+
 # Build ISO. Pass pacman cache through so pacstrap doesn't re-download every
 # run (saves ~2-5 min depending on mirror speed). Also export JOBS so any
 # sub-tools that honour it (xz, zstd via mksquashfs) get full parallelism.

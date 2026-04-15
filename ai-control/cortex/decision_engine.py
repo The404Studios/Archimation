@@ -200,14 +200,19 @@ class DecisionEngine:
         ))
 
         # Service policies
-        self.add_rule(PolicyRule(
-            name="auto_restart_crashed",
-            source_layer=3, event_type=EVT_SVC_CRASH,
-            condition=lambda e: True,
-            verdict=Verdict.ALLOW,
-            reason="Service crashed -- auto-restart per policy",
-            priority=30,
-        ))
+        #
+        # NOTE: We deliberately do NOT install an always-true
+        # "auto_restart_crashed" tier-1 ALLOW rule here.  The previous
+        # version of this file did, and because tier-1 policy wins over
+        # tier-2 heuristics the crash-loop detection heuristic in
+        # _eval_heuristics() (5+ crashes in 60s -> DENY) was DEAD CODE --
+        # the policy rule matched first and short-circuited the pipeline
+        # on every crash, so restart-storms were never caught.
+        # Leaving no rule means:
+        #   * normal crash  -> heuristic returns None -> default-ALLOW
+        #                      (handler runs normal autonomy flow -> restart)
+        #   * crash loop    -> heuristic DENY -> handler skips restart
+        # which is the intended three-tier behavior.
 
         self.add_rule(PolicyRule(
             name="escalate_dependency_failure",

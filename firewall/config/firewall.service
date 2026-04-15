@@ -14,7 +14,11 @@ StartLimitIntervalSec=60
 StartLimitBurst=3
 
 [Service]
-Type=simple
+# Session 36: nft_manager.py --daemon now sends READY=1 after rules
+# apply, WATCHDOG=1 every 30s, and STOPPING=1 on SIGTERM/SIGINT. Uses
+# stdlib AF_UNIX datagram — no sdnotify dependency.
+Type=notify
+NotifyAccess=main
 # Ensure nf_tables kernel module is loaded before applying rules.
 # Prefix with - so failure is non-fatal (module may be built-in).
 ExecStartPre=-/usr/sbin/modprobe -q nf_tables
@@ -45,9 +49,8 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE
 Restart=on-failure
 RestartSec=5
 
-# TODO: enable WatchdogSec=60 after nft_manager.py's netlink loop sends
-# WATCHDOG=1 periodically (and unit is flipped to Type=notify).
-# WatchdogSec=60
+# Heartbeat posted every 30s from the daemon's main loop (half-interval).
+WatchdogSec=60
 
 # Runtime directory for socket/pid
 RuntimeDirectory=pe-compat

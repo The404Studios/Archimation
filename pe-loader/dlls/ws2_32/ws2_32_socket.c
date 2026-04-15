@@ -593,10 +593,18 @@ WINAPI_EXPORT int ws2_gethostname(char *name, int namelen)
         wsa_last_error = WSANOTINITIALISED;
         return SOCKET_ERROR_WIN;
     }
+    if (!name || namelen <= 0) {
+        wsa_last_error = 10014 /* WSAEFAULT */;
+        return SOCKET_ERROR_WIN;
+    }
     if (gethostname(name, (size_t)namelen) < 0) {
         wsa_last_error = errno_to_wsa(errno);
         return SOCKET_ERROR_WIN;
     }
+    /* POSIX gethostname() does not guarantee NUL-termination when the
+     * hostname is >= namelen; glibc leaves the last byte as-is. Force
+     * termination so PE callers can safely strlen() the result. */
+    name[namelen - 1] = '\0';
     return 0;
 }
 
@@ -782,7 +790,9 @@ typedef struct _WSAOVERLAPPED {
     HANDLE   hEvent;
 } WSAOVERLAPPED;
 
-typedef void (*LPWSAOVERLAPPED_COMPLETION_ROUTINE)(DWORD, DWORD, WSAOVERLAPPED *, DWORD);
+/* PE-side callback: must be ms_abi so any future invocation uses the
+ * Windows x64 register/shadow-space convention, not sysv_abi. */
+typedef void (__attribute__((ms_abi)) *LPWSAOVERLAPPED_COMPLETION_ROUTINE)(DWORD, DWORD, WSAOVERLAPPED *, DWORD);
 
 WINAPI_EXPORT int WSASend(SOCKET_WIN s, WSABUF *lpBuffers, DWORD dwBufferCount,
                            LPDWORD lpNumberOfBytesSent, DWORD dwFlags,

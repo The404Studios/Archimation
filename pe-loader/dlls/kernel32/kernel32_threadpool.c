@@ -240,7 +240,8 @@ WINAPI_EXPORT void CloseThreadpoolTimer(void *pti)
 }
 
 /* QueueUserWorkItem - legacy thread pool API */
-typedef DWORD (*LPTHREAD_START_ROUTINE)(LPVOID);
+/* PE-side Windows callback: must be ms_abi. */
+typedef DWORD (__attribute__((ms_abi)) *LPTHREAD_START_ROUTINE)(LPVOID);
 
 typedef struct {
     LPTHREAD_START_ROUTINE func;

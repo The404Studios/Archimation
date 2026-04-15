@@ -43,6 +43,48 @@
 #define HEALTH_CHECK_INTERVAL_SEC  5
 #define HEALTH_MAX_BACKOFF_SEC     60
 
+/*
+ * Minimal sd_notify(3) implementation using only stdlib. Avoids linking
+ * libsystemd so the daemon still builds on systems without systemd headers
+ * (e.g. WSL pacstrap without systemd-devel). Supports both filesystem and
+ * abstract-namespace NOTIFY_SOCKET paths, per systemd.exec(5).
+ *
+ * Returns 1 on success, 0 if NOTIFY_SOCKET is unset or send failed. No
+ * logging on failure -- this is called from the hot path every few seconds
+ * and must not spam the journal.
+ */
+static int sd_notify_stdlib(const char *state)
+{
+    const char *sock_path = getenv("NOTIFY_SOCKET");
+    if (!sock_path || !*sock_path)
+        return 0;
+
+    int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return 0;
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    size_t path_len = strlen(sock_path);
+    if (path_len >= sizeof(addr.sun_path)) {
+        close(fd);
+        return 0;
+    }
+    if (sock_path[0] == '@') {
+        /* Abstract namespace: first byte must be NUL, remainder is name */
+        addr.sun_path[0] = '\0';
+        memcpy(addr.sun_path + 1, sock_path + 1, path_len - 1);
+    } else {
+        memcpy(addr.sun_path, sock_path, path_len + 1);
+    }
+
+    ssize_t n = sendto(fd, state, strlen(state), 0,
+                       (struct sockaddr *)&addr, sizeof(addr));
+    close(fd);
+    return n > 0 ? 1 : 0;
+}
+
 pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_sigchld_pending = 0;
@@ -182,11 +224,18 @@ static void reap_and_restart(void)
 
         pthread_mutex_unlock(&g_lock);
 
-        /* Restart outside the lock to avoid fork-with-mutex UB */
+        /* Restart outside the lock to avoid fork-with-mutex UB.
+         * Re-verify under the lock after the backoff sleep so a user-
+         * initiated stop or delete during the window is honored. */
         if (restart_name[0]) {
             usleep((useconds_t)delay_ms * 1000);
+            if (!g_running) continue;
             pthread_mutex_lock(&g_lock);
-            scm_start_service(restart_name);
+            service_entry_t *svc2 = scm_db_find(restart_name);
+            if (svc2 && !svc2->manually_stopped &&
+                svc2->state == SERVICE_STOPPED) {
+                scm_start_service(restart_name);
+            }
             pthread_mutex_unlock(&g_lock);
         }
     }
@@ -261,11 +310,19 @@ static void *health_monitor_thread(void *arg)
 
         pthread_mutex_unlock(&g_lock);
 
-        /* Now restart outside the lock to avoid fork-with-mutex UB */
+        /* Now restart outside the lock to avoid fork-with-mutex UB.
+         * After the backoff sleep the world may have changed: the user
+         * may have stopped or deleted the service, or another thread may
+         * have restarted it. Re-verify under the lock before respawning. */
         for (int i = 0; i < restart_count; i++) {
             usleep((useconds_t)restart_delays[i] * 1000);
+            if (!g_running) break;
             pthread_mutex_lock(&g_lock);
-            scm_start_service(restart_names[i]);
+            service_entry_t *svc = scm_db_find(restart_names[i]);
+            if (svc && !svc->manually_stopped &&
+                svc->state == SERVICE_STOPPED) {
+                scm_start_service(restart_names[i]);
+            }
             pthread_mutex_unlock(&g_lock);
         }
     }
@@ -812,6 +869,18 @@ int main(int argc, char **argv)
 
     printf(SCM_LOG_PREFIX "SCM ready. Listening on %s\n", SCM_SOCKET_PATH);
 
+    /* Notify systemd Type=notify. Harmless no-op under Type=simple. */
+    if (sd_notify_stdlib("READY=1"))
+        fprintf(stderr, SCM_LOG_PREFIX "Sent READY=1 to systemd\n");
+
+    /*
+     * Watchdog cadence: WatchdogSec=30 in the unit file, so we ping every
+     * 15s (half-interval, systemd-recommended). The select() timeout below
+     * is 1s, so we track elapsed seconds with a counter.
+     */
+    unsigned int wd_counter = 0;
+    const unsigned int wd_interval_sec = 15;
+
     /* Main loop: accept and handle clients */
     while (g_running) {
         /* Check for exited children (restart policy) */
@@ -835,7 +904,19 @@ int main(int argc, char **argv)
             if (client_fd >= 0)
                 handle_client(client_fd);
         }
+
+        /* Heartbeat: ping systemd roughly every wd_interval_sec seconds.
+         * This runs in the main thread so it also proves the accept loop
+         * is live, not just the health-monitor thread. */
+        if (++wd_counter >= wd_interval_sec) {
+            wd_counter = 0;
+            sd_notify_stdlib("WATCHDOG=1");
+        }
     }
+
+    /* Tell systemd we're stopping so it doesn't fire WatchdogSec during
+     * the potentially slow per-service stop loop below. */
+    sd_notify_stdlib("STOPPING=1");
 
     /* Cleanup */
     close(listen_fd);

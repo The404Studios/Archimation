@@ -476,6 +476,8 @@ WINAPI_EXPORT BOOL GetComputerNameA(LPSTR lpBuffer, LPDWORD nSize)
     if (gethostname(hostname, sizeof(hostname)) != 0) {
         strncpy(hostname, "ARCHLINUX", sizeof(hostname));
     }
+    /* POSIX gethostname() may not NUL-terminate if truncated. */
+    hostname[sizeof(hostname) - 1] = '\0';
 
     DWORD len = (DWORD)strlen(hostname);
     if (*nSize < len + 1) {

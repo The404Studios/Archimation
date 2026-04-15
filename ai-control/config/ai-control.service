@@ -62,10 +62,11 @@ TimeoutStopSec=15
 # mixed avoids the "cgroup-wide SIGKILL" path which can truncate logs.
 KillMode=mixed
 KillSignal=SIGTERM
-# TODO: enable WatchdogSec=60 after main.py starts pinging WATCHDOG=1
-# periodically from the asyncio event loop.  _notify_systemd() in main.py
-# already supports arbitrary state strings — only needs a periodic task.
-# WatchdogSec=60
+# Session 36: wired. main.py runs _watchdog_heartbeat() every 30s (half
+# of WatchdogSec) after READY=1, and sends STOPPING=1 on shutdown. If the
+# asyncio loop stalls for >60s, systemd SIGKILLs and Restart=on-failure
+# brings us back.
+WatchdogSec=60
 # No restrictions - AI has full access
 ProtectSystem=false
 ProtectHome=false

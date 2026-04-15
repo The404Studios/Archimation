@@ -1,4 +1,8 @@
 #!/bin/bash
+# Quick-and-dirty gdb wrapper for peloader + PuTTY crash repro.
+# Not set -e because we want the pipeline to reach `tail -100` even if gdb
+# reports a caught crash; but we do want unset-var detection.
+set -uo pipefail
 cd /opt/pe-loader
 export DISPLAY=:0
 export XAUTHORITY=/run/lightdm/root/:0

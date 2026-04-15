@@ -617,72 +617,9 @@ def create_app(config: dict):
         info["api_version"] = "0.1.0"
         return info
 
-    @app.get("/system/summary")
-    async def system_summary():
-        """Unified daemon state for monitoring + test harnesses.
-
-        Aggregates the per-subsystem liveness reported by /health with a
-        handful of cheap counters (uptime, active PE processes, issued
-        auth-token cache size). Auth-exempt: used by /system/coherence
-        (planned), the QEMU smoke test, and the desktop status widget.
-        No hostname or command strings are returned so the response is
-        safe to serve without a bearer token.
-        """
-        subsystems = {
-            name: (ctrl is not None) for name, ctrl in _controllers.items()
-        }
-        counters: dict = {}
-        # Active PE processes seen by the memory observer (0 when unloaded)
-        if _memory_observer is not None:
-            try:
-                mstats = _memory_observer.get_stats() or {}
-                counters["active_pe_processes"] = int(
-                    mstats.get("processes_tracked", 0)
-                )
-            except Exception:
-                counters["active_pe_processes"] = 0
-        else:
-            counters["active_pe_processes"] = 0
-        # Pattern scanner library size
-        if _scanner is not None:
-            try:
-                sstats = _scanner.get_stats() or {}
-                counters["scanner_patterns"] = int(
-                    sstats.get("total_patterns", 0)
-                )
-            except Exception:
-                counters["scanner_patterns"] = 0
-        else:
-            counters["scanner_patterns"] = 0
-        # Auth-token cache size — proxy for issued-and-still-valid tokens.
-        try:
-            from auth import _TOKEN_CACHE, _token_cache_lock
-            with _token_cache_lock:
-                counters["auth_tokens_cached"] = len(_TOKEN_CACHE)
-        except Exception:
-            counters["auth_tokens_cached"] = 0
-        # Trust observer: subject count (defensive — some configs disable it)
-        if _trust_observer is not None:
-            try:
-                summary = _trust_observer.get_summary() or {}
-                counters["trust_subjects"] = int(summary.get("subjects", 0))
-            except Exception:
-                counters["trust_subjects"] = 0
-        else:
-            counters["trust_subjects"] = 0
-        # State machine: any critical subsystem missing → "degraded"
-        critical = ("system", "trust_observer")
-        missing_critical = [n for n in critical if not subsystems.get(n)]
-        state = "degraded" if missing_critical else "ready"
-        return {
-            "daemon": "ai-control",
-            "version": "0.1.0",
-            "state": state,
-            "uptime_s": int(time.time() - _start_time),
-            "subsystems": subsystems,
-            "counters": counters,
-            "missing_critical": missing_critical,
-        }
+    # /system/summary is served by the factory router registered below
+    # (see system_summary.make_summary_router). The inline implementation
+    # was removed in favour of the unit-tested, pure-introspection module.
 
     # --- Keyboard ---
 
@@ -4198,6 +4135,40 @@ def create_app(config: dict):
                 results["behavioral"] = {"error": str(e)}
 
         return {"status": "ok", "pid": pid, "analysis": results}
+
+    # --- /system/summary (factory-based, unit-tested) ---
+    # The app_state mapping is read on every summary request, so
+    # late-initialised subsystems (e.g. those started from lifespan)
+    # appear automatically once present.
+    try:
+        from system_summary import make_summary_router
+        _summary_state: dict = {
+            "scanner": _scanner,
+            "memory_observer": _memory_observer,
+            "memory_diff": _memory_diff,
+            "stub_discovery": _stub_discovery,
+            "binary_signatures": _binary_signatures,
+            "win_api_db": _win_api_db,
+            "stub_generator": _stub_generator,
+            "syscall_monitor": _syscall_monitor,
+            "syscall_translator": _syscall_translator,
+            "behavioral_model": _behavioral_model,
+            "thermal": _thermal,
+            "power": _power,
+            "contusion": _contusion,
+            "firewall": _firewall,
+            "audit": _audit,
+            "session": os.environ.get("XDG_SESSION_TYPE", "headless"),
+            "ready": True,  # create_app completed; lifespan start runs shortly
+            # Omit start_monotonic: the factory falls back to its own
+            # module-level _BOOT_MONOTONIC (set at import), which is a
+            # valid time.monotonic() origin. _start_time is wall-clock
+            # (time.time()) and MUST NOT be passed here.
+        }
+        app.include_router(make_summary_router(_summary_state))
+        logger.info("Registered /system/summary factory router")
+    except Exception as e:
+        logger.error("Failed to register /system/summary router: %s", e)
 
     return app
 

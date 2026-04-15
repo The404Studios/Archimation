@@ -252,7 +252,21 @@ int namespace_create_symlink(const char *link_name, const char *target)
     /* Check for existing entry */
     int idx = find_entry_locked(link_name);
     if (idx >= 0) {
-        /* Update existing entry */
+        /*
+         * Refuse to overwrite a base device (is_symlink == 0) such as
+         * \Device\Null or \BaseNamedObjects.  Previously a client could
+         * redirect \Device\Null -> /etc/shadow and cause subsequent
+         * opens by other processes to hit an attacker-chosen path.
+         * Only client-created symlinks (is_symlink == 1) may be
+         * updated in place.
+         */
+        if (!g_ns_table[idx].is_symlink) {
+            pthread_mutex_unlock(&g_ns_lock);
+            fprintf(stderr, "[objectd] Refusing to overwrite base namespace "
+                    "entry '%s' (not a symlink)\n", link_name);
+            return -1;
+        }
+        /* Update existing symlink */
         strncpy(g_ns_table[idx].linux_path, target,
                 sizeof(g_ns_table[idx].linux_path) - 1);
         g_ns_table[idx].linux_path[sizeof(g_ns_table[idx].linux_path) - 1] = '\0';

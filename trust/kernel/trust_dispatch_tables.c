@@ -214,28 +214,48 @@ EXPORT_SYMBOL_GPL(trust_ctx_set_coherence_hint);
  * directly if it ever calls the dispatcher (it should not).
  * ================================================================== */
 
-/* Per-task BATCH flag: set by the dispatcher around its main loop so
- * that recursive ops (a handler that loops back into
- * trust_cmd_submit) see BATCH.  Simpler than a per-cpu bool because
- * the dispatcher is synchronous on the calling task.  An atomic_t is
- * overkill; use a per-CPU u32 with preempt disable around the
- * set/clear (done by the caller, trust_dispatch.c). */
+/* Per-CPU BATCH depth counter.
+ *
+ * SAFETY MODEL: the dispatcher's main loop sleeps (copy_from_user,
+ * kvmalloc(GFP_KERNEL)) so preempt_disable() cannot span enter..exit.
+ * Without pinning, the task could migrate CPUs between enter and
+ * exit, which would:
+ *   1. Cause trust_current_context() on the new CPU to see depth=0
+ *      and incorrectly return NORMAL instead of BATCH, bypassing the
+ *      BATCH-only context gate.
+ *   2. Decrement the wrong CPU's counter on exit, underflowing u32
+ *      to ~0u on the new CPU and leaving the origin CPU permanently
+ *      +1.
+ *
+ * Fix: wrap enter/exit with migrate_disable()/migrate_enable().  This
+ * is sleepable-safe (unlike preempt_disable) and pins the task to one
+ * CPU so the per-CPU counter is always read/written on the same CPU
+ * within a single batch.  trust_current_context() is called from
+ * inside the dispatcher, which is inside the migrate_disable() window,
+ * so its __this_cpu_read() observes the same CPU that did the inc.
+ */
 
 static DEFINE_PER_CPU(u32, trust_ctx_batch_depth);
 
 void trust_ctx_batch_enter(void)
 {
-	preempt_disable();
+	migrate_disable();
 	__this_cpu_inc(trust_ctx_batch_depth);
-	preempt_enable();
 }
 EXPORT_SYMBOL_GPL(trust_ctx_batch_enter);
 
 void trust_ctx_batch_exit(void)
 {
-	preempt_disable();
-	__this_cpu_dec(trust_ctx_batch_depth);
-	preempt_enable();
+	/* Underflow guard: if something went wrong and we'd wrap, stay
+	 * at 0 rather than producing 0xFFFFFFFF (which would poison the
+	 * next enter on this CPU). */
+	u32 d = __this_cpu_read(trust_ctx_batch_depth);
+	if (d > 0)
+		__this_cpu_dec(trust_ctx_batch_depth);
+	else
+		WARN_ONCE(1, "trust_ctx_batch_exit underflow on cpu %d\n",
+			  smp_processor_id());
+	migrate_enable();
 }
 EXPORT_SYMBOL_GPL(trust_ctx_batch_exit);
 
@@ -252,9 +272,15 @@ u32 trust_current_context(void)
 	if (in_interrupt())
 		return TRUST_CTX_INTERRUPT;
 
-	preempt_disable();
+	/* Callers from inside the dispatcher are already migrate_disable'd
+	 * by trust_ctx_batch_enter(); callers from elsewhere are not, but
+	 * they will observe depth=0 on whichever CPU they read, which is
+	 * the intended semantics ("BATCH only when this task is inside a
+	 * submit on this CPU").  A brief migrate_disable() here keeps the
+	 * read consistent with any concurrent enter on this CPU. */
+	migrate_disable();
 	depth = __this_cpu_read(trust_ctx_batch_depth);
-	preempt_enable();
+	migrate_enable();
 	if (depth > 0)
 		return TRUST_CTX_BATCH;
 

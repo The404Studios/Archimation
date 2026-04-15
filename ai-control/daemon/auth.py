@@ -274,7 +274,10 @@ ENDPOINT_TRUST = {
     "/system/kill": 600,
     # Desktop automation
     "/desktop/launch": 200,
-    "/desktop/launch-exe": 200,
+    # launch-exe runs a Windows .exe via pe-run-game; match /contusion/launch
+    # (400). /desktop/launch stays at 200 because its allowlist is constrained
+    # to known shortcuts; arbitrary .exe paths deserve elevated trust.
+    "/desktop/launch-exe": 400,
     "/desktop/windows": 200,
     "/desktop/active-window": 200,
     "/desktop/window/focus": 200,
@@ -299,7 +302,9 @@ ENDPOINT_TRUST = {
     "/ai/models": 200,
     "/ai/load": 400,
     "/ai/unload": 400,
-    "/ai/query": 200,
+    # LLM inference is CPU/GPU-expensive and uncapped per-caller.
+    # Bump to 300 so unauthenticated/low-trust probes cannot DoS inference.
+    "/ai/query": 300,
     # Compositor
     "/compositor/info": 200,
     "/compositor/windows": 200,
@@ -368,8 +373,9 @@ ENDPOINT_TRUST = {
     "/contusion/clipboard": 400,
     "/contusion/screen/read": 400,
     "/contusion/window/wait": 400,
-    # Audit
-    "/audit/recent": 100,
+    # Audit — entries contain subject_id, paths, and detail strings that
+    # can expose the caller's recent sensitive actions. Gate at user+.
+    "/audit/recent": 300,
     "/audit/stats": 200,
     # Trust history + Dashboard
     "/trust-history": 200,
@@ -451,6 +457,23 @@ ENDPOINT_TRUST = {
     "/syscall/track": 400,          # Start/stop tracing requires elevated trust
     # Comprehensive analysis (runs all engines)
     "/analyze": 400,
+    # GPU controller (read-only enumeration + mode selection). Without an
+    # explicit entry these fell through to the fail-secure 600 default,
+    # which effectively made them admin-only — harsher than intended.
+    "/gpu/list": 200,
+    "/gpu/primary": 200,
+    "/gpu/render": 200,
+    "/gpu/hybrid": 200,
+    "/gpu/vulkan": 200,
+    "/gpu/select": 300,          # returns env vars; mild side-effect surface
+    # Input device enumeration (uhid/evdev). Read-only list of devices;
+    # uhid write path is reserved (returns 501). Prefix match covers
+    # /input/list, /input/state, /input/uhid/status.
+    "/input/list": 200,
+    "/input/state": 200,
+    "/input/uhid/status": 200,
+    "/input/uhid/enable": 400,
+    "/input/uhid/inject": 600,
 }
 
 

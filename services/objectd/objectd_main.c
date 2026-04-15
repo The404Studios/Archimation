@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 
 #include "objectd_protocol.h"
 #include "objectd_objects.h"
@@ -138,6 +139,44 @@ static void sig_handler(int sig)
 {
     if (sig == SIGTERM || sig == SIGINT)
         g_running = 0;
+}
+
+/*
+ * Minimal sd_notify(3) implementation using only stdlib. Same pattern
+ * used in services/scm/scm_daemon.c -- duplicated rather than sharing a
+ * header so neither daemon gains a libsystemd link-time dependency and
+ * the Makefile stays unchanged.
+ *
+ * Returns 1 on success, 0 on NOTIFY_SOCKET unset / send failure. Must be
+ * async-signal-unsafe-free of anything else in the hot path; uses only
+ * socket(), sendto(), close() and memcpy().
+ */
+static int sd_notify_stdlib(const char *state)
+{
+    const char *sock_path = getenv("NOTIFY_SOCKET");
+    if (!sock_path || !*sock_path)
+        return 0;
+    int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return 0;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    size_t path_len = strlen(sock_path);
+    if (path_len >= sizeof(addr.sun_path)) {
+        close(fd);
+        return 0;
+    }
+    if (sock_path[0] == '@') {
+        addr.sun_path[0] = '\0';
+        memcpy(addr.sun_path + 1, sock_path + 1, path_len - 1);
+    } else {
+        memcpy(addr.sun_path, sock_path, path_len + 1);
+    }
+    ssize_t n = sendto(fd, state, strlen(state), 0,
+                       (struct sockaddr *)&addr, sizeof(addr));
+    close(fd);
+    return n > 0 ? 1 : 0;
 }
 
 static void sigchld_handler(int sig)
@@ -881,8 +920,25 @@ static void event_loop(void)
 
     fprintf(stderr, "[objectd] Entering event loop\n");
 
+    /*
+     * Watchdog: WatchdogSec=30 in pe-objectd.service, so we ping every 15s
+     * (half-interval per systemd's recommendation). The epoll_wait timeout
+     * is 1000ms so we count seconds via a deadline, not an iteration
+     * counter (iterations are non-uniform under load).
+     */
+    time_t next_wd = time(NULL) + 15;
+
     while (g_running) {
         int nfds = epoll_wait(g_epoll_fd, events, MAX_EVENTS, 1000);
+
+        /* Heartbeat regardless of epoll return (including EINTR): proves
+         * this loop and the process are alive even during idle periods. */
+        time_t now = time(NULL);
+        if (now >= next_wd) {
+            sd_notify_stdlib("WATCHDOG=1");
+            next_wd = now + 15;
+        }
+
         if (nfds < 0) {
             if (errno == EINTR)
                 continue;
@@ -1012,8 +1068,17 @@ int main(int argc, char **argv)
     fprintf(stderr, "[objectd] Ready. Objects: %d, Namespace initialized, "
             "Registry loaded\n", objects_active_count());
 
+    /* Notify systemd we're ready. Harmless no-op under Type=simple. */
+    if (sd_notify_stdlib("READY=1"))
+        fprintf(stderr, "[objectd] Sent READY=1 to systemd\n");
+
     /* Run */
     event_loop();
+
+    /* Tell systemd we're stopping so WatchdogSec isn't enforced during
+     * cleanup (which closes N client sockets + unmaps shm). */
+    sd_notify_stdlib("STOPPING=1");
+
     cleanup();
 
     return 0;

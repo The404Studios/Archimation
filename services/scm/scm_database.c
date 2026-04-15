@@ -260,27 +260,40 @@ int scm_db_delete_service(const char *name)
         return -1;
     }
 
-    /* Stop the service if it is still running to avoid leaking a child PID */
+    /* Stop the service if it is still running/pending to avoid leaking
+     * a child PID or racing with an in-flight start. Also cover
+     * START_PENDING -- a parallel start may have already spawned a child
+     * and assigned a pid but not yet transitioned to RUNNING. */
     for (int i = 0; i < g_service_count; i++) {
-        if (strcmp(g_services[i].name, name) == 0 &&
-            g_services[i].state == SERVICE_RUNNING && g_services[i].pid > 0) {
-            fprintf(stderr, "[scm_db] Stopping running service '%s' before delete\n", name);
+        if (strcmp(g_services[i].name, name) != 0) continue;
+        int s = g_services[i].state;
+        if ((s == SERVICE_RUNNING || s == SERVICE_START_PENDING ||
+             s == SERVICE_PAUSED) && g_services[i].pid > 0) {
+            fprintf(stderr, "[scm_db] Stopping service '%s' (state=%d) before delete\n",
+                    name, s);
             g_services[i].manually_stopped = 1;
             g_services[i].crash_handled = 1;
-            if (kill(g_services[i].pid, SIGTERM) == 0) {
+            pid_t pid = g_services[i].pid;
+            if (kill(pid, SIGTERM) == 0) {
                 /* Brief wait for graceful exit */
                 for (int w = 0; w < 10; w++) {
-                    if (kill(g_services[i].pid, 0) != 0) break;
+                    if (kill(pid, 0) != 0) break;
                     usleep(100000);
                 }
-                if (kill(g_services[i].pid, 0) == 0)
-                    kill(g_services[i].pid, SIGKILL);
-                waitpid(g_services[i].pid, NULL, WNOHANG);
+                if (kill(pid, 0) == 0)
+                    kill(pid, SIGKILL);
+                /* Reap: retry briefly so we don't leave a zombie if the
+                 * signal hasn't been delivered+processed yet. */
+                for (int w = 0; w < 5; w++) {
+                    pid_t r = waitpid(pid, NULL, WNOHANG);
+                    if (r > 0 || (r < 0 && errno == ECHILD)) break;
+                    usleep(20000);
+                }
             }
             g_services[i].state = SERVICE_STOPPED;
             g_services[i].pid = 0;
-            break;
         }
+        break;
     }
 
     char filepath[4096];

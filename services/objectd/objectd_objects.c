@@ -275,8 +275,14 @@ int objects_open(const char *name, uint8_t type, uint8_t *status, int *out_shm_f
 
     named_object_t *obj = &g_objects[idx];
 
-    /* Type check (0 = any type) */
-    if (type != 0 && obj->type != type) {
+    /*
+     * Require explicit type match.  Historically type==0 meant "any" which
+     * let a malicious client obtain a handle to an object of a different
+     * kind than it advertised — e.g. open a mutex as an event and futex-wait
+     * on a word that encodes a different structure.  Only accept the
+     * documented OBJ_TYPE_* values, and reject 0.
+     */
+    if (type == 0 || obj->type != type) {
         if (status) *status = OBJ_STATUS_INVALID;
         pthread_mutex_unlock(&g_obj_lock);
         return -1;

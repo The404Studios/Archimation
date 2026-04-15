@@ -872,8 +872,35 @@ class NftManager:
         logger.info("Firewall rules reloaded")
 
 
+def _notify_systemd(state: str) -> bool:
+    """Stdlib sd_notify(3). Mirrors ai-control/daemon/main.py._notify_systemd.
+
+    Supports both filesystem (/path) and abstract-namespace (@name) sockets.
+    Returns True on success, False if NOTIFY_SOCKET is unset or send fails.
+    No AUR-only python-sdnotify dependency.
+    """
+    import os as _os
+    import socket as _socket
+    sock_path = _os.environ.get("NOTIFY_SOCKET")
+    if not sock_path:
+        return False
+    addr = "\x00" + sock_path[1:] if sock_path.startswith("@") else sock_path
+    try:
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_DGRAM | _socket.SOCK_CLOEXEC)
+        try:
+            s.settimeout(2.0)
+            s.connect(addr)
+            s.sendall(state.encode("utf-8"))
+            return True
+        finally:
+            s.close()
+    except OSError:
+        return False
+
+
 if __name__ == "__main__":
     import argparse as _argparse
+    import signal as _signal
     import time as _time
 
     _parser = _argparse.ArgumentParser(description="NftManager daemon/flush helper")
@@ -897,16 +924,46 @@ if __name__ == "__main__":
         _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
         from rule_store import RuleStore as _RuleStore
         _store = _RuleStore()
+
+        # Graceful shutdown: SIGTERM/SIGINT flip _stopping so the heartbeat
+        # loop exits, STOPPING=1 is posted, and the finally block closes
+        # the store. Without a handler, KeyboardInterrupt only catches
+        # SIGINT; systemd sends SIGTERM.
+        _stopping = {"flag": False}
+        def _on_stop(signum, _frame):
+            logger.info("Received signal %d, shutting down...", signum)
+            _stopping["flag"] = True
+        _signal.signal(_signal.SIGTERM, _on_stop)
+        _signal.signal(_signal.SIGINT, _on_stop)
+
         try:
             _all_rules = _store.list_rules()
             _mgr.load_rules(_all_rules)
             _mgr.apply_rules()
-            logger.info("Daemon mode: rules loaded and applied. Sleeping...")
-            while True:
-                _time.sleep(60)
+            logger.info("Daemon mode: rules loaded and applied.")
+
+            # Notify systemd we're ready. Unit file declares Type=notify
+            # + WatchdogSec=60, so we must ping every 30s (half-interval)
+            # or systemd SIGKILLs us.
+            if _notify_systemd("READY=1"):
+                logger.info("Sent READY=1 to systemd")
+
+            _heartbeat_interval = 30.0  # half of WatchdogSec=60
+            while not _stopping["flag"]:
+                # Sleep in short slices so SIGTERM wakes us promptly;
+                # Python's sleep is interrupted by signals but the EINTR
+                # semantics differ by version -- a loop is simpler.
+                _elapsed = 0.0
+                while _elapsed < _heartbeat_interval and not _stopping["flag"]:
+                    _time.sleep(1.0)
+                    _elapsed += 1.0
+                if _stopping["flag"]:
+                    break
+                _notify_systemd("WATCHDOG=1")
         except KeyboardInterrupt:
             logger.info("Daemon interrupted, exiting.")
         finally:
+            _notify_systemd("STOPPING=1")
             _store.close()
     else:
         _parser.print_help()

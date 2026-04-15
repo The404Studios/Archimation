@@ -688,7 +688,7 @@ WINAPI_EXPORT BOOL CloseHandle(HANDLE hObject)
         handle_entry_t *entry = handle_lookup(hObject);
         if (entry && entry->ref_count <= 1 &&
             entry->type == HANDLE_TYPE_IOCP && entry->data) {
-            extern BOOL CloseIoCompletionPort(HANDLE);
+            extern BOOL __attribute__((ms_abi)) CloseIoCompletionPort(HANDLE);
             CloseIoCompletionPort(hObject);
         }
     }

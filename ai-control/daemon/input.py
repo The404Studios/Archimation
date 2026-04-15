@@ -286,9 +286,11 @@ def build_router(controller: Optional[InputController] = None):
     async def list_inputs(refresh: bool = Query(False)):
         try:
             devs = ctrl.enumerate(force_refresh=refresh)
-        except Exception as e:
+        except Exception:
+            # Exception message can include /dev/input/eventN paths and
+            # hidraw names. Keep internals in the daemon log only.
             logger.exception("input enumerate failed")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail="enumerate failed")
         return {"count": len(devs), "devices": devs}
 
     @router.get("/state")

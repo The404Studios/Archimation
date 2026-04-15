@@ -129,12 +129,40 @@ def get_status() -> dict:
 
 async def query(prompt: str, max_tokens: int = 512, temperature: float = 0.7,
                 stop: Optional[list] = None) -> dict:
-    """Run inference on the loaded model."""
+    """Run inference on the loaded model.
+
+    max_tokens is clamped to [1, 4096]; temperature to [0.0, 2.0]; prompt
+    length is capped at 64 KiB. These guardrails prevent a single caller
+    from parking the global inference lock for minutes with a pathological
+    request, and stop negative / NaN temperature inputs from reaching
+    llama-cpp.
+    """
+    # Input clamps — the FastAPI model validation (api_server.py) should
+    # also enforce these, but we guard at the controller in case a caller
+    # reaches us via a different path (cortex, direct Python call).
+    try:
+        max_tokens = int(max_tokens)
+    except (TypeError, ValueError):
+        max_tokens = 512
+    max_tokens = max(1, min(max_tokens, 4096))
+    try:
+        temperature = float(temperature)
+    except (TypeError, ValueError):
+        temperature = 0.7
+    if temperature != temperature or temperature < 0.0:  # NaN or negative
+        temperature = 0.0
+    if temperature > 2.0:
+        temperature = 2.0
+    if isinstance(prompt, str) and len(prompt) > 65536:
+        prompt = prompt[:65536]
     async with _get_lock():
         if _model is None:
+            # Don't echo get_model_dir() — it's an internal filesystem path
+            # and leaks daemon layout to unauthenticated probes. Generic
+            # message is enough for the client.
             return {
                 "status": "error",
-                "message": "No model loaded. Download a GGUF model to " + get_model_dir()
+                "message": "No model loaded",
             }
 
         try:
@@ -153,8 +181,11 @@ async def query(prompt: str, max_tokens: int = 512, temperature: float = 0.7,
                 "usage": result.get("usage", {}),
             }
         except Exception as e:
-            logger.error(f"Inference error: {e}")
-            return {"status": "error", "message": str(e)}
+            # Full exception (may include model-internal tensor shapes and
+            # file paths) goes to the daemon log; the caller only sees the
+            # exception type to preserve programmatic error handling.
+            logger.exception("Inference error: %s", e)
+            return {"status": "error", "message": type(e).__name__}
 
 
 async def query_stream(prompt: str, max_tokens: int = 512,

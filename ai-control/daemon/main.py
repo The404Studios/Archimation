@@ -164,6 +164,37 @@ def detect_session_type() -> str:
         return "headless"
 
 
+async def _watchdog_heartbeat(interval_s: float, shutdown_event: asyncio.Event):
+    """Periodically send WATCHDOG=1 to systemd.
+
+    Session 35 follow-up: the unit file's WatchdogSec=60 tells systemd to
+    SIGKILL us if we don't ping within the interval. We ping at half-interval
+    (30s) to leave headroom for event-loop stalls.
+
+    Only active when NOTIFY_SOCKET is set (running under Type=notify with
+    WatchdogSec=). No-op otherwise, so unit tests and manual runs work.
+
+    The task exits cleanly when shutdown_event fires, which means this
+    cooperates with the existing SIGTERM/SIGINT shutdown path in main().
+    """
+    if "NOTIFY_SOCKET" not in os.environ:
+        return
+    logger.info("Watchdog heartbeat task started (interval=%.1fs)", interval_s)
+    try:
+        while not shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=interval_s)
+                # shutdown_event fired — exit loop
+                break
+            except asyncio.TimeoutError:
+                # Normal path: timeout elapsed, send ping.
+                _notify_systemd("WATCHDOG=1")
+    except asyncio.CancelledError:
+        pass
+    finally:
+        logger.debug("Watchdog heartbeat task exiting")
+
+
 async def _watch_server(server_task, shutdown_event):
     """Monitor the server task and trigger shutdown if it crashes."""
     try:
@@ -348,15 +379,25 @@ async def main():
 
     logger.info("AI Control Daemon ready - full system access enabled")
 
+    # Start watchdog heartbeat. Unit file declares WatchdogSec=60 so we ping
+    # at 30s (half-interval) -- systemd's documented recommendation.
+    watchdog_task = asyncio.create_task(
+        _watchdog_heartbeat(30.0, shutdown_event)
+    )
+
     # Wait for either shutdown signal or server crash
     server_done = asyncio.create_task(_watch_server(server_task, shutdown_event))
     await shutdown_event.wait()
 
     logger.info("AI Control Daemon shutting down...")
+    # Tell systemd we're stopping so it doesn't fire watchdog during the
+    # graceful shutdown window.
+    _notify_systemd("STOPPING=1")
+    watchdog_task.cancel()
     server_task.cancel()
     server_done.cancel()
     try:
-        await asyncio.wait_for(asyncio.gather(server_task, server_done, return_exceptions=True), timeout=10)
+        await asyncio.wait_for(asyncio.gather(server_task, server_done, watchdog_task, return_exceptions=True), timeout=10)
     except asyncio.TimeoutError:
         logger.warning("Server shutdown timed out after 10s")
     except Exception:

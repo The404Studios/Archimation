@@ -73,7 +73,11 @@ StartLimitIntervalSec=60
 StartLimitBurst=3
 
 [Service]
-Type=simple
+# Session 36: objectd_main.c now sends READY=1 after broker init, pings
+# WATCHDOG=1 every 15s from the epoll loop, and STOPPING=1 before cleanup.
+# Stdlib AF_UNIX datagram -- no libsystemd link dep.
+Type=notify
+NotifyAccess=main
 ExecStartPre=/usr/bin/mkdir -p /run/pe-compat
 ExecStart=/usr/bin/pe-objectd
 Restart=on-failure
@@ -91,9 +95,8 @@ RuntimeDirectory=pe-compat
 RuntimeDirectoryMode=0755
 StandardOutput=journal
 StandardError=journal
-# TODO: enable WatchdogSec=30 after pe-objectd.c sends WATCHDOG=1 in
-# its main epoll loop (see systemd sd_watchdog_enabled(3) for C API).
-# WatchdogSec=30
+# Heartbeat posted every 15s from the epoll loop (half-interval).
+WatchdogSec=30
 
 [Install]
 WantedBy=multi-user.target
@@ -115,7 +118,11 @@ StartLimitIntervalSec=60
 StartLimitBurst=3
 
 [Service]
-Type=simple
+# Session 36: scm_daemon.c now sends READY=1 after service auto-start,
+# pings WATCHDOG=1 every 15s from the select() accept loop, and STOPPING=1
+# before cleanup. Stdlib AF_UNIX datagram -- no libsystemd link dep.
+Type=notify
+NotifyAccess=main
 ExecStartPre=/usr/bin/mkdir -p /run/pe-compat/services
 ExecStart=/usr/bin/scm_daemon
 Restart=on-failure
@@ -132,9 +139,8 @@ RuntimeDirectory=pe-compat/services
 RuntimeDirectoryMode=0755
 StandardOutput=journal
 StandardError=journal
-# TODO: enable WatchdogSec=30 after scm_daemon.c sends WATCHDOG=1 in its
-# main poll loop.
-# WatchdogSec=30
+# Heartbeat posted every 15s from the main accept loop (half-interval).
+WatchdogSec=30
 
 [Install]
 WantedBy=multi-user.target

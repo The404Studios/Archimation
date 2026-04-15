@@ -55,13 +55,22 @@ package() {
     install -Dm755 objectd/pe-objectd "$pkgdir/usr/bin/pe-objectd"
 
     # pe-objectd systemd service
+    #
+    # Heredoc uses 'EOF' (quoted) so the shell does NOT expand $MAINPID;
+    # systemd needs those specifiers verbatim at unit-activation time.
     install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/system/pe-objectd.service" <<'EOF'
 [Unit]
 Description=PE Compatibility Object Broker
+Documentation=https://github.com/ai-arch-linux/windows-services
+# L1 layer: object broker must be up before L3 SCM and L4 cortex.
 Before=ai-cortex.service scm-daemon.service
-After=network.target
+# local-fs for /var/lib/pe-compat/services state, network for unix socket
+# bind (doesn't wait for connectivity, just for loopback to be up).
+After=network.target local-fs.target systemd-modules-load.service
 # Skip if binary was not installed (build failure, etc.)
 ConditionPathExists=/usr/bin/pe-objectd
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -69,8 +78,22 @@ ExecStartPre=/usr/bin/mkdir -p /run/pe-compat
 ExecStart=/usr/bin/pe-objectd
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=3
+# Broker cold-start: hive load + session namespace init.  Fast on real HW,
+# up to ~20s on TCG QEMU.
+TimeoutStartSec=30
+# Broker answers SIGTERM immediately (unix-socket listen loop drops out).
+TimeoutStopSec=10
+KillMode=mixed
+KillSignal=SIGTERM
+# Runtime dir: systemd creates /run/pe-compat with 0755 automatically,
+# which makes the ExecStartPre mkdir above redundant but harmless.
+RuntimeDirectory=pe-compat
+RuntimeDirectoryMode=0755
+StandardOutput=journal
+StandardError=journal
+# TODO: enable WatchdogSec=30 after pe-objectd.c sends WATCHDOG=1 in
+# its main epoll loop (see systemd sd_watchdog_enabled(3) for C API).
+# WatchdogSec=30
 
 [Install]
 WantedBy=multi-user.target
@@ -80,9 +103,16 @@ EOF
     install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/system/scm-daemon.service" <<'SERVICE'
 [Unit]
 Description=Windows Service Control Manager Daemon
-After=network.target pe-objectd.service
+Documentation=https://github.com/ai-arch-linux/windows-services
+# L3 layer: SCM needs pe-objectd (L1) for handle resolution.  Using After=
+# rather than Requires= because SCM can start in degraded mode without the
+# broker (only reports error when a client actually needs a named object).
+After=network.target pe-objectd.service local-fs.target
+Wants=pe-objectd.service
 # Skip if binary was not installed (build failure, etc.)
 ConditionPathExists=/usr/bin/scm_daemon
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -90,8 +120,21 @@ ExecStartPre=/usr/bin/mkdir -p /run/pe-compat/services
 ExecStart=/usr/bin/scm_daemon
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=3
+# SCM startup: service-graph load from /var/lib/pe-compat/services.
+# Fast on real HW; 30s ceiling for TCG QEMU + large service graph.
+TimeoutStartSec=30
+# SCM graceful shutdown: signals each managed service in reverse dep order.
+# Give 15s before SIGKILL — enough time to notify 10-20 shims.
+TimeoutStopSec=15
+KillMode=mixed
+KillSignal=SIGTERM
+RuntimeDirectory=pe-compat/services
+RuntimeDirectoryMode=0755
+StandardOutput=journal
+StandardError=journal
+# TODO: enable WatchdogSec=30 after scm_daemon.c sends WATCHDOG=1 in its
+# main poll loop.
+# WatchdogSec=30
 
 [Install]
 WantedBy=multi-user.target

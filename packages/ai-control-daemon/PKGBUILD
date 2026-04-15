@@ -42,6 +42,12 @@ package() {
     cd "$_srcdir"
 
     # Install daemon Python modules
+    #
+    # The glob ``daemon/*.py`` intentionally does NOT descend into
+    # subdirectories, so ``daemon/tests/`` (the test harness for
+    # e.g. ``system_summary.py``) is excluded from the runtime
+    # package by construction.  If you add another test directory,
+    # keep it under ``daemon/tests/`` so the glob keeps skipping it.
     install -d "$pkgdir/usr/lib/ai-control-daemon"
     install -Dm644 daemon/*.py "$pkgdir/usr/lib/ai-control-daemon/"
     # Ensure __init__.py is installed (may be missed by glob on some systems)
@@ -110,11 +116,30 @@ sys.exit(2 if report['overall']=='error' else 1 if report['overall']=='warning' 
 PESTATUS
 
     # AI Cortex systemd service
+    #
+    # Heredoc uses 'EOF' (quoted) so the shell does NOT expand $MAINPID or
+    # $NOTIFY_SOCKET at package() time; those belong to systemd's escape
+    # namespace at unit-activation time and must survive verbatim.
     install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/system/ai-cortex.service" <<'EOF'
 [Unit]
 Description=AI Cortex - System Orchestrator
+Documentation=https://github.com/ai-arch-linux/ai-control-daemon
+# Ordering: cortex needs (a) the object broker for session handles,
+# (b) kernel modules (trust.ko), and (c) ai-control so its /health + /events
+# endpoints are ready.  Since ai-control is Type=notify, After=ai-control
+# now means "ai-control has sent READY=1" — i.e. FastAPI is accepting
+# connections.  No retry loop needed inside cortex.
 After=pe-objectd.service systemd-modules-load.service ai-control.service
 Wants=pe-objectd.service
+# Requires= on ai-control — if the daemon dies, the cortex has nothing
+# to talk to.  systemd will stop cortex cleanly instead of leaving it
+# spinning on ECONNREFUSED.
+Requires=ai-control.service
+# StartLimit* live in [Unit] as of systemd 230.  Older placement in
+# [Service] still works but triggers a deprecation warning in
+# systemd-analyze verify.
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -122,9 +147,23 @@ ExecStartPre=/usr/bin/mkdir -p /run/pe-compat /var/lib/pe-compat/trust-history
 ExecStart=/usr/bin/ai-cortex
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=3
+# Cortex cold-start does: imports, event-bus setup, REST API on :8421,
+# and the autonomy controller's first tick.  45s is ample on TCG QEMU.
+TimeoutStartSec=45
+# Cortex has a graceful shutdown path (orchestrator.notify + task drain);
+# give it 10s before SIGKILL.
+TimeoutStopSec=10
+KillMode=mixed
+KillSignal=SIGTERM
 Environment=PYTHONUNBUFFERED=1
+# TODO: if cortex/main.py begins sending WATCHDOG=1 via the same
+# NOTIFY_SOCKET path ai-control uses, flip this on.  cortex currently
+# relies on python-sdnotify (optional) for READY=1 only.
+# Conversion plan: switch cortex to Type=notify once main.py sends
+# READY=1 via the stdlib _notify_systemd() pattern, then enable:
+# Type=notify
+# NotifyAccess=main
+# WatchdogSec=60
 
 [Install]
 WantedBy=multi-user.target

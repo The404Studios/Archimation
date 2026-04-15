@@ -1078,36 +1078,107 @@ async def main(argv: Optional[list[str]] = None) -> None:
         logger.warning("Command socket failed to start: %s", exc)
 
     # -- Optional REST API ----------------------------------------------------
+    #
+    # Bind-before-ready (Session 34):  the cortex REST API must be *actually
+    # listening* before we tell systemd READY=1 and before ai-control's
+    # cortex-proxy aiohttp session starts issuing requests.  Previously we
+    # fired the uvicorn task with `asyncio.create_task(...)` and logged
+    # "REST API listening..." immediately -- but uvicorn hadn't yet called
+    # `server.started = True` (lifespan.startup + socket bind happens inside
+    # `server.serve()` after a few ticks).  On slow hardware (QEMU TCG,
+    # cold-boot with a lot of imports) that window is hundreds of ms, which
+    # is plenty for the ai-control daemon's startup fanout (dashboard +
+    # health checks) to hit ECONNREFUSED and mark cortex as unavailable.
+    #
+    # Fix mirrors the pattern ai-control/daemon/main.py uses for uvicorn:
+    # an asyncio.Event set by _run_api_server() when server.started flips,
+    # awaited here with a bounded timeout before we progress to "ready".
 
     api_task: Optional[asyncio.Task] = None
+    api_ready: asyncio.Event = asyncio.Event()
+    api_port: int = args.api_port or 8421
     if not args.no_api:
         try:
             from .api import create_cortex_api
 
-            api_port = args.api_port or 8421
             app = create_cortex_api(
                 autonomy, orchestrator, handlers, bus, trust_history,
                 decision_engine=decision_engine,
             )
 
-            # Start uvicorn in a background task
+            # Start uvicorn in a background task.  The task sets `api_ready`
+            # once `server.started` flips to True, i.e. the TCP socket is
+            # open and accepting -- not merely "the task was scheduled".
+            logger.info("REST API startup: binding 127.0.0.1:%d ...", api_port)
             api_task = asyncio.create_task(
-                _run_api_server(app, port=api_port)
+                _run_api_server(app, port=api_port, ready_event=api_ready),
             )
-            logger.info("REST API listening on 127.0.0.1:%d", api_port)
         except ImportError as exc:
             logger.warning("REST API unavailable (missing dependency): %s", exc)
         except Exception as exc:
             logger.warning("REST API failed to start: %s", exc)
 
+    # Gate the READY signal on actual uvicorn bind.  60s is generous --
+    # typical cold-boot on a beefy host is <300ms; QEMU TCG + Pentium 4
+    # class hardware has been observed at ~3-5s.  If the task already
+    # failed (no api_task set), skip the wait entirely and proceed to
+    # the degraded-but-running state.  Do NOT sys.exit(): cortex's
+    # command socket + event bus are independently useful without the
+    # REST surface, and the ai-control daemon treats cortex-proxy failures
+    # as degraded JSON rather than fatal.
+    if api_task is not None:
+        try:
+            await asyncio.wait_for(api_ready.wait(), timeout=60.0)
+            logger.info("REST API listening on 127.0.0.1:%d (bound)", api_port)
+        except asyncio.TimeoutError:
+            logger.error(
+                "REST API did not bind within 60s on 127.0.0.1:%d; "
+                "continuing in degraded mode (cortex-proxy calls from "
+                "ai-control will return connection errors until uvicorn "
+                "finishes startup).", api_port,
+            )
+            # Leave api_task running -- uvicorn may still come up late;
+            # we just don't block the rest of the cortex startup on it.
+
     # -- Notify systemd -------------------------------------------------------
+    #
+    # ai-cortex.service is currently Type=simple (per packages/ai-control-
+    # daemon/PKGBUILD).  Under Type=simple, READY=1 is a no-op: systemd
+    # considers the service active the moment exec() succeeds.  We still
+    # send the notification in case the unit ever gets upgraded to
+    # Type=notify -- and to be idempotent with ai-control/daemon/main.py
+    # which writes to NOTIFY_SOCKET directly via stdlib sockets.
+    #
+    # Critical ordering: READY=1 comes AFTER `api_ready.wait()` above so the
+    # systemd-visible "active" state (when/if Type=notify) truly means
+    # "REST surface is accepting HTTP".
 
     try:
         import sdnotify  # type: ignore[import-untyped]
         n = sdnotify.SystemdNotifier()
         n.notify("READY=1")
+        logger.info("Sent READY=1 to systemd (Type=notify if configured)")
     except ImportError:
-        pass
+        # sdnotify is AUR-only; fall back to stdlib AF_UNIX datagram to
+        # NOTIFY_SOCKET.  Mirrors ai-control/daemon/main.py._notify_systemd.
+        notify_sock = os.environ.get("NOTIFY_SOCKET")
+        if notify_sock:
+            try:
+                import socket as _sock_mod
+                addr = (
+                    "\x00" + notify_sock[1:]
+                    if notify_sock.startswith("@") else notify_sock
+                )
+                _s = _sock_mod.socket(_sock_mod.AF_UNIX, _sock_mod.SOCK_DGRAM)
+                try:
+                    _s.settimeout(2.0)
+                    _s.connect(addr)
+                    _s.sendall(b"READY=1")
+                    logger.info("Sent READY=1 to systemd via stdlib fallback")
+                finally:
+                    _s.close()
+            except OSError as _exc:
+                logger.debug("NOTIFY_SOCKET send failed: %s", _exc)
 
     logger.info(
         "AI Cortex ready. Autonomy ceiling: Level %d (%s). "
@@ -1227,13 +1298,21 @@ async def main(argv: Optional[list[str]] = None) -> None:
     except asyncio.CancelledError:
         pass
 
-    # Stop API server
+    # Stop API server.  Bound the join-wait so a stuck uvicorn doesn't
+    # block shutdown forever (e.g. a request handler hung in a blocking
+    # call that ignored the cancel).  Mirrors the pattern ai-control's
+    # shutdown uses for its uvicorn task.
     if api_task is not None:
         api_task.cancel()
         try:
-            await api_task
+            await asyncio.wait_for(api_task, timeout=5.0)
         except asyncio.CancelledError:
             pass
+        except asyncio.TimeoutError:
+            logger.warning(
+                "REST API task did not exit within 5s of cancel; "
+                "proceeding with shutdown anyway",
+            )
 
     # Drain pending handler tasks so nothing is lost on shutdown.
     # Snapshot the set BEFORE awaiting so new tasks arriving during the drain
@@ -1265,8 +1344,26 @@ async def main(argv: Optional[list[str]] = None) -> None:
     )
 
 
-async def _run_api_server(app: object, host: str = "127.0.0.1", port: int = 8421) -> None:
-    """Run the FastAPI app via uvicorn."""
+async def _run_api_server(
+    app: object,
+    host: str = "127.0.0.1",
+    port: int = 8421,
+    ready_event: Optional[asyncio.Event] = None,
+) -> None:
+    """Run the FastAPI app via uvicorn.
+
+    Args:
+        app:         The FastAPI application (from create_cortex_api).
+        host:        Bind host. Default 127.0.0.1 (cortex is internal-only --
+                     ai-control proxies external access).
+        port:        Bind port. Default 8421 (daemon uses 8420).
+        ready_event: If provided, is set() once uvicorn.Server.started flips
+                     to True, i.e. the socket is bound and lifespan.startup
+                     completed.  Callers use this to gate systemd READY=1
+                     and to log truthful bind state.  If uvicorn import or
+                     startup fails, the event is left unset so callers can
+                     time out and proceed in degraded mode.
+    """
     try:
         import uvicorn  # type: ignore[import-untyped]
 
@@ -1278,8 +1375,47 @@ async def _run_api_server(app: object, host: str = "127.0.0.1", port: int = 8421
             access_log=False,
         )
         server = uvicorn.Server(server_config)
+
+        # Signal the ready event when uvicorn has finished startup.  Poll
+        # `server.started` (an internal bool flipped after socket bind +
+        # lifespan.startup complete).  Typical wait is <500ms on warm
+        # disk; in QEMU TCG or heavily loaded hosts it can stretch to
+        # several seconds.  The polling interval is deliberately tight
+        # (50ms) to minimize the window between "really listening" and
+        # "ready_event observed by main()".  This mirrors the pattern
+        # ai-control/daemon/api_server.start_server() uses for the
+        # outer ai-control REST surface.
+        if ready_event is not None:
+            async def _signal_when_started() -> None:
+                try:
+                    # Guard with a wall-clock budget in case server.started
+                    # never flips (e.g. lifespan.startup stalls on a bad
+                    # route handler). 90s matches uvicorn's own startup
+                    # timeout ceiling.
+                    deadline = time.time() + 90.0
+                    while not getattr(server, "started", False):
+                        if time.time() > deadline:
+                            logger.error(
+                                "uvicorn.Server.started never flipped to True "
+                                "within 90s; ready_event will remain unset",
+                            )
+                            return
+                        await asyncio.sleep(0.05)
+                    ready_event.set()
+                except asyncio.CancelledError:
+                    # On shutdown we intentionally don't set the event --
+                    # avoids a late-arriving ready signal racing a stop.
+                    raise
+
+            asyncio.create_task(_signal_when_started())
+
         await server.serve()
     except ImportError:
         logger.warning("uvicorn not installed -- REST API disabled")
     except asyncio.CancelledError:
-        pass
+        # Cooperative shutdown -- propagate so asyncio.wait() observes it.
+        raise
+    except Exception:
+        # Any other error: log with traceback so startup failures surface
+        # in journalctl instead of being silently swallowed by the task.
+        logger.exception("REST API server crashed")

@@ -207,10 +207,16 @@ class CallerIdentity:
 
 # Endpoint trust requirements
 ENDPOINT_TRUST = {
-    # No auth needed
+    # No auth needed — read-only status/monitoring surfaces. These are
+    # polled by the QEMU smoke test, systemd health probes, and external
+    # monitoring tools that have no token. Each must be limited to
+    # aggregate counters (no hostname, no command strings, no file paths).
     "/health": 0,
     "/docs": 0,
     "/openapi.json": 0,
+    "/system/summary": 0,        # aggregate counts + subsystem liveness
+    "/scanner/stats": 0,         # pattern DB totals (no per-process data)
+    "/memory/processes": 0,      # per-PID region counts only; localhost CORS
     # Read-only, low trust
     "/screen/capture": 100,
     "/screen/capture/base64": 100,
@@ -368,9 +374,8 @@ ENDPOINT_TRUST = {
     # Trust history + Dashboard
     "/trust-history": 200,
     "/dashboard": 200,
-    # Pattern scanner
+    # Pattern scanner — /scanner/stats is auth-exempt above
     "/scanner/patterns": 200,
-    "/scanner/stats": 200,
     "/scanner/scan": 400,
     "/scanner/analyze": 400,
     # Stub discovery engine
@@ -394,7 +399,7 @@ ENDPOINT_TRUST = {
     "/automation/tasks": 200,
     "/automation/history": 200,
     # Memory observer (PE memory translator)
-    "/memory/processes": 200,
+    # /memory/processes is auth-exempt above (aggregate counts only)
     "/memory/process": 200,
     "/memory/anomalies": 200,
     "/memory/stats": 200,
@@ -588,6 +593,17 @@ def check_auth(path: str, method: str, token: Optional[str],
     # No auth required for this endpoint
     if required == 0:
         return True, None, "no_auth_required"
+
+    # Localhost bootstrap exemption for /auth/token.
+    # The handler at api_server.py:1850 has its own is_local check, but the
+    # middleware runs BEFORE the handler — without this exemption, a local
+    # process cannot obtain its first token (chicken-and-egg). The handler's
+    # own check still applies to cross-network callers, so remote /auth/token
+    # POSTs still require an admin token.
+    if (path == "/auth/token"
+            and method == "POST"
+            and client_ip in ("127.0.0.1", "::1", "localhost", "local", "unknown")):
+        return True, None, "localhost_bootstrap"
 
     # Rate limit: reject early if this source has too many recent failures
     if _is_rate_limited(client_ip):

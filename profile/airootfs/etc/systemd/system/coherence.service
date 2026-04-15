@@ -115,6 +115,18 @@ StandardError=journal
 
 # Timeout: we answer SIGTERM immediately by design; 5 s ceiling.
 TimeoutStopSec=5s
+# Startup: coherenced boots in <1s on real HW (just mmap sysfs + start
+# the 500ms frame loop).  10s ceiling is generous.
+TimeoutStartSec=10s
+KillSignal=SIGTERM
+KillMode=mixed
+
+# TODO: enable WatchdogSec=2 after coherenced's 500ms frame loop sends
+# WATCHDOG=1 every frame via sd_notify("WATCHDOG=1") from the C side
+# (libsystemd: sd_notify(0, "WATCHDOG=1")).  Current frame budget is
+# 500ms; a 2s watchdog = 4 missed frames = genuine hang.  Until then
+# we rely on Restart=always to catch a dead loop.
+# WatchdogSec=2
 
 [Install]
 WantedBy=multi-user.target graphical.target

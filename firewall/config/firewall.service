@@ -1,11 +1,17 @@
 [Unit]
 Description=PE-Compat Windows-Style Firewall
 Documentation=man:pe-compat-firewall(8)
-After=network.target nftables.service
+After=network.target nftables.service local-fs.target
 Wants=nftables.service
+# Install nft rules before any PE application binds a socket.  The broker
+# itself doesn't expose network services but PE apps launched under SCM
+# do, and we want the policy in place first to avoid leaky-first-packet.
+Before=pe-objectd.service
 Conflicts=ufw.service firewalld.service
 # Skip entirely if nft binary is missing (package not installed)
 ConditionPathExists=/usr/sbin/nft
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -14,6 +20,11 @@ Type=simple
 ExecStartPre=-/usr/sbin/modprobe -q nf_tables
 ExecStart=/usr/bin/python3 /usr/lib/pe-compat/firewall/backend/nft_manager.py --daemon
 ExecReload=/bin/kill -HUP $MAINPID
+# Firewall startup: parse rules json, apply nft ruleset, open netlink.
+# Bounded 30s — rule compilation is O(rules) and large policies exist.
+TimeoutStartSec=30
+# Shutdown: close netlink + flush rules.  10s is generous.
+TimeoutStopSec=10
 KillSignal=SIGTERM
 KillMode=mixed
 
@@ -33,8 +44,10 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE
 # Restart policy
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=3
+
+# TODO: enable WatchdogSec=60 after nft_manager.py's netlink loop sends
+# WATCHDOG=1 periodically (and unit is flipped to Type=notify).
+# WatchdogSec=60
 
 # Runtime directory for socket/pid
 RuntimeDirectory=pe-compat

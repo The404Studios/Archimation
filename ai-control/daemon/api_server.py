@@ -617,6 +617,73 @@ def create_app(config: dict):
         info["api_version"] = "0.1.0"
         return info
 
+    @app.get("/system/summary")
+    async def system_summary():
+        """Unified daemon state for monitoring + test harnesses.
+
+        Aggregates the per-subsystem liveness reported by /health with a
+        handful of cheap counters (uptime, active PE processes, issued
+        auth-token cache size). Auth-exempt: used by /system/coherence
+        (planned), the QEMU smoke test, and the desktop status widget.
+        No hostname or command strings are returned so the response is
+        safe to serve without a bearer token.
+        """
+        subsystems = {
+            name: (ctrl is not None) for name, ctrl in _controllers.items()
+        }
+        counters: dict = {}
+        # Active PE processes seen by the memory observer (0 when unloaded)
+        if _memory_observer is not None:
+            try:
+                mstats = _memory_observer.get_stats() or {}
+                counters["active_pe_processes"] = int(
+                    mstats.get("processes_tracked", 0)
+                )
+            except Exception:
+                counters["active_pe_processes"] = 0
+        else:
+            counters["active_pe_processes"] = 0
+        # Pattern scanner library size
+        if _scanner is not None:
+            try:
+                sstats = _scanner.get_stats() or {}
+                counters["scanner_patterns"] = int(
+                    sstats.get("total_patterns", 0)
+                )
+            except Exception:
+                counters["scanner_patterns"] = 0
+        else:
+            counters["scanner_patterns"] = 0
+        # Auth-token cache size — proxy for issued-and-still-valid tokens.
+        try:
+            from auth import _TOKEN_CACHE, _token_cache_lock
+            with _token_cache_lock:
+                counters["auth_tokens_cached"] = len(_TOKEN_CACHE)
+        except Exception:
+            counters["auth_tokens_cached"] = 0
+        # Trust observer: subject count (defensive — some configs disable it)
+        if _trust_observer is not None:
+            try:
+                summary = _trust_observer.get_summary() or {}
+                counters["trust_subjects"] = int(summary.get("subjects", 0))
+            except Exception:
+                counters["trust_subjects"] = 0
+        else:
+            counters["trust_subjects"] = 0
+        # State machine: any critical subsystem missing → "degraded"
+        critical = ("system", "trust_observer")
+        missing_critical = [n for n in critical if not subsystems.get(n)]
+        state = "degraded" if missing_critical else "ready"
+        return {
+            "daemon": "ai-control",
+            "version": "0.1.0",
+            "state": state,
+            "uptime_s": int(time.time() - _start_time),
+            "subsystems": subsystems,
+            "counters": counters,
+            "missing_critical": missing_critical,
+        }
+
     # --- Keyboard ---
 
     @app.post("/keyboard/type")
@@ -2465,11 +2532,23 @@ def create_app(config: dict):
 
     @app.get("/contusion/apps")
     async def contusion_apps():
-        """List available apps from the library."""
-        cn = _require(_contusion, "contusion")
-        library = cn.get_app_library()
-        apps = [{"name": name, **info} for name, info in sorted(library.items())]
-        return {"status": "ok", "apps": apps}
+        """List available apps from the Contusion launch library.
+
+        Returns a JSON envelope with ``{status, apps, count}``. When the
+        Contusion engine failed to load at startup this endpoint degrades
+        to ``{status: "unavailable", apps: [], count: 0}`` rather than 503
+        so the desktop launcher + test harness can probe safely without
+        handling an error path.
+        """
+        if _contusion is None:
+            return {"status": "unavailable", "apps": [], "count": 0}
+        try:
+            library = _contusion.get_app_library() or {}
+            apps = [{"name": name, **info} for name, info in sorted(library.items())]
+            return {"status": "ok", "apps": apps, "count": len(apps)}
+        except Exception as e:
+            logger.warning("contusion/apps failed: %s", e)
+            return {"status": "error", "apps": [], "count": 0, "error": str(e)}
 
     @app.post("/contusion/context")
     async def contusion_context(req: ContusionContextRequest):
@@ -2938,9 +3017,39 @@ def create_app(config: dict):
 
     @app.get("/scanner/stats")
     async def scanner_stats():
-        """Get pattern database statistics."""
-        sc = _require(_scanner, "scanner")
-        return {"status": "ok", "stats": sc.get_stats()}
+        """Get pattern scanner statistics.
+
+        Read-only aggregate counts (patterns/scans/hits). Auth-exempt so
+        external monitoring tools can poll liveness without a token — see
+        auth.ENDPOINT_TRUST. Returns the ``unavailable`` envelope when the
+        scanner is disabled in config.
+        """
+        if _scanner is None:
+            return {
+                "status": "unavailable",
+                "patterns": 0,
+                "scans": 0,
+                "hits": 0,
+                "stats": {},
+            }
+        try:
+            stats = _scanner.get_stats() or {}
+        except Exception as e:
+            logger.warning("scanner/stats failed: %s", e)
+            return {
+                "status": "error",
+                "patterns": 0,
+                "scans": 0,
+                "hits": 0,
+                "error": str(e),
+            }
+        return {
+            "status": "ok",
+            "patterns": int(stats.get("total_patterns", 0)),
+            "scans": int(stats.get("scans", 0)),
+            "hits": int(stats.get("hits", 0)),
+            "stats": stats,
+        }
 
     @app.post("/scanner/patterns")
     async def scanner_add_pattern(req: AddPatternRequest):
@@ -3099,14 +3208,47 @@ def create_app(config: dict):
 
     @app.get("/memory/processes")
     async def memory_processes():
-        """List all tracked PE processes with memory summary."""
-        mo = _require(_memory_observer, "memory_observer")
-        tracked = await mo.get_all_tracked()
+        """List all tracked PE processes with a per-process memory summary.
+
+        Read-only monitoring surface. Auth-exempt so external test
+        harnesses (QEMU smoke test, monitoring daemons) can probe without
+        a token. Returns ``{processes: [], count: 0, enabled: false}``
+        when the memory observer is not loaded — an empty list is a
+        valid steady state on a freshly-booted system with no PE
+        processes.
+        """
+        if _memory_observer is None:
+            return {
+                "status": "unavailable",
+                "enabled": False,
+                "processes": [],
+                "count": 0,
+                "mode": "none",
+                "stats": {},
+            }
+        try:
+            tracked = await _memory_observer.get_all_tracked()
+            if tracked is None:
+                tracked = []
+            stats = _memory_observer.get_stats() or {}
+        except Exception as e:
+            logger.warning("memory/processes failed: %s", e)
+            return {
+                "status": "error",
+                "enabled": True,
+                "processes": [],
+                "count": 0,
+                "mode": getattr(_memory_observer, "_mode", "unknown"),
+                "stats": {},
+                "error": str(e),
+            }
         return {
             "status": "ok",
-            "mode": mo._mode,
+            "enabled": True,
+            "mode": getattr(_memory_observer, "_mode", "unknown"),
             "processes": tracked,
-            "stats": mo.get_stats(),
+            "count": len(tracked),
+            "stats": stats,
         }
 
     @app.get("/memory/process/{pid}")

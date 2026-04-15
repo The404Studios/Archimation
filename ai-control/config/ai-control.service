@@ -1,5 +1,6 @@
 [Unit]
 Description=AI Control Daemon - Full System Control
+Documentation=https://github.com/ai-arch-linux/ai-control-daemon
 # Start after basic networking is available. Do NOT use network-online.target
 # because it can hang indefinitely if NetworkManager hasn't established a
 # connection (common in QEMU/first-boot). The daemon doesn't need full
@@ -7,6 +8,16 @@ Description=AI Control Daemon - Full System Control
 After=network.target
 # Start after systemd basic targets are up
 After=local-fs.target
+# ai-hw-detect drops /run/ai-arch-hw-profile which main.py reads at startup
+# to learn whether it's on OLD (P4) or NEW hardware.  Wants= not Requires=
+# so a hw-detect failure doesn't block the daemon (it falls back to DEFAULT).
+After=ai-hw-detect.service
+Wants=ai-hw-detect.service
+# StartLimit* live in [Unit] as of systemd 230.  Older placement in
+# [Service] still works but triggers a deprecation warning in
+# systemd-analyze verify.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 # Type=notify: the daemon calls sd_notify(0, "READY=1") AFTER uvicorn has
@@ -37,13 +48,24 @@ LogsDirectory=ai-control-daemon
 # Restart policy — restart on failure, but also on abnormal exit/watchdog
 Restart=on-failure
 RestartSec=3
-StartLimitIntervalSec=60
-StartLimitBurst=5
+# NOTE: StartLimitIntervalSec / StartLimitBurst moved to [Unit] above.
 # Bumped from 30s → 90s to accommodate the cold-start path:
 # Python module imports, FastAPI app construction, cortex/pattern-scanner
 # lazy init, uvloop import, and uvicorn socket bind. On TCG-emulated QEMU
 # this is consistently ~30-45s; 90s gives headroom for 1GB Pentium 4.
 TimeoutStartSec=90
+# Bounded shutdown.  main.py's signal handlers close uvicorn gracefully
+# within ~10s (see asyncio.gather timeout in main._shutdown).  Give ourselves
+# 15s before systemd escalates to SIGKILL so in-flight audit writes flush.
+TimeoutStopSec=15
+# Kill main process first; allow children to receive SIGTERM individually.
+# mixed avoids the "cgroup-wide SIGKILL" path which can truncate logs.
+KillMode=mixed
+KillSignal=SIGTERM
+# TODO: enable WatchdogSec=60 after main.py starts pinging WATCHDOG=1
+# periodically from the asyncio event loop.  _notify_systemd() in main.py
+# already supports arbitrary state strings — only needs a periodic task.
+# WatchdogSec=60
 # No restrictions - AI has full access
 ProtectSystem=false
 ProtectHome=false

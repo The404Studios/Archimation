@@ -1,6 +1,7 @@
 obj-m := trust.o
 trust-objs := trust_core.o trust_tlb.o trust_risc.o trust_fbc.o trust_dna_gate.o \
               trust_ape.o trust_chromosome.o trust_token.o trust_lifecycle.o \
-              trust_dispatch.o trust_memory.o trust_syscall.o \
-              trust_vector.o trust_fused.o trust_stats.o
+              trust_dispatch.o trust_dispatch_tables.o trust_memory.o \
+              trust_syscall.o trust_vector.o trust_fused.o trust_stats.o \
+              trust_subject_pool.o
 ccflags-y := -I$(src)/../include -I$(src)/include

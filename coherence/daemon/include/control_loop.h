@@ -60,16 +60,25 @@ typedef struct {
 	uint32_t           m_head;        /* next write slot */
 	uint32_t           m_filled;      /* saturates at COH_M_RING_DEPTH */
 
-	/* Latest derived snapshot + last *valid* derived snapshot. If the
-	 * current one is stale, we plan against the last valid one. */
-	coh_derived_t      d_current;
-	coh_derived_t      d_last_valid;
-	bool               d_have_last_valid;
+	/* Latest derived snapshot + last *FRESH* derived snapshot. If the
+	 * current one is not FRESH (STALE / DEGRADED / UNINIT), we plan
+	 * against the last-FRESH snapshot instead. The legacy
+	 * d_have_last_valid bool has been REPLACED by d_state (R34 typestate):
+	 *   d_state == UNINIT   ⇒ no prior FRESH, fall through to noop
+	 *   d_state == FRESH    ⇒ d_current is authoritative
+	 *   d_state == STALE    ⇒ plan against d_last_fresh
+	 *   d_state == DEGRADED ⇒ plan against d_last_fresh; log confidence loss
+	 */
+	coh_derived_t       d_current;
+	coh_derived_t       d_last_fresh;      /* last snapshot while FRESH */
+	coh_derived_state_t d_state;           /* current typestate */
 
-	/* A(t-1) and A(t): committed vs. planned. */
+	/* A(t-1) and A(t): committed vs. planned. The legacy
+	 * a_committed_valid bool has been REPLACED by a_state (R34 typestate),
+	 * queried via actuation_last_commit_state() after each commit. */
 	coh_actuation_t    a_committed;
 	coh_actuation_t    a_next;
-	bool               a_committed_valid;
+	coh_act_state_t    a_state;            /* last-commit typestate */
 
 	/* Per-frame gate flags — reset at frame boundary. */
 	bool               phase_measurement_done_for_window;
@@ -107,6 +116,22 @@ void coh_loop_request_reload(coh_loop_ctx_t *ctx);
 /* Emit one JSON status line per frame to stderr. Called internally at
  * every 500 ms frame boundary AFTER actuation. Exposed for testing. */
 void coh_loop_emit_frame_json(const coh_loop_ctx_t *ctx);
+
+/*
+ * R34 typestate transition helpers for the control loop. These are
+ * thin wrappers over coh_{derived,act}_transition_legal() that log the
+ * illegal edge and otherwise apply the transition. Used by the loop to
+ * track ctx->d_state and ctx->a_state without every call site needing
+ * to open-code the log format.
+ *
+ * Returns true on success, false if the transition was rejected.
+ */
+bool coh_loop_derived_transition(coh_loop_ctx_t *ctx,
+                                 coh_derived_state_t to,
+                                 uint64_t now_ms);
+bool coh_loop_act_transition(coh_loop_ctx_t *ctx,
+                             coh_act_state_t to,
+                             uint64_t now_ms);
 
 /* ---- Integration points filled by Agents 4/5/6 ----
  *

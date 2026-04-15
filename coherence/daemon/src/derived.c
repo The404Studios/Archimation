@@ -61,6 +61,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "coherence_types.h"
@@ -84,9 +85,67 @@ void coh_ema_reset(ema_state_t *s);
 
 /* ===== Module-static state ===== */
 
-static ema_state_t   g_ema;
-static coh_derived_t g_last_valid;   /* cached last fresh D(t) */
-static bool          g_have_last;    /* false until first valid compute */
+static ema_state_t          g_ema;
+static coh_derived_t        g_last_valid;   /* cached last fresh D(t) */
+static bool                 g_have_last;    /* false until first valid compute */
+
+/*
+ * R34 typestate tracker. `coh_derived_t.valid` remains in the struct
+ * for ABI compatibility with the simulator and the state machine
+ * (both of which read d->valid directly). This module-static state
+ * carries the richer 4-state typestate and is queried via
+ * coh_derived_current_state() by the control loop.
+ *
+ * Invariants (enforced below via coh_derived_transition_legal):
+ *   valid == true  ⇔ state == FRESH
+ *   valid == false ⇔ state ∈ {UNINIT, STALE, DEGRADED}
+ *
+ * g_stale_run counts consecutive stale frames since the last FRESH. Once
+ * it reaches COH_DEGRADED_STALE_THRESHOLD, state promotes to DEGRADED.
+ * A fresh sample resets it to 0.
+ */
+#define COH_DEGRADED_STALE_THRESHOLD 3u
+
+static coh_derived_state_t g_derived_state = COH_DERIVED_UNINIT;
+static uint32_t            g_stale_run     = 0;
+
+/* Transition helper: log + apply with legality check. On an illegal
+ * transition we log and ignore (daemon continues in current state).
+ * This is a DIAGNOSTIC path; the table SHOULD make illegal transitions
+ * unreachable when the rules below are written correctly. If we ever
+ * see "derived_illegal_transition" in the journal, there is a rule bug
+ * and it needs a fix. */
+static void coh_derived_apply_transition(coh_derived_state_t to, uint64_t now_ms)
+{
+	if (!coh_derived_transition_legal(g_derived_state, to)) {
+		fprintf(stderr,
+		        "{\"event\":\"derived_illegal_transition\",\"t_ms\":%llu,"
+		        "\"from\":\"%s\",\"to\":\"%s\"}\n",
+		        (unsigned long long)now_ms,
+		        coh_derived_state_str(g_derived_state),
+		        coh_derived_state_str(to));
+		return;
+	}
+	if (g_derived_state == to) {
+		/* Self-loop; table permits. Silent (happens every frame). */
+		return;
+	}
+	fprintf(stderr,
+	        "{\"event\":\"derived_transition\",\"t_ms\":%llu,"
+	        "\"from\":\"%s\",\"to\":\"%s\",\"stale_run\":%u}\n",
+	        (unsigned long long)now_ms,
+	        coh_derived_state_str(g_derived_state),
+	        coh_derived_state_str(to),
+	        g_stale_run);
+	g_derived_state = to;
+}
+
+/* Public accessor. Safe to call from any thread — single atomic enum
+ * read, torn-read-safe (aligned int). */
+coh_derived_state_t coh_derived_current_state(void)
+{
+	return g_derived_state;
+}
 
 /* ===== Clamp/bounds helpers (branchless, no libm) ===== */
 
@@ -117,7 +176,9 @@ int derived_init(void)
 {
 	coh_ema_reset(&g_ema);
 	memset(&g_last_valid, 0, sizeof(g_last_valid));
-	g_have_last = false;
+	g_have_last     = false;
+	g_derived_state = COH_DERIVED_UNINIT;
+	g_stale_run     = 0;
 	return 0;
 }
 
@@ -125,7 +186,9 @@ void derived_shutdown(void)
 {
 	coh_ema_reset(&g_ema);
 	memset(&g_last_valid, 0, sizeof(g_last_valid));
-	g_have_last = false;
+	g_have_last     = false;
+	g_derived_state = COH_DERIVED_UNINIT;
+	g_stale_run     = 0;
 }
 
 void derived_compute(coh_derived_t *out,
@@ -133,7 +196,8 @@ void derived_compute(coh_derived_t *out,
                      uint64_t now_ms)
 {
 	if (!out || !m_lagged) {
-		/* Defensive: never crash on NULL even though contract says non-NULL. */
+		/* Defensive: never crash on NULL even though contract says non-NULL.
+		 * No state transition — we have no information to act on. */
 		if (out) {
 			memset(out, 0, sizeof(*out));
 			out->t_ms = now_ms;
@@ -161,6 +225,32 @@ void derived_compute(coh_derived_t *out,
 			out->source_m_t_ms = m_lagged->t_ms;
 			out->valid         = false;
 		}
+
+		/* ===== Typestate transition on stale input =====
+		 *   UNINIT   → UNINIT      still no first fresh sample seen
+		 *   FRESH    → STALE       aged out
+		 *   STALE    → STALE       continuing to age (bump run counter)
+		 *   STALE    → DEGRADED    after COH_DEGRADED_STALE_THRESHOLD
+		 *                          consecutive stale frames, confidence
+		 *                          has collapsed
+		 *   DEGRADED → DEGRADED    continued degradation
+		 *
+		 * Note UNINIT → STALE is forbidden by the table; on cold start
+		 * with no prior fresh sample we remain in UNINIT. */
+		if (g_derived_state == COH_DERIVED_UNINIT) {
+			/* no transition — cold start */
+			return;
+		}
+		g_stale_run++;
+		if (g_derived_state == COH_DERIVED_FRESH) {
+			coh_derived_apply_transition(COH_DERIVED_STALE, now_ms);
+		} else if (g_derived_state == COH_DERIVED_STALE) {
+			if (g_stale_run >= COH_DEGRADED_STALE_THRESHOLD) {
+				coh_derived_apply_transition(COH_DERIVED_DEGRADED, now_ms);
+			}
+			/* else: STALE self-loop, silent */
+		}
+		/* DEGRADED: stays DEGRADED until a fresh sample arrives. */
 		return;
 	}
 
@@ -247,6 +337,17 @@ void derived_compute(coh_derived_t *out,
 	/* Cache as last valid snapshot for the next stale-M guard. */
 	g_last_valid = *out;
 	g_have_last  = true;
+
+	/* ===== Typestate transition on fresh input =====
+	 *   UNINIT   → FRESH     first fresh sample after init
+	 *   FRESH    → FRESH     continuing fresh (self-loop, silent)
+	 *   STALE    → FRESH     recovered
+	 *   DEGRADED → FRESH     clean recovery from soft-floor
+	 *
+	 * Reset the consecutive-stale run counter unconditionally — any
+	 * fresh sample clears the confidence-loss countdown. */
+	g_stale_run = 0;
+	coh_derived_apply_transition(COH_DERIVED_FRESH, now_ms);
 }
 
 void derived_get_ema_state(double out_ema[8])

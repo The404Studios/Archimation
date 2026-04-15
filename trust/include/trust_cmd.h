@@ -597,6 +597,114 @@ _Static_assert(META_OP_TRC_STATE      <= 0xF,                    "META opcode ex
 _Static_assert(TRUST_CMD_MAX_OPCODES == 8, "opcode count invariant");
 
 /* ========================================================================
+ * Trust-ISA execution contexts (Session 34, Round 34 discipline R34)
+ *
+ * Each opcode is annotated with a `context_mask` in trust_opcode_meta[]
+ * (kernel-side, trust_dispatch_tables.c).  At dispatch time the kernel
+ * computes the current execution context bit (exactly one of the bits
+ * below is set in the returned value) and rejects the instruction with
+ * -EPERM if the bit is not present in the opcode's mask.
+ *
+ * Bits are stable; they are an ABI-visible contract between the kernel
+ * dispatcher and the userspace diagnostic consumer of
+ * /sys/kernel/trust/opcodes.  Do NOT renumber.  Unused bits (8..31) are
+ * reserved; set them in a mask to request permissive behavior on future
+ * kernels.  Default mask is TRUST_CTX_ALL (~0u) which preserves the
+ * pre-Session-34 "always dispatch" behavior.
+ * ======================================================================== */
+
+#define TRUST_CTX_BOOT           (1u << 0)   /* during trust module init */
+#define TRUST_CTX_NORMAL         (1u << 1)   /* ordinary runtime */
+#define TRUST_CTX_DEGRADED       (1u << 2)   /* coherence state DEGRADED */
+#define TRUST_CTX_THERMAL        (1u << 3)   /* coherence THERMAL_CONSTRAINED */
+#define TRUST_CTX_LATENCY        (1u << 4)   /* coherence LATENCY_CRITICAL */
+#define TRUST_CTX_RECLAIM        (1u << 5)   /* memory reclaim hot path */
+#define TRUST_CTX_INTERRUPT      (1u << 6)   /* softirq / hardirq */
+#define TRUST_CTX_BATCH          (1u << 7)   /* inside a VEC batch submit */
+/* Bits 8..31 reserved for future contexts.  Treat as "always set" in
+ * TRUST_CTX_ALL so extending the enumeration does not silently forbid
+ * existing ops. */
+
+#define TRUST_CTX_ALL            0xFFFFFFFFu
+#define TRUST_CTX_ANY_LIVE       (TRUST_CTX_NORMAL | TRUST_CTX_DEGRADED | \
+                                  TRUST_CTX_THERMAL | TRUST_CTX_LATENCY)
+
+/* Explicit bit-position asserts.  Session 33 Agent 1 style: prefer
+ * explicit over clever.  Every bit is locked to its wire value so that
+ * sysfs readers and kernel-level consumers never drift. */
+_Static_assert(TRUST_CTX_BOOT      == 0x01u, "CTX BOOT bit");
+_Static_assert(TRUST_CTX_NORMAL    == 0x02u, "CTX NORMAL bit");
+_Static_assert(TRUST_CTX_DEGRADED  == 0x04u, "CTX DEGRADED bit");
+_Static_assert(TRUST_CTX_THERMAL   == 0x08u, "CTX THERMAL bit");
+_Static_assert(TRUST_CTX_LATENCY   == 0x10u, "CTX LATENCY bit");
+_Static_assert(TRUST_CTX_RECLAIM   == 0x20u, "CTX RECLAIM bit");
+_Static_assert(TRUST_CTX_INTERRUPT == 0x40u, "CTX INTERRUPT bit");
+_Static_assert(TRUST_CTX_BATCH     == 0x80u, "CTX BATCH bit");
+
+/* Distinctness matrix (8 bits, 28 pairs). */
+_Static_assert((TRUST_CTX_BOOT      & TRUST_CTX_NORMAL)    == 0, "CTX collide BOOT/NORMAL");
+_Static_assert((TRUST_CTX_BOOT      & TRUST_CTX_DEGRADED)  == 0, "CTX collide BOOT/DEGRADED");
+_Static_assert((TRUST_CTX_BOOT      & TRUST_CTX_THERMAL)   == 0, "CTX collide BOOT/THERMAL");
+_Static_assert((TRUST_CTX_BOOT      & TRUST_CTX_LATENCY)   == 0, "CTX collide BOOT/LATENCY");
+_Static_assert((TRUST_CTX_BOOT      & TRUST_CTX_RECLAIM)   == 0, "CTX collide BOOT/RECLAIM");
+_Static_assert((TRUST_CTX_BOOT      & TRUST_CTX_INTERRUPT) == 0, "CTX collide BOOT/INTERRUPT");
+_Static_assert((TRUST_CTX_BOOT      & TRUST_CTX_BATCH)     == 0, "CTX collide BOOT/BATCH");
+_Static_assert((TRUST_CTX_NORMAL    & TRUST_CTX_DEGRADED)  == 0, "CTX collide NORMAL/DEGRADED");
+_Static_assert((TRUST_CTX_NORMAL    & TRUST_CTX_THERMAL)   == 0, "CTX collide NORMAL/THERMAL");
+_Static_assert((TRUST_CTX_NORMAL    & TRUST_CTX_LATENCY)   == 0, "CTX collide NORMAL/LATENCY");
+_Static_assert((TRUST_CTX_NORMAL    & TRUST_CTX_RECLAIM)   == 0, "CTX collide NORMAL/RECLAIM");
+_Static_assert((TRUST_CTX_NORMAL    & TRUST_CTX_INTERRUPT) == 0, "CTX collide NORMAL/INTERRUPT");
+_Static_assert((TRUST_CTX_NORMAL    & TRUST_CTX_BATCH)     == 0, "CTX collide NORMAL/BATCH");
+_Static_assert((TRUST_CTX_DEGRADED  & TRUST_CTX_THERMAL)   == 0, "CTX collide DEGRADED/THERMAL");
+_Static_assert((TRUST_CTX_DEGRADED  & TRUST_CTX_LATENCY)   == 0, "CTX collide DEGRADED/LATENCY");
+_Static_assert((TRUST_CTX_DEGRADED  & TRUST_CTX_RECLAIM)   == 0, "CTX collide DEGRADED/RECLAIM");
+_Static_assert((TRUST_CTX_DEGRADED  & TRUST_CTX_INTERRUPT) == 0, "CTX collide DEGRADED/INTERRUPT");
+_Static_assert((TRUST_CTX_DEGRADED  & TRUST_CTX_BATCH)     == 0, "CTX collide DEGRADED/BATCH");
+_Static_assert((TRUST_CTX_THERMAL   & TRUST_CTX_LATENCY)   == 0, "CTX collide THERMAL/LATENCY");
+_Static_assert((TRUST_CTX_THERMAL   & TRUST_CTX_RECLAIM)   == 0, "CTX collide THERMAL/RECLAIM");
+_Static_assert((TRUST_CTX_THERMAL   & TRUST_CTX_INTERRUPT) == 0, "CTX collide THERMAL/INTERRUPT");
+_Static_assert((TRUST_CTX_THERMAL   & TRUST_CTX_BATCH)     == 0, "CTX collide THERMAL/BATCH");
+_Static_assert((TRUST_CTX_LATENCY   & TRUST_CTX_RECLAIM)   == 0, "CTX collide LATENCY/RECLAIM");
+_Static_assert((TRUST_CTX_LATENCY   & TRUST_CTX_INTERRUPT) == 0, "CTX collide LATENCY/INTERRUPT");
+_Static_assert((TRUST_CTX_LATENCY   & TRUST_CTX_BATCH)     == 0, "CTX collide LATENCY/BATCH");
+_Static_assert((TRUST_CTX_RECLAIM   & TRUST_CTX_INTERRUPT) == 0, "CTX collide RECLAIM/INTERRUPT");
+_Static_assert((TRUST_CTX_RECLAIM   & TRUST_CTX_BATCH)     == 0, "CTX collide RECLAIM/BATCH");
+_Static_assert((TRUST_CTX_INTERRUPT & TRUST_CTX_BATCH)     == 0, "CTX collide INTERRUPT/BATCH");
+
+/* Composite sanity. */
+_Static_assert(TRUST_CTX_ALL == 0xFFFFFFFFu, "CTX_ALL value");
+_Static_assert((TRUST_CTX_ANY_LIVE & TRUST_CTX_NORMAL)   != 0, "ANY_LIVE includes NORMAL");
+_Static_assert((TRUST_CTX_ANY_LIVE & TRUST_CTX_DEGRADED) != 0, "ANY_LIVE includes DEGRADED");
+_Static_assert((TRUST_CTX_ANY_LIVE & TRUST_CTX_THERMAL)  != 0, "ANY_LIVE includes THERMAL");
+_Static_assert((TRUST_CTX_ANY_LIVE & TRUST_CTX_LATENCY)  != 0, "ANY_LIVE includes LATENCY");
+_Static_assert((TRUST_CTX_ANY_LIVE & TRUST_CTX_BOOT)     == 0, "ANY_LIVE excludes BOOT");
+_Static_assert((TRUST_CTX_ANY_LIVE & TRUST_CTX_INTERRUPT)== 0, "ANY_LIVE excludes INTERRUPT");
+
+/* ========================================================================
+ * Opcode metadata table entry (Session 34, R34)
+ *
+ * A parallel, read-only table that annotates every (family, opcode) pair
+ * with a human-readable name and a context mask.  The table lives in
+ * trust_dispatch_tables.c and is walked by /sys/kernel/trust/opcodes and
+ * by trust_opcode_context_ok() during dispatch.
+ *
+ * Additive: if a (family, opcode) is NOT present in the table, the
+ * context check is treated as permissive (return true).  Unknown opcodes
+ * are rejected via the existing -ENOSYS path in trust_cmd_submit().
+ * ======================================================================== */
+
+typedef struct {
+	uint16_t family;        /* TRUST_FAMILY_* */
+	uint16_t opcode;        /* per-family opcode (0..15) */
+	uint32_t context_mask;  /* TRUST_CTX_* OR-combination; TRUST_CTX_ALL = permissive */
+	const char *name;       /* "FAMILY.OPCODE" for diagnostic sysfs */
+} trust_opcode_meta_t;
+
+_Static_assert(sizeof(trust_opcode_meta_t) ==
+	       sizeof(uint16_t) + sizeof(uint16_t) + sizeof(uint32_t) + sizeof(const char *),
+	       "trust_opcode_meta_t layout");
+
+/* ========================================================================
  * Command entry (in-buffer representation)
  *
  * Each command is a 32-bit instruction word followed by 0-15 operands.

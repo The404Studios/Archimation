@@ -91,6 +91,66 @@ const char *coh_sm_state_name(coh_state_t s)
 	}
 }
 
+/* ===== R34 typestate stringifiers =====
+ *
+ * These are the RUNTIME SIDE of the declarations in coherence_types.h.
+ * Discipline rules (non-negotiable):
+ *   - Every named state has an explicit case.
+ *   - Unknown / out-of-range inputs return the literal "INVALID".
+ *   - Returned string is statically allocated; caller never frees.
+ *   - _Static_assert below wires the switch coverage to the enum
+ *     cardinality so adding an enum member without extending the
+ *     stringifier fails the build.
+ *
+ * NOTE on the _Static_assert strategy: C11 does not give us a way to
+ * assert switch-case coverage directly. We instead assert the total
+ * STATE_COUNT so that the next developer who bumps the enum is forced
+ * into this file via the build break on the updated count value. See
+ * the sibling tests/test_typestate.c which exercises every value at
+ * runtime.
+ */
+
+const char *coh_derived_state_str(coh_derived_state_t s)
+{
+	switch (s) {
+	case COH_DERIVED_UNINIT:      return "UNINIT";
+	case COH_DERIVED_FRESH:       return "FRESH";
+	case COH_DERIVED_STALE:       return "STALE";
+	case COH_DERIVED_DEGRADED:    return "DEGRADED";
+	case COH_DERIVED_STATE_COUNT: /* fallthrough — not a real state */
+	default:                      return "INVALID";
+	}
+}
+
+const char *coh_act_state_str(coh_act_state_t s)
+{
+	switch (s) {
+	case COH_ACT_UNINIT:       return "UNINIT";
+	case COH_ACT_PLANNED:      return "PLANNED";
+	case COH_ACT_RATE_LIMITED: return "RATE_LIMITED";
+	case COH_ACT_BARRIERED:    return "BARRIERED";
+	case COH_ACT_COMMITTED:    return "COMMITTED";
+	case COH_ACT_FAILED:       return "FAILED";
+	case COH_ACT_STATE_COUNT:  /* fallthrough */
+	default:                   return "INVALID";
+	}
+}
+
+/* coh_posture_state_str() is owned by Agent 2 (src/posture.c). We
+ * deliberately do NOT define it here to avoid a multiple-definition
+ * link error. The prototype is in coherence_types.h and is resolved
+ * at link time by Agent 2's translation unit. */
+
+/* Compile-time anchor: if a new enum member appears without being added
+ * to the switch above, this assert will not fire on its own — but the
+ * next developer should be forced to update the expected count here
+ * and land in this file. Matching counts are the cheapest tripwire we
+ * can build without reflection. */
+_Static_assert(COH_DERIVED_STATE_COUNT == 4,
+               "derived stringifier must cover exactly 4 named states");
+_Static_assert(COH_ACT_STATE_COUNT == 6,
+               "actuation stringifier must cover exactly 6 named states");
+
 bool coh_sm_evaluate(coh_arbiter_t *arb,
                      coh_sm_scratch_t *scratch,
                      const coh_derived_t *d,

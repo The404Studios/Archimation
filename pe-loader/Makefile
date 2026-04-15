@@ -58,6 +58,7 @@ LOADER_SRCS = loader/main.c \
               loader/pe_patch.c \
               loader/pe_patch_crt.c \
               loader/pe_patch_cache.c \
+              loader/pe_patch_pool.c \
               loader/sigill_trampoline.c \
               dlls/common/wchar_util.c \
               loader/abi_thunk.S
@@ -608,6 +609,23 @@ tests: loader dlls
 		echo "  (no test script found - skipping)"; \
 	fi
 
+# --- Benchmarks ---
+# bench-patch-pool: measures pe_patch_pool hit cost vs fresh-rescan cost.
+# R34 rule: a concept without a benchmark does not survive.  The benchmark
+# binary returns non-zero if the pool is not at least 3x faster than the
+# fresh-rescan simulation on the generated trace.
+.PHONY: bench-patch-pool
+BENCH_PP_SRCS = tests/bench_patch_pool.c loader/pe_patch_pool.c
+BENCH_PP_BIN  = tests/bench_patch_pool
+
+$(BENCH_PP_BIN): $(BENCH_PP_SRCS)
+	$(CC) $(CFLAGS) -I$(CURDIR)/include -I$(CURDIR)/loader \
+	    -o $@ $(BENCH_PP_SRCS) -lpthread -lrt
+
+bench-patch-pool: $(BENCH_PP_BIN)
+	@echo "== pe_patch_pool microbenchmark =="
+	@$(BENCH_PP_BIN)
+
 # --- Tools ---
 tools:
 	$(CC) $(CFLAGS) -o tools/pe_dump tools/pe_dump.c $(LDFLAGS)
@@ -654,6 +672,7 @@ clean:
 	rm -f graphics/*.o graphics/*.d
 	rm -f registry/*.o registry/*.d
 	rm -f tools/pe_dump tools/*.o tools/*.d
+	rm -f tests/bench_patch_pool
 	rm -f kernel/*.o kernel/*.ko kernel/*.mod* kernel/.*.cmd
 	rm -rf kernel/.tmp_versions kernel/Module.symvers kernel/modules.order
 # NOTE: perfect-hash headers (pe_import_*_ph.h) are NOT removed by clean --

@@ -201,13 +201,98 @@ static inline bool coh_a_equal(const coh_actuation_t *a, const coh_actuation_t *
     for (int i = 0; i < a->irq_count; i++) {
         if (a->irq_list[i] != b->irq_list[i]) return false;
     }
-    /* String masks compared via memcmp (NUL-terminated, fixed buffer) */
-    extern int memcmp(const void *, const void *, unsigned long);
+    /* String masks compared via memcmp (NUL-terminated, fixed buffer).
+     * memcmp declaration comes via <string.h> included at top of header. */
     if (memcmp(a->game_cpuset, b->game_cpuset, COH_CPUMASK_STRLEN)) return false;
     if (memcmp(a->system_cpuset, b->system_cpuset, COH_CPUMASK_STRLEN)) return false;
     if (memcmp(a->irq_affinity, b->irq_affinity, sizeof(a->irq_affinity))) return false;
     return true;
 }
+
+/* ===== R34 typestate contract =====
+ *
+ * Typestate pattern: the state IS the permission. Instead of a bool
+ * validity flag plus a separate "is this committable?" check, the
+ * structure carries an enum that encodes what it is AND what it may do.
+ * Every new state enum MUST:
+ *   (1) use 0 as the UNINIT (invalid / uninitialized) variant
+ *   (2) publish a total transition table as `static const` (see *_TRANSITIONS)
+ *   (3) ship a debug stringifier coh_*_str()
+ *   (4) use EXPLICIT integer values for ABI stability
+ * If a transition is not in the table, it is forbidden. No "default fallback".
+ */
+
+/* Derived signal state. Replaces the earlier `bool valid` on coh_derived_t.
+ * FRESH = M source was in validity window; EMAs advanced.
+ * STALE = M source outside validity window; EMAs frozen; cached snapshot.
+ * DEGRADED = multiple stale frames in a row; confidence below threshold.
+ */
+typedef enum {
+    COH_DERIVED_UNINIT   = 0,
+    COH_DERIVED_FRESH    = 1,
+    COH_DERIVED_STALE    = 2,
+    COH_DERIVED_DEGRADED = 3,
+    COH_DERIVED_STATE_COUNT = 4
+} coh_derived_state_t;
+
+/* Actuation commit pipeline. Replaces ad-hoc flag checks in actuation.c.
+ * PLANNED      = arbiter filled in fields; not yet validated.
+ * RATE_LIMITED = at least one actuator missed its τ window; queued for retry.
+ * BARRIERED    = equal to last committed A; idempotent skip recorded.
+ * COMMITTED    = writes succeeded; g_last_committed updated.
+ * FAILED       = at least one write returned < 0; g_last_committed unchanged.
+ */
+typedef enum {
+    COH_ACT_UNINIT       = 0,
+    COH_ACT_PLANNED      = 1,
+    COH_ACT_RATE_LIMITED = 2,
+    COH_ACT_BARRIERED    = 3,
+    COH_ACT_COMMITTED    = 4,
+    COH_ACT_FAILED       = 5,
+    COH_ACT_STATE_COUNT  = 6
+} coh_act_state_t;
+
+/* Posture: an atomically validated composite actuator. Replaces the
+ * pattern where cpuset/IRQ/SQPOLL/EPP were validated independently and
+ * could be committed in inconsistent combinations.
+ *
+ * UNVALIDATED = fields filled in, invariants not yet checked.
+ * VALIDATED   = cross-field invariants hold (e.g., SQPOLL cpu ∉ game cpuset).
+ * COMMITTED   = atomically written to the kernel at frame edge.
+ */
+typedef enum {
+    COH_POSTURE_UNINIT      = 0,
+    COH_POSTURE_UNVALIDATED = 1,
+    COH_POSTURE_VALIDATED   = 2,
+    COH_POSTURE_COMMITTED   = 3,
+    COH_POSTURE_STATE_COUNT = 4
+} coh_posture_state_t;
+
+/* Composite posture struct. Atomic unit of actuator configuration.
+ * All fields must agree; validation is all-or-nothing. */
+typedef struct {
+    coh_posture_state_t state;
+    char     game_cpuset[COH_CPUMASK_STRLEN];
+    char     system_cpuset[COH_CPUMASK_STRLEN];
+    int      sqpoll_cpu;              /* MUST NOT overlap game_cpuset when validated */
+    coh_epp_t epp;
+    int       min_perf_pct;
+    int       numa_node;              /* -1 for no NUMA preference */
+    uint64_t  validated_at_ms;        /* 0 if state < VALIDATED */
+} coh_posture_t;
+
+/* Stringifier prototypes. Implementations live in state_machine.c (Agent 1)
+ * and posture.c (Agent 2). Never NULL; unknown inputs return "INVALID". */
+const char *coh_derived_state_str(coh_derived_state_t s);
+const char *coh_act_state_str(coh_act_state_t s);
+const char *coh_posture_state_str(coh_posture_state_t s);
+
+/* Transition legality helpers. Total-function: returns false for any
+ * transition not in the published table. Callers must branch on the
+ * return value; there is no "try anyway" path. */
+bool coh_derived_transition_legal(coh_derived_state_t from, coh_derived_state_t to);
+bool coh_act_transition_legal(coh_act_state_t from, coh_act_state_t to);
+bool coh_posture_transition_legal(coh_posture_state_t from, coh_posture_state_t to);
 
 /* ===== Compile-time invariants ===== */
 _Static_assert(COH_VALIDITY_WINDOW_MS == 2 * COH_CONTROL_FRAME_MS,
@@ -220,5 +305,8 @@ _Static_assert(COH_DECISION_FRAME_MS > COH_CONTROL_FRAME_MS,
                "decision frame must strictly follow control frame");
 _Static_assert(COH_DERIVATION_LAG_K >= 2,
                "derivation lag k must be >= 2 to prevent instantaneous loops");
+_Static_assert(COH_DERIVED_UNINIT == 0, "UNINIT must be zero variant");
+_Static_assert(COH_ACT_UNINIT == 0, "UNINIT must be zero variant");
+_Static_assert(COH_POSTURE_UNINIT == 0, "UNINIT must be zero variant");
 
 #endif /* COHERENCE_TYPES_H */

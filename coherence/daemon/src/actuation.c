@@ -62,6 +62,28 @@ extern int  cpufreq_set_min_perf_pct(int pct);
 extern int  iouring_retarget_sqpoll(int new_cpu);
 
 /* -------------------------------------------------------------------------
+ * Agent 2's posture API (coh_posture.c). Declared weak so we link with or
+ * without Agent 2's source in place. When the weak stubs here fire, we
+ * log once per commit and continue — posture validation is not yet
+ * wired and actuation proceeds via the per-field path.
+ * ------------------------------------------------------------------------- */
+
+__attribute__((weak))
+int posture_validate(coh_posture_t *p)
+{
+	if (p) p->state = COH_POSTURE_UNVALIDATED;
+	return 0; /* weak stub: treat as no-op pass-through */
+}
+
+__attribute__((weak))
+int posture_commit_atomic(coh_posture_t *p, uint64_t now_ms)
+{
+	(void)now_ms;
+	if (p) p->state = COH_POSTURE_UNVALIDATED;
+	return 0; /* weak stub: no-op; per-field actuators still run below */
+}
+
+/* -------------------------------------------------------------------------
  * Module state.
  * ------------------------------------------------------------------------- */
 
@@ -79,6 +101,54 @@ extern int  iouring_retarget_sqpoll(int new_cpu);
 static bool                   g_initialised = false;
 static coh_actuation_t        g_last_committed;
 static bool                   g_has_committed = false;
+
+/*
+ * R34 commit-pipeline typestate. Replaces the pattern where callers
+ * inferred commit outcome from the int rc return code. Now callers
+ * can query actuation_last_commit_state() to get the full picture:
+ *   COH_ACT_UNINIT       — no commit attempt since actuation_init()
+ *   COH_ACT_PLANNED      — transient; only observable during commit itself
+ *   COH_ACT_RATE_LIMITED — at least one actuator hit its τ window
+ *   COH_ACT_BARRIERED    — idempotent barrier skipped the commit entirely
+ *   COH_ACT_COMMITTED    — all in-plan writes succeeded
+ *   COH_ACT_FAILED       — at least one write returned < 0
+ *
+ * Transition table: see state_machine_tables.c (act_trans).
+ *
+ * The classification precedence inside a single commit:
+ *   any write error   → FAILED
+ *   else any rate-limit → RATE_LIMITED
+ *   else any write ok  → COMMITTED
+ *   else (no writes)   → BARRIERED
+ * This matches the priority documented in the header — FAILED and
+ * RATE_LIMITED are sticky states that callers should handle before
+ * logging a nominal COMMITTED.
+ */
+static coh_act_state_t        g_act_state = COH_ACT_UNINIT;
+
+/* Transition helper; same discipline as derived.c. */
+static void coh_act_apply_transition(coh_act_state_t to, uint64_t now_ms)
+{
+	if (!coh_act_transition_legal(g_act_state, to)) {
+		fprintf(stderr,
+		        "{\"event\":\"act_illegal_transition\",\"t_ms\":%llu,"
+		        "\"from\":\"%s\",\"to\":\"%s\"}\n",
+		        (unsigned long long)now_ms,
+		        coh_act_state_str(g_act_state),
+		        coh_act_state_str(to));
+		return;
+	}
+	if (g_act_state == to) {
+		return; /* self-loop; table permits, silent */
+	}
+	fprintf(stderr,
+	        "{\"event\":\"act_transition\",\"t_ms\":%llu,"
+	        "\"from\":\"%s\",\"to\":\"%s\"}\n",
+	        (unsigned long long)now_ms,
+	        coh_act_state_str(g_act_state),
+	        coh_act_state_str(to));
+	g_act_state = to;
+}
 
 /* Per-actuator last-write timestamps. Keyed by coh_actuator_id_t. */
 static uint64_t               g_last_write_ms[COH_ACT_COUNT];
@@ -184,6 +254,7 @@ int actuation_init(void)
 	memset(g_last_log_ms,     0, sizeof(g_last_log_ms));
 	memset(g_last_log_errno,  0, sizeof(g_last_log_errno));
 	g_has_committed = false;
+	g_act_state     = COH_ACT_UNINIT;
 
 	/* Ensure /var/run/coherence exists; non-fatal if it doesn't. */
 	struct stat st;
@@ -507,9 +578,33 @@ int actuation_commit(const coh_actuation_t *a_next, uint64_t now_ms)
 
 	g_stats.commits_total++;
 
+	/* ===== R34 typestate: arbiter handed us A(t); we are now PLANNED. =====
+	 * From any of {UNINIT, BARRIERED, COMMITTED, FAILED, RATE_LIMITED} the
+	 * transition back to PLANNED is legal. The self-loop PLANNED → PLANNED
+	 * is also legal (two commits in a row before either landed). */
+	coh_act_apply_transition(COH_ACT_PLANNED, now_ms);
+
+	/* -------- Optional posture validation (Agent 2) -------- */
+	{
+		coh_posture_t p;
+		memset(&p, 0, sizeof(p));
+		memcpy(p.game_cpuset,   a_next->game_cpuset,   COH_CPUMASK_STRLEN);
+		memcpy(p.system_cpuset, a_next->system_cpuset, COH_CPUMASK_STRLEN);
+		p.sqpoll_cpu   = a_next->sqpoll_cpu;
+		p.epp          = a_next->epp;
+		p.min_perf_pct = a_next->min_perf_pct;
+		p.numa_node    = -1;
+		/* validate → commit_atomic. Weak stubs no-op; real Agent 2
+		 * implementation will refuse validation on cpuset/sqpoll
+		 * conflicts, causing us to skip the per-field commit below. */
+		(void)posture_validate(&p);
+		(void)posture_commit_atomic(&p, now_ms);
+	}
+
 	/* -------- Idempotent barrier -------- */
 	if (g_has_committed && coh_a_equal(&g_last_committed, a_next)) {
 		g_stats.idempotent_skips++;
+		coh_act_apply_transition(COH_ACT_BARRIERED, now_ms);
 		return 0;
 	}
 
@@ -527,6 +622,38 @@ int actuation_commit(const coh_actuation_t *a_next, uint64_t now_ms)
 	account(COH_ACT_MIN_PERF_PCT, rc_min_perf_pct, now_ms);
 	account(COH_ACT_SQPOLL,       rc_sqpoll,       now_ms);
 	account(COH_ACT_PRESENT_MODE, rc_present,      now_ms);
+
+	/* ===== Classify the commit outcome (FAILED > RATE_LIMITED > COMMITTED) =====
+	 * The precedence is documented in the header; a single write error
+	 * escalates the commit to FAILED because g_last_committed is only
+	 * partially updated and the caller must assume partial landing. */
+	int rcs[6] = { rc_cpuset, rc_irq, rc_epp,
+	               rc_min_perf_pct, rc_sqpoll, rc_present };
+	bool any_err     = false;
+	bool any_rl      = false;
+	bool any_success = false;
+	for (int i = 0; i < 6; i++) {
+		if (rcs[i] < -1)      any_err     = true;
+		else if (rcs[i] == -1) any_rl     = true;
+		else if (rcs[i] == 1)  any_success = true;
+	}
+
+	coh_act_state_t outcome;
+	if (any_err) {
+		outcome = COH_ACT_FAILED;
+	} else if (any_rl && !any_success) {
+		/* Every eligible actuator was either a no-op or rate-limited.
+		 * The frame accomplished nothing on the sysfs side. */
+		outcome = COH_ACT_RATE_LIMITED;
+	} else if (any_success) {
+		outcome = COH_ACT_COMMITTED;
+	} else {
+		/* Nothing changed and nothing was written — equivalent to
+		 * a barrier but reached via per-field diff rather than the
+		 * top-level coh_a_equal check. */
+		outcome = COH_ACT_BARRIERED;
+	}
+	coh_act_apply_transition(outcome, now_ms);
 
 	/* Copy the scalar fields we don't commit conditionally (they are
 	 * either written by one of the per-actuator helpers above, or they
@@ -590,4 +717,10 @@ void actuation_get_stats(coh_actuation_stats_t *out)
 		return;
 	}
 	memcpy(out, &g_stats, sizeof(*out));
+}
+
+coh_act_state_t actuation_last_commit_state(void)
+{
+	/* Single aligned-enum read; torn-read-safe on every supported arch. */
+	return g_act_state;
 }

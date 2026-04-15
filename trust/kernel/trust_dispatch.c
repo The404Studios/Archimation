@@ -1655,6 +1655,14 @@ int trust_cmd_submit(const trust_ioc_cmd_submit_t __user *arg)
 	/* Iterate and dispatch commands */
 	offset = TRUST_CMD_HEADER_SIZE;
 
+	/* Session 34 R34: BATCH context entry.  Nested ops (a handler
+	 * that loops back into trust_cmd_submit on the same CPU) will
+	 * see TRUST_CTX_BATCH from trust_current_context() so meta
+	 * table rows gated to TRUST_CTX_BATCH are permitted here and
+	 * ONLY here.  The companion _exit() call sits on both success
+	 * and failure paths below (see goto writeback / atomic_fail). */
+	trust_ctx_batch_enter();
+
 	for (i = 0; i < header.cmd_count; i++) {
 		trust_cmd_entry_t entry;
 		trust_cmd_handler_t handler;
@@ -2017,6 +2025,36 @@ int trust_cmd_submit(const trust_ioc_cmd_submit_t __user *arg)
 			continue;
 		}
 
+		/* Session 34 R34: context-mask gate.
+		 *
+		 * Every opcode in trust_opcode_meta[] carries a bitmap of
+		 * contexts in which it is permitted to run.  The default
+		 * (TRUST_CTX_ALL) preserves pre-R34 behavior; restricted
+		 * masks (e.g. META.DUMP excluded from INTERRUPT) cause
+		 * dispatch to return -EPERM and bump the context-mask
+		 * reject counter.  Unknown (family, opcode) pairs are
+		 * permissive -- the existing -ENOSYS path above and
+		 * below catches those. */
+		{
+			u32 ctx_bit = trust_current_context();
+			if (!trust_opcode_context_ok((u16)family,
+						     (u16)opcode, ctx_bit)) {
+				results[i].status = -EPERM;
+				results[i].value = 0;
+				prev_status = -EPERM;
+				batch_result.commands_executed++;
+				batch_result.commands_failed++;
+				trust_stats_record_context_mask_reject();
+				/* Bump predicate-skip too so downstream
+				 * CONDITIONAL ops see the failure in the
+				 * exact same way they see other skips. */
+				trust_stats_record_predicate_skip();
+				if (header.flags & TRUST_CMD_BUF_ATOMIC)
+					goto atomic_fail;
+				continue;
+			}
+		}
+
 		handler = dispatch_table[family][opcode];
 		if (!handler) {
 			results[i].status = -ENOSYS;
@@ -2067,6 +2105,9 @@ int trust_cmd_submit(const trust_ioc_cmd_submit_t __user *arg)
 		trust_stats_record_dispatch_time(ktime_get_ns() - t_start_ns);
 	}
 
+	/* Session 34 R34: BATCH context exit (success path). */
+	trust_ctx_batch_exit();
+
 	goto writeback;
 
 atomic_fail:
@@ -2078,6 +2119,11 @@ atomic_fail:
 	 */
 	pr_info("trust_cmd: atomic batch failed at cmd %u\n",
 		batch_result.commands_executed - 1);
+	/* Session 34 R34: BATCH context exit (atomic-fail path).  Must
+	 * pair with the enter() above on every return path that exits
+	 * the main loop, otherwise per-CPU BATCH depth leaks and a
+	 * future call on the same CPU would see stale BATCH context. */
+	trust_ctx_batch_exit();
 
 writeback:
 	/* Copy batch result header to userspace */

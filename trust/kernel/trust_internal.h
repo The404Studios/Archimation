@@ -19,6 +19,7 @@
 #include <linux/rcupdate.h>  /* rcu_assign_pointer / rcu_dereference */
 #include <linux/build_bug.h> /* static_assert */
 #include "../include/trust_types.h"
+#include "../include/trust_cmd.h"  /* trust_opcode_meta_t, TRUST_CTX_* */
 
 /* Forward declaration for TMS region tags (full definition in trust_memory.h) */
 enum tms_region_tag;
@@ -394,6 +395,68 @@ void trust_stats_record_predicate_skip(void);
 void trust_stats_record_dispatch_time(u64 ns);
 void trust_stats_record_cmdbuf_in(u32 total_bytes, u32 varlen_bytes);
 
+/* Session 34 R34: context-mask reject counter.
+ *
+ * Bumped from trust_dispatch.c whenever trust_opcode_context_ok()
+ * returns false for the current instruction.  Aggregated on read
+ * into /sys/kernel/trust/stats line `context_mask_rejects=N`. */
+void trust_stats_record_context_mask_reject(void);
+
+/* ======================================================================
+ * Context-mask opcode metadata (Session 34 R34, trust_dispatch_tables.c).
+ *
+ * trust_opcode_meta_lookup() - O(log N) binary search over a table
+ * sorted by (family<<4 | opcode).  Returns NULL for entries we don't
+ * annotate (unknown opcodes); callers treat NULL as "permissive" and
+ * let the existing -ENOSYS path catch true unknowns.
+ *
+ * trust_opcode_context_ok() - inline fast path: lookup + bit test.
+ *
+ * trust_current_context() - returns exactly ONE TRUST_CTX_* bit based on
+ * current kernel state (in_interrupt(), module init flag, coherence hint).
+ *
+ * trust_ctx_mask_str() - stringify a bitmap into buf; writes "NORMAL|
+ * DEGRADED|BATCH" or "*" (for TRUST_CTX_ALL).
+ *
+ * trust_opcode_meta_show_sysfs() - walks the table writing one
+ * `FAMILY.OPCODE ctx=... (0xNN)` line per entry into buf (PAGE_SIZE
+ * limit enforced by caller).
+ *
+ * trust_ctx_set_coherence_hint() - setter used by the coherence daemon
+ * (future; no-op stub for now) to select between NORMAL/DEGRADED/
+ * THERMAL/LATENCY.
+ * ====================================================================== */
+
+const trust_opcode_meta_t *
+trust_opcode_meta_lookup(u16 family, u16 opcode);
+
+static inline bool
+trust_opcode_context_ok(u16 family, u16 opcode, u32 ctx_bit)
+{
+	const trust_opcode_meta_t *m = trust_opcode_meta_lookup(family, opcode);
+	if (!m)
+		return true;  /* additive: unknown entries are permissive */
+	return (m->context_mask & ctx_bit) != 0;
+}
+
+u32  trust_current_context(void);
+void trust_ctx_set_coherence_hint(u32 ctx_bit);
+
+/* Per-CPU BATCH depth accounting: the dispatcher calls
+ * trust_ctx_batch_enter() before its main loop and
+ * trust_ctx_batch_exit() on the way out so nested ops see
+ * TRUST_CTX_BATCH in trust_current_context(). */
+void trust_ctx_batch_enter(void);
+void trust_ctx_batch_exit(void);
+
+size_t trust_ctx_mask_str(u32 mask, char *buf, size_t n);
+ssize_t trust_opcode_meta_show_sysfs(char *buf, size_t buf_size);
+
+/* Table size exposed so trust_stats.c can verify cardinality for its
+ * "expected count" _Static_assert in the table unit. */
+extern const unsigned int trust_opcode_meta_count;
+extern const trust_opcode_meta_t trust_opcode_meta[];
+
 /* ======================================================================
  * ioctl handler for TRUST_IOC_QUERY_CAPS.
  *
@@ -506,6 +569,47 @@ int  trust_immune_evaluate(u32 subject_id);
 int  trust_immune_quarantine(u32 subject_id, u32 reason);
 int  trust_immune_release_quarantine(u32 subject_id);
 void trust_immune_tick(void);
+
+/* --- Subject absent pool (trust_subject_pool.c) ---
+ *
+ * Bounded pool holding RECENTLY-FREED subjects for fast resurrection
+ * within a time + population budget.  NOT a cache, NOT a GC.
+ *
+ * Call trust_subject_pool_put() at the end of a subject's free/apoptosis
+ * path.  Call trust_subject_pool_try_get() at the start of subject
+ * creation; hit resurrects the subject, miss falls back to fresh alloc.
+ *
+ * Stats readable via trust_subject_pool_get_stats() for the
+ * /sys/kernel/trust/subject_pool sysfs node.
+ */
+#define TRUST_SUBJECT_POOL_MAX            64u
+#define TRUST_SUBJECT_POOL_MAX_POINTS     256u
+#define TRUST_SUBJECT_POOL_HALF_LIFE_NS   (5ULL * 1000000000ULL)
+#define TRUST_SUBJECT_POOL_FULL_LIFE_NS   (15ULL * 1000000000ULL)
+#define TRUST_SUBJECT_POOL_POINT_COST     4u
+
+typedef struct {
+    u32 population;
+    u32 max_population;
+    u32 points;
+    u32 max_points;
+    u64 hits;
+    u64 misses;
+    u64 evictions;
+    u64 avg_age_on_hit_ns;
+} trust_subject_pool_stats_t;
+
+void trust_subject_pool_init(void);
+void trust_subject_pool_cleanup(void);
+/* subj is copied in under the pool spinlock; safe to call with a
+ * locally-scoped subject on the stack. */
+void trust_subject_pool_put(const trust_subject_t *subj);
+/* Resurrect a subject whose 32-byte identity digest + type match.
+ * Returns 0 on hit, -ENOENT on miss. */
+int  trust_subject_pool_try_get(const u8 subject_sha[32],
+                                 u32 subject_type,
+                                 trust_subject_t *out);
+void trust_subject_pool_get_stats(trust_subject_pool_stats_t *out);
 
 /* --- Trust Syscall Tracer operations (trust_syscall.c) ---
  *

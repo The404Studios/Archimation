@@ -20,14 +20,28 @@ LIBTRUST_DIR := $(CURDIR)/../lib
 LDFLAGS  += -L$(LIBTRUST_DIR) -Wl,-rpath,$(LIBTRUST_DIR)
 LDLIBS   += -ltrust -lpthread
 
-TESTS := test_dispatch_roundtrip
+TESTS := test_dispatch_roundtrip test_context_mask
+BENCHES := bench_subject_pool
 
-.PHONY: all clean test-dispatch
+.PHONY: all clean test-dispatch test-context-mask bench-subject-pool
 
-all: $(TESTS)
+all: $(TESTS) $(BENCHES)
 
 test_dispatch_roundtrip: test_dispatch_roundtrip.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
+
+test_context_mask: test_context_mask.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
+
+# bench-subject-pool: userland mirror of the trust.ko absent pool.
+# R34 gate -- 1.5x speedup vs fresh-alloc or the concept is ripped out.
+# Built with only libpthread + librt; does NOT require /dev/trust.
+bench_subject_pool: bench_subject_pool.c
+	$(CC) $(CFLAGS) -o $@ $< -lpthread -lrt
+
+bench-subject-pool: bench_subject_pool
+	@echo "== trust_subject_pool microbenchmark =="
+	@./bench_subject_pool
 
 # Run target.  We tolerate exit 77 (SKIP) and exit 0 (PASS); anything
 # else (non-zero non-77) counts as FAIL.
@@ -39,5 +53,15 @@ test-dispatch: test_dispatch_roundtrip
 	    echo "SKIP: trust.ko not loaded; see message above"; exit 0; \
 	  else exit $$rc; fi
 
+# Session 34 R34: context-mask dispatch gate.
+test-context-mask: test_context_mask
+	@echo "== Running test_context_mask =="
+	@LD_LIBRARY_PATH=$(LIBTRUST_DIR):$$LD_LIBRARY_PATH \
+	  ./test_context_mask; rc=$$?; \
+	  if [ "$$rc" = "77" ]; then \
+	    echo "SKIP: trust.ko not loaded or pre-R34; see message above"; \
+	    exit 0; \
+	  else exit $$rc; fi
+
 clean:
-	rm -f $(TESTS)
+	rm -f $(TESTS) $(BENCHES)

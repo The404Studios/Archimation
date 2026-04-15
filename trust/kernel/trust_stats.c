@@ -52,6 +52,13 @@ DEFINE_PER_CPU(u64, trust_stat_dispatch_time_ns);
 DEFINE_PER_CPU(u64, trust_stat_cmdbuf_bytes_in);
 DEFINE_PER_CPU(u64, trust_stat_cmdbuf_bytes_varlen);
 
+/* Session 34 R34: counts instructions rejected at dispatch time because
+ * their context_mask did not include the current context bit.  Bumped
+ * from trust_dispatch.c via trust_stats_record_context_mask_reject();
+ * aggregated into /sys/kernel/trust/stats as
+ * `context_mask_rejects=N`. */
+DEFINE_PER_CPU(u64, trust_stat_context_mask_rejects);
+
 /* One counter slot per family (0..7); index 0-5 are legacy, 6=VEC, 7=FUSED.
  *
  * We use a percpu struct so `per_cpu_ptr(&g_fam_stats, cpu)` returns a
@@ -212,6 +219,9 @@ static ssize_t stats_show(struct kobject *kobj, struct kobj_attribute *attr,
 	n += scnprintf(buf + n, PAGE_SIZE - n,
 		       "cmdbuf_bytes_varlen=%llu\n",
 		       (unsigned long long)agg_percpu_u64(&trust_stat_cmdbuf_bytes_varlen));
+	n += scnprintf(buf + n, PAGE_SIZE - n,
+		       "context_mask_rejects=%llu\n",
+		       (unsigned long long)agg_percpu_u64(&trust_stat_context_mask_rejects));
 
 	return n;
 }
@@ -224,6 +234,23 @@ static ssize_t caps_show(struct kobject *kobj, struct kobj_attribute *attr,
 			 (unsigned long long)trust_caps_bitmap_value);
 }
 
+/*
+ * opcodes_show - Emit one line per (family, opcode) with context mask.
+ *
+ * Format:
+ *     FAMILY.OPCODE  ctx=NORMAL|DEGRADED|...  (0xNN)
+ *
+ * Read-only (0444).  Implemented in trust_dispatch_tables.c so the
+ * metadata stays next to the table itself; we just forward the
+ * sysfs buffer.
+ */
+static ssize_t opcodes_show(struct kobject *kobj, struct kobj_attribute *attr,
+			    char *buf)
+{
+	(void)kobj; (void)attr;
+	return trust_opcode_meta_show_sysfs(buf, PAGE_SIZE);
+}
+
 /* ==================================================================
  * sysfs kobject + attribute wiring
  * ================================================================== */
@@ -232,10 +259,13 @@ static struct kobj_attribute trust_stats_attr =
 	__ATTR(stats, 0444, stats_show, NULL);
 static struct kobj_attribute trust_caps_attr =
 	__ATTR(caps,  0444, caps_show,  NULL);
+static struct kobj_attribute trust_opcodes_attr =
+	__ATTR(opcodes, 0444, opcodes_show, NULL);
 
 static struct attribute *trust_stats_attrs[] = {
 	&trust_stats_attr.attr,
 	&trust_caps_attr.attr,
+	&trust_opcodes_attr.attr,
 	NULL,
 };
 
@@ -342,5 +372,11 @@ void trust_stats_record_cmdbuf_in(u32 total_bytes, u32 varlen_bytes)
 		this_cpu_add(trust_stat_cmdbuf_bytes_varlen, varlen_bytes);
 }
 EXPORT_SYMBOL_GPL(trust_stats_record_cmdbuf_in);
+
+void trust_stats_record_context_mask_reject(void)
+{
+	this_cpu_inc(trust_stat_context_mask_rejects);
+}
+EXPORT_SYMBOL_GPL(trust_stats_record_context_mask_reject);
 
 MODULE_LICENSE("GPL");

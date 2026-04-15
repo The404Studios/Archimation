@@ -500,6 +500,8 @@ static int _apoptosis_cb(trust_subject_t *subj, void *data)
 static int _trust_lifecycle_apoptosis(u32 subject_id, int depth)
 {
     struct apoptosis_ctx ctx = { 0 };
+    trust_subject_t snap;
+    int have_snap;
     int ret;
 
     ctx.deadline = trust_get_timestamp() + 5000000000ULL;  /* 5s */
@@ -514,6 +516,10 @@ static int _trust_lifecycle_apoptosis(u32 subject_id, int depth)
         return 0;
     }
 
+    /* Snapshot the subject BEFORE proof destruction so the absent pool
+     * stores a coherent last-known-good copy. */
+    have_snap = (trust_tlb_lookup(subject_id, &snap) == 0);
+
     /* Destroy proof chain — authority is irrecoverably lost.
      * Must be done outside the TLB set-lock: trust_ape has its own locks. */
     trust_ape_destroy_entity(subject_id);
@@ -526,6 +532,12 @@ static int _trust_lifecycle_apoptosis(u32 subject_id, int depth)
 
     /* Trigger cascade for children (allocates/recurses — outside lock) */
     _trust_lifecycle_apoptotic_cascade(subject_id, depth);
+
+    /* Route the freed subject into the absent pool for fast resurrection
+     * within the time + population budget.  MUST be the last call: double
+     * entry would be wasted work but is idempotent (refresh semantics). */
+    if (have_snap)
+        trust_subject_pool_put(&snap);
 
     return 0;
 }

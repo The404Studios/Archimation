@@ -33,6 +33,7 @@
 #include <sys/mman.h>
 
 #include "pe_patch.h"
+#include "pe_patch_pool.h"
 #include "pe/pe_patch_abi.h"
 #include "pe/pe_header.h"
 #include "pe/pe_import.h"
@@ -73,19 +74,43 @@ static inline int rva_valid(uint64_t rva, uint64_t len, uint64_t image_size)
     return (rva + len) <= image_size;
 }
 
+/* Decode first 16 bytes of a 64-char hex sha256 into a byte prefix.
+ * Returns 0 on success, -1 on bad input.  Used to key the pe_patch_pool
+ * without pulling in a full hex decoder. */
+static int sha256_hex_prefix16(const char *hex, uint8_t out[16])
+{
+    if (!hex) return -1;
+    for (int i = 0; i < 16; i++) {
+        char h = hex[2 * i], l = hex[2 * i + 1];
+        if (h == 0 || l == 0) return -1;
+        int hv = (h >= '0' && h <= '9') ? h - '0'
+               : (h >= 'a' && h <= 'f') ? h - 'a' + 10
+               : (h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1;
+        int lv = (l >= '0' && l <= '9') ? l - '0'
+               : (l >= 'a' && l <= 'f') ? l - 'a' + 10
+               : (l >= 'A' && l <= 'F') ? l - 'A' + 10 : -1;
+        if (hv < 0 || lv < 0) return -1;
+        out[i] = (uint8_t)((hv << 4) | lv);
+    }
+    return 0;
+}
+
 int pe_patch_init(void)
 {
     if (g_patch_init_done) return 0;
     const char *env = getenv("PE_DIAG");
     if (env && *env == '1') g_verbose = 1;
     /* Cache dir is created lazily by the cache TU on first save/load. */
+    pe_patch_pool_init();
     g_patch_init_done = 1;
     return 0;
 }
 
 void pe_patch_shutdown(void)
 {
-    /* No persistent state yet; placeholder for future lazy flushing. */
+    /* Drain the absent pool so leaked entries don't count against
+     * a future embedder's teardown accounting. */
+    pe_patch_pool_shutdown();
     g_patch_init_done = 0;
 }
 
@@ -254,10 +279,31 @@ int pe_patch_apply(pe_image_t *image, const char *image_sha256_hex)
     pe_patch_plan_t plan;
     memset(&plan, 0, sizeof(plan));
 
-    /* Try cache first. */
-    int from_cache = 0;
+    /* Extract a 16-byte pool key from the hex sha.  We also need a
+     * section_count + dxvk_tag to disambiguate re-signed binaries that
+     * happen to collide on the prefix.  section_count is on image;
+     * dxvk_tag is a stable build tag -- we use PE_PATCH_CACHE_VERSION as
+     * a stand-in so a cache-format bump also invalidates the pool. */
+    uint8_t sha_prefix[16];
+    int have_pool_key = 0;
+    uint16_t section_count = (uint16_t)(image->num_sections & 0xFFFFu);
+    uint16_t dxvk_tag = (uint16_t)(PE_PATCH_CACHE_VERSION & 0xFFFFu);
     if (image_sha256_hex &&
-        pe_patch_cache_load(image_sha256_hex, &plan) == 0) {
+        sha256_hex_prefix16(image_sha256_hex, sha_prefix) == 0)
+        have_pool_key = 1;
+
+    /* Try the pool first -- it holds recently-invalidated plans and is
+     * the hottest path.  Misses fall through to the on-disk cache. */
+    int from_pool = 0;
+    int from_cache = 0;
+    if (have_pool_key &&
+        pe_patch_pool_try_get(sha_prefix, section_count, dxvk_tag,
+                              &plan) == 0) {
+        from_pool = 1;
+        if (g_verbose)
+            printf(LOG_PREFIX "Pool hit: %u patches\n", plan.count);
+    } else if (image_sha256_hex &&
+               pe_patch_cache_load(image_sha256_hex, &plan) == 0) {
         from_cache = 1;
         if (g_verbose)
             printf(LOG_PREFIX "Cache hit: %u patches from %.16s...\n",
@@ -276,7 +322,7 @@ int pe_patch_apply(pe_image_t *image, const char *image_sha256_hex)
 
     /* Persist on miss.  Don't regress a good cache on partial-apply
      * failure: if we applied at least half, assume the plan is valid. */
-    if (!from_cache && image_sha256_hex && scanned > 0 &&
+    if (!from_cache && !from_pool && image_sha256_hex && scanned > 0 &&
         (uint32_t)applied >= scanned / 2) {
         if (pe_patch_cache_save(image_sha256_hex, &plan) != 0) {
             /* Non-fatal: we still applied the patches. */
@@ -285,14 +331,26 @@ int pe_patch_apply(pe_image_t *image, const char *image_sha256_hex)
         }
     }
 
+    /* Route the freshly-validated plan into the absent pool for fast
+     * resurrection if this image reloads soon.  Skip on pool-hit path
+     * to avoid thrashing the entry's hit_count. */
+    if (!from_pool && have_pool_key && scanned > 0 &&
+        (uint32_t)applied >= scanned / 2) {
+        (void)pe_patch_pool_put(sha_prefix, section_count, dxvk_tag, &plan);
+    }
+
     pe_patch_plan_free(&plan);
 
     if (applied > 0) {
-        printf(LOG_PREFIX "Applied %d CRT body patches%s\n", applied,
-               from_cache ? " (cache)" : "");
+        const char *src = from_pool ? " (pool)"
+                        : from_cache ? " (cache)" : "";
+        printf(LOG_PREFIX "Applied %d CRT body patches%s\n", applied, src);
         emit_patch_event((uint32_t)applied, scanned);
     } else if (g_verbose) {
         printf(LOG_PREFIX "No CRT imports matched; nothing to patch\n");
     }
+
+    /* Publish pool stats for coherence daemon (rate-limited internally). */
+    pe_patch_pool_write_stats_file(NULL);
     return applied;
 }

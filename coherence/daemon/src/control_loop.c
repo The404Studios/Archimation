@@ -30,6 +30,13 @@
 #include "control_loop.h"
 #include "state_machine.h"
 #include "config.h"
+#include "actuation.h"
+
+/* Forward-declare coh_derived_current_state() from derived.h WITHOUT
+ * pulling derived.h in — it conflicts with control_loop.h's weak-stub
+ * signature of derived_compute (int vs void return). The accessor is
+ * independent and stable. */
+coh_derived_state_t coh_derived_current_state(void);
 
 #include <errno.h>
 #include <fcntl.h>
@@ -78,6 +85,44 @@ static int coh_sleep_until_ms(uint64_t deadline_ms)
 	return rc == 0 ? 0 : -rc;
 }
 
+/* -------- R34 typestate transition helpers -------- */
+
+bool coh_loop_derived_transition(coh_loop_ctx_t *ctx,
+                                 coh_derived_state_t to,
+                                 uint64_t now_ms)
+{
+	if (!ctx) return false;
+	if (!coh_derived_transition_legal(ctx->d_state, to)) {
+		fprintf(stderr,
+		        "{\"event\":\"loop_derived_illegal\",\"t_ms\":%llu,"
+		        "\"from\":\"%s\",\"to\":\"%s\"}\n",
+		        (unsigned long long)now_ms,
+		        coh_derived_state_str(ctx->d_state),
+		        coh_derived_state_str(to));
+		return false;
+	}
+	ctx->d_state = to;
+	return true;
+}
+
+bool coh_loop_act_transition(coh_loop_ctx_t *ctx,
+                             coh_act_state_t to,
+                             uint64_t now_ms)
+{
+	if (!ctx) return false;
+	if (!coh_act_transition_legal(ctx->a_state, to)) {
+		fprintf(stderr,
+		        "{\"event\":\"loop_act_illegal\",\"t_ms\":%llu,"
+		        "\"from\":\"%s\",\"to\":\"%s\"}\n",
+		        (unsigned long long)now_ms,
+		        coh_act_state_str(ctx->a_state),
+		        coh_act_state_str(to));
+		return false;
+	}
+	ctx->a_state = to;
+	return true;
+}
+
 /* -------- weak stubs for Agents 4/5/6 ----------
  *
  * Declared __attribute__((weak)) so linking succeeds even if Agents 4/5/6
@@ -110,6 +155,22 @@ int derived_compute(coh_derived_t *d, const coh_metrics_t *m_lagged, uint64_t no
 	d->source_m_t_ms = m_lagged->t_ms;
 	d->valid = false;               /* weak stub can't compute — pretend stale */
 	return 0;
+}
+
+__attribute__((weak))
+coh_derived_state_t coh_derived_current_state(void)
+{
+	/* Weak stub — mirrors the derived-module behavior when nothing has
+	 * been computed: UNINIT. Real derived.c provides a strong symbol. */
+	return COH_DERIVED_UNINIT;
+}
+
+__attribute__((weak))
+coh_act_state_t actuation_last_commit_state(void)
+{
+	/* Weak stub — UNINIT when actuation.c is not linked. The real
+	 * symbol in actuation.c shadows this at link time. */
+	return COH_ACT_UNINIT;
 }
 
 /* actuation_commit is the strong symbol from actuation.c with signature
@@ -186,8 +247,12 @@ int coh_loop_init(coh_loop_ctx_t *ctx, const coh_config_t *cfg)
 	ctx->m_head = 0;
 	ctx->m_filled = 0;
 
-	ctx->d_have_last_valid = false;
-	ctx->a_committed_valid = false;
+	/* R34 typestate init: both start in UNINIT. Contract requires
+	 * COH_*_UNINIT == 0 so the memset above already satisfies this;
+	 * we re-assign for explicitness (and to guard against someone
+	 * reordering the memset away). */
+	ctx->d_state = COH_DERIVED_UNINIT;
+	ctx->a_state = COH_ACT_UNINIT;
 
 	ctx->phase_measurement_done_for_window = false;
 	ctx->current_control_window_idx = 0;
@@ -254,7 +319,23 @@ static void coh_phase_measurement(coh_loop_ctx_t *ctx,
 
 /* DERIVATION: once per frame, at t == 100ms (top of the derivation phase).
  * Feeds the lagged M(t - k * CONTROL_FRAME). If lagged sample is stale,
- * D.valid=false and the last_valid snapshot is reused in the decision. */
+ * derived_compute leaves d->valid=false and transitions the module-
+ * static typestate to STALE (or DEGRADED after 3 stale in a row). We
+ * mirror the typestate into ctx->d_state so downstream consumers
+ * (decision phase, frame JSON) can branch on a single field.
+ *
+ * Transition table (ctx->d_state):
+ *   UNINIT   → FRESH      first fresh compute
+ *   FRESH    → FRESH      continuing fresh (self-loop)
+ *   FRESH    → STALE      lagged M aged out
+ *   STALE    → STALE      continued staleness below the degraded floor
+ *   STALE    → DEGRADED   after 3 consecutive stale frames (module owns
+ *                         the counter; we just observe the module state)
+ *   STALE    → FRESH      recovered
+ *   DEGRADED → FRESH      recovered (legal; table permits)
+ *   DEGRADED → DEGRADED   continued (self-loop)
+ *   FRESH    → UNINIT     FORBIDDEN (no regression to uninitialized)
+ */
 static void coh_phase_derivation(coh_loop_ctx_t *ctx, uint64_t now_ms)
 {
 	if (ctx->phase_derivation_done)
@@ -270,9 +351,18 @@ static void coh_phase_derivation(coh_loop_ctx_t *ctx, uint64_t now_ms)
 		ctx->d_current.valid = false;
 	}
 
-	if (ctx->d_current.valid) {
-		ctx->d_last_valid = ctx->d_current;
-		ctx->d_have_last_valid = true;
+	/* Pull the module-owned typestate through into the loop ctx so
+	 * downstream code can branch on ctx->d_state consistently. The
+	 * derived module applied its own transition inside derived_compute;
+	 * we reconcile via coh_loop_derived_transition which will log if
+	 * the delta is illegal (should never happen). */
+	coh_derived_state_t new_state = coh_derived_current_state();
+	if (new_state != ctx->d_state) {
+		(void)coh_loop_derived_transition(ctx, new_state, now_ms);
+	}
+
+	if (ctx->d_state == COH_DERIVED_FRESH) {
+		ctx->d_last_fresh = ctx->d_current;
 	} else {
 		ctx->stats.derivation_stale++;
 	}
@@ -286,12 +376,28 @@ static void coh_phase_decision(coh_loop_ctx_t *ctx, uint64_t now_ms)
 	if (ctx->phase_decision_done)
 		return;
 
-	/* Pick the D to feed the arbiter. If current is invalid, fall back
-	 * to last_valid. If we have nothing valid yet, pass an invalid D
-	 * and the arbiter will skip. */
+	/* Pick the D to feed the arbiter via R34 typestate:
+	 *   FRESH     → use current
+	 *   STALE     → fall back to last FRESH snapshot (carried EMA state)
+	 *   DEGRADED  → fall back to last FRESH snapshot; state_machine will
+	 *               still refuse to advance dwell because d->valid=false,
+	 *               but logging downstream gets the DEGRADED label
+	 *   UNINIT    → pass d_current (which is fully zero); arbiter skips
+	 */
 	const coh_derived_t *d_use = &ctx->d_current;
-	if (!ctx->d_current.valid && ctx->d_have_last_valid) {
-		d_use = &ctx->d_last_valid;
+	switch (ctx->d_state) {
+	case COH_DERIVED_FRESH:
+		d_use = &ctx->d_current;
+		break;
+	case COH_DERIVED_STALE:
+	case COH_DERIVED_DEGRADED:
+		d_use = &ctx->d_last_fresh;
+		break;
+	case COH_DERIVED_UNINIT:
+	case COH_DERIVED_STATE_COUNT:
+	default:
+		d_use = &ctx->d_current;
+		break;
 	}
 
 	bool changed = coh_sm_evaluate(&ctx->arb, &ctx->sm_scratch, d_use,
@@ -306,19 +412,42 @@ static void coh_phase_decision(coh_loop_ctx_t *ctx, uint64_t now_ms)
 	ctx->phase_decision_done = true;
 }
 
-/* ACTUATION: single idempotent commit at the frame boundary (f == 0). */
+/* ACTUATION: single idempotent commit at the frame boundary (f == 0).
+ *
+ * Typestate transitions driven here (ctx->a_state):
+ *   * → PLANNED          arbiter handed us a plan; we're about to commit
+ *   PLANNED → BARRIERED  idempotent top-level barrier hit; no writes
+ *   PLANNED → COMMITTED  actuation_commit reported success; A(t) landed
+ *   PLANNED → FAILED     actuation_commit returned <0 at the top level
+ *                        (e.g., -EAGAIN before init)
+ *   PLANNED → RATE_LIMITED   every actuator was inside its τ window;
+ *                            we read this back from
+ *                            actuation_last_commit_state()
+ * Dry-run: we still set PLANNED → COMMITTED because the loop WOULD have
+ * written; the distinction is captured in the actuation_dry_skips counter.
+ */
 static void coh_phase_actuation(coh_loop_ctx_t *ctx, uint64_t now_ms)
 {
 	/* Skip if we haven't made a decision yet (e.g., first frame after
-	 * boot). Also skip if the planned A equals the committed A — that's
-	 * the idempotent barrier. */
+	 * boot). The loop ctx.a_state stays in its current state (UNINIT
+	 * on the very first pass). */
 	if (!ctx->phase_decision_done) {
 		return;
 	}
 
-	if (ctx->a_committed_valid && coh_a_equal(&ctx->a_committed, &ctx->a_next)) {
+	/* Start commit: transition to PLANNED. Legal from UNINIT or from
+	 * any of the prior terminal states (BARRIERED, COMMITTED, FAILED,
+	 * RATE_LIMITED) per the transition table. */
+	(void)coh_loop_act_transition(ctx, COH_ACT_PLANNED, now_ms);
+
+	if (ctx->a_state == COH_ACT_PLANNED &&
+	    ctx->arb.transitions_total > 0 &&
+	    coh_a_equal(&ctx->a_committed, &ctx->a_next)) {
+		/* We've committed before (transitions_total > 0 is a proxy;
+		 * more precisely: a_state was in a post-commit terminal
+		 * state before we bumped to PLANNED). Idempotent barrier. */
 		ctx->stats.actuation_noops++;
-		/* Intentionally NOT calling commit again. */
+		(void)coh_loop_act_transition(ctx, COH_ACT_BARRIERED, now_ms);
 		return;
 	}
 
@@ -327,17 +456,32 @@ static void coh_phase_actuation(coh_loop_ctx_t *ctx, uint64_t now_ms)
 		 * system. a_committed still advances so the idempotent barrier
 		 * on the NEXT frame compares against what we WOULD have written. */
 		ctx->stats.actuation_dry_skips++;
+		(void)coh_loop_act_transition(ctx, COH_ACT_COMMITTED, now_ms);
 	} else {
 		int rc = actuation_commit(&ctx->a_next, now_ms);
 		if (rc < 0) {
 			fprintf(stderr, "{\"event\":\"actuation_commit_error\",\"rc\":%d}\n", rc);
-			/* Do not update a_committed — we'll retry next frame. */
+			/* Do not update a_committed — we'll retry next frame.
+			 * Transition to FAILED so next frame's commit starts
+			 * from a legal FAILED → PLANNED edge. */
+			(void)coh_loop_act_transition(ctx, COH_ACT_FAILED, now_ms);
 			return;
+		}
+		/* actuation_commit returned 0. Read back the granular outcome
+		 * from the actuation module and mirror it into ctx->a_state. */
+		coh_act_state_t module_state = actuation_last_commit_state();
+		if (module_state != COH_ACT_PLANNED &&
+		    module_state != COH_ACT_UNINIT) {
+			(void)coh_loop_act_transition(ctx, module_state, now_ms);
+		} else {
+			/* Defensive fallback — the module is wedged mid-commit
+			 * (shouldn't happen since commits are synchronous). Log
+			 * and assume COMMITTED to let the loop keep moving. */
+			(void)coh_loop_act_transition(ctx, COH_ACT_COMMITTED, now_ms);
 		}
 	}
 
 	ctx->a_committed = ctx->a_next;
-	ctx->a_committed_valid = true;
 	ctx->arb.effective_actions++;
 	ctx->stats.actuation_commits++;
 }
@@ -358,13 +502,32 @@ void coh_loop_emit_frame_json(const coh_loop_ctx_t *ctx)
 {
 	if (!ctx) return;
 
-	const coh_derived_t *d = ctx->d_have_last_valid ? &ctx->d_last_valid : &ctx->d_current;
+	/* Pick the D snapshot to report from. FRESH uses current; non-FRESH
+	 * shows the last fresh values so the consumer sees the numeric view
+	 * the arbiter actually saw, but the derived_state field says STALE
+	 * / DEGRADED so the consumer can't mistake it for current. */
+	const coh_derived_t *d;
+	switch (ctx->d_state) {
+	case COH_DERIVED_FRESH:
+		d = &ctx->d_current;
+		break;
+	case COH_DERIVED_STALE:
+	case COH_DERIVED_DEGRADED:
+		d = &ctx->d_last_fresh;
+		break;
+	case COH_DERIVED_UNINIT:
+	case COH_DERIVED_STATE_COUNT:
+	default:
+		d = &ctx->d_current;
+		break;
+	}
 
 	fprintf(stderr,
 	        "{\"event\":\"frame\","
 	        "\"frame\":%llu,\"t_ms\":%llu,"
 	        "\"state\":\"%s\",\"lockout\":%s,"
-	        "\"d_valid\":%s,\"lat\":%.3f,\"therm\":%.3f,\"V\":%.3f,"
+	        "\"derived_state\":\"%s\",\"act_state\":\"%s\","
+	        "\"lat\":%.3f,\"therm\":%.3f,\"V\":%.3f,"
 	        "\"epp\":%d,\"min_pct\":%d,\"present\":%d,"
 	        "\"meas\":%llu,\"der\":%llu,\"der_stale\":%llu,"
 	        "\"dec\":%llu,\"act\":%llu,\"act_noop\":%llu,"
@@ -373,7 +536,8 @@ void coh_loop_emit_frame_json(const coh_loop_ctx_t *ctx)
 	        (unsigned long long)coh_now_ms(),
 	        coh_sm_state_name(ctx->arb.state),
 	        coh_in_lockout(&ctx->arb, coh_now_ms()) ? "true" : "false",
-	        d->valid ? "true" : "false",
+	        coh_derived_state_str(ctx->d_state),
+	        coh_act_state_str(ctx->a_state),
 	        d->latency_pressure, d->thermal, d->lyapunov_v,
 	        (int)ctx->a_next.epp, ctx->a_next.min_perf_pct,
 	        (int)ctx->a_next.present_mode_override,

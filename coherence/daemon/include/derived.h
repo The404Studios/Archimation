@@ -56,6 +56,21 @@ void derived_compute(coh_derived_t *out,
  * symmetry + future allocation-safety. */
 void derived_shutdown(void);
 
+/* R34 typestate accessor. Returns the current coh_derived_state_t.
+ *
+ * Valid states:
+ *   COH_DERIVED_UNINIT   — derived_init called, no successful compute yet
+ *   COH_DERIVED_FRESH    — last compute had a fresh M source + EMAs advanced
+ *   COH_DERIVED_STALE    — last compute saw stale M; EMAs frozen
+ *   COH_DERIVED_DEGRADED — COH_DEGRADED_STALE_THRESHOLD (=3) stale frames
+ *                          in a row; confidence is below threshold
+ *
+ * Transition table: see state_machine_tables.c (derived_trans).
+ * The state machine consumers should branch on this instead of the
+ * legacy coh_derived_t.valid field (which remains for simulator ABI
+ * compatibility). */
+coh_derived_state_t coh_derived_current_state(void);
+
 /* Introspection hook for the simulator and /system/coherence endpoint.
  *
  * Fills the 8-slot array with a live snapshot of internal state:

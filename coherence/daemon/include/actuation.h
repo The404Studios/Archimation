@@ -136,6 +136,38 @@ typedef struct {
 
 void actuation_get_stats(coh_actuation_stats_t *out);
 
+/*
+ * R34 commit-pipeline typestate accessor.
+ *
+ * Returns the coh_act_state_t recorded by the most recent
+ * actuation_commit() call. Before the first commit, returns
+ * COH_ACT_UNINIT.
+ *
+ * State meanings:
+ *   COH_ACT_UNINIT       — no commit attempted since actuation_init()
+ *   COH_ACT_PLANNED      — transient; observable only mid-commit
+ *                          (callers should never see this via the
+ *                          accessor because the commit completes
+ *                          synchronously)
+ *   COH_ACT_RATE_LIMITED — last commit was skipped entirely because
+ *                          every eligible actuator was inside its τ
+ *                          window; retry will happen next frame
+ *   COH_ACT_BARRIERED    — last commit was skipped because A(t) == A(t-1)
+ *   COH_ACT_COMMITTED    — last commit wrote at least one actuator
+ *                          successfully; no write errors
+ *   COH_ACT_FAILED       — last commit had at least one write error;
+ *                          g_last_committed is only partially updated
+ *
+ * Callers should branch on this AFTER observing the return value of
+ * actuation_commit() — a rc==0 return can mean any of COMMITTED,
+ * BARRIERED, RATE_LIMITED. The accessor disambiguates.
+ *
+ * Transition table: see state_machine_tables.c (act_trans).
+ *
+ * Thread-safe: single aligned-enum read; torn-read-safe.
+ */
+coh_act_state_t actuation_last_commit_state(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -11533,12 +11533,27 @@ class InstallerApp(Adw.Application):
             progress(2, "Formatting partitions...")
             self._set_step("format", "active")
 
-            self._run_cmd(f"mkfs.fat -F32 {efi_part}",
+            self._run_cmd(f"mkfs.fat -F32 -n AIARCH_ESP {efi_part}",
                           desc="Formatting EFI partition (FAT32)")
-            self._run_cmd(f"mkfs.ext4 -F -L AIArch {root_part}",
-                          desc="Formatting root partition (ext4)")
+            # mkfs.ext4 -O '^has_journal' would kill safety; keep journal.
+            # -E lazy_itable_init=0,lazy_journal_init=0 forces full format
+            #    up-front -- saves 30-60s of background I/O on first boot.
+            # -m 1 leaves 1% reserved for root (default 5% wastes GBs on
+            #    large NVMe drives).  -T default picks inode ratio by size.
+            self._run_cmd(
+                f"mkfs.ext4 -F -L AIArch -m 1 "
+                f"-E lazy_itable_init=0,lazy_journal_init=0 "
+                f"-O dir_index,extent,flex_bg,has_journal,huge_file,uninit_bg "
+                f"{root_part}",
+                desc="Formatting root partition (ext4, tuned)")
+            # Apply post-format tune2fs defaults (errors=continue, no time/count fsck)
+            self._run_cmd(
+                f"bash -c 'source /usr/lib/ai-arch/fstab-optimize.sh && "
+                f"fstab_ext4_tune {root_part}'",
+                desc="Applying ext4 tune2fs defaults",
+                check=False)
             if swap_part:
-                self._run_cmd(f"mkswap {swap_part}",
+                self._run_cmd(f"mkswap -L AIArchSwap {swap_part}",
                               desc="Creating swap")
 
             self._set_step("format", "done")
@@ -11577,7 +11592,8 @@ class InstallerApp(Adw.Application):
                 "python python-pip python-fastapi uvicorn python-gobject "
                 "gtk4 libadwaita "
                 "firefox thunar terminator zenity "
-                "nftables dosfstools e2fsprogs parted "
+                "nftables dosfstools e2fsprogs parted btrfs-progs xfsprogs "
+                "zram-generator "
                 "pipewire-jack iptables-nft "
                 "papirus-icon-theme noto-fonts ttf-dejavu ttf-jetbrains-mono "
                 "bluez bluez-utils blueman acpid tlp "
@@ -11635,6 +11651,49 @@ class InstallerApp(Adw.Application):
             self._run_cmd(
                 f"bash -c 'genfstab -U {MOUNT_ROOT} >> {MOUNT_ROOT}/etc/fstab'",
                 desc="Generating /etc/fstab with UUIDs")
+
+            # --- Apply hardware-aware filesystem defaults ---
+            # Sourced from /usr/lib/ai-arch/fstab-optimize.sh.  This rewrites
+            # mount options (noatime, ext4 commit=60, btrfs compress=zstd,
+            # mountpoint-specific nodev/nosuid/noexec flags), installs
+            # tmp.mount 40% cap drop-in, propagates the live-ISO udev
+            # I/O scheduler rules, sets swappiness for zram, patches
+            # transparent_hugepage=madvise into GRUB cmdline, and copies
+            # zram-generator.conf.  All tunings are idempotent and
+            # non-fatal -- a failure here does not abort installation.
+            #
+            # using_zram=1 because zram-generator is our default swap
+            # strategy (Round 30 config).  When the user selected an
+            # on-disk swap partition we still keep zram enabled for
+            # effective RAM multiplication and let swap-priority order
+            # decide which gets used first.
+            using_zram = "1"
+
+            # Copy the helper into the installed system FIRST so it's
+            # available for future rescue / rerun scenarios.
+            try:
+                os.makedirs(f"{MOUNT_ROOT}/usr/lib/ai-arch", exist_ok=True)
+                src_helper = "/usr/lib/ai-arch/fstab-optimize.sh"
+                dst_helper = f"{MOUNT_ROOT}/usr/lib/ai-arch/fstab-optimize.sh"
+                if os.path.exists(src_helper):
+                    shutil.copy2(src_helper, dst_helper)
+                    os.chmod(dst_helper, 0o755)
+                    self._log(f"  Copied fstab-optimize.sh to installed system")
+            except (OSError, shutil.Error) as e:
+                self._log(f"  WARNING: Could not copy fstab-optimize.sh: {e}")
+
+            self._run_cmd(
+                f"bash -c 'source /usr/lib/ai-arch/fstab-optimize.sh && "
+                f"fstab_optimize_all {MOUNT_ROOT} {using_zram}'",
+                desc="Optimizing fstab + mount options (HW-aware)",
+                check=False)
+
+            # --- Enable tmp.mount on installed system ---
+            # Arch ships the unit but does not enable it by default.  Our
+            # drop-in only applies if the unit is actually mounted.
+            self._chroot("systemctl enable tmp.mount",
+                         desc="Enabling tmpfs /tmp mount",
+                         check=False)
 
             self._set_step("fstab", "done")
 
@@ -11736,11 +11795,18 @@ class InstallerApp(Adw.Application):
             if os.path.exists(grub_default):
                 with open(grub_default, "r") as f:
                     grub_cfg = f.read()
-                # Add kernel parameters for NVIDIA and Plymouth
+                # Add kernel parameters for NVIDIA, Plymouth, and the
+                # memory tunings that fstab-optimize.sh recommends.
+                # transparent_hugepage=madvise: safer than 'always'; matches
+                #   ai-hw-detect.sh runtime setting for consistency.
+                # nowatchdog: disables unused hardware watchdog -- saves a
+                #   kernel thread wakeup per CPU per second (measurable
+                #   power win on laptops).
                 grub_cfg = re.sub(
                     r'GRUB_CMDLINE_LINUX_DEFAULT="[^"]*"',
                     'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash '
-                    'nvidia_drm.modeset=1 amd_pstate=active"',
+                    'nvidia_drm.modeset=1 amd_pstate=active '
+                    'transparent_hugepage=madvise nowatchdog"',
                     grub_cfg)
                 # Set timeout
                 grub_cfg = re.sub(

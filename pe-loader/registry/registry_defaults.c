@@ -27,44 +27,28 @@
 #define HKCU ((HKEY)(uintptr_t)0x80000001)
 #define HKCR ((HKEY)(uintptr_t)0x80000000)
 
-/* Helper: value already present? Avoids overwriting user changes. */
-static int reg_value_exists(HKEY root, const char *subkey, const char *name)
-{
-    HKEY hk;
-    if (registry_open_key(root, subkey, &hk) != 0)
-        return 0;
-    DWORD type = 0, size = 0;
-    LONG ret = registry_get_value(hk, NULL, name ? name : "", &type, NULL, &size);
-    registry_close_key(hk);
-    /* ERROR_SUCCESS means the value file exists (we passed NULL data for
-     * query-only).  Any other result (incl ERROR_FILE_NOT_FOUND) = absent. */
-    return ret == 0;
-}
+/*
+ * Session 30: helpers below now route to registry_set_default /
+ * registry_set_force from registry.h.  That collapses the old
+ * open+get+close + create+set+close (6 locked ops) to a single locked
+ * critical section with O(1) hash lookups -- ~6x fewer locks and zero
+ * handle alloc/free churn for this whole populator.
+ */
 
 /* Helper: create key and set a string value. Idempotent: won't clobber
  * an existing value (so user customisations via RegSetValueEx survive
  * subsequent defaults population). */
 static void reg_set_sz(HKEY root, const char *subkey, const char *name, const char *value)
 {
-    if (reg_value_exists(root, subkey, name ? name : ""))
-        return;
-    HKEY hk;
-    if (registry_create_key(root, subkey, &hk) == 0) {
-        registry_set_value(hk, name, REG_SZ, value, (DWORD)(strlen(value) + 1));
-        registry_close_key(hk);
-    }
+    registry_set_default(root, subkey, name, REG_SZ,
+                         value, (DWORD)(strlen(value) + 1));
 }
 
 /* Helper: create key and set a DWORD value (idempotent). */
 static void reg_set_dw(HKEY root, const char *subkey, const char *name, unsigned int value)
 {
-    if (reg_value_exists(root, subkey, name ? name : ""))
-        return;
-    HKEY hk;
-    if (registry_create_key(root, subkey, &hk) == 0) {
-        registry_set_value(hk, name, REG_DWORD, &value, sizeof(value));
-        registry_close_key(hk);
-    }
+    registry_set_default(root, subkey, name, REG_DWORD,
+                         &value, (DWORD)sizeof(value));
 }
 
 /* Force-write variant for values that must refresh each startup (e.g.
@@ -72,11 +56,8 @@ static void reg_set_dw(HKEY root, const char *subkey, const char *name, unsigned
 static void reg_set_sz_force(HKEY root, const char *subkey,
                               const char *name, const char *value)
 {
-    HKEY hk;
-    if (registry_create_key(root, subkey, &hk) == 0) {
-        registry_set_value(hk, name, REG_SZ, value, (DWORD)(strlen(value) + 1));
-        registry_close_key(hk);
-    }
+    registry_set_force(root, subkey, name, REG_SZ,
+                       value, (DWORD)(strlen(value) + 1));
 }
 
 /* Derive a stable 32-hex GUID from the host's /etc/machine-id.

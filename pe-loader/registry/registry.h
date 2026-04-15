@@ -39,4 +39,21 @@ LONG registry_enum_key(HKEY hKey, DWORD index, char *name, DWORD *name_size);
 LONG registry_enum_value(HKEY hKey, DWORD index, char *name, DWORD *name_size,
                          DWORD *type, void *data, DWORD *data_size);
 
+/* ---------------------------------------------------------------------- */
+/* Fast-path bulk helpers (used by registry_defaults.c).                  */
+/* These avoid the Reg* handle alloc/free cycle and take the registry    */
+/* write lock exactly once per call instead of 3 times.                   */
+/* ---------------------------------------------------------------------- */
+
+/* Idempotent write: only writes when (subkey, name) is absent.
+ * Returns 1 if the value was written, 0 if already present (or error). */
+int registry_set_default(HKEY root, const char *subkey,
+                         const char *name, DWORD type,
+                         const void *data, DWORD size);
+
+/* Force-write: always overwrites.  For volatile state like hostname. */
+int registry_set_force(HKEY root, const char *subkey,
+                       const char *name, DWORD type,
+                       const void *data, DWORD size);
+
 #endif /* REGISTRY_H */

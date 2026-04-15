@@ -22,6 +22,24 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Optional
 
+try:
+    # Event-driven process tracker.  Import is safe on any platform --
+    # the listener's probe() returns False off Linux.  Daemon modules
+    # are loaded by filename (main.py adds the daemon/ dir to sys.path)
+    # so a flat "cn_proc" import is the canonical form; we also try the
+    # dotted form for benchmarks / test runners.
+    from cn_proc import CnProcListener, CnProcEvent, ProcEvent
+    _CN_PROC_IMPORT_OK = True
+except Exception:
+    try:
+        from daemon.cn_proc import CnProcListener, CnProcEvent, ProcEvent  # type: ignore
+        _CN_PROC_IMPORT_OK = True
+    except Exception:
+        CnProcListener = None  # type: ignore[assignment]
+        CnProcEvent = None     # type: ignore[assignment]
+        ProcEvent = None       # type: ignore[assignment]
+        _CN_PROC_IMPORT_OK = False
+
 logger = logging.getLogger("ai-control.memory_observer")
 
 # ---------------------------------------------------------------------------
@@ -369,11 +387,28 @@ class MemoryObserver:
         # Netlink socket (if TMS available)
         self._nl_sock = None
 
+        # cn_proc event-driven process tracker (simulation-mode assist).
+        # When this is active we stop walking /proc every poll and only
+        # scan on exec() events, which is a huge idle-CPU saving on
+        # low-end hardware.  If CAP_NET_ADMIN is unavailable we transparently
+        # stay on the polling path.
+        self._cnproc: Optional["CnProcListener"] = None
+        self._cnproc_active: bool = False
+        # PIDs that need a memory-map scan on the next loop iteration.
+        # Populated from cn_proc exec events; drained by the simulation
+        # loop.  A set dedupes rapid-fire execs from shell pipelines.
+        self._pending_exec_pids: set[int] = set()
+        # PIDs that need eviction (exit events).
+        self._pending_exit_pids: set[int] = set()
+        # Set whenever an event landed -- wakes the simulation loop.
+        self._event_wake: Optional[asyncio.Event] = None
+
     # ── Lifecycle ──
 
     async def start(self):
         """Start the memory observer. Tries TMS netlink first, falls back to simulation."""
         self._running = True
+        self._event_wake = asyncio.Event()
 
         # Try to connect to TMS via netlink
         if self._try_connect_tms():
@@ -381,18 +416,35 @@ class MemoryObserver:
             self._task = asyncio.create_task(self._tms_event_loop())
             logger.info("Memory observer started in TMS mode (netlink)")
         else:
-            # Fall back to /proc/PID/maps simulation
+            # Try the cn_proc fast path before committing to a plain poll
+            # loop.  If it succeeds we get event-driven process discovery
+            # and drop the per-poll /proc walk; if not we fall back.
+            await self._try_start_cnproc()
             self._mode = "simulation"
             self._task = asyncio.create_task(self._simulation_loop())
-            logger.info(
-                "Memory observer started in simulation mode "
-                "(polling /proc/PID/maps every %.1fs)",
-                self._poll_interval,
-            )
+            if self._cnproc_active:
+                logger.info(
+                    "Memory observer started in simulation mode "
+                    "(cn_proc event-driven, lazy rescan interval %.1fs)",
+                    self._poll_interval,
+                )
+            else:
+                logger.info(
+                    "Memory observer started in simulation mode "
+                    "(polling /proc/PID/maps every %.1fs)",
+                    self._poll_interval,
+                )
 
     async def stop(self):
         """Stop the memory observer and clean up."""
         self._running = False
+        # Wake the simulation loop so it observes the stop flag promptly
+        # instead of sitting out the full poll interval.
+        if self._event_wake is not None:
+            try:
+                self._event_wake.set()
+            except RuntimeError:
+                pass
         if self._task:
             self._task.cancel()
             try:
@@ -406,6 +458,13 @@ class MemoryObserver:
             except OSError:
                 pass
             self._nl_sock = None
+        if self._cnproc is not None:
+            try:
+                self._cnproc.stop()
+            except Exception:
+                pass
+            self._cnproc = None
+            self._cnproc_active = False
         logger.info(
             "Memory observer stopped. mode=%s tracked=%d anomalies=%d events=%d",
             self._mode, len(self._processes),
@@ -440,6 +499,59 @@ class MemoryObserver:
                     pass
             logger.debug("TMS netlink unavailable: %s", e)
             return False
+
+    async def _try_start_cnproc(self) -> bool:
+        """Subscribe to PROC_CN_MCAST_LISTEN if the platform permits.
+
+        Requires CAP_NET_ADMIN.  When the subscribe succeeds we register
+        fork/exec/exit callbacks that queue PIDs for the simulation loop
+        to pick up -- the loop itself then stops enumerating all of
+        /proc on every tick.
+        """
+        if not _CN_PROC_IMPORT_OK or CnProcListener is None:
+            return False
+        if not CnProcListener.probe():
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+
+        listener = CnProcListener()
+        ok = await listener.start(loop)
+        if not ok:
+            return False
+
+        # Bind event handlers.  These run in the event-loop thread with
+        # no await, so they must be cheap -- just enqueue PIDs and set
+        # the wake event.
+        listener.on_exec(self._on_cnproc_exec)
+        listener.on_exit(self._on_cnproc_exit)
+        # Fork is informational; we wait for exec before scanning because
+        # forked-without-exec children inherit the parent's mapping.
+
+        self._cnproc = listener
+        self._cnproc_active = True
+        return True
+
+    def _on_cnproc_exec(self, ev: "CnProcEvent") -> None:
+        """exec() event: a new program is running under this PID.
+
+        Queue a memory-map rescan on the next simulation loop tick.
+        """
+        if not self._running:
+            return
+        self._pending_exec_pids.add(ev.pid)
+        if self._event_wake is not None:
+            self._event_wake.set()
+
+    def _on_cnproc_exit(self, ev: "CnProcEvent") -> None:
+        """exit() event: drop tracking so we don't rescan a dead PID."""
+        if not self._running:
+            return
+        self._pending_exit_pids.add(ev.pid)
+        if self._event_wake is not None:
+            self._event_wake.set()
 
     # ── TMS event loop ──
 
@@ -490,20 +602,126 @@ class MemoryObserver:
     # ── Simulation loop (fallback) ──
 
     async def _simulation_loop(self):
-        """Poll /proc for PE processes and build memory maps from /proc/PID/maps."""
+        """Drive the /proc/PID/maps scanner.
+
+        Two modes:
+
+        * **cn_proc-driven** (preferred): wait on an asyncio Event that
+          the event callbacks fire.  Each wake processes only the PIDs
+          that exec'd or exited, then does a cheap refresh of already-
+          tracked processes.  A long-interval tick still runs in the
+          background so we catch any events we may have missed (e.g.
+          during a brief buffer overflow).
+
+        * **polling fallback**: every ``poll_interval`` seconds walk
+          /proc top-to-bottom for PE processes.
+        """
+        # Initial full scan so we don't start empty.
+        try:
+            await self._scan_all_processes()
+            self._evict_dead_processes()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("Error during initial simulation scan")
+
+        # Longer idle interval when events drive us -- cn_proc wakes us
+        # immediately on interesting changes, so the periodic rescan is
+        # just a safety net.
+        idle_interval = max(self._poll_interval * 6.0, 30.0) if self._cnproc_active \
+            else self._poll_interval
+
         while self._running:
             try:
-                await self._scan_all_processes()
-                self._evict_dead_processes()
+                if self._cnproc_active and self._event_wake is not None:
+                    try:
+                        await asyncio.wait_for(
+                            self._event_wake.wait(),
+                            timeout=idle_interval,
+                        )
+                    except asyncio.TimeoutError:
+                        # Safety-net rescan -- rare under cn_proc mode.
+                        pass
+                    self._event_wake.clear()
+                    await self._process_pending_events()
+                else:
+                    # Classic polling: sleep first, then scan.
+                    try:
+                        await asyncio.sleep(self._poll_interval)
+                    except asyncio.CancelledError:
+                        break
+                    await self._scan_all_processes()
+                    self._evict_dead_processes()
             except asyncio.CancelledError:
                 break
             except Exception:
                 logger.exception("Error in simulation loop")
 
-            try:
-                await asyncio.sleep(self._poll_interval)
-            except asyncio.CancelledError:
+    async def _process_pending_events(self):
+        """Drain PID queues produced by cn_proc callbacks.
+
+        Called from the simulation loop when an event fired.  Scans any
+        newly-exec'd PIDs and drops any PIDs that exited, then refreshes
+        the PIDs we already track (cheap -- only reads /proc/PID/maps).
+        """
+        exec_pids = self._pending_exec_pids
+        exit_pids = self._pending_exit_pids
+        self._pending_exec_pids = set()
+        self._pending_exit_pids = set()
+
+        # Evict exited PIDs first -- saves doing a wasted scan if an
+        # exec + exit arrived in the same wake.
+        for pid in exit_pids:
+            self._processes.pop(pid, None)
+
+        # New/rescanned PIDs.  Scan only those that look PE-relevant to
+        # avoid tracking every short-lived shell child that exec'd.
+        for pid in exec_pids:
+            if pid in exit_pids:
+                continue
+            if not self._running:
                 break
+            if self._is_pe_candidate(pid):
+                await self._scan_process(pid)
+
+        # Refresh already-tracked processes so mmap/mprotect deltas still
+        # turn into anomaly events.  Reuses the same executor path.
+        if self._processes:
+            known_pids = list(self._processes.keys())
+            for pid in known_pids:
+                if not self._running:
+                    break
+                await self._scan_process(pid)
+
+        self._evict_dead_processes()
+        self._stats["scans_completed"] += 1
+        self._stats["last_scan_time"] = time.time()
+        self._stats["processes_tracked"] = len(self._processes)
+
+    @staticmethod
+    def _is_pe_candidate(pid: int) -> bool:
+        """Fast check whether a PID is worth a full maps scan.
+
+        Mirrors the first-pass filter in ``_find_pe_processes`` so we
+        don't rescan every single exec() (a shell script could fire 100s
+        per second during a build).
+        """
+        try:
+            exe = os.readlink(f"/proc/{pid}/exe")
+        except (OSError, PermissionError):
+            return False
+        if "peloader" in exe or "pe-loader" in exe:
+            return True
+        if exe.endswith(".exe") or "pe-compat" in exe:
+            return True
+        # Fallback: peek at maps for pe-compat markers.  Bounded read
+        # so a giant process map doesn't spike CPU.
+        try:
+            with open(f"/proc/{pid}/maps", "r") as f:
+                head = f.read(8192)
+            return "pe-compat" in head or "libpe_" in head
+        except (OSError, PermissionError):
+            return False
 
     async def _scan_all_processes(self):
         """Discover and scan all PE-related processes."""
@@ -1068,13 +1286,17 @@ class MemoryObserver:
 
     def get_stats(self) -> dict:
         """Return observer statistics."""
-        return {
+        stats = {
             **self._stats,
             "mode": self._mode,
             "processes_tracked": len(self._processes),
             "anomalies_total": len(self._anomalies),
             "running": self._running,
+            "cnproc_active": self._cnproc_active,
         }
+        if self._cnproc is not None:
+            stats["cnproc_events"] = self._cnproc.event_count
+        return stats
 
 
 # ---------------------------------------------------------------------------

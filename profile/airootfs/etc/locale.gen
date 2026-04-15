@@ -1,0 +1,12 @@
+# AI Arch Linux live ISO locale.gen
+#
+# The live ISO ships ONLY en_US.UTF-8 to keep locale-archive small
+# (~3 MB vs the 220 MB default).  The installer's pacstrap regenerates
+# locale-archive on the target system with whatever locales the user
+# selects in the installer UI, so this restriction does not propagate
+# to installed systems.
+#
+# If you boot this ISO and need another locale at runtime:
+#   echo 'xx_XX.UTF-8 UTF-8' >> /etc/locale.gen && locale-gen
+#
+en_US.UTF-8 UTF-8

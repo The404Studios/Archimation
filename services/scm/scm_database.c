@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "scm.h"
+#include "pe/xxh3_compat.h"
 
 static service_entry_t g_services[MAX_SERVICES];
 static int g_service_count = 0;
@@ -28,23 +29,29 @@ static int g_service_count = 0;
  *
  * Concurrency: callers of scm_db_* already hold g_lock; no internal lock
  * needed here.  Both -1 (empty) and -2 (tombstone) are reserved sentinels.
+ *
+ * Hash: xxh32_lower() (see pe-loader/include/pe/xxh3_compat.h).  Replaced
+ * the former djb2 with a proper avalanche-tested hash:
+ *   - djb2 leaves clumps of sequential service names ("foo1","foo2",...)
+ *     in adjacent buckets -- common in real deployments.
+ *   - xxh32's final mul/shift/xor cascade kills that clustering, keeping
+ *     probe chains short even at higher load factors.
+ *   - Pure scalar, P4-safe (no SIMD).
+ * Speed difference is a wash at this table size; the win is distribution
+ * quality and future-proofing for larger MAX_SERVICES values.
  */
 #define SCM_HASH_BUCKETS (MAX_SERVICES * 2)
 #define SCM_HASH_EMPTY     -1
 #define SCM_HASH_TOMBSTONE -2
+#define SCM_HASH_SEED      0x5C9E1ABEU  /* arbitrary -- bake once, forever */
 static int g_scm_hash[SCM_HASH_BUCKETS];
 static int g_scm_hash_initialized = 0;
 
 static unsigned int scm_hash_name(const char *name)
 {
-    /* djb2 case-insensitive */
-    unsigned int h = 5381;
-    while (*name) {
-        unsigned char c = (unsigned char)*name++;
-        if (c >= 'A' && c <= 'Z') c += 32;
-        h = ((h << 5) + h) + c;
-    }
-    return h % SCM_HASH_BUCKETS;
+    /* Case-insensitive xxh32.  Folds ASCII 'A'..'Z' to lowercase inside
+     * the hash loop so callers don't need to pre-lowercase. */
+    return xxh32_lower(name, SCM_HASH_SEED) % SCM_HASH_BUCKETS;
 }
 
 static void scm_hash_init(void)

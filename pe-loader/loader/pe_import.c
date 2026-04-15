@@ -20,6 +20,7 @@
 #include "pe/pe_import.h"
 #include "pe/pe_export.h"
 #include "pe/pe_types.h"
+#include "pe/xxh3_compat.h"
 
 /* MS ABI printf/scanf format engine (static helpers, safe to include here) */
 #include "compat/ms_abi_format.h"
@@ -1410,68 +1411,43 @@ static const crt_abi_wrapper_t g_crt_wrappers[] = {
 };
 
 /*
- * ---- CRT wrapper fast-path hash index ----
+ * ---- CRT wrapper perfect-hash lookup (compile-time, O(1)) ----
  *
- * The wrapper table has ~180 entries and is consulted FIRST on every
+ * The wrapper table has ~150 entries and is consulted FIRST on every
  * named import from an MSVCRT-family DLL (malloc/memcpy/printf/etc.).
- * Linear strcmp across 180 entries for every import is ~O(N*M) where
- * M is avg name length; FNV-1a + open addressing takes it to O(1).
+ * Round 30 used FNV-1a + open-addressed probing to get expected O(1);
+ * here we replace that with a TRUE perfect hash generated offline by
+ * scripts/gen-perfect-hash.py and checked into the repo.
  *
- * The table is const and immutable, so we build the hash lazily once.
- * Case-sensitive -- CRT function names are always in a known canonical
- * form ("memset", "_strdup", "_vsnprintf", etc.).
+ * Lookup is now one xxh32_lower() call (pure scalar, P4-safe) + one
+ * array load + one strcmp to guard unknown keys.  No probe loop, no
+ * lazy init, no atomic.  The slot table fits in < 2 KB and is read-
+ * only .rodata.
+ *
+ * Regenerate the header after editing g_crt_wrappers by running:
+ *   python3 scripts/gen-perfect-hash.py \
+ *       --input pe-loader/loader/pe_import.c \
+ *       --table g_crt_wrappers \
+ *       --output pe-loader/loader/pe_import_crt_ph.h \
+ *       --symbol CRT_PH
+ *
+ * Case-sensitive: CRT function names are always in a known canonical
+ * form ("memset", "_strdup", "_vsnprintf", etc.).  The generator's
+ * case-folded xxh32 still works here because our table has no mixed-
+ * case collisions -- an all-lowercase query over canonical names is
+ * equivalent to case-sensitive.
  */
-#define CRT_HASH_BUCKETS 1024
-#define CRT_HASH_MASK    (CRT_HASH_BUCKETS - 1)
+#include "pe_import_crt_ph.h"
 
-static int16_t g_crt_hash[CRT_HASH_BUCKETS];
-static int g_crt_hash_built = 0;
-
-static inline uint32_t crt_fnv1a(const char *s)
-{
-    uint32_t h = 0x811C9DC5u;
-    for (; *s; s++) {
-        h ^= (unsigned char)*s;
-        h *= 0x01000193u;
-    }
-    return h;
-}
-
-static void crt_hash_build(void)
-{
-    if (g_crt_hash_built) return;
-    memset(g_crt_hash, 0, sizeof(g_crt_hash));
-    for (int n = 0; g_crt_wrappers[n].name != NULL; n++) {
-        uint32_t h = crt_fnv1a(g_crt_wrappers[n].name) & CRT_HASH_MASK;
-        while (g_crt_hash[h] != 0)
-            h = (h + 1) & CRT_HASH_MASK;
-        g_crt_hash[h] = (int16_t)(n + 1);
-    }
-    __atomic_store_n(&g_crt_hash_built, 1, __ATOMIC_RELEASE);
-}
-
-/*
- * Look up a CRT function name in the ms_abi wrapper table.
- * Returns wrapper address or NULL if not found.
- * Non-static so PE DLL import resolution in kernel32_module_pe.c
- * can access it via -rdynamic weak symbol linkage.
- */
 __attribute__((hot))
 void *pe_find_crt_wrapper(const char *name)
 {
-    if (__builtin_expect(!__atomic_load_n(&g_crt_hash_built, __ATOMIC_ACQUIRE), 0))
-        crt_hash_build();
-
-    /* Fast early-out on common CRT name pattern: most are 3-10 bytes.
-     * Cheap length cap avoids hashing arbitrarily long names. */
-    uint32_t h = crt_fnv1a(name) & CRT_HASH_MASK;
-    for (int probes = 0; probes < CRT_HASH_BUCKETS; probes++) {
-        int idx = g_crt_hash[h];
-        if (idx == 0) return NULL;
-        if (strcmp(g_crt_wrappers[idx - 1].name, name) == 0)
-            return g_crt_wrappers[idx - 1].wrapper;
-        h = (h + 1) & CRT_HASH_MASK;
-    }
+    int idx = CRT_PH_lookup(name);
+    if (idx < 0) return NULL;
+    /* Guard strcmp: perfect hash maps unknown inputs into populated
+     * slots, so we still verify the full name matches. */
+    if (strcmp(g_crt_wrappers[idx].name, name) == 0)
+        return g_crt_wrappers[idx].wrapper;
     return NULL;
 }
 
@@ -1625,72 +1601,49 @@ static void str_lower(char *s)
 }
 
 /*
- * ---- DLL mapping fast-path hash index ----
+ * ---- DLL mapping perfect-hash lookup (compile-time, O(1)) ----
  *
- * g_dll_mappings[] has ~190 entries.  Every PE import descriptor and every
+ * g_dll_mappings[] has ~208 entries.  Every PE import descriptor and every
  * forwarder hop does a full strcmp() linear scan over this table.  For a
  * typical 64-DLL application with 2000 imports that's ~380,000 strcmp
  * calls just during import resolution.
  *
- * We build a 1024-bucket FNV-1a hash index at first call (single thread on
- * the hot path -- callers serialise the import loop) and use it for O(1)
- * average lookup.  The bucket count is a power-of-two so modulo is a mask.
- * The hash uses only the lowercased name, so case-folding still has to
- * happen -- but that's O(strlen) once, not O(N * strlen).
+ * Round 30 added a 1024-bucket FNV-1a open-addressed index; this round
+ * replaces that with a TRUE perfect hash.  The header pe_import_dll_ph.h
+ * is generated offline by scripts/gen-perfect-hash.py (checked into the
+ * repo, no build-time Python dependency).  Lookup is:
+ *
+ *   uint32_t h   = xxh32_lower(name, SEED) & MASK;
+ *   int16_t  idx = slots[h];
+ *   if (idx < 0) return -1;
+ *   if (strcmp(g_dll_mappings[idx].win_name, name) == 0) return idx;
+ *   return -1;
+ *
+ * Zero probe chains, zero lazy init, zero atomics -- pure .rodata.
+ * The xxh32_lower scalar kernel runs on any x86_64 (no SIMD required),
+ * preserving dual-hardware P4 compatibility.
+ *
+ * After editing g_dll_mappings, regenerate with:
+ *   python3 scripts/gen-perfect-hash.py \
+ *       --input pe-loader/loader/pe_import.c \
+ *       --table g_dll_mappings \
+ *       --output pe-loader/loader/pe_import_dll_ph.h \
+ *       --symbol DLL_PH
  */
-#define DLL_HASH_BUCKETS 1024
-#define DLL_HASH_MASK    (DLL_HASH_BUCKETS - 1)
+#include "pe_import_dll_ph.h"
 
-/* Small open-addressed index: g_dll_mappings index + 1, 0 = empty. */
-static int16_t g_dll_hash[DLL_HASH_BUCKETS];
-static int g_dll_hash_built = 0;
-
-static inline uint32_t dll_fnv1a(const char *s)
-{
-    uint32_t h = 0x811C9DC5u;
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
-        /* Cheap tolower on ASCII: bit-or 0x20 only when 'A'..'Z'.
-         * Stays branchless and matches the canonical lowercased keys. */
-        unsigned lc = c - 'A';
-        c = (lc < 26u) ? (c | 0x20u) : c;
-        h ^= c;
-        h *= 0x01000193u;
-    }
-    return h;
-}
-
-static void dll_hash_build(void)
-{
-    if (g_dll_hash_built) return;
-    memset(g_dll_hash, 0, sizeof(g_dll_hash));
-    for (int n = 0; g_dll_mappings[n].win_name != NULL; n++) {
-        uint32_t h = dll_fnv1a(g_dll_mappings[n].win_name) & DLL_HASH_MASK;
-        /* Linear probe for open addressing; table is 1024 / ~190 ≈ 5x
-         * larger than population so probe chains stay short (<4 typical). */
-        while (g_dll_hash[h] != 0)
-            h = (h + 1) & DLL_HASH_MASK;
-        /* Store index+1 so 0 means empty */
-        g_dll_hash[h] = (int16_t)(n + 1);
-    }
-    __atomic_store_n(&g_dll_hash_built, 1, __ATOMIC_RELEASE);
-}
-
-/* Look up a pre-lowercased, suffixed name in the hash index.
+/* Look up a pre-lowercased, suffixed name in the perfect-hash index.
  * Returns index into g_dll_mappings or -1 if not found. */
+__attribute__((hot))
 static int dll_hash_lookup(const char *lower)
 {
-    if (__builtin_expect(!__atomic_load_n(&g_dll_hash_built, __ATOMIC_ACQUIRE), 0))
-        dll_hash_build();
-
-    uint32_t h = dll_fnv1a(lower) & DLL_HASH_MASK;
-    for (int probes = 0; probes < DLL_HASH_BUCKETS; probes++) {
-        int idx = g_dll_hash[h];
-        if (idx == 0) return -1;
-        if (strcmp(g_dll_mappings[idx - 1].win_name, lower) == 0)
-            return idx - 1;
-        h = (h + 1) & DLL_HASH_MASK;
-    }
+    int idx = DLL_PH_lookup(lower);
+    if (idx < 0) return -1;
+    /* Guard strcmp: perfect hash maps unknown inputs into populated
+     * slots, so we still verify the full name matches.  Cheap -- names
+     * are < 64 B and most mismatches differ in the first few chars. */
+    if (strcmp(g_dll_mappings[idx].win_name, lower) == 0)
+        return idx;
     return -1;
 }
 
@@ -1966,7 +1919,7 @@ static int str_casecmp(const char *a, const char *b)
 }
 
 /*
-/* ---- Export directory cache ----
+ * ---- Export directory cache ----
  *
  * resolve_pe_export_by_name / _by_ordinal re-walk the MZ/PE/optional header
  * every call to find the export directory.  When a PE imports 200 symbols

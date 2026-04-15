@@ -1558,4 +1558,364 @@ else
     echo "WARNING: Could not create local pe-compat repo"
 fi
 
+# ==========================================================================
+# AGGRESSIVE LIVE-ISO BLOAT PRUNING (Session 31)
+# ==========================================================================
+# The live ISO does not need docs, man pages, non-English locales, or Python
+# test suites.  The INSTALLED system downloads fresh packages via pacstrap,
+# so none of this pruning affects a user's installed system.
+#
+# Targets the ~200 MB locale-archive, ~300 MB /usr/share/doc + man + info,
+# Python __pycache__ and test/ dirs, unused fonts/icons/wallpapers, and the
+# pacman download cache.  Total expected savings: 500-800 MB uncompressed
+# (compresses to ~300-500 MB squashfs reduction at zstd-22).
+#
+# Every path is absolute and scoped to /usr/share, /usr/lib/python*, or
+# /var/cache.  No wildcards traverse outside these roots.
+# ==========================================================================
+
+echo "[+] === Pruning live-ISO bloat ==="
+
+# Relax strictness for the prune block:
+#   * nullglob -- let `for d in */` no-op on empty dirs under `set -e`
+#   * +pipefail -- du|awk reporting is best-effort; a failed du must not abort
+#   * +e       -- rm/find failures are tolerated (already have `|| true`)
+shopt -s nullglob 2>/dev/null || true
+set +o pipefail
+set +e
+
+# --- (1) /usr/share/doc -- almost entirely useless on a live ISO ---
+# Keep licenses subtree (some packages expect /usr/share/licenses not /doc).
+if [ -d /usr/share/doc ]; then
+    _before=$(du -sm /usr/share/doc 2>/dev/null | awk '{print $1}')
+    rm -rf /usr/share/doc
+    mkdir -p /usr/share/doc
+    echo "[+] Pruned /usr/share/doc (~${_before:-?} MB)"
+fi
+
+# --- (2) /usr/share/man -- live ISO has no man reader by default ---
+if [ -d /usr/share/man ]; then
+    _before=$(du -sm /usr/share/man 2>/dev/null | awk '{print $1}')
+    rm -rf /usr/share/man
+    mkdir -p /usr/share/man/man1 /usr/share/man/man5 /usr/share/man/man8
+    echo "[+] Pruned /usr/share/man (~${_before:-?} MB)"
+fi
+
+# --- (3) /usr/share/info -- GNU info pages, nobody reads these ---
+if [ -d /usr/share/info ]; then
+    _before=$(du -sm /usr/share/info 2>/dev/null | awk '{print $1}')
+    rm -rf /usr/share/info
+    mkdir -p /usr/share/info
+    echo "[+] Pruned /usr/share/info (~${_before:-?} MB)"
+fi
+
+# --- (4) /usr/share/gtk-doc -- GTK developer documentation ---
+if [ -d /usr/share/gtk-doc ]; then
+    _before=$(du -sm /usr/share/gtk-doc 2>/dev/null | awk '{print $1}')
+    rm -rf /usr/share/gtk-doc
+    echo "[+] Pruned /usr/share/gtk-doc (~${_before:-?} MB)"
+fi
+
+# --- (5) /usr/share/help -- GNOME yelp help docs (pulled in transitively) ---
+if [ -d /usr/share/help ]; then
+    _before=$(du -sm /usr/share/help 2>/dev/null | awk '{print $1}')
+    rm -rf /usr/share/help
+    echo "[+] Pruned /usr/share/help (~${_before:-?} MB)"
+fi
+
+# --- (6) locale-archive -- strip to en_US.UTF-8 + C only ---
+# glibc ships a 200+ MB /usr/lib/locale/locale-archive containing hundreds
+# of locales.  Strategy: nuke the archive entirely then rebuild with only
+# en_US.UTF-8.  This is faster and more reliable than `localedef
+# --delete-from-archive` (which doesn't actually free disk until the archive
+# is rebuilt, and there's no portable `build-locale-archive` binary on
+# vanilla glibc >= 2.37).
+#
+# The locale.gen + locale-gen step below (line ~290) ran before this prune;
+# our target locales are already in the archive.  Now we wipe and regenerate
+# with ONLY what we need.
+if [ -f /usr/lib/locale/locale-archive ]; then
+    _before=$(du -sm /usr/lib/locale/locale-archive 2>/dev/null | awk '{print $1}')
+    # Truncate locale.gen to just en_US.UTF-8 (was already written above,
+    # but defensively enforce a single-line file to shrink the rebuild).
+    printf 'en_US.UTF-8 UTF-8\n' > /etc/locale.gen
+    # Wipe and regenerate
+    rm -f /usr/lib/locale/locale-archive
+    locale-gen 2>/dev/null || true
+    _after=$(du -sm /usr/lib/locale/locale-archive 2>/dev/null | awk '{print $1}')
+    echo "[+] Pruned locale-archive (${_before:-?} MB -> ${_after:-?} MB, kept en_US.UTF-8)"
+fi
+
+# --- (7) /usr/share/locale/* -- remove non-English gettext translations ---
+# Keep en, en_US, en_GB + C, POSIX.  Also keep any locale symlinks.
+if [ -d /usr/share/locale ]; then
+    _before=$(du -sm /usr/share/locale 2>/dev/null | awk '{print $1}')
+    (
+        cd /usr/share/locale || exit 0
+        for d in */; do
+            d="${d%/}"
+            case "$d" in
+                en|en_US|en_GB|C|POSIX|locale.alias)
+                    continue
+                    ;;
+                *)
+                    rm -rf "./$d" 2>/dev/null || true
+                    ;;
+            esac
+        done
+    )
+    _after=$(du -sm /usr/share/locale 2>/dev/null | awk '{print $1}')
+    echo "[+] Pruned /usr/share/locale non-en translations (${_before:-?} MB -> ${_after:-?} MB)"
+fi
+
+# --- (8) Python __pycache__ + test suites ---
+# Python re-generates __pycache__ at first import (tiny cost).  The test/
+# and tests/ subdirs under stdlib are useless on non-dev systems.
+# Use find -delete (no wildcards above /usr/lib).
+_before=$(du -sm /usr/lib/python3* 2>/dev/null | awk '{sum+=$1} END {print sum}')
+if [ -d /usr/lib ]; then
+    find /usr/lib -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+    # Strip stdlib test suites (large: test/, idlelib/, turtledemo/, tkinter/test, etc.)
+    for p in /usr/lib/python3.*/test \
+             /usr/lib/python3.*/idlelib \
+             /usr/lib/python3.*/turtledemo \
+             /usr/lib/python3.*/tkinter/test \
+             /usr/lib/python3.*/unittest/test \
+             /usr/lib/python3.*/distutils/tests \
+             /usr/lib/python3.*/lib2to3/tests \
+             /usr/lib/python3.*/ensurepip/_bundled \
+             /usr/lib/python3.*/sqlite3/test; do
+        [ -d "$p" ] && rm -rf "$p" 2>/dev/null || true
+    done
+    # Site-packages __pycache__ and tests in third-party libs
+    find /usr/lib/python3.*/site-packages -maxdepth 3 -type d \
+        \( -name 'tests' -o -name 'test' -o -name '__pycache__' \) \
+        -prune -exec rm -rf {} + 2>/dev/null || true
+fi
+_after=$(du -sm /usr/lib/python3* 2>/dev/null | awk '{sum+=$1} END {print sum}')
+echo "[+] Pruned Python __pycache__ + test dirs (${_before:-?} MB -> ${_after:-?} MB)"
+
+# --- (9) /usr/share/backgrounds -- distro default wallpapers ---
+# ai-desktop-config ships its own wallpapers; distro defaults are redundant.
+if [ -d /usr/share/backgrounds ]; then
+    _before=$(du -sm /usr/share/backgrounds 2>/dev/null | awk '{print $1}')
+    # Keep the ai-arch / archwindows backgrounds if any, drop everything else
+    (
+        cd /usr/share/backgrounds || exit 0
+        for d in */; do
+            d="${d%/}"
+            case "$d" in
+                ai-arch|archwindows|xfce)
+                    continue
+                    ;;
+                *)
+                    rm -rf "./$d" 2>/dev/null || true
+                    ;;
+            esac
+        done
+    )
+    _after=$(du -sm /usr/share/backgrounds 2>/dev/null | awk '{print $1}')
+    echo "[+] Pruned /usr/share/backgrounds (${_before:-?} MB -> ${_after:-?} MB)"
+fi
+
+# --- (10) /usr/share/icons -- remove unused icon themes ---
+# Keep: Papirus-Dark (primary), hicolor (required fallback), ai-arch (branding)
+if [ -d /usr/share/icons ]; then
+    _before=$(du -sm /usr/share/icons 2>/dev/null | awk '{print $1}')
+    (
+        cd /usr/share/icons || exit 0
+        for d in */; do
+            d="${d%/}"
+            case "$d" in
+                Papirus-Dark|Papirus|hicolor|default|ai-arch|archwindows)
+                    continue
+                    ;;
+                Adwaita)
+                    # Adwaita is pulled in by GTK but Papirus-Dark covers all app icons.
+                    # Keep only cursor theme from Adwaita (GTK default cursor).
+                    find "./$d" -mindepth 1 -maxdepth 1 -type d \
+                        ! -name 'cursors' -exec rm -rf {} + 2>/dev/null || true
+                    ;;
+                *)
+                    rm -rf "./$d" 2>/dev/null || true
+                    ;;
+            esac
+        done
+    )
+    _after=$(du -sm /usr/share/icons 2>/dev/null | awk '{print $1}')
+    echo "[+] Pruned /usr/share/icons (${_before:-?} MB -> ${_after:-?} MB, kept Papirus-Dark + hicolor)"
+fi
+
+# --- (11) Unused fonts ---
+# Keep: ttf-dejavu (fallback), noto (emoji + wide UTF-8), jetbrains-mono +
+# cascadia-code (terminal), fira-sans (UI), terminus (VT console).
+# Drop: liberation (dejavu covers it), cantarell (GNOME default, unused in
+# XFCE), noto-cjk if present (CJK is ~80 MB and most users don't need it).
+if [ -d /usr/share/fonts ]; then
+    _before=$(du -sm /usr/share/fonts 2>/dev/null | awk '{print $1}')
+    for f in /usr/share/fonts/cantarell \
+             /usr/share/fonts/noto-cjk \
+             /usr/share/fonts/google-noto-cjk \
+             /usr/share/fonts/adobe-source-han-sans-* \
+             /usr/share/fonts/adobe-source-han-serif-*; do
+        [ -d "$f" ] && rm -rf "$f" 2>/dev/null || true
+    done
+    # Refresh fontconfig cache after pruning
+    fc-cache -f 2>/dev/null || true
+    _after=$(du -sm /usr/share/fonts 2>/dev/null | awk '{print $1}')
+    echo "[+] Pruned unused fonts (${_before:-?} MB -> ${_after:-?} MB)"
+fi
+
+# --- (12) /usr/share/vim -- drop tutor, spell dicts, language packs ---
+if [ -d /usr/share/vim ]; then
+    for sub in tutor lang spell print macros; do
+        for d in /usr/share/vim/vim*/"$sub"; do
+            [ -d "$d" ] && rm -rf "$d" 2>/dev/null || true
+        done
+    done
+    echo "[+] Pruned /usr/share/vim extras (tutor/lang/spell/print/macros)"
+fi
+
+# --- (13) Zoneinfo non-essential regions ---
+# Keep the core zoneinfo so `ln -sf` in installer keeps working, but drop
+# the deprecated/right and posix duplicate trees (~5 MB).
+if [ -d /usr/share/zoneinfo ]; then
+    for d in /usr/share/zoneinfo/right /usr/share/zoneinfo/posix; do
+        [ -d "$d" ] && rm -rf "$d" 2>/dev/null || true
+    done
+    echo "[+] Pruned /usr/share/zoneinfo duplicates (right/, posix/)"
+fi
+
+# --- (14) Firmware audit -- drop clearly-unused legacy NIC families ---
+# ONLY remove firmware we're certain no live-ISO user will hit.
+# liquidio: Cavium OCTEON enterprise NICs (servers, not desktop HW).
+# netronome: enterprise SmartNICs (Agilio CX series).
+# qed/qede: QLogic FastLinQ 40G (datacenter).
+# mellanox: ConnectX datacenter NICs (mlxsw_*, not client HW).
+# mrvl: Marvell Octeon platforms.
+# hfi1_dc8051 (Intel Omni-Path): HPC interconnect.
+# keep everything else -- b43, rtl, ath, iwlwifi, realtek, broadcom, intel, etc.
+if [ -d /lib/firmware ]; then
+    _before=$(du -sm /lib/firmware 2>/dev/null | awk '{print $1}')
+    for f in /lib/firmware/liquidio \
+             /lib/firmware/netronome \
+             /lib/firmware/qed \
+             /lib/firmware/mellanox \
+             /lib/firmware/mrvl/prestera \
+             /lib/firmware/qcom/sdx* \
+             /lib/firmware/qcom/sc8* \
+             /lib/firmware/qcom/sm8* \
+             /lib/firmware/qcom/apq* \
+             /lib/firmware/qcom/msm*; do
+        [ -e "$f" ] && rm -rf "$f" 2>/dev/null || true
+    done
+    # Drop individual big files: hfi1 OmniPath and various server ASIC blobs
+    for f in /lib/firmware/hfi1_dc8051.fw \
+             /lib/firmware/hfi1_fabric.fw \
+             /lib/firmware/hfi1_pcie.fw \
+             /lib/firmware/hfi1_sbus.fw; do
+        [ -f "$f" ] && rm -f "$f" 2>/dev/null || true
+    done
+    _after=$(du -sm /lib/firmware 2>/dev/null | awk '{print $1}')
+    echo "[+] Pruned /lib/firmware datacenter blobs (${_before:-?} MB -> ${_after:-?} MB)"
+fi
+
+# --- (15) /usr/include -- kernel headers are needed for DKMS first-boot ---
+# DO NOT touch /usr/include or /usr/lib/modules/*/build -- trust-dkms +
+# pe-compat-dkms build at first boot.  Flagged as deliberate kept overhead.
+
+# --- (16) Misc small cleanups ---
+# /usr/share/i18n/charmaps -- charmap defs beyond UTF-8 (rarely used)
+if [ -d /usr/share/i18n/charmaps ]; then
+    (
+        cd /usr/share/i18n/charmaps || exit 0
+        for f in *.gz; do
+            case "$f" in
+                UTF-8.gz|ANSI_X3.4-1968.gz|ISO-8859-1.gz|ISO-8859-15.gz)
+                    continue
+                    ;;
+                *)
+                    rm -f "$f" 2>/dev/null || true
+                    ;;
+            esac
+        done
+    )
+    echo "[+] Pruned /usr/share/i18n/charmaps (kept UTF-8, ASCII, Latin-1, Latin-9)"
+fi
+
+# /usr/share/i18n/locales -- locale source defs (regenerated locales use
+# these).  Keep en_*, C, POSIX, i18n common; drop the rest.
+if [ -d /usr/share/i18n/locales ]; then
+    (
+        cd /usr/share/i18n/locales || exit 0
+        for f in *; do
+            case "$f" in
+                en_*|C|POSIX|i18n*|iso14651_t1*|translit_*)
+                    continue
+                    ;;
+                *)
+                    rm -f "$f" 2>/dev/null || true
+                    ;;
+            esac
+        done
+    )
+    echo "[+] Pruned /usr/share/i18n/locales non-en sources"
+fi
+
+# --- (17) Pacman hook: auto-prune docs/man on package installs ---
+# Keeps the INSTALLED system slim too.  Only active on systems that copy
+# this hook over (post-install via ai-desktop-config).  On the live ISO
+# it fires during customize_airootfs.sh only if any late package lands.
+mkdir -p /etc/pacman.d/hooks
+cat > /etc/pacman.d/hooks/90-prune-docs.hook <<'PRUNE_HOOK'
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = usr/share/doc/*
+Target = usr/share/man/*
+Target = usr/share/info/*
+Target = usr/share/gtk-doc/*
+
+[Action]
+Description = Pruning docs/man/info (AI Arch -- live ISO keeps this slim)
+When = PostTransaction
+Exec = /usr/bin/sh -c 'rm -rf /usr/share/doc/* /usr/share/info/* /usr/share/gtk-doc/* /usr/share/man/??/* /usr/share/man/??_*/* 2>/dev/null || true'
+PRUNE_HOOK
+echo "[+] Installed pacman hook: 90-prune-docs (future installs auto-prune)"
+
+# --- (18) Caches and logs accumulated during customize_airootfs.sh ---
+# /tmp should already be empty since we clean up after each download above,
+# but be defensive.
+rm -rf /tmp/* /tmp/.[!.]* 2>/dev/null || true
+rm -rf /var/log/pacman.log 2>/dev/null || true  # regenerates on install
+rm -rf /root/.cache 2>/dev/null || true
+rm -rf /root/.npm 2>/dev/null || true           # Claude Code install cache
+rm -rf /home/arch/.cache 2>/dev/null || true
+mkdir -p /home/arch/.cache
+chown arch:arch /home/arch/.cache 2>/dev/null || true
+echo "[+] Cleaned /tmp, /root/.cache, /root/.npm, /home/arch/.cache"
+
+# --- (19) FINAL: nuke /var/cache/pacman/pkg ---
+# This MUST run after the pe-compat repo copy above (which reads from
+# /var/cache/pacman/pkg).  Freeing ~400-600 MB of downloaded .pkg.tar.zst.
+# pacman -Scc would also work but leaves empty dirs + DB stamp.
+if [ -d /var/cache/pacman/pkg ]; then
+    _before=$(du -sm /var/cache/pacman/pkg 2>/dev/null | awk '{print $1}')
+    rm -rf /var/cache/pacman/pkg/*
+    echo "[+] Pruned /var/cache/pacman/pkg (~${_before:-?} MB freed)"
+fi
+
+# --- (20) Report final airootfs size --------------------------------------
+if command -v du &>/dev/null; then
+    _total=$(du -sh / --exclude=/proc --exclude=/sys --exclude=/dev \
+             --exclude=/run --exclude=/tmp 2>/dev/null | awk '{print $1}')
+    echo "[+] Post-prune airootfs size: ${_total:-unknown}"
+fi
+echo "[+] === Bloat pruning complete ==="
+
+# Restore strict mode for any trailing steps.
+set -e
+set -o pipefail
+
 echo "=== Customization complete ==="

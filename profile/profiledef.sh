@@ -32,4 +32,5 @@ file_permissions=(
   ["/etc/lightdm/display-setup.sh"]="0:0:755"
   ["/usr/lib/ai-arch/hw-detect.sh"]="0:0:755"
   ["/usr/lib/ai-arch/low-ram-services.sh"]="0:0:755"
+  ["/usr/lib/ai-arch/fstab-optimize.sh"]="0:0:755"
 )

@@ -196,12 +196,10 @@ if [ -f /usr/lib/systemd/system/power-profiles-daemon.service ]; then
     ln -sf /dev/null "$MASK_DIR/power-profiles-daemon.service"
 fi
 
-# fstrim.timer -- weekly TRIM for SSDs / NVMe.  Ships in util-linux and is
-# safe to enable unconditionally: the timer is a no-op on rotational media.
-if [ -f /usr/lib/systemd/system/fstrim.timer ]; then
-    ln -sf /usr/lib/systemd/system/fstrim.timer \
-        "$WANTS_DIR/fstrim.timer"
-fi
+# fstrim.timer -- weekly TRIM for SSDs / NVMe.
+# Do NOT enable on the live ISO: there's nothing to trim on a read-only
+# squashfs.  low-ram-services.sh re-enables it on NEW-tier installs where
+# the host has an SSD/NVMe and benefits from weekly TRIM.
 
 # systemd-timesyncd -- network time, critical for HTTPS/TLS handshakes.
 # Many of our services (ai-control, claude-code, etc.) will fail cert
@@ -211,12 +209,130 @@ if [ -f /usr/lib/systemd/system/systemd-timesyncd.service ]; then
         "$SYSINIT_WANTS/systemd-timesyncd.service"
 fi
 
-# Mask boot-delay services that waste time on the live ISO:
-# - man-db.service (regenerates mandb cache at boot, 10-20 s on slow HDD)
-# - updatedb.service (plocate, takes 30+ s on large roots)
-# - pacman-keyring-refresh.timer (network call, fails on offline boots)
-for unit in man-db.service updatedb.service mandb.service \
-            systemd-hibernate-resume@.service; do
+# Mask boot-delay services that waste time on the live ISO.
+# These are SAFE to mask unconditionally on the live ISO because the disk
+# installer lays a fresh /etc over the user's root partition -- these
+# symlinks don't propagate to installed systems (setup-services.sh writes
+# into the airootfs, not the target of pacstrap).
+#
+# Categories:
+#   A) cache-regeneration services (pointless on read-only squashfs)
+#   B) periodic timers (nothing persistent to rotate on live ISO)
+#   C) duplicate network stacks (NM + iwd are authoritative)
+#   D) hibernate/suspend helpers (live ISO has no swap)
+#   E) hwdb/udev-db regenerators (shipped pre-built in airootfs)
+for unit in \
+        man-db.service mandb.service man-db.timer \
+        updatedb.service plocate-updatedb.service plocate-updatedb.timer \
+        mlocate.timer locate.timer \
+        systemd-hibernate-resume@.service systemd-hibernate.service \
+        logrotate.service logrotate.timer \
+        shadow.timer \
+        fstrim.service \
+        paccache.timer paccache-cleanup.timer \
+        archlinux-keyring-wkd-sync.service archlinux-keyring-wkd-sync.timer \
+        systemd-time-wait-sync.service \
+        systemd-pstore.service \
+        btrfs-scrub@.timer \
+        abrtd.service abrt-journal-core.service abrt-oops.service abrt-xorg.service \
+        systemd-update-done.service \
+        systemd-journal-catalog-update.service \
+        systemd-hwdb-update.service; do
+    if [ -f "/usr/lib/systemd/system/$unit" ]; then
+        ln -sf /dev/null "$MASK_DIR/$unit"
+    fi
+done
+
+# --- Periodic systemd timers: fstrim is no-op on read-only squashfs.
+#     tmpfiles-clean has nothing to clean on volatile tmpfs.  We re-enable
+#     fstrim.timer on NEW HW via low-ram-services.sh.
+for unit in \
+        fstrim.timer \
+        systemd-tmpfiles-clean.timer; do
+    if [ -f "/usr/lib/systemd/system/$unit" ]; then
+        ln -sf /dev/null "$MASK_DIR/$unit"
+    fi
+done
+
+# --- Duplicate network stacks.  We use NetworkManager + iwd.
+#     dhcpcd, wpa_supplicant, systemd-networkd all fight over rfkill /
+#     netlink with NM and slow boot by 3-5 s each.
+for unit in \
+        dhcpcd.service \
+        dhcpcd@.service \
+        wpa_supplicant.service \
+        wpa_supplicant@.service \
+        wpa_supplicant-nl80211@.service \
+        wpa_supplicant-wired@.service \
+        systemd-networkd.service \
+        systemd-networkd.socket \
+        systemd-networkd-wait-online.service \
+        systemd-resolved.service; do
+    if [ -f "/usr/lib/systemd/system/$unit" ]; then
+        ln -sf /dev/null "$MASK_DIR/$unit"
+    fi
+done
+
+# --- Optional desktop daemons.  Safe to mask on live ISO; NEW-tier
+#     installed systems can re-enable via systemctl unmask.  We do NOT
+#     mask avahi here (some users rely on mDNS discovery at install time
+#     for PXE / network mirrors).
+for unit in \
+        packagekit.service \
+        packagekit-offline-update.service \
+        colord.service \
+        colord-sane.service \
+        cups.service \
+        cups.socket \
+        cups.path \
+        cups-browsed.service \
+        org.cups.cupsd.service \
+        org.cups.cupsd.socket \
+        org.cups.cupsd.path; do
+    if [ -f "/usr/lib/systemd/system/$unit" ]; then
+        ln -sf /dev/null "$MASK_DIR/$unit"
+    fi
+done
+
+# --- rpc/nfs client stack: not needed on a live ISO, pulled in
+#     transitively by gvfs. ~15 MB RSS for rpcbind + rpc-statd. ---
+for unit in \
+        rpcbind.service \
+        rpcbind.socket \
+        rpc-statd.service \
+        rpc-statd-notify.service \
+        nfs-client.target; do
+    if [ -f "/usr/lib/systemd/system/$unit" ]; then
+        ln -sf /dev/null "$MASK_DIR/$unit"
+    fi
+done
+
+# --- Virtualization stacks (dev-laptop extras).  None of them belong on
+#     the live ISO; they cost 40-80 MB RSS each once running. ---
+for unit in \
+        docker.service \
+        docker.socket \
+        containerd.service \
+        libvirtd.service \
+        libvirtd.socket \
+        podman.service \
+        podman.socket \
+        podman-auto-update.timer \
+        snapd.service \
+        snapd.socket; do
+    if [ -f "/usr/lib/systemd/system/$unit" ]; then
+        ln -sf /dev/null "$MASK_DIR/$unit"
+    fi
+done
+
+# --- Legacy / redundant systemd helpers that we actively don't need.
+#     systemd-binfmt is REQUIRED (binfmt_pe) -- do NOT mask.
+#     systemd-vconsole-setup IS needed (sets font + keymap); keep. ---
+for unit in \
+        systemd-homed.service \
+        systemd-userdbd.service \
+        systemd-userdbd.socket \
+        systemd-boot-update.service; do
     if [ -f "/usr/lib/systemd/system/$unit" ]; then
         ln -sf /dev/null "$MASK_DIR/$unit"
     fi

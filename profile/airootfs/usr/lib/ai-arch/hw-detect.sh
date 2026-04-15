@@ -226,5 +226,13 @@ if [ -w /etc ] && ! mountpoint -q /etc 2>/dev/null && [ ! -L /etc ]; then
     cp -f "$PROFILE_FILE_RUN" "$PROFILE_FILE_ETC" 2>/dev/null || true
 fi
 
+# --- HW-tiered sysctl application -----------------------------------------
+# Invokes the companion script, which writes /run/sysctl.d/90-ai-arch-hw.conf
+# and runs `sysctl --system`.  Ordering matters: the profile file must exist
+# first (we just wrote it above), so sysctl-tune.sh can source it.
+if [ -x /usr/lib/ai-arch/sysctl-tune.sh ]; then
+    /usr/lib/ai-arch/sysctl-tune.sh || true
+fi
+
 echo "ai-hw-detect: profile=$PROFILE reasons=${REASONS[*]:-default}"
 exit 0

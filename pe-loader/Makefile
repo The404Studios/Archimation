@@ -611,6 +611,35 @@ install: all
 	install -d $(DESTDIR)$(LIB_DIR)
 	install -m755 dlls/libpe_*.so $(DESTDIR)$(LIB_DIR)/
 
+# --- Perfect-hash regeneration ---
+# The import resolver's DLL and CRT name lookups use compile-time perfect
+# hashes produced offline by scripts/gen-perfect-hash.py.  The generated
+# headers (loader/pe_import_dll_ph.h, loader/pe_import_crt_ph.h) are
+# committed to the repo so the build does NOT require Python.
+#
+# Regenerate after editing g_dll_mappings[] or g_crt_wrappers[]:
+#     make perfect-hash
+# Or individually:
+#     make loader/pe_import_dll_ph.h
+#     make loader/pe_import_crt_ph.h
+PY ?= python3
+GEN_PH = $(CURDIR)/../scripts/gen-perfect-hash.py
+
+# Explicit-only target; do NOT put pe_import_*_ph.h on any regular build
+# dependency chain.  The seed search can take 1-3 minutes and we want
+# normal incremental builds to stay fast.  Run `make perfect-hash`
+# manually after editing either table.
+.PHONY: perfect-hash perfect-hash-dll perfect-hash-crt
+perfect-hash: perfect-hash-dll perfect-hash-crt
+
+perfect-hash-dll:
+	$(PY) $(GEN_PH) --input loader/pe_import.c --table g_dll_mappings \
+	    --output loader/pe_import_dll_ph.h --symbol DLL_PH --min-factor 4.0
+
+perfect-hash-crt:
+	$(PY) $(GEN_PH) --input loader/pe_import.c --table g_crt_wrappers \
+	    --output loader/pe_import_crt_ph.h --symbol CRT_PH --min-factor 4.0
+
 # --- Clean ---
 clean:
 	rm -f loader/peloader loader/*.o loader/*.d
@@ -620,6 +649,8 @@ clean:
 	rm -f tools/pe_dump tools/*.o tools/*.d
 	rm -f kernel/*.o kernel/*.ko kernel/*.mod* kernel/.*.cmd
 	rm -rf kernel/.tmp_versions kernel/Module.symvers kernel/modules.order
+# NOTE: perfect-hash headers (pe_import_*_ph.h) are NOT removed by clean --
+# they are source artifacts, regenerated only via `make perfect-hash`.
 
 # --- Auto-generated header dependencies (from -MMD -MP) ---
 # -include silences the error when .d files don't exist yet on a fresh checkout.

@@ -1,9 +1,23 @@
 """
 Real-time connection monitor.
 
-Runs a background thread that polls ``/proc/net/tcp``, ``/proc/net/tcp6``,
-and ``/proc/net/udp`` for active network connections.  Tracks new and
-closed connections and fires callbacks when changes are detected.
+Runs a background thread that polls for active network connections.
+Tracks new and closed connections and fires callbacks when changes are
+detected.
+
+Two data sources are supported:
+
+* **NETLINK_INET_DIAG (preferred)** -- binary ``sock_diag`` dump over an
+  AF_NETLINK socket.  ~10x cheaper than text-parsing ``/proc/net/*`` on
+  hosts with thousands of sockets and lets us filter by TCP state at
+  the kernel side.  See :mod:`firewall.backend.netlink`.
+
+* **``/proc/net/{tcp,tcp6,udp,udp6}`` (fallback)** -- classic text parse,
+  kept for hosts where netlink is unavailable (no CAP_NET_RAW, kernel
+  without ``sock_diag``, or non-Linux dev hosts).
+
+Both paths produce identical :class:`ConnectionInfo` objects, so the
+rest of the firewall stack can't tell which was used.
 """
 
 import asyncio
@@ -17,6 +31,20 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Optional
+
+try:
+    # Local helper; safe to import on any platform (probe-guarded).
+    from firewall.backend.netlink import (
+        InetDiagClient,
+        TCP_STATE_NAME,
+        TCP_CLOSE,
+    )
+    _NETLINK_IMPORT_OK = True
+except Exception:  # pragma: no cover - only when module layout changes
+    InetDiagClient = None  # type: ignore[assignment]
+    TCP_STATE_NAME = {}    # type: ignore[assignment]
+    TCP_CLOSE = 7          # type: ignore[assignment]
+    _NETLINK_IMPORT_OK = False
 
 logger = logging.getLogger("firewall.connection_monitor")
 
@@ -169,7 +197,8 @@ class ConnectionMonitor:
             pass
         return default
 
-    def __init__(self, poll_interval: Optional[float] = None) -> None:
+    def __init__(self, poll_interval: Optional[float] = None,
+                 use_netlink: Optional[bool] = None) -> None:
         # Allow explicit interval override but default to hardware-aware
         # tuning.  None = auto; anything else wins.
         if poll_interval is None:
@@ -209,6 +238,15 @@ class ConnectionMonitor:
         self._get_connections_cache_time: float = 0.0
         self._get_connections_ttl: float = 0.5
 
+        # Netlink / sock_diag fast path.  None = probe lazily on first
+        # poll; True/False = explicit override (tests, benchmarks).  When
+        # the probe fails we don't retry -- the per-poll fallback cost is
+        # tiny and a failing probe usually means missing capability.
+        self._use_netlink = use_netlink
+        self._netlink: Optional["InetDiagClient"] = None
+        self._netlink_failed: bool = False
+        self._netlink_source: str = "proc"  # "netlink" or "proc"
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -239,6 +277,15 @@ class ConnectionMonitor:
             self._thread.join(timeout=self._poll_interval * 3)
         self._running = False
         self._thread = None
+        # Release the netlink socket so we don't leak an FD when the
+        # monitor is restarted (tests do this; long-running daemons
+        # should also behave).
+        if self._netlink is not None:
+            try:
+                self._netlink.close()
+            except Exception:
+                pass
+            self._netlink = None
         logger.info("ConnectionMonitor stopped")
 
     def __del__(self) -> None:
@@ -345,6 +392,7 @@ class ConnectionMonitor:
                 "total_closed": self._total_closed,
                 "running": self._running,
                 "poll_interval": self._poll_interval,
+                "source": self._netlink_source,
             }
 
     # ------------------------------------------------------------------
@@ -431,10 +479,45 @@ class ConnectionMonitor:
         return bool(new_conns or closed_conns)
 
     def _read_current_connections(self) -> dict[ConnectionKey, ConnectionInfo]:
-        """Read all connections from /proc/net/* and map to processes."""
+        """Read all connections, preferring NETLINK_INET_DIAG.
+
+        Falls back to the classic /proc/net/* text parse when:
+
+        * netlink has been explicitly disabled (``use_netlink=False``);
+        * the probe failed on a previous call (missing kernel support
+          or restrictive seccomp);
+        * this specific poll's netlink dump raised an OSError.
+
+        The inode -> pid map comes from the same /proc/*/fd walk used
+        by the fallback path; that's unavoidable because the kernel's
+        sock_diag doesn't expose pid attribution directly (only uid).
+        """
         inode_map = self._get_cached_inode_map()
         connections: dict[ConnectionKey, ConnectionInfo] = {}
 
+        # Netlink fast path.  Probe once, reuse the client across polls.
+        if self._should_try_netlink():
+            try:
+                netlink_conns = self._read_via_netlink(inode_map)
+                if netlink_conns is not None:
+                    for conn in netlink_conns:
+                        connections[conn.key] = conn
+                    self._netlink_source = "netlink"
+                    return connections
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "Netlink sock_diag poll failed; reverting to /proc"
+                )
+                self._netlink_failed = True
+                if self._netlink is not None:
+                    try:
+                        self._netlink.close()
+                    except Exception:
+                        pass
+                    self._netlink = None
+
+        # /proc text-parse fallback (legacy path).
+        self._netlink_source = "proc"
         for proto, path in [
             ("tcp", "/proc/net/tcp"),
             ("tcp6", "/proc/net/tcp6"),
@@ -445,6 +528,88 @@ class ConnectionMonitor:
                 connections[conn.key] = conn
 
         return connections
+
+    def _should_try_netlink(self) -> bool:
+        """Return True if we should attempt the netlink fast path now."""
+        if self._use_netlink is False:
+            return False
+        if self._netlink_failed:
+            return False
+        if not _NETLINK_IMPORT_OK or InetDiagClient is None:
+            return False
+        return True
+
+    def _read_via_netlink(
+        self,
+        inode_map: dict[int, tuple[int, str, str]],
+    ) -> Optional[list[ConnectionInfo]]:
+        """Dump all four (family x proto) tables via sock_diag.
+
+        Returns ``None`` if the netlink probe fails -- the caller takes
+        that as the signal to use /proc.  Returns a (possibly empty) list
+        on success.  Empty-on-success is valid: the host may have no
+        live sockets.
+        """
+        if InetDiagClient is None:
+            return None
+
+        if self._netlink is None:
+            client = InetDiagClient()
+            if not client.open():
+                self._netlink_failed = True
+                logger.info(
+                    "NETLINK_INET_DIAG unavailable; using /proc polling"
+                )
+                return None
+            self._netlink = client
+            logger.info(
+                "NETLINK_INET_DIAG available; switched to binary sock_diag dump"
+            )
+
+        client = self._netlink
+        results: list[ConnectionInfo] = []
+
+        for raw in client.query_all():
+            proto = raw["protocol"]
+            state_code = raw["state_code"]
+            # Skip fully-closed sockets; they'd otherwise appear once and
+            # vanish, inflating the new/closed callback churn.
+            if proto.startswith("tcp") and state_code == TCP_CLOSE:
+                continue
+
+            if proto.startswith("tcp"):
+                state_name = TCP_STATE_NAME.get(state_code, ConnState.CLOSED.value)
+                # Normalise to our ConnState enum where possible.
+                try:
+                    state = ConnState(state_name).value
+                except ValueError:
+                    state = state_name
+            else:
+                # UDP uses state 7 == UNCONN, else ESTABLISHED per /proc
+                # semantics.  Keep that convention here.
+                state = (
+                    ConnState.UNCONN.value
+                    if state_code == TCP_CLOSE
+                    else ConnState.ESTABLISHED.value
+                )
+
+            inode = raw["inode"]
+            pid, proc_name, exe_path = inode_map.get(inode, (0, "", ""))
+
+            results.append(ConnectionInfo(
+                protocol=proto,
+                local_addr=raw["local_addr"],
+                local_port=raw["local_port"],
+                remote_addr=raw["remote_addr"],
+                remote_port=raw["remote_port"],
+                state=state,
+                pid=pid,
+                process_name=proc_name,
+                exe_path=exe_path,
+                inode=inode,
+            ))
+
+        return results
 
     def _parse_proc_net(
         self,

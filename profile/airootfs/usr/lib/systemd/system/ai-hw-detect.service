@@ -3,7 +3,9 @@ Description=AI Arch hardware profiler (old vs new HW detection)
 # Runs as part of basic.target so /run/ai-arch-hw-profile exists before
 # any service that depends on it (display-manager, ai-control, firewall).
 # DefaultDependencies=yes so it gets proper early-boot ordering for free.
-After=systemd-modules-load.service local-fs.target
+# After=swap.target ensures zram (if enabled) is up before sysctl-tune.sh
+# probes /proc/swaps for zram-aware swappiness.
+After=systemd-modules-load.service local-fs.target swap.target
 Before=display-manager.service ai-control.service lightdm.service \
        ai-low-ram-services.service basic.target
 Documentation=file:///usr/lib/ai-arch/hw-detect.sh

@@ -12,6 +12,7 @@ import subprocess
 import base64
 import io
 import os
+import time
 
 logger = logging.getLogger("ai-control.screen")
 
@@ -164,11 +165,20 @@ class ScreenCapture:
 
     def _detect_fb_resolution(self) -> tuple[int, int]:
         """Auto-detect framebuffer resolution from sysfs."""
+        # Framebuffer geometry is fixed for the life of the session — cache
+        # it after the first successful probe to avoid sysfs reads on every
+        # capture_full() / get_screen_size() call.
+        cached = getattr(self, "_fb_res_cache", None)
+        if cached is not None:
+            return cached
+        result = (1920, 1080)  # Default fallback
         try:
             with open("/sys/class/graphics/fb0/virtual_size", "r") as f:
                 parts = f.read().strip().split(",")
                 if len(parts) == 2:
-                    return int(parts[0]), int(parts[1])
+                    result = (int(parts[0]), int(parts[1]))
+                    self._fb_res_cache = result
+                    return result
         except (FileNotFoundError, ValueError, PermissionError):
             pass
         # Fallback: try to read from fb_var_screeninfo via ioctl
@@ -179,10 +189,13 @@ class ScreenCapture:
                 if "x" in mode:
                     dim = mode.split(":")[1].split("p")[0] if ":" in mode else mode
                     w, h = dim.split("x")
-                    return int(w), int(h)
+                    result = (int(w), int(h))
+                    self._fb_res_cache = result
+                    return result
         except (FileNotFoundError, ValueError, IndexError, PermissionError):
             pass
-        return 1920, 1080  # Default fallback
+        self._fb_res_cache = result
+        return result
 
     def _capture_framebuffer(self) -> bytes | None:
         """Capture from /dev/fb0 (requires root)."""
@@ -218,6 +231,11 @@ class ScreenCapture:
 
     def get_screen_size(self) -> tuple[int, int]:
         """Get the screen resolution."""
+        # Screen resolution rarely changes; cache briefly to avoid spawning
+        # xdpyinfo on every call (20-50ms each on old hardware).
+        cached = getattr(self, "_size_cache", None)
+        if cached is not None and (time.monotonic() - cached[1]) < 30.0:
+            return cached[0]
         if self.method == "x11":
             try:
                 result = subprocess.run(
@@ -228,9 +246,14 @@ class ScreenCapture:
                     if "dimensions:" in line:
                         parts = line.split()
                         dims = parts[1].split("x")
-                        return int(dims[0]), int(dims[1])
+                        size = (int(dims[0]), int(dims[1]))
+                        self._size_cache = (size, time.monotonic())
+                        return size
             except Exception:
                 pass
         elif self.method == "framebuffer":
-            return self._detect_fb_resolution()
+            size = self._detect_fb_resolution()
+            self._size_cache = (size, time.monotonic())
+            return size
+        self._size_cache = ((1920, 1080), time.monotonic())
         return 1920, 1080  # Default fallback

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #include "common/dll_common.h"
 
@@ -31,22 +32,33 @@ WINAPI_EXPORT const uint16_t *WindowsGetStringRawBuffer(void *string, uint32_t *
 #define RO_INIT_SINGLETHREADED 0
 #define RO_INIT_MULTITHREADED  1
 
-static int g_ro_init_count = 0;
+/*
+ * WinRT apartments: UE5 + other apps may call RoInitialize/RoUninitialize
+ * from worker threads and pool allocators concurrently. A plain int counter
+ * had torn-read/lost-increment races; use atomic_int (single-word relaxed
+ * updates are cheap on both old HW and new HW). */
+static atomic_int g_ro_init_count = 0;
 
 /* ========== WinRT Initialization ========== */
 
 WINAPI_EXPORT HRESULT RoInitialize(uint32_t initType)
 {
     (void)initType;
-    g_ro_init_count++;
+    int n = atomic_fetch_add(&g_ro_init_count, 1) + 1;
     fprintf(stderr, COMBASE_LOG "RoInitialize(%s): OK (count=%d)\n",
-            initType == RO_INIT_MULTITHREADED ? "MTA" : "STA", g_ro_init_count);
+            initType == RO_INIT_MULTITHREADED ? "MTA" : "STA", n);
     return S_OK;
 }
 
 WINAPI_EXPORT void RoUninitialize(void)
 {
-    if (g_ro_init_count > 0) g_ro_init_count--;
+    /* Saturate at zero so over-releasing callers don't push negative. */
+    for (;;) {
+        int cur = atomic_load(&g_ro_init_count);
+        if (cur <= 0) return;
+        if (atomic_compare_exchange_weak(&g_ro_init_count, &cur, cur - 1))
+            return;
+    }
 }
 
 /* ========== Activation Factories ========== */
@@ -129,6 +141,10 @@ WINAPI_EXPORT HRESULT WindowsCreateString(
         *string = NULL; /* Empty HSTRING = NULL */
         return S_OK;
     }
+
+    /* Guard against (length + 1) overflow when computing buffer bytes. */
+    if (length >= (UINT32_MAX / sizeof(uint16_t)) - 1)
+        return E_OUTOFMEMORY;
 
     hstring_internal_t *hs = calloc(1, sizeof(hstring_internal_t));
     if (!hs) return E_OUTOFMEMORY;
@@ -278,6 +294,9 @@ WINAPI_EXPORT HRESULT WindowsConcatString(void *string1, void *string2, void **n
     const uint16_t *buf1 = WindowsGetStringRawBuffer(string1, &len1);
     const uint16_t *buf2 = WindowsGetStringRawBuffer(string2, &len2);
 
+    /* Guard against len1 + len2 overflow. */
+    if (len1 > UINT32_MAX - len2)
+        return E_OUTOFMEMORY;
     uint32_t total = len1 + len2;
     if (total == 0) {
         *newString = NULL;
@@ -320,7 +339,8 @@ WINAPI_EXPORT HRESULT WindowsSubstringWithSpecifiedLength(
     uint32_t srcLen = 0;
     const uint16_t *buf = WindowsGetStringRawBuffer(string, &srcLen);
 
-    if (startIndex > srcLen || startIndex + length > srcLen)
+    /* Use subtraction form to avoid overflow in startIndex + length. */
+    if (startIndex > srcLen || length > srcLen - startIndex)
         return E_INVALIDARG;
 
     return WindowsCreateString(buf + startIndex, length, newString);

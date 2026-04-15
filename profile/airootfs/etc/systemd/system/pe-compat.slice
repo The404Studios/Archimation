@@ -1,0 +1,30 @@
+[Unit]
+Description=AI Arch PE Compatibility Application Slice
+Documentation=https://github.com/ai-arch-linux
+# Make sure the unified cgroup hierarchy is set up before we try to
+# populate this slice.  systemd itself guarantees this on modern installs
+# but being explicit makes the dependency graph self-documenting.
+DefaultDependencies=no
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Slice]
+# Delegate cgroup controllers to children so firewall app-scopes inherit
+# them.  "Delegate=" here asks systemd to hand control of this subtree
+# over to us: scope units created under pe-compat.slice/<app>.scope can
+# then enable their own controllers without systemd overwriting
+# cgroup.subtree_control behind our back.
+Delegate=pids memory cpu io
+
+# Enable accounting so the nft `socket cgroupv2` predicate has reliable
+# cgroup membership state and systemd exposes per-scope resource usage
+# for debugging ("systemd-cgtop -m /pe-compat.slice").  Without these
+# flags systemd may skip controller wiring for transient scopes, causing
+# ensure_subtree_controllers() to log EBUSY on every invocation.
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+TasksAccounting=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,29 @@
+[Unit]
+Description=AI Arch hardware profiler (old vs new HW detection)
+# Runs as part of basic.target so /run/ai-arch-hw-profile exists before
+# any service that depends on it (display-manager, ai-control, firewall).
+# DefaultDependencies=yes so it gets proper early-boot ordering for free.
+After=systemd-modules-load.service local-fs.target
+Before=display-manager.service ai-control.service lightdm.service \
+       ai-low-ram-services.service basic.target
+Documentation=file:///usr/lib/ai-arch/hw-detect.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/ai-arch/hw-detect.sh
+# Fast: 10-second ceiling.  If detection hangs (e.g., missing lspci)
+# the unit quietly falls back to DEFAULT profile and boot continues.
+TimeoutStartSec=10
+# Fail silently -- never block boot on a classifier hiccup.
+SuccessExitStatus=0 1 2
+# Lightweight sandbox (still allow writing to /etc + /sys)
+ProtectSystem=no
+NoNewPrivileges=yes
+# Give detection CPU to run quickly on loaded systems
+Nice=-5
+IOSchedulingClass=realtime
+IOSchedulingPriority=4
+
+[Install]
+WantedBy=multi-user.target graphical.target

@@ -240,7 +240,18 @@ WINAPI_EXPORT HANDLE CreateIoCompletionPort(
     if (!h || h == INVALID_HANDLE_VALUE) {
         close(evfd);
         close(epfd);
-        /* Don't decrement g_iocp_count -- slot is consumed */
+        /* Remove from g_iocps before freeing, otherwise iteration over the
+         * array will read a dangling pointer. */
+        pthread_mutex_lock(&g_iocp_global_lock);
+        for (int i = 0; i < g_iocp_count; i++) {
+            if (g_iocps[i] == iocp) {
+                g_iocps[i] = g_iocps[--g_iocp_count];
+                g_iocps[g_iocp_count] = NULL;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_iocp_global_lock);
+        pthread_mutex_destroy(&iocp->lock);
         free(iocp);
         set_last_error(ERROR_OUTOFMEMORY);
         return NULL;
@@ -669,7 +680,14 @@ WINAPI_EXPORT BOOL CloseIoCompletionPort(HANDLE CompletionPort)
     iocp->epoll_fd = -1;
     iocp->event_fd = -1;
 
-    /* Note: don't free iocp itself -- threads may still reference it briefly.
-     * The closed flag tells them to bail out. */
+    /* Prevent handle_close() in the CloseHandle wrapper from free()ing iocp
+     * while other threads may still deref it (UAF).  Null out the data slot
+     * in the handle table entry so handle_close skips the generic free. */
+    handle_entry_t *entry = handle_lookup(CompletionPort);
+    if (entry)
+        entry->data = NULL;
+
+    /* Note: iocp itself is intentionally leaked -- threads may still reference
+     * it briefly.  The closed flag tells them to bail out. */
     return TRUE;
 }

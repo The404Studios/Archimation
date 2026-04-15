@@ -28,8 +28,11 @@ WINAPI_EXPORT void KeInitializeSpinLock(PKSPIN_LOCK SpinLock)
     *SpinLock = 0;  /* L5 audit fix: ensure zero on failure */
     pthread_mutex_t *mtx = (pthread_mutex_t *)calloc(1, sizeof(pthread_mutex_t));
     if (mtx) {
-        pthread_mutex_init(mtx, NULL);
-        *SpinLock = (KSPIN_LOCK)(uintptr_t)mtx;
+        if (pthread_mutex_init(mtx, NULL) == 0) {
+            *SpinLock = (KSPIN_LOCK)(uintptr_t)mtx;
+        } else {
+            free(mtx);
+        }
     }
 }
 
@@ -101,6 +104,7 @@ WINAPI_EXPORT void KeRaiseIrql(KIRQL NewIrql, PKIRQL OldIrql)
 WINAPI_EXPORT void KeInitializeEvent(
     PKEVENT Event, EVENT_TYPE Type, BOOLEAN State)
 {
+    if (!Event) return;
     pthread_mutex_t *mtx = (pthread_mutex_t *)calloc(1, sizeof(pthread_mutex_t));
     pthread_cond_t *cond = (pthread_cond_t *)calloc(1, sizeof(pthread_cond_t));
     if (mtx && cond) {
@@ -115,6 +119,7 @@ WINAPI_EXPORT void KeInitializeEvent(
         free(cond);
         Event->_internal[0] = NULL;
         Event->_internal[1] = NULL;
+        Event->_internal[2] = (PVOID)(uintptr_t)Type;
     }
     Event->Header.SignalState = State ? 1 : 0;
 }
@@ -249,9 +254,15 @@ WINAPI_EXPORT NTSTATUS KeDelayExecutionThread(
     (void)Alertable;
 
     if (Interval) {
-        long long us = (-Interval->QuadPart) / 10; /* 100ns units -> us */
-        if (us > 0)
-            usleep((useconds_t)us);
+        /* Convert 100ns units to microseconds. Negative = relative time. */
+        long long hundred_ns = Interval->QuadPart < 0 ? -Interval->QuadPart : Interval->QuadPart;
+        long long us_total = hundred_ns / 10;
+        /* usleep rejects values >= 1000000; split into sleep() + usleep() */
+        while (us_total > 0) {
+            long long chunk = us_total > 999999LL ? 999999LL : us_total;
+            usleep((useconds_t)chunk);
+            us_total -= chunk;
+        }
     }
 
     return STATUS_SUCCESS;

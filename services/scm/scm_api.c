@@ -13,10 +13,14 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <spawn.h>
 #include <errno.h>
 
 #include "scm.h"
 #include "scm_event.h"
+
+extern char **environ;
 
 static void ensure_run_dir(void)
 {
@@ -81,35 +85,89 @@ int scm_start_service(const char *name)
         return -1;
     }
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        fprintf(stderr, "[scm_api] fork() failed: %s\n", strerror(errno));
+    /* Use posix_spawn() instead of fork()+exec() to avoid async-signal-unsafe
+     * calls (fopen/mkdir/snprintf) running in the child between fork and exec
+     * while g_lock is held -- fork() snapshots glibc's malloc arena state
+     * including any locks the parent held at the time of fork, which can
+     * deadlock the child if an allocator path reacquires. posix_spawn goes
+     * directly through execve via vfork/clone and never runs libc allocator
+     * setup in the child, so it's safe to call with g_lock held.
+     *
+     * Pre-create the log directory in the parent (this is safe: the parent
+     * owns its full allocator state). posix_spawn_file_actions_addopen
+     * records a deferred open(2) that runs inside the child; open(2) is a
+     * syscall and is async-signal-safe. */
+    mkdir("/var/log/pe-compat", 0755);
+
+    char logpath[4096];
+    snprintf(logpath, sizeof(logpath), "/var/log/pe-compat/%s.log", name);
+
+    /* Stage argv/binary locally: svc may be invalidated across I/O in
+     * subsequent callers, but posix_spawn copies argv internally. */
+    char binary[4096];
+    strncpy(binary, svc->binary_path, sizeof(binary) - 1);
+    binary[sizeof(binary) - 1] = '\0';
+
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attrs;
+
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        fprintf(stderr, "[scm_api] posix_spawn_file_actions_init failed: %s\n",
+                strerror(errno));
+        svc->state = SERVICE_STOPPED;
+        return -1;
+    }
+    if (posix_spawnattr_init(&attrs) != 0) {
+        posix_spawn_file_actions_destroy(&actions);
         svc->state = SERVICE_STOPPED;
         return -1;
     }
 
-    if (pid == 0) {
-        /* Child: exec the service binary via peloader */
-        setsid(); /* New session */
+    /* Detach into a new session so that a controlling-terminal SIGHUP to
+     * the SCM doesn't propagate to the service children. POSIX_SPAWN_SETSID
+     * is the async-signal-safe analogue of setsid() in the forked child. */
+#ifdef POSIX_SPAWN_SETSID
+    posix_spawnattr_setflags(&attrs, POSIX_SPAWN_SETSID);
+#endif
 
-        /* Redirect output */
-        char logpath[4096];
-        snprintf(logpath, sizeof(logpath), "/var/log/pe-compat/%s.log", name);
-        mkdir("/var/log/pe-compat", 0755);
-        FILE *log = fopen(logpath, "a");
-        if (log) {
-            dup2(fileno(log), STDOUT_FILENO);
-            dup2(fileno(log), STDERR_FILENO);
-            fclose(log);
-        }
+    /* Deferred open(2) of the log file inside the child as fd 100, then
+     * dup2 onto stdout/stderr, then close the intermediate fd. Close stdin
+     * so services don't block on terminal I/O. Using a high fd (100) avoids
+     * colliding with any fd already open in the spawning process. */
+    (void)posix_spawn_file_actions_addclose(&actions, STDIN_FILENO);
+    (void)posix_spawn_file_actions_addopen(&actions, STDIN_FILENO,
+                                           "/dev/null", O_RDONLY, 0);
+    (void)posix_spawn_file_actions_addopen(&actions, 100, logpath,
+                                           O_WRONLY | O_CREAT | O_APPEND, 0644);
+    (void)posix_spawn_file_actions_adddup2(&actions, 100, STDOUT_FILENO);
+    (void)posix_spawn_file_actions_adddup2(&actions, 100, STDERR_FILENO);
+    (void)posix_spawn_file_actions_addclose(&actions, 100);
 
-        execlp("/usr/bin/peloader", "peloader", svc->binary_path, NULL);
-        _exit(127);
+    char *argv[] = {
+        (char *)"peloader",
+        binary,
+        NULL
+    };
+
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, "/usr/bin/peloader", &actions, &attrs,
+                         argv, environ);
+
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawnattr_destroy(&attrs);
+
+    if (rc != 0) {
+        fprintf(stderr, "[scm_api] posix_spawn() failed: %s\n", strerror(rc));
+        svc->state = SERVICE_STOPPED;
+        return -1;
     }
 
     /* Parent: mark as running immediately. If the process dies, SIGCHLD
      * will catch it and apply the restart policy. This avoids the TOCTOU
-     * race of sleep+kill(0) which can also conflict with the SIGCHLD handler. */
+     * race of sleep+kill(0) which can also conflict with the SIGCHLD handler.
+     * Explicit waitpid() is done by the main-loop reaper (scm_daemon.c)
+     * triggered via SIGCHLD; we do not set SIGCHLD=SIG_IGN because SCM
+     * needs to observe state transitions to apply restart policy. */
     svc->pid = pid;
     svc->state = SERVICE_RUNNING;
     write_status_file(name, SERVICE_RUNNING, pid);

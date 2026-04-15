@@ -1353,6 +1353,10 @@ int windrv_host_load_driver(const char *sys_path, const char *registry_path)
     void *handle = dlopen(sys_path, RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
         LOG_ERR("Failed to load %s: %s\n", sys_path, dlerror());
+        pthread_mutex_lock(&g_driver_lock);
+        if (reserved_slot == g_loaded_count - 1) g_loaded_count--;
+        else g_loaded_drivers[reserved_slot].in_use = 0;
+        pthread_mutex_unlock(&g_driver_lock);
         return -1;
     }
 
@@ -1365,6 +1369,10 @@ int windrv_host_load_driver(const char *sys_path, const char *registry_path)
     if (!entry) {
         LOG_ERR("No DriverEntry found in %s\n", sys_path);
         dlclose(handle);
+        pthread_mutex_lock(&g_driver_lock);
+        if (reserved_slot == g_loaded_count - 1) g_loaded_count--;
+        else g_loaded_drivers[reserved_slot].in_use = 0;
+        pthread_mutex_unlock(&g_driver_lock);
         return -1;
     }
 
@@ -1375,6 +1383,10 @@ int windrv_host_load_driver(const char *sys_path, const char *registry_path)
         free(drv);
         free(ext);
         dlclose(handle);
+        pthread_mutex_lock(&g_driver_lock);
+        if (reserved_slot == g_loaded_count - 1) g_loaded_count--;
+        else g_loaded_drivers[reserved_slot].in_use = 0;
+        pthread_mutex_unlock(&g_driver_lock);
         return -1;
     }
 
@@ -1414,6 +1426,11 @@ int windrv_host_load_driver(const char *sys_path, const char *registry_path)
         reg_ustr->Length = (USHORT)(wcslen16(reg_buf) * sizeof(WCHAR));
         reg_ustr->MaximumLength = reg_ustr->Length + sizeof(WCHAR);
         reg_ustr->Buffer = reg_buf;
+    } else {
+        free(reg_buf);
+        free(reg_ustr);
+        reg_buf = NULL;
+        reg_ustr = NULL;
     }
 
     /* Initialize all MajorFunction entries to the fallback dispatcher.
@@ -1433,9 +1450,9 @@ int windrv_host_load_driver(const char *sys_path, const char *registry_path)
     if (!NT_SUCCESS(status)) {
         LOG_ERR("DriverEntry for '%s' FAILED: NTSTATUS 0x%08X\n",
                 driver_name, (unsigned)status);
-        /* Release the reserved slot */
         pthread_mutex_lock(&g_driver_lock);
-        g_loaded_drivers[reserved_slot].in_use = 0;
+        if (reserved_slot == g_loaded_count - 1) g_loaded_count--;
+        else g_loaded_drivers[reserved_slot].in_use = 0;
         pthread_mutex_unlock(&g_driver_lock);
         free(drv);
         free(ext);
@@ -1475,6 +1492,12 @@ int windrv_host_load_driver(const char *sys_path, const char *registry_path)
     ld->is_kernel_driver = 1;
     ld->in_use = 1;
     pthread_mutex_unlock(&g_driver_lock);
+
+    /* RegistryPath is a transient parameter to DriverEntry; drivers that
+     * need it must copy the buffer. Free after DriverEntry returns to
+     * avoid per-load leak. */
+    free(reg_buf);
+    free(reg_ustr);
 
     return 0;
 }
@@ -1690,6 +1713,8 @@ NTSTATUS windrv_call_driver_timeout(PDEVICE_OBJECT device, PIRP irp,
 
     pthread_t tid;
     if (pthread_create(&tid, NULL, irp_dispatch_thread, ctx) != 0) {
+        pthread_mutex_destroy(&ctx->lock);
+        pthread_cond_destroy(&ctx->cond);
         free(ctx);
         return STATUS_INSUFFICIENT_RESOURCES;
     }

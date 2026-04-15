@@ -84,7 +84,7 @@ static int acb_connect(void)
     struct sockaddr_un addr;
     int fd;
 
-    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) {
         fprintf(stderr, ACB_LOG_PREFIX "socket() failed: %s\n", strerror(errno));
         return -1;

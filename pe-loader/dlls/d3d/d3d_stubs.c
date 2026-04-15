@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <pthread.h>
 
 #include "common/dll_common.h"
 
@@ -38,14 +39,17 @@ extern void *g_dxvk_d3d9;
 extern int   g_dxvk_tried;
 
 static void *g_dxvk_d3d11 = NULL;
-static int   g_dxvk_d3d11_tried = 0;
+/* Session 30: plain 'tried' flags were raced by concurrent D3D init from
+ * the UI thread + Unity job system. Replace with pthread_once so each
+ * backend is probed exactly once even under thundering-herd startup. */
+static pthread_once_t g_dxvk_d3d11_once = PTHREAD_ONCE_INIT;
 
 /* g_dxvk_dxgi and g_dxvk_dxgi_tried are defined in dxgi_factory.c */
 extern void *g_dxvk_dxgi;
 extern int   g_dxvk_dxgi_tried;
 
 static void *g_vkd3d_d3d12 = NULL;
-static int   g_vkd3d_d3d12_tried = 0;
+static pthread_once_t g_vkd3d_d3d12_once = PTHREAD_ONCE_INIT;
 
 static void *try_dlopen_paths(const char *name, const char **paths, int npaths)
 {
@@ -91,14 +95,16 @@ static __attribute__((unused)) void *get_dxvk_d3d9(void)
     return g_dxvk_d3d9;
 }
 
+static void dxvk_d3d11_probe_once(void)
+{
+    g_dxvk_d3d11 = try_dlopen_paths("d3d11.so", g_dxvk_search_paths, DXVK_NPATHS);
+    if (g_dxvk_d3d11)
+        fprintf(stderr, "[d3d] DXVK D3D11 found and loaded\n");
+}
+
 static void *get_dxvk_d3d11(void)
 {
-    if (!g_dxvk_d3d11_tried) {
-        g_dxvk_d3d11_tried = 1;
-        g_dxvk_d3d11 = try_dlopen_paths("d3d11.so", g_dxvk_search_paths, DXVK_NPATHS);
-        if (g_dxvk_d3d11)
-            fprintf(stderr, "[d3d] DXVK D3D11 found and loaded\n");
-    }
+    pthread_once(&g_dxvk_d3d11_once, dxvk_d3d11_probe_once);
     return g_dxvk_d3d11;
 }
 
@@ -113,18 +119,20 @@ static void *get_dxvk_dxgi(void)
     return g_dxvk_dxgi;
 }
 
+static void vkd3d_d3d12_probe_once(void)
+{
+    g_vkd3d_d3d12 = try_dlopen_paths("libvkd3d-proton-d3d12.so",
+                                       g_vkd3d_search_paths, VKD3D_NPATHS);
+    if (!g_vkd3d_d3d12)
+        g_vkd3d_d3d12 = try_dlopen_paths("d3d12.so",
+                                          g_vkd3d_search_paths, VKD3D_NPATHS);
+    if (g_vkd3d_d3d12)
+        fprintf(stderr, "[d3d] VKD3D-Proton D3D12 found and loaded\n");
+}
+
 static void *get_vkd3d_d3d12(void)
 {
-    if (!g_vkd3d_d3d12_tried) {
-        g_vkd3d_d3d12_tried = 1;
-        g_vkd3d_d3d12 = try_dlopen_paths("libvkd3d-proton-d3d12.so",
-                                           g_vkd3d_search_paths, VKD3D_NPATHS);
-        if (!g_vkd3d_d3d12)
-            g_vkd3d_d3d12 = try_dlopen_paths("d3d12.so",
-                                              g_vkd3d_search_paths, VKD3D_NPATHS);
-        if (g_vkd3d_d3d12)
-            fprintf(stderr, "[d3d] VKD3D-Proton D3D12 found and loaded\n");
-    }
+    pthread_once(&g_vkd3d_d3d12_once, vkd3d_d3d12_probe_once);
     return g_vkd3d_d3d12;
 }
 
@@ -1044,19 +1052,8 @@ WINAPI_EXPORT DWORD XInputGetAudioDeviceIds(DWORD userIndex,
 }
 
 /*
- * d3d_stubs_cleanup - Release DXVK/VKD3D dlopen handles at .so unload.
+ * Intentionally no destructor: games keep D3D11/D3D12 device pointers with
+ * vtables that live inside DXVK/VKD3D .so code. Closing the handles at
+ * process exit would unmap the code before late Release() unwinds run,
+ * which would crash. The OS reclaims everything at process exit.
  */
-__attribute__((destructor))
-static void d3d_stubs_cleanup(void)
-{
-    if (g_dxvk_d3d11) {
-        dlclose(g_dxvk_d3d11);
-        g_dxvk_d3d11 = NULL;
-        g_dxvk_d3d11_tried = 0;
-    }
-    if (g_vkd3d_d3d12) {
-        dlclose(g_vkd3d_d3d12);
-        g_vkd3d_d3d12 = NULL;
-        g_vkd3d_d3d12_tried = 0;
-    }
-}

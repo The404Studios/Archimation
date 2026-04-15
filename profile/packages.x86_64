@@ -277,5 +277,14 @@ acpid
 tlp
 xorg-xbacklight
 
+# Boot speed / memory stretching (low-RAM systems)
+# zram-generator: creates zstd-compressed RAM swap from /etc/systemd/zram-generator.conf
+# util-linux already shipped via base, provides fstrim.timer, hwclock, fsck
+# lspci / lscpu for ai-hw-detect.service at boot
+zram-generator
+pciutils
+usbutils
+dmidecode
+
 # Extra gaming tools
 # vkbasalt → not in official repos (AUR)

@@ -170,28 +170,38 @@ int mem_decommit(void *addr, size_t size)
 
     pthread_mutex_lock(&g_mem_lock);
 
+    size_t safe_size = size;
     mem_region_t *region = find_region(start);
     if (region) {
         size_t page_start = (start - region->base) / g_page_size;
         size_t page_count = size / g_page_size;
 
-        for (size_t i = page_start; i < page_start + page_count && i < region->page_count; i++) {
+        if (page_start >= region->page_count) {
+            pthread_mutex_unlock(&g_mem_lock);
+            return -1;
+        }
+        size_t max_pages = region->page_count - page_start;
+        size_t capped = (page_count < max_pages) ? page_count : max_pages;
+        size_t page_end = page_start + capped;
+        for (size_t i = page_start; i < page_end; i++) {
             region->commit_bitmap[i / 32] &= ~(1 << (i % 32));
         }
+        safe_size = capped * g_page_size;
     }
 
     pthread_mutex_unlock(&g_mem_lock);
 
     /* Set PROT_NONE to decommit */
-    mprotect((void *)start, size, PROT_NONE);
+    mprotect((void *)start, safe_size, PROT_NONE);
     /* Also use madvise to release physical pages */
-    madvise((void *)start, size, MADV_DONTNEED);
+    madvise((void *)start, safe_size, MADV_DONTNEED);
 
     return 0;
 }
 
 int mem_release(void *addr)
 {
+    ensure_page_size();
     uintptr_t target = (uintptr_t)addr;
 
     pthread_mutex_lock(&g_mem_lock);

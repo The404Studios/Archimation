@@ -450,12 +450,14 @@ WINAPI_EXPORT DWORD ExpandEnvironmentStringsW(LPCWSTR lpSrc, LPWSTR lpDst, DWORD
     DWORD len = ExpandEnvironmentStringsA(narrow, expanded, sizeof(expanded));
     if (len == 0) return 0;
 
+    /* 'len' is the required buffer size (includes null terminator). */
     if (lpDst && nSize > 0) {
         DWORD copy = len < nSize ? len : nSize;
+        /* Copy characters including the trailing NUL if it fits. */
         for (DWORD j = 0; j < copy; j++)
             lpDst[j] = (WCHAR)(unsigned char)expanded[j];
-        if (copy > 0)
-            lpDst[copy - 1] = 0;
+        /* Ensure NUL termination when truncated. */
+        lpDst[copy - 1] = 0;
     }
 
     return len;

@@ -305,19 +305,50 @@ class RuleStore:
 
         if replace:
             self._conn.execute("DELETE FROM rules")
-            self._conn.commit()
+            # No commit yet -- rolled into the single batch commit below.
             logger.info("Cleared existing rules for import")
 
+        # Batch inserts/updates into a single transaction.  The per-rule
+        # add_rule()/update_rule() paths each commit after every rule, which
+        # is O(N) fsyncs for an N-rule import.
         count = 0
+        now = _utcnow_iso()
         for item in items:
             rule = FirewallRule.from_dict(item)
             try:
-                self.add_rule(rule)
+                self._conn.execute(
+                    """INSERT INTO rules
+                       (id, name, direction, action, protocol, port, port_range,
+                        remote_address, local_address, application, enabled,
+                        profile, priority, created_at, modified_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        rule.id, rule.name, rule.direction, rule.action,
+                        rule.protocol, rule.port, rule.port_range,
+                        rule.remote_address, rule.local_address,
+                        rule.application, int(rule.enabled),
+                        rule.profile, rule.priority, now, now,
+                    ),
+                )
                 count += 1
             except sqlite3.IntegrityError:
-                # Duplicate id - try update instead
-                self.update_rule(rule)
+                # Duplicate id -- update in place
+                self._conn.execute(
+                    """UPDATE rules SET
+                           name=?, direction=?, action=?, protocol=?, port=?,
+                           port_range=?, remote_address=?, local_address=?,
+                           application=?, enabled=?, profile=?, priority=?,
+                           modified_at=?
+                       WHERE id=?""",
+                    (
+                        rule.name, rule.direction, rule.action, rule.protocol,
+                        rule.port, rule.port_range, rule.remote_address,
+                        rule.local_address, rule.application, int(rule.enabled),
+                        rule.profile, rule.priority, now, rule.id,
+                    ),
+                )
                 count += 1
+        self._conn.commit()
 
         logger.info("Imported %d rules from JSON", count)
         return count
@@ -388,25 +419,135 @@ class RuleStore:
 
     def _connect(self) -> None:
         """Open (or create) the SQLite database."""
-        self._conn = sqlite3.connect(self._db_path)
+        # isolation_level=None lets us control transaction boundaries
+        # explicitly via BEGIN/COMMIT.  We intentionally keep the
+        # default deferred behaviour, but setting busy_timeout below
+        # means we get a clean retry under WAL when GUI + CLI hit the
+        # DB concurrently instead of an SQLITE_BUSY exception.
+        self._conn = sqlite3.connect(self._db_path, timeout=5.0)
         self._conn.row_factory = sqlite3.Row
         # Enable WAL for concurrent reads
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # On old/slow disks a full fsync per commit dominates latency;
+        # NORMAL is still crash-safe under WAL (only a checkpoint failure
+        # can lose a committed transaction).
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        # 2 MiB page cache -- default is 2000 pages (~8 MiB on 4k), but
+        # the negative form pins memory in bytes and is cheaper on RAM
+        # constrained old hardware while still covering the typical
+        # rule table many times over.
+        self._conn.execute("PRAGMA cache_size=-2000")
+        # Keep temp state in memory rather than on disk.
+        self._conn.execute("PRAGMA temp_store=MEMORY")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        # 5 s busy_timeout matches the Python-level connect timeout and
+        # prevents spurious SQLITE_BUSY on systems where the GUI, CLI,
+        # and daemon may open the DB concurrently.  WAL allows multi-
+        # reader + single-writer; the busy timeout gives writers a
+        # window to queue up instead of failing outright.
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        # mmap lets SQLite skip page-copy syscalls for read-heavy
+        # workloads like our list_rules() path.  32 MiB is far more
+        # than we need for a typical rule set but is cheap when the
+        # file is small (only actually-accessed pages get mapped).
+        try:
+            self._conn.execute("PRAGMA mmap_size=33554432")
+        except sqlite3.OperationalError:
+            # mmap unsupported on this platform (older SQLite) -- ignore
+            pass
         logger.debug("Opened database at %s", self._db_path)
 
     def _migrate(self) -> None:
-        """Create or migrate the schema."""
+        """Create or migrate the schema.
+
+        Reads the stored ``schema_version`` from the ``meta`` table before
+        overwriting it so future version bumps can run migration steps.
+        Previously this unconditionally ``INSERT OR REPLACE``d the version,
+        which would silently mask the presence of an older on-disk schema.
+        """
         self._conn.executescript(_CREATE_RULES_TABLE)
         self._conn.executescript(_CREATE_META_TABLE)
 
-        # Store schema version
+        # Indexes on columns commonly used in WHERE / ORDER BY clauses.
+        # CREATE INDEX IF NOT EXISTS is idempotent so this is safe across
+        # migrations without touching the schema_version.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rules_direction ON rules(direction)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rules_profile ON rules(profile)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rules_priority ON rules(priority)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rules_dir_prof ON rules(direction, profile)"
+        )
+        # GUI and daemon commonly filter by (direction, enabled) when
+        # showing active rules only; add a covering index so we can
+        # skip the full table scan on largish rule sets.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rules_dir_enabled "
+            "ON rules(direction, enabled)"
+        )
+        # list_rules() sorts by priority after filtering on direction.
+        # A composite index lets SQLite serve both the WHERE and the
+        # ORDER BY from a single structure.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rules_dir_prio "
+            "ON rules(direction, priority)"
+        )
+        # Application-path lookups are used by the AppTracker / dashboard
+        # when cross-referencing the rule set against tracked exes.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rules_application "
+            "ON rules(application) WHERE application IS NOT NULL"
+        )
+
+        # Read existing schema version so callers can key future migration
+        # steps off of it.  An older DB (version < _SCHEMA_VERSION) is
+        # upgraded in-place; a newer one (future _SCHEMA_VERSION) is
+        # logged but left alone.
+        cursor = self._conn.execute(
+            "SELECT value FROM meta WHERE key = ?", ("schema_version",)
+        )
+        row = cursor.fetchone()
+        try:
+            current_version = int(row["value"]) if row else 0
+        except (ValueError, TypeError):
+            current_version = 0
+
+        if current_version > _SCHEMA_VERSION:
+            logger.warning(
+                "DB schema version %d newer than code %d -- "
+                "running code may not understand new columns",
+                current_version, _SCHEMA_VERSION,
+            )
+        elif current_version < _SCHEMA_VERSION:
+            logger.info(
+                "Upgrading DB schema from v%d to v%d",
+                current_version, _SCHEMA_VERSION,
+            )
+            # Future: add per-version migration steps here.
+
+        # Record the resolved version.
         self._conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
             ("schema_version", str(_SCHEMA_VERSION)),
         )
         self._conn.commit()
         logger.debug("Schema version %d ready", _SCHEMA_VERSION)
+
+    def get_schema_version(self) -> int:
+        """Return the on-disk schema version (0 if missing or malformed)."""
+        cursor = self._conn.execute(
+            "SELECT value FROM meta WHERE key = ?", ("schema_version",)
+        )
+        row = cursor.fetchone()
+        try:
+            return int(row["value"]) if row else 0
+        except (ValueError, TypeError):
+            return 0
 
     @staticmethod
     def _row_to_rule(row: sqlite3.Row) -> FirewallRule:

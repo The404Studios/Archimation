@@ -31,6 +31,54 @@ static dep_node_t g_nodes[MAX_SERVICES];
 static int g_node_count = 0;
 static int g_order_counter = 0;
 
+/* Name -> g_nodes[] index hash built once per build_graph() call.
+ * Eliminates the O(N) scan inside parse_deps for every dependency token. */
+#define DEP_HASH_BUCKETS (MAX_SERVICES * 2)
+static int g_dep_hash[DEP_HASH_BUCKETS];
+
+static unsigned int dep_hash_name(const char *name)
+{
+    unsigned int h = 5381;
+    while (*name) {
+        unsigned char c = (unsigned char)*name++;
+        if (c >= 'A' && c <= 'Z') c += 32;
+        h = ((h << 5) + h) + c;
+    }
+    return h % DEP_HASH_BUCKETS;
+}
+
+static void dep_hash_rebuild(void)
+{
+    for (int i = 0; i < DEP_HASH_BUCKETS; i++)
+        g_dep_hash[i] = -1;
+    for (int i = 0; i < g_node_count; i++) {
+        unsigned int bucket = dep_hash_name(g_nodes[i].name);
+        for (unsigned int step = 0; step < DEP_HASH_BUCKETS; step++) {
+            unsigned int probe = (bucket + step) % DEP_HASH_BUCKETS;
+            if (g_dep_hash[probe] == -1) {
+                g_dep_hash[probe] = i;
+                break;
+            }
+        }
+    }
+}
+
+static int dep_hash_lookup(const char *name)
+{
+    unsigned int bucket = dep_hash_name(name);
+    for (unsigned int step = 0; step < DEP_HASH_BUCKETS; step++) {
+        unsigned int probe = (bucket + step) % DEP_HASH_BUCKETS;
+        int idx = g_dep_hash[probe];
+        if (idx == -1)
+            return -1;
+        if (idx >= 0 && idx < g_node_count &&
+            strcasecmp(g_nodes[idx].name, name) == 0) {
+            return idx;
+        }
+    }
+    return -1;
+}
+
 /* Parse comma/semicolon-separated dependency list */
 static void parse_deps(const char *dep_str, dep_node_t *node)
 {
@@ -51,13 +99,10 @@ static void parse_deps(const char *dep_str, dep_node_t *node)
         while (end > token && *end == ' ') *end-- = '\0';
 
         if (*token) {
-            /* Find the index of this dependency */
-            for (int i = 0; i < g_node_count; i++) {
-                if (strcasecmp(g_nodes[i].name, token) == 0) {
-                    node->deps[node->dep_count++] = i;
-                    break;
-                }
-            }
+            /* O(1) average hash lookup */
+            int idx = dep_hash_lookup(token);
+            if (idx >= 0)
+                node->deps[node->dep_count++] = idx;
         }
 
         token = strtok_r(NULL, ",;", &saveptr);
@@ -76,11 +121,16 @@ static void build_graph(void)
         if (!svc) continue;
 
         strncpy(g_nodes[g_node_count].name, svc->name, sizeof(g_nodes[g_node_count].name) - 1);
+        g_nodes[g_node_count].name[sizeof(g_nodes[g_node_count].name) - 1] = '\0';
         g_nodes[g_node_count].dep_count = 0;
         g_nodes[g_node_count].visited = 0;
         g_nodes[g_node_count].order = -1;
         g_node_count++;
     }
+
+    /* Build the name -> index hash once so parse_deps becomes O(1) per
+     * dependency token rather than O(N). */
+    dep_hash_rebuild();
 
     /* Second pass: resolve dependencies */
     for (int i = 0; i < count && i < g_node_count; i++) {
@@ -152,14 +202,8 @@ int scm_start_with_deps(const char *name)
 {
     build_graph();
 
-    /* Find the target node */
-    int target = -1;
-    for (int i = 0; i < g_node_count; i++) {
-        if (strcasecmp(g_nodes[i].name, name) == 0) {
-            target = i;
-            break;
-        }
-    }
+    /* O(1) hash lookup (built by build_graph) */
+    int target = dep_hash_lookup(name);
 
     if (target < 0) {
         fprintf(stderr, "[scm_dep] Service not found: %s\n", name);
@@ -219,14 +263,8 @@ static int stop_with_deps_impl(const char *name, int depth)
     /* Find all services that depend on 'name' (reverse deps) */
     fprintf(stderr, "[scm_dep] Stopping service and dependents: %s\n", name);
 
-    /* First pass: find dependents */
-    int target = -1;
-    for (int i = 0; i < g_node_count; i++) {
-        if (strcasecmp(g_nodes[i].name, name) == 0) {
-            target = i;
-            break;
-        }
-    }
+    /* First pass: find dependents (O(1) via rebuilt hash) */
+    int target = dep_hash_lookup(name);
 
     if (target < 0) return -1;
 
@@ -259,9 +297,9 @@ int scm_stop_with_deps(const char *name)
  */
 int scm_parallel_auto_start(void)
 {
-    char *order[MAX_SERVICES];
     int count = 0;
     int depth[MAX_SERVICES];
+    int failed[MAX_SERVICES];    /* 1 = this service (or a transitive dep) failed */
     int max_depth = 0;
     int i, d;
 
@@ -272,6 +310,7 @@ int scm_parallel_auto_start(void)
     for (i = 0; i < g_node_count; i++) {
         g_nodes[i].visited = 0;
         g_nodes[i].order = -1;
+        failed[i] = 0;
     }
 
     int svc_count = scm_db_count();
@@ -287,35 +326,39 @@ int scm_parallel_auto_start(void)
         }
     }
 
-    /* Collect services to start */
-    memset(order, 0, sizeof(order));
-    count = 0;
+    /* Count services to start (those with assigned topo order) */
     for (i = 0; i < g_node_count; i++) {
-        if (g_nodes[i].order >= 0 && g_nodes[i].order < MAX_SERVICES) {
-            order[g_nodes[i].order] = g_nodes[i].name;
+        if (g_nodes[i].order >= 0 && g_nodes[i].order < MAX_SERVICES)
             count++;
-        }
     }
 
     if (count == 0) return 0;
-    (void)order;  /* populated for possible future use; suppress unused warning */
 
     /* Compute dependency depth for each node (longest path from root) */
     for (i = 0; i < g_node_count; i++)
         depth[i] = 0;
 
+    /* Build order -> node_idx reverse map to avoid the O(N^2) scan when
+     * computing longest-path depths.  g_nodes[].order is dense in [0,count)
+     * because DFS assigns consecutive values via g_order_counter. */
+    int order_to_node[MAX_SERVICES];
+    for (i = 0; i < MAX_SERVICES; i++) order_to_node[i] = -1;
+    for (i = 0; i < g_node_count; i++) {
+        int ord = g_nodes[i].order;
+        if (ord >= 0 && ord < MAX_SERVICES)
+            order_to_node[ord] = i;
+    }
+
     /* For each service in topological order, its depth = max(dep depths) + 1 */
     for (i = 0; i < count; i++) {
-        int node_idx = -1;
-        for (int j = 0; j < g_node_count; j++) {
-            if (g_nodes[j].order == i) { node_idx = j; break; }
-        }
+        int node_idx = order_to_node[i];
         if (node_idx < 0) continue;
 
         int max_dep_depth = -1;
         for (int j = 0; j < g_nodes[node_idx].dep_count; j++) {
             int dep_idx = g_nodes[node_idx].deps[j];
-            if (depth[dep_idx] > max_dep_depth)
+            if (dep_idx >= 0 && dep_idx < g_node_count &&
+                depth[dep_idx] > max_dep_depth)
                 max_dep_depth = depth[dep_idx];
         }
         depth[node_idx] = max_dep_depth + 1;
@@ -323,23 +366,45 @@ int scm_parallel_auto_start(void)
             max_depth = depth[node_idx];
     }
 
-    /* Start services sequentially by depth level */
+    /* Start services sequentially by depth level.  Propagate failure: if any
+     * dep of a service failed to start, mark this service failed and skip it
+     * rather than silently starting a service with missing prerequisites. */
     for (d = 0; d <= max_depth; d++) {
         int batch_count = 0;
 
         fprintf(stderr, "[scm_dep] Starting depth %d services:\n", d);
 
         for (i = 0; i < g_node_count; i++) {
-            if (g_nodes[i].order >= 0 && depth[i] == d) {
-                fprintf(stderr, "[scm_dep]   Starting: %s\n", g_nodes[i].name);
-                int ret = scm_start_service(g_nodes[i].name);
-                if (ret < 0) {
-                    fprintf(stderr, "[scm_dep]   FAILED: %s\n", g_nodes[i].name);
-                    scm_event_emit(SVC_EVT_DEPENDENCY_FAIL, 0,
-                                   g_nodes[i].name, -1, 0);
+            if (g_nodes[i].order < 0 || depth[i] != d)
+                continue;
+
+            /* If any dep is failed, skip this service */
+            int dep_failed = 0;
+            for (int j = 0; j < g_nodes[i].dep_count; j++) {
+                int dep_idx = g_nodes[i].deps[j];
+                if (dep_idx >= 0 && dep_idx < g_node_count && failed[dep_idx]) {
+                    dep_failed = 1;
+                    break;
                 }
-                batch_count++;
             }
+            if (dep_failed) {
+                fprintf(stderr, "[scm_dep]   SKIP '%s' (dependency failed)\n",
+                        g_nodes[i].name);
+                failed[i] = 1;
+                scm_event_emit(SVC_EVT_DEPENDENCY_FAIL, 0,
+                               g_nodes[i].name, -1, 0);
+                continue;
+            }
+
+            fprintf(stderr, "[scm_dep]   Starting: %s\n", g_nodes[i].name);
+            int ret = scm_start_service(g_nodes[i].name);
+            if (ret < 0) {
+                fprintf(stderr, "[scm_dep]   FAILED: %s\n", g_nodes[i].name);
+                failed[i] = 1;
+                scm_event_emit(SVC_EVT_DEPENDENCY_FAIL, 0,
+                               g_nodes[i].name, -1, 0);
+            }
+            batch_count++;
         }
 
         if (batch_count > 0) {

@@ -223,13 +223,36 @@ class MonitoringPanel(Gtk.Box):
             GLib.source_remove(self._timer_id)
         self._timer_id = GLib.timeout_add(DEFAULT_REFRESH_MS, self._on_timer)
 
+    def _stop_timer(self) -> None:
+        """Remove the auto-refresh GLib source -- call from parent on close."""
+        if self._timer_id:
+            try:
+                GLib.source_remove(self._timer_id)
+            except Exception:
+                pass
+            self._timer_id = 0
+
     def _on_timer(self) -> bool:
-        """Called every refresh interval. Returns True to keep timer alive."""
-        if not self._paused:
-            self.refresh()
+        """Called every refresh interval. Returns True to keep timer alive.
+
+        If the widget has been unparented (window closed before the
+        timer tick), suppress the refresh -- accessing the monitor or
+        the filter widgets after destruction raises GLib warnings that
+        clutter the journal.
+        """
+        if self._paused:
+            return True
+        # get_root() returns None once the widget has been removed from
+        # its toplevel; that's the clearest "I'm no longer shown" signal
+        # Gtk4 gives us without a dedicated destroy handler.
+        if self.get_root() is None:
+            self._timer_id = 0
+            return False
+        self.refresh()
         return True
 
     def _on_pause_toggled(self, btn: Gtk.ToggleButton) -> None:
+        was_paused = self._paused
         self._paused = btn.get_active()
         if self._paused:
             btn.set_icon_name("media-playback-start-symbolic")
@@ -237,6 +260,10 @@ class MonitoringPanel(Gtk.Box):
         else:
             btn.set_icon_name("media-playback-pause-symbolic")
             btn.set_tooltip_text("Pause auto-refresh")
+            # On resume, pull fresh data immediately instead of making
+            # the user wait up to DEFAULT_REFRESH_MS for the next tick.
+            if was_paused:
+                self.refresh()
 
     # -- ColumnView factories ----------------------------------------------
 
@@ -261,10 +288,6 @@ class MonitoringPanel(Gtk.Box):
         obj: ConnectionObject = list_item.get_item()
         label: Gtk.Label = list_item.get_child()
 
-        # Remove any previously applied state CSS classes
-        for css_cls in STATE_CSS.values():
-            label.remove_css_class(css_cls)
-
         if prop == "protocol":
             label.set_text(obj.protocol)
         elif prop == "local":
@@ -274,9 +297,16 @@ class MonitoringPanel(Gtk.Box):
         elif prop == "state":
             state = obj.state
             label.set_text(state)
+            # Only strip the previously-applied state class (stashed on
+            # the widget) rather than looping over every possible class
+            # on every bind.
+            prev = getattr(label, "_fw_state_css", None)
             css_cls = STATE_CSS.get(state.upper())
-            if css_cls:
+            if prev and prev != css_cls:
+                label.remove_css_class(prev)
+            if css_cls and css_cls != prev:
                 label.add_css_class(css_cls)
+            label._fw_state_css = css_cls
         elif prop == "pid":
             label.set_text(str(obj.pid) if obj.pid else "-")
         elif prop == "process_name":
@@ -301,9 +331,14 @@ class MonitoringPanel(Gtk.Box):
         return proto, state, proc_text
 
     def refresh(self) -> None:
-        """Reload active connections, applying current filters."""
-        self._model.remove_all()
+        """Reload active connections, applying current filters.
 
+        Instead of ``remove_all()`` + re-append (which destroys and
+        re-creates every row widget in GTK), diff against the previously
+        displayed set and only touch rows that changed.  On a typical
+        system with dozens to hundreds of connections and a 2 s poll
+        timer, this removes the bulk of per-tick redraw cost.
+        """
         proto_filter, state_filter, proc_filter = self._get_active_filters()
 
         try:
@@ -312,9 +347,9 @@ class MonitoringPanel(Gtk.Box):
             logger.error("Failed to fetch connections: %s", exc)
             connections = []
 
-        displayed = 0
+        # Build filtered list and keep insertion order
+        filtered: list[dict] = []
         for conn in connections:
-            # Apply filters
             if proto_filter and conn.get("protocol", "").lower() != proto_filter:
                 continue
             if state_filter and conn.get("state", "").upper() != state_filter:
@@ -323,10 +358,45 @@ class MonitoringPanel(Gtk.Box):
                 pname = conn.get("process_name", "").lower()
                 if proc_filter not in pname:
                     continue
+            filtered.append(conn)
 
-            self._model.append(ConnectionObject(conn))
-            displayed += 1
+        def _key(c: dict) -> tuple:
+            return (
+                c.get("protocol", ""),
+                c.get("local_addr", c.get("local_address", "")),
+                c.get("local_port", 0),
+                c.get("remote_addr", c.get("remote_address", "")),
+                c.get("remote_port", 0),
+            )
 
+        n_existing = self._model.get_n_items()
+
+        # Walk filtered list; replace in-place where possible, append new.
+        for i, conn in enumerate(filtered):
+            k = _key(conn)
+            if i < n_existing:
+                existing_obj = self._model.get_item(i)
+                existing_key = _key(existing_obj.data)
+                # Only replace the row object when the identity or the
+                # mutable state actually changed -- unchanged rows keep
+                # their widget and avoid a bind cycle.
+                if (existing_key != k
+                        or existing_obj.data.get("state") != conn.get("state")
+                        or existing_obj.data.get("pid") != conn.get("pid")
+                        or existing_obj.data.get("process_name")
+                        != conn.get("process_name")):
+                    # splice takes (position, n_removals, additions)
+                    self._model.splice(i, 1, [ConnectionObject(conn)])
+            else:
+                self._model.append(ConnectionObject(conn))
+
+        # Drop trailing rows that are no longer present.
+        target_len = len(filtered)
+        current_len = self._model.get_n_items()
+        if current_len > target_len:
+            self._model.splice(target_len, current_len - target_len, [])
+
+        displayed = len(filtered)
         total = len(connections)
         self._status_label.set_text(
             f"Showing {displayed} of {total} connection(s)  |  "

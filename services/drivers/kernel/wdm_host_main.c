@@ -325,6 +325,15 @@ static long wdm_host_ioctl(struct file *filp, unsigned int cmd,
 			return -EFAULT;
 		req.device_name[sizeof(req.device_name) - 1] = '\0';
 
+		/* Cap user-specified buffer sizes to prevent DoS via
+		 * arbitrary kernel allocation. 16 MiB is well beyond any
+		 * reasonable single-IRP payload. */
+		if (req.in_len > (16UL << 20) || req.out_len > (16UL << 20)) {
+			wdm_err("send_irp: buffer sizes too large "
+				"(in=%zu, out=%zu)", req.in_len, req.out_len);
+			return -EINVAL;
+		}
+
 		wdm_dbg("SEND_IRP: device='%s' major=%u ioctl=0x%x",
 			 req.device_name, req.major, req.ioctl_code);
 
@@ -633,18 +642,24 @@ err_loader:
  */
 static void __exit wdm_host_exit(void)
 {
-	struct wdm_driver *drv, *drv_tmp;
+	struct wdm_driver *drv;
 
 	pr_info("wdm_host: unloading module\n");
 
 	/*
-	 * Phase 1: Unload all drivers.
-	 * Call each driver's DriverUnload function (if set), free the mapped
-	 * image, and remove the driver tracking structure.
+	 * Phase 1: Call DriverUnload on each driver.
+	 *
+	 * We must NOT kfree driver structs here — devices still reference their
+	 * driver via dev->driver and via dev->driver_list.{prev,next} pointing
+	 * into the driver's devices list_head. Freeing drivers before devices
+	 * would cause UAF writes in wdm_device_exit()'s list_del calls.
+	 *
+	 * We only invoke the driver's unload callback; list detach and kfree
+	 * happen in Phase 3 after all devices are gone.
 	 */
 	mutex_lock(&wdm_driver_lock);
-	list_for_each_entry_safe(drv, drv_tmp, &wdm_driver_list, list) {
-		pr_info("wdm_host: unloading driver '%s' (state=%d)\n",
+	list_for_each_entry(drv, &wdm_driver_list, list) {
+		pr_info("wdm_host: preparing driver '%s' for unload (state=%d)\n",
 			drv->name, drv->state);
 
 		/* Invoke DriverUnload if the driver was started and has one */
@@ -655,31 +670,33 @@ static void __exit wdm_host_exit(void)
 			pr_info("wdm_host: calling DriverUnload for '%s'\n",
 				drv->name);
 			unload(drv);
+			drv->state = WDM_STATE_UNLOADED;
 		}
-
-		/* Free the mapped driver image */
-		if (drv->image_base) {
-			vfree(drv->image_base);
-			drv->image_base = NULL;
-		}
-
-		list_del(&drv->list);
-		kfree(drv);
 	}
 	mutex_unlock(&wdm_driver_lock);
 
-	/* Phase 2: Shut down subsystems in reverse order
-	 * wdm_device_exit() properly destroys all remaining devices
-	 * (cdev_del, device_destroy, kfree). */
+	/*
+	 * Phase 2: Destroy all devices FIRST (they reference drivers).
+	 * wdm_device_exit() properly tears down every remaining device
+	 * (cdev_del, device_destroy, list_del, kfree). After this the
+	 * drivers' devices lists are empty, so kfree-ing driver structs
+	 * below is safe.
+	 */
 	wdm_registry_exit();
 	wdm_pnp_exit();
 	wdm_dma_exit();
 	wdm_device_exit();
 	wdm_thunk_exit();
 	wdm_irp_exit();
+
+	/*
+	 * Phase 3: Now that no device references drivers, free driver
+	 * images and structures. wdm_host_loader_exit() walks the driver
+	 * list and performs this cleanup (vfree image, list_del, kfree).
+	 */
 	wdm_host_loader_exit();
 
-	/* Phase 3: Remove proc entry and deregister misc device */
+	/* Phase 4: Remove proc entry and deregister misc device */
 	if (wdm_proc_entry)
 		proc_remove(wdm_proc_entry);
 

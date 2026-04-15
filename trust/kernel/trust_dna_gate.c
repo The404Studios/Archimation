@@ -119,6 +119,23 @@ int trust_dna_gate_translate(u32 subject_id, u32 trust_cap,
     if (trust_tlb_lookup(subject_id, &subj) < 0)
         return -1;
 
+    /* Reject empty capability requests — a zero trust_cap would otherwise
+     * skip the entire per-bit check loop below and spuriously record a
+     * "successful" domain transfer. */
+    if (trust_cap == 0)
+        return -1;
+
+    /* Deny cross-domain transfers from frozen/apoptotic/cancerous or
+     * quarantined subjects — the fast-path check already rejects them,
+     * but translate() is reachable separately. */
+    if (subj.flags & (TRUST_FLAG_FROZEN | TRUST_FLAG_APOPTOTIC |
+                      TRUST_FLAG_CANCEROUS))
+        return -1;
+    if (subj.tokens.starved)
+        return -1;
+    if (subj.immune.status == TRUST_IMMUNE_QUARANTINED)
+        return -1;
+
     /* Verify the subject is in the source domain */
     if (subj.domain != from_domain) {
         pr_warn("trust: DNA Gate: subject %u domain mismatch (%u != %u)\n",

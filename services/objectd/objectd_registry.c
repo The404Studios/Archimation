@@ -60,6 +60,14 @@ int objectd_registry_handle(uint8_t req_type, const void *payload,
                             void *resp_buf, size_t resp_buf_size,
                             size_t *resp_len)
 {
+    /* Guard against undersized response buffer.  size_t underflow below
+     * would produce a huge resp_data_max that later compares as "always
+     * fits" and corrupt memory outside resp_buf. */
+    if (resp_buf_size < sizeof(objectd_response_t) || !resp_buf || !resp_len) {
+        if (resp_len) *resp_len = 0;
+        return -1;
+    }
+
     objectd_response_t *resp = (objectd_response_t *)resp_buf;
     uint8_t *resp_data = (uint8_t *)resp_buf + sizeof(objectd_response_t);
     size_t resp_data_max = resp_buf_size - sizeof(objectd_response_t);

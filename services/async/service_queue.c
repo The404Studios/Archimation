@@ -119,8 +119,10 @@ int svc_queue_init(void)
 
 void svc_queue_shutdown(void)
 {
+    pthread_mutex_lock(&g_queue_lock);
     g_worker_running = 0;
-    pthread_cond_signal(&g_queue_cond);
+    pthread_cond_broadcast(&g_queue_cond);
+    pthread_mutex_unlock(&g_queue_lock);
     pthread_join(g_worker_thread, NULL);
     fprintf(stderr, "[svc_queue] Async service queue shut down\n");
 }

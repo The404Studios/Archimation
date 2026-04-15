@@ -87,6 +87,14 @@ class MouseController:
                 ],
             }
             self.device = UInput(capabilities, name="ai-control-mouse")
+            # Cache ecodes constants on the instance to avoid re-importing
+            # evdev.ecodes on every move/click/scroll call.
+            self._ecodes = ecodes
+            self._btn_map = {
+                "left": ecodes.BTN_LEFT,
+                "right": ecodes.BTN_RIGHT,
+                "middle": ecodes.BTN_MIDDLE,
+            }
             logger.info("Virtual mouse device created")
         except ImportError:
             logger.warning("python-evdev not available, mouse control disabled")
@@ -99,7 +107,7 @@ class MouseController:
         """Move mouse to absolute position."""
         if not self.device:
             return False
-        import evdev.ecodes as ecodes
+        ecodes = self._ecodes
 
         x = max(0, min(x, self.screen_width))
         y = max(0, min(y, self.screen_height))
@@ -113,14 +121,8 @@ class MouseController:
         """Click a mouse button."""
         if not self.device:
             return False
-        import evdev.ecodes as ecodes
-
-        btn_map = {
-            "left": ecodes.BTN_LEFT,
-            "right": ecodes.BTN_RIGHT,
-            "middle": ecodes.BTN_MIDDLE,
-        }
-        btn = btn_map.get(button, ecodes.BTN_LEFT)
+        ecodes = self._ecodes
+        btn = self._btn_map.get(button, ecodes.BTN_LEFT)
 
         self.device.write(ecodes.EV_KEY, btn, 1)  # Press
         self.device.syn()
@@ -146,14 +148,8 @@ class MouseController:
         """Drag from one position to another."""
         if not self.device:
             return False
-        import evdev.ecodes as ecodes
-
-        btn_map = {
-            "left": ecodes.BTN_LEFT,
-            "right": ecodes.BTN_RIGHT,
-            "middle": ecodes.BTN_MIDDLE,
-        }
-        btn = btn_map.get(button, ecodes.BTN_LEFT)
+        ecodes = self._ecodes
+        btn = self._btn_map.get(button, ecodes.BTN_LEFT)
 
         # Move to start position
         self.move_to(from_x, from_y)
@@ -181,7 +177,7 @@ class MouseController:
         """Scroll the mouse wheel."""
         if not self.device:
             return False
-        import evdev.ecodes as ecodes
+        ecodes = self._ecodes
 
         axis = ecodes.REL_HWHEEL if horizontal else ecodes.REL_WHEEL
         self.device.write(ecodes.EV_REL, axis, amount)

@@ -277,6 +277,11 @@ static void *thread_wrapper(void *arg)
     extern void fls_thread_cleanup(void);
     fls_thread_cleanup();
 
+    /* Free any thread-fiber the thread created via ConvertThreadToFiber
+     * but never undid via ConvertFiberToThread (prevents fiber_data_t leak). */
+    extern void fiber_thread_cleanup(void);
+    fiber_thread_cleanup();
+
     /* Per Windows spec, invoke TLS callbacks on thread detach before exit */
     pe_tls_call_callbacks(DLL_THREAD_DETACH);
     pe_tls_free_thread();
@@ -338,15 +343,31 @@ WINAPI_EXPORT HANDLE CreateThread(
     if (lpThreadId)
         *lpThreadId = (DWORD)(uintptr_t)data->pthread;
 
-    /* Notify anticheat bridge of thread creation */
+    /* Notify anticheat bridge of thread creation.  Cache the dlsym result
+     * since RTLD_DEFAULT scans all loaded libs on each lookup. */
     {
         typedef int (*acb_create_fn)(void *);
-        acb_create_fn fn = (acb_create_fn)dlsym(RTLD_DEFAULT,
-            "anticheat_bridge_on_create_thread");
-        if (fn) fn((void *)lpStartAddress);
+        static acb_create_fn cached_fn = NULL;
+        static int cache_initialized = 0;
+        if (!cache_initialized) {
+            cached_fn = (acb_create_fn)dlsym(RTLD_DEFAULT,
+                "anticheat_bridge_on_create_thread");
+            cache_initialized = 1;
+        }
+        if (cached_fn) cached_fn((void *)lpStartAddress);
     }
 
-    return handle_alloc(HANDLE_TYPE_THREAD, -1, data);
+    HANDLE h = handle_alloc(HANDLE_TYPE_THREAD, -1, data);
+    /* handle_alloc returns INVALID_HANDLE_VALUE on failure, but CreateThread
+     * contract returns NULL on failure. The thread is already running, so we
+     * can't cleanly roll it back — just normalize the return value so callers
+     * testing if (!h) behave correctly. Handle-table exhaustion also leaks
+     * the thread_data_t (thread still uses it), which is the least-bad option. */
+    if (h == INVALID_HANDLE_VALUE) {
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    return h;
 }
 
 WINAPI_EXPORT void ExitThread(DWORD dwExitCode)

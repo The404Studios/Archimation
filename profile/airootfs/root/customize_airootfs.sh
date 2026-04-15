@@ -75,6 +75,9 @@ DKMS_FB
 
 # --- NetworkManager WiFi configuration ---
 # Main NetworkManager.conf — use iwd backend (faster scanning than wpa_supplicant)
+# `[connectivity]` probe is disabled on live ISO for faster boot (see
+# /etc/NetworkManager/conf.d/00-boot-speed.conf); installed systems can
+# edit this file to re-enable the captive-portal detector.
 mkdir -p /etc/NetworkManager/conf.d /etc/NetworkManager/dispatcher.d
 cat > /etc/NetworkManager/NetworkManager.conf <<'NM_MAIN'
 [main]
@@ -85,7 +88,10 @@ dhcp=internal
 unmanaged-devices=none
 
 [connectivity]
-enabled=true
+# Disabled by /etc/NetworkManager/conf.d/00-boot-speed.conf on live ISO.
+# Re-enable once online: set `enabled=true` and `interval=300` for
+# captive portal detection.
+enabled=false
 
 [device]
 wifi.scan-rand-mac-address=yes
@@ -105,10 +111,9 @@ wifi.powersave=2
 NM_PS
 
 # Ensure WiFi radio is ON by default (some systems soft-block it)
+# NOTE: do NOT re-enable [connectivity] here -- 00-boot-speed.conf owns
+# that for fast boot.  This file only controls WiFi autoconnect retries.
 cat > /etc/NetworkManager/conf.d/wifi-enable.conf <<'NM_WIFI'
-[connectivity]
-enabled=true
-
 [main]
 # Ensure WiFi is enabled on startup
 autoconnect-retries-default=3
@@ -150,6 +155,10 @@ REGDOM
 chmod 755 /etc/NetworkManager/dispatcher.d/10-regdom.sh
 
 # --- nm-applet system-wide autostart (fallback if skel copy missed) ---
+# X-GNOME-Autostart-Delay: defer 3 seconds to let the XFCE panel register
+# the system tray first.  Without this delay, nm-applet starts before the
+# tray slot is claimed and either crashes silently or shows as a floating
+# window until restarted.  Harmless on fast systems, critical on old HW.
 mkdir -p /etc/xdg/autostart
 cat > /etc/xdg/autostart/nm-applet.desktop <<'NMEOF'
 [Desktop Entry]
@@ -159,6 +168,7 @@ Exec=nm-applet
 Icon=network-wireless
 X-XFCE-Autostart=true
 OnlyShowIn=XFCE;
+X-GNOME-Autostart-Delay=3
 NMEOF
 
 # --- Enable services ---
@@ -301,24 +311,35 @@ echo "root:root" | chpasswd
 echo "arch:arch" | chpasswd
 
 # --- Regenerate initramfs with archiso hooks + ai-persist fallback ---
-# Include NVIDIA modules for early KMS (RTX 5070 / Blackwell needs nvidia-open)
+# NOTE: We inline this config (instead of relying on the overlay file) so that
+# a broken overlay can't silently bake a bad initramfs.  Keep the content in
+# sync with profile/airootfs/etc/mkinitcpio.conf.
 cat > /etc/mkinitcpio.conf <<'INITCPIO'
-# mkinitcpio.conf for AI Arch Linux Live ISO
-MODULES=(i915 amdgpu)
+# mkinitcpio.conf for AI Arch Linux Live ISO (runtime copy)
+MODULES=(i915 amdgpu radeon)
 BINARIES=()
 FILES=()
-HOOKS=(base udev plymouth ai-persist archiso archiso_loop_mnt modconf block filesystems keyboard)
+HOOKS=(base udev modconf keyboard keymap plymouth ai-persist archiso archiso_loop_mnt block filesystems fsck)
+COMPRESSION="zstd"
+COMPRESSION_OPTIONS=(-19 -T0)
 INITCPIO
 if ! mkinitcpio -P; then
-    echo "ERROR: mkinitcpio failed — trying without NVIDIA modules as fallback"
+    echo "ERROR: mkinitcpio failed — trying without early-KMS modules as fallback"
     # Fall back to base modules only (no early KMS, but system will boot)
     cat > /etc/mkinitcpio.conf <<'INITCPIO_FALLBACK'
 MODULES=()
 BINARIES=()
 FILES=()
-HOOKS=(base udev plymouth ai-persist archiso archiso_loop_mnt modconf block filesystems keyboard)
+HOOKS=(base udev modconf keyboard keymap plymouth ai-persist archiso archiso_loop_mnt block filesystems fsck)
+COMPRESSION="zstd"
+COMPRESSION_OPTIONS=(-19 -T0)
 INITCPIO_FALLBACK
-    mkinitcpio -P || echo "WARNING: mkinitcpio failed completely — ISO may not boot"
+    if ! mkinitcpio -P; then
+        echo "WARNING: mkinitcpio with zstd failed — retrying with default compression"
+        # Last-resort: remove COMPRESSION lines (use mkinitcpio default)
+        sed -i '/^COMPRESSION/d' /etc/mkinitcpio.conf
+        mkinitcpio -P || echo "WARNING: mkinitcpio failed completely — ISO may not boot"
+    fi
 fi
 
 # --- Set Plymouth theme + daemon config ---
@@ -460,8 +481,11 @@ vm.dirty_background_ratio = 5
 # Increase max memory map areas (large game address spaces)
 vm.max_map_count = 1048576
 
-# Ensure transparent hugepages are available for gaming workloads
-# (kernel cmdline sets transparent_hugepages=always, sysctl reinforces)
+# Transparent hugepages: kernel cmdline sets transparent_hugepage=madvise
+# (note: correct singular spelling -- earlier versions had a typo
+#  `transparent_hugepages=always` which the kernel silently ignored).
+# ai-hw-detect.service additionally writes /sys/kernel/mm/transparent_hugepage
+# at boot so modern HW gets defer+madvise defrag behaviour.
 vm.nr_hugepages = 0
 AMD_SYSCTL
 
@@ -1465,6 +1489,9 @@ mkdir -p /etc/systemd/system/graphical.target.wants
 ln -sf /usr/lib/systemd/system/ai-boot-chime.service /etc/systemd/system/graphical.target.wants/ai-boot-chime.service
 
 # Login chime autostart (plays when XFCE desktop loads)
+# Delayed 4 seconds so PipeWire + wireplumber are fully initialized.
+# Without this delay, sox/play opens before the user audio session is up
+# and silently drops the chime through the null sink.
 cat > /etc/xdg/autostart/ai-login-chime.desktop <<'LOGINCHIMEAUTO'
 [Desktop Entry]
 Type=Application
@@ -1472,6 +1499,7 @@ Name=AI Login Chime
 Exec=/usr/bin/ai-login-chime
 X-XFCE-Autostart=true
 NoDisplay=true
+X-GNOME-Autostart-Delay=4
 LOGINCHIMEAUTO
 
 echo "Boot chime + login chime installed"
@@ -1494,7 +1522,21 @@ echo "Auto-installer boot entry configured"
 echo 'kernel.printk = 3 3 3 3' > /etc/sysctl.d/20-quiet-boot.conf
 
 # Persist quiet boot params in GRUB defaults (used if grub-mkconfig is ever run on installed system)
-echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash vt.global_cursor_default=0 loglevel=3"' >> /etc/default/grub 2>/dev/null || true
+# Includes: mitigations=auto (explicit), nowatchdog (softlockup detector off),
+# transparent_hugepage=madvise (madvise+defer defrag), rd.udev.children-max=16
+# for parallel udev workers on multi-core HW.
+if [ -f /etc/default/grub ]; then
+    # Replace existing line or append
+    if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub; then
+        sed -i 's|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT="quiet splash vt.global_cursor_default=0 loglevel=3 mitigations=auto nowatchdog transparent_hugepage=madvise rd.udev.children-max=16"|' /etc/default/grub
+    else
+        echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash vt.global_cursor_default=0 loglevel=3 mitigations=auto nowatchdog transparent_hugepage=madvise rd.udev.children-max=16"' >> /etc/default/grub
+    fi
+    # Short menu timeout on installed system too
+    if grep -q '^GRUB_TIMEOUT=' /etc/default/grub; then
+        sed -i 's|^GRUB_TIMEOUT=.*|GRUB_TIMEOUT=2|' /etc/default/grub
+    fi
+fi
 
 echo "Quiet boot parameters configured"
 

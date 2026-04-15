@@ -1755,6 +1755,10 @@ class StubGenerator:
     # Available template families
     TEMPLATE_FAMILIES = ["file", "memory", "thread", "registry", "network", "generic"]
 
+    # Cap the in-memory generated-stub cache to prevent unbounded growth over
+    # long uptimes (each entry retains the full generated C source).
+    MAX_GENERATED_CACHE = 2048
+
     def __init__(self, output_dir: str = "/tmp/generated-stubs"):
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
@@ -1860,6 +1864,11 @@ class StubGenerator:
             "signature": sig.to_dict(),
         }
 
+        if (len(self._generated) >= self.MAX_GENERATED_CACHE
+                and sig.name not in self._generated):
+            # Evict oldest insertion to keep dict bounded (dict is insertion-ordered)
+            oldest = next(iter(self._generated))
+            del self._generated[oldest]
         self._generated[sig.name] = result
         return result
 

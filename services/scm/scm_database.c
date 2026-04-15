@@ -21,6 +21,84 @@
 static service_entry_t g_services[MAX_SERVICES];
 static int g_service_count = 0;
 
+/*
+ * O(1) name lookup: small open-addressing hash table mapping lowercase
+ * service name -> index into g_services[].  Sized at 2x MAX_SERVICES to
+ * keep load factor under 0.5 and preserve probe-length bounds.
+ *
+ * Concurrency: callers of scm_db_* already hold g_lock; no internal lock
+ * needed here.  Both -1 (empty) and -2 (tombstone) are reserved sentinels.
+ */
+#define SCM_HASH_BUCKETS (MAX_SERVICES * 2)
+#define SCM_HASH_EMPTY     -1
+#define SCM_HASH_TOMBSTONE -2
+static int g_scm_hash[SCM_HASH_BUCKETS];
+static int g_scm_hash_initialized = 0;
+
+static unsigned int scm_hash_name(const char *name)
+{
+    /* djb2 case-insensitive */
+    unsigned int h = 5381;
+    while (*name) {
+        unsigned char c = (unsigned char)*name++;
+        if (c >= 'A' && c <= 'Z') c += 32;
+        h = ((h << 5) + h) + c;
+    }
+    return h % SCM_HASH_BUCKETS;
+}
+
+static void scm_hash_init(void)
+{
+    for (int i = 0; i < SCM_HASH_BUCKETS; i++)
+        g_scm_hash[i] = SCM_HASH_EMPTY;
+    g_scm_hash_initialized = 1;
+}
+
+static void scm_hash_insert(const char *name, int idx)
+{
+    if (!g_scm_hash_initialized) scm_hash_init();
+    unsigned int bucket = scm_hash_name(name);
+    for (unsigned int step = 0; step < SCM_HASH_BUCKETS; step++) {
+        unsigned int probe = (bucket + step) % SCM_HASH_BUCKETS;
+        if (g_scm_hash[probe] == SCM_HASH_EMPTY ||
+            g_scm_hash[probe] == SCM_HASH_TOMBSTONE) {
+            g_scm_hash[probe] = idx;
+            return;
+        }
+    }
+    /* Table full - should never happen at 50% load; fall back to linear scan */
+    fprintf(stderr, "[scm_db] hash table saturated inserting '%s'\n", name);
+}
+
+static int scm_hash_find(const char *name)
+{
+    if (!g_scm_hash_initialized) return -1;
+    if (!name || !name[0]) return -1;
+    unsigned int bucket = scm_hash_name(name);
+    for (unsigned int step = 0; step < SCM_HASH_BUCKETS; step++) {
+        unsigned int probe = (bucket + step) % SCM_HASH_BUCKETS;
+        int idx = g_scm_hash[probe];
+        if (idx == SCM_HASH_EMPTY) return -1;
+        if (idx == SCM_HASH_TOMBSTONE) continue;
+        if (idx >= 0 && idx < g_service_count &&
+            strcasecmp(g_services[idx].name, name) == 0) {
+            return idx;
+        }
+    }
+    return -1;
+}
+
+/* Rebuild the hash table from scratch using current g_services[] contents.
+ * Called after delete_service() shuffles the table via memmove().
+ * A targeted "remove by name" is not needed because memmove renumbers
+ * every index >= removed_slot; a rebuild is simpler and always correct. */
+static void scm_hash_rebuild(void)
+{
+    scm_hash_init();
+    for (int i = 0; i < g_service_count; i++)
+        scm_hash_insert(g_services[i].name, i);
+}
+
 static void ensure_db_dir(void)
 {
     mkdir("/var/lib/pe-compat", 0755);
@@ -88,6 +166,7 @@ int scm_db_load(void)
 {
     ensure_db_dir();
     g_service_count = 0;
+    scm_hash_init();
 
     DIR *d = opendir(SCM_DB_PATH);
     if (!d) return -1;
@@ -107,6 +186,8 @@ int scm_db_load(void)
                     g_services[g_service_count].name,
                     g_services[g_service_count].type,
                     g_services[g_service_count].start_type);
+            scm_hash_insert(g_services[g_service_count].name,
+                            g_service_count);
             g_service_count++;
         }
     }
@@ -206,12 +287,14 @@ int scm_db_delete_service(const char *name)
     snprintf(status_path, sizeof(status_path), "%s/%s.status", SCM_RUN_PATH, name);
     unlink(status_path);
 
-    /* Remove from in-memory list */
+    /* Remove from in-memory list.  memmove() shifts indices, so the hash
+     * table (which stores indices) becomes stale -- rebuild after. */
     for (int i = 0; i < g_service_count; i++) {
         if (strcmp(g_services[i].name, name) == 0) {
             memmove(&g_services[i], &g_services[i + 1],
                     (g_service_count - i - 1) * sizeof(service_entry_t));
             g_service_count--;
+            scm_hash_rebuild();
             break;
         }
     }
@@ -221,9 +304,18 @@ int scm_db_delete_service(const char *name)
 
 service_entry_t *scm_db_find(const char *name)
 {
-    for (int i = 0; i < g_service_count; i++) {
-        if (strcasecmp(g_services[i].name, name) == 0)
-            return &g_services[i];
+    /* Hot path: SCM API callers invoke this on every command.  The hash
+     * table gives O(1) average lookup; fall back to linear scan if the
+     * hash has not been initialized (e.g. mid-load). */
+    int idx = scm_hash_find(name);
+    if (idx >= 0 && idx < g_service_count)
+        return &g_services[idx];
+
+    if (!g_scm_hash_initialized) {
+        for (int i = 0; i < g_service_count; i++) {
+            if (strcasecmp(g_services[i].name, name) == 0)
+                return &g_services[i];
+        }
     }
     return NULL;
 }
@@ -244,6 +336,14 @@ int scm_db_install(const char *name, const char *display_name,
                    const char *binary_path, int type, int start_type,
                    const char *dependencies)
 {
+    /* Validate name BEFORE any state mutation so a reject never leaves
+     * a partial entry in g_services[g_service_count]. */
+    if (!validate_service_name(name)) {
+        fprintf(stderr, "[scm_db] Invalid service name: '%s'\n",
+                name ? name : "(null)");
+        return -3;
+    }
+
     if (scm_db_find(name))
         return -1; /* Already exists */
 
@@ -268,7 +368,15 @@ int scm_db_install(const char *name, const char *display_name,
         strncpy(svc->dependencies, dependencies, sizeof(svc->dependencies) - 1);
     svc->loaded = 1;
 
-    g_service_count++;
+    /* Persist to disk BEFORE committing the in-memory count.  If save fails
+     * (e.g., no disk space), the in-memory table stays consistent with disk. */
+    int sr = scm_db_save_service(svc);
+    if (sr != 0) {
+        memset(svc, 0, sizeof(*svc));
+        return sr;
+    }
 
-    return scm_db_save_service(svc);
+    scm_hash_insert(svc->name, g_service_count);
+    g_service_count++;
+    return 0;
 }

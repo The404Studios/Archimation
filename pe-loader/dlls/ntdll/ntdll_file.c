@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <wchar.h>
+#include <pthread.h>
 
 #include "common/dll_common.h"
 
@@ -157,17 +158,19 @@ WINAPI_EXPORT NTSTATUS NtCreateFile(
     int flags = 0;
     mode_t mode = 0644;
 
-    /* Access flags */
+    /* Access flags: check combined read+write cases BEFORE individual
+     * read/write so apps passing GENERIC_READ|GENERIC_WRITE open the file
+     * read/write instead of falling into the first matched single branch. */
     if ((DesiredAccess & FILE_READ_DATA) && (DesiredAccess & FILE_WRITE_DATA))
+        flags = O_RDWR;
+    else if ((DesiredAccess & GENERIC_READ) && (DesiredAccess & GENERIC_WRITE))
         flags = O_RDWR;
     else if (DesiredAccess & FILE_WRITE_DATA)
         flags = O_WRONLY;
-    else if (DesiredAccess & GENERIC_READ)
-        flags = O_RDONLY;
     else if (DesiredAccess & GENERIC_WRITE)
         flags = O_WRONLY;
-    else if ((DesiredAccess & GENERIC_READ) && (DesiredAccess & GENERIC_WRITE))
-        flags = O_RDWR;
+    else if (DesiredAccess & (FILE_READ_DATA | GENERIC_READ))
+        flags = O_RDONLY;
     else
         flags = O_RDONLY;
 
@@ -183,17 +186,29 @@ WINAPI_EXPORT NTSTATUS NtCreateFile(
 
     int fd = open(linux_path, flags, mode);
     if (fd < 0) {
+        *FileHandle = NULL;
+        NTSTATUS st = errno == ENOENT ? STATUS_NO_SUCH_FILE :
+                      errno == EACCES ? STATUS_ACCESS_DENIED :
+                      errno == EEXIST ? STATUS_OBJECT_NAME_COLLISION :
+                      STATUS_UNSUCCESSFUL;
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_NO_SUCH_FILE;
+            IoStatusBlock->Status = st;
             IoStatusBlock->Information = 0;
         }
-        return errno == ENOENT ? STATUS_NO_SUCH_FILE :
-               errno == EACCES ? STATUS_ACCESS_DENIED :
-               errno == EEXIST ? STATUS_OBJECT_NAME_COLLISION :
-               STATUS_UNSUCCESSFUL;
+        return st;
     }
 
-    *FileHandle = handle_alloc(HANDLE_TYPE_FILE, fd, NULL);
+    HANDLE h = handle_alloc(HANDLE_TYPE_FILE, fd, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        close(fd);
+        *FileHandle = NULL;
+        if (IoStatusBlock) {
+            IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+            IoStatusBlock->Information = 0;
+        }
+        return STATUS_UNSUCCESSFUL;
+    }
+    *FileHandle = h;
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == FILE_CREATE) ? 2 : 1;
@@ -422,60 +437,99 @@ WINAPI_EXPORT NTSTATUS NtDeleteFile(POBJECT_ATTRIBUTES ObjectAttributes)
  */
 typedef struct {
     DIR    *dirp;
+    HANDLE  handle;          /* Owning file handle (used for lookup key) */
     char    path[4096];      /* Linux directory path */
     char    pattern[256];    /* Glob pattern (e.g., "*.txt") or "" for all */
     int     first_query;     /* 1 if this is the first call */
+    int     in_use;          /* 1 if this slot is allocated */
 } dir_enum_state_t;
 
 #define MAX_DIR_STATES 256
 static dir_enum_state_t g_dir_states[MAX_DIR_STATES];
-static int g_dir_states_init = 0;
+static pthread_mutex_t g_dir_states_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * Release a directory state slot. Must be called with g_dir_states_lock held.
+ * Closes any open DIR* and marks the slot free for reuse.
+ */
+static void release_dir_state_locked(dir_enum_state_t *state)
+{
+    if (!state)
+        return;
+    if (state->dirp) {
+        closedir(state->dirp);
+        state->dirp = NULL;
+    }
+    state->handle = NULL;
+    state->path[0] = '\0';
+    state->pattern[0] = '\0';
+    state->first_query = 0;
+    state->in_use = 0;
+}
 
 static dir_enum_state_t *get_dir_state(HANDLE FileHandle, int create)
 {
-    if (!g_dir_states_init) {
-        memset(g_dir_states, 0, sizeof(g_dir_states));
-        g_dir_states_init = 1;
-    }
+    pthread_mutex_lock(&g_dir_states_lock);
 
-    /* Look for existing state for this handle */
-    uintptr_t key = (uintptr_t)FileHandle;
+    /* Look for existing state for this handle (primary key: FileHandle) */
     for (int i = 0; i < MAX_DIR_STATES; i++) {
-        if (g_dir_states[i].dirp && (uintptr_t)g_dir_states[i].dirp == key)
-            return &g_dir_states[i]; /* Simplified: use dirp as key marker */
-    }
-
-    /* Look by path match from fd */
-    int fd = handle_get_fd(FileHandle);
-    if (fd >= 0) {
-        char fd_path[4096];
-        char proc_path[64];
-        snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
-        ssize_t len = readlink(proc_path, fd_path, sizeof(fd_path) - 1);
-        if (len > 0) {
-            fd_path[len] = '\0';
-            for (int i = 0; i < MAX_DIR_STATES; i++) {
-                if (g_dir_states[i].dirp && strcmp(g_dir_states[i].path, fd_path) == 0)
-                    return &g_dir_states[i];
-            }
-        }
-
-        if (create) {
-            /* Allocate new state */
-            for (int i = 0; i < MAX_DIR_STATES; i++) {
-                if (!g_dir_states[i].dirp) {
-                    if (len > 0) {
-                        fd_path[len] = '\0';
-                        strncpy(g_dir_states[i].path, fd_path, sizeof(g_dir_states[i].path) - 1);
-                    }
-                    g_dir_states[i].first_query = 1;
-                    return &g_dir_states[i];
-                }
-            }
+        if (g_dir_states[i].in_use && g_dir_states[i].handle == FileHandle) {
+            pthread_mutex_unlock(&g_dir_states_lock);
+            return &g_dir_states[i];
         }
     }
 
+    if (!create) {
+        pthread_mutex_unlock(&g_dir_states_lock);
+        return NULL;
+    }
+
+    /* Allocate new state */
+    for (int i = 0; i < MAX_DIR_STATES; i++) {
+        if (!g_dir_states[i].in_use) {
+            g_dir_states[i].in_use = 1;
+            g_dir_states[i].handle = FileHandle;
+            g_dir_states[i].dirp = NULL;
+            g_dir_states[i].path[0] = '\0';
+            g_dir_states[i].pattern[0] = '\0';
+            g_dir_states[i].first_query = 1;
+
+            /* Populate path from fd readlink */
+            int fd = handle_get_fd(FileHandle);
+            if (fd >= 0) {
+                char proc_path[64];
+                snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
+                ssize_t len = readlink(proc_path, g_dir_states[i].path,
+                                       sizeof(g_dir_states[i].path) - 1);
+                if (len > 0)
+                    g_dir_states[i].path[len] = '\0';
+                else
+                    g_dir_states[i].path[0] = '\0';
+            }
+
+            pthread_mutex_unlock(&g_dir_states_lock);
+            return &g_dir_states[i];
+        }
+    }
+
+    pthread_mutex_unlock(&g_dir_states_lock);
     return NULL;
+}
+
+/*
+ * Release the dir state associated with a handle (called from NtClose hook).
+ * Safe to call even if no state exists for the handle.
+ */
+void ntdll_file_release_dir_state(HANDLE FileHandle)
+{
+    pthread_mutex_lock(&g_dir_states_lock);
+    for (int i = 0; i < MAX_DIR_STATES; i++) {
+        if (g_dir_states[i].in_use && g_dir_states[i].handle == FileHandle) {
+            release_dir_state_locked(&g_dir_states[i]);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_dir_states_lock);
 }
 
 /* FILE_BOTH_DIR_INFORMATION - the most commonly used info class for directory queries */
@@ -527,7 +581,7 @@ WINAPI_EXPORT NTSTATUS NtQueryDirectoryFile(
         return STATUS_NO_MORE_ENTRIES;
     }
 
-    /* Get path from fd if not set */
+    /* Get path from fd if not set (may be empty if fd was unavailable at create) */
     if (state->path[0] == '\0') {
         int fd = handle_get_fd(FileHandle);
         if (fd >= 0) {
@@ -535,6 +589,7 @@ WINAPI_EXPORT NTSTATUS NtQueryDirectoryFile(
             snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
             ssize_t plen = readlink(proc_path, state->path, sizeof(state->path) - 1);
             if (plen > 0) state->path[plen] = '\0';
+            else state->path[0] = '\0';
         }
     }
 
@@ -556,12 +611,16 @@ WINAPI_EXPORT NTSTATUS NtQueryDirectoryFile(
             closedir(state->dirp);
             state->dirp = NULL;
         }
-        state->dirp = opendir(state->path);
+        state->dirp = (state->path[0] != '\0') ? opendir(state->path) : NULL;
         if (!state->dirp) {
             if (IoStatusBlock) {
                 IoStatusBlock->Status = STATUS_NO_SUCH_FILE;
                 IoStatusBlock->Information = 0;
             }
+            /* Release the slot so it doesn't leak on failure */
+            pthread_mutex_lock(&g_dir_states_lock);
+            release_dir_state_locked(state);
+            pthread_mutex_unlock(&g_dir_states_lock);
             return STATUS_NO_SUCH_FILE;
         }
     }
@@ -660,10 +719,11 @@ WINAPI_EXPORT NTSTATUS NtQueryDirectoryFile(
             IoStatusBlock->Status = STATUS_NO_MORE_ENTRIES;
             IoStatusBlock->Information = 0;
         }
-        /* Close directory - we're done */
-        closedir(state->dirp);
-        state->dirp = NULL;
-        state->path[0] = '\0';
+        /* Enumeration complete: release the slot so the handle can re-enumerate
+         * if caller RestartScans later, and so a handle close doesn't leak. */
+        pthread_mutex_lock(&g_dir_states_lock);
+        release_dir_state_locked(state);
+        pthread_mutex_unlock(&g_dir_states_lock);
         return STATUS_NO_MORE_ENTRIES;
     }
 

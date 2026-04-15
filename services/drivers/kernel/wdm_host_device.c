@@ -153,31 +153,47 @@ static long wdm_dev_ioctl(struct file *filp, unsigned int cmd,
 	if (copy_from_user(&req, uarg, sizeof(req)))
 		return -EFAULT;
 
-	/* Allocate and copy input buffer if present */
-	if (req.in_len > 0 && req.in_buf) {
-		in_buf = kzalloc(req.in_len, GFP_KERNEL);
-		if (!in_buf)
-			return -ENOMEM;
-		if (copy_from_user(in_buf, req.in_buf, req.in_len)) {
-			kfree(in_buf);
-			return -EFAULT;
-		}
-	}
+	/*
+	 * METHOD_BUFFERED semantics: allocate ONE system buffer large enough
+	 * for max(in_len, out_len). Input is copied in; driver writes output
+	 * to the same buffer; we copy out on the way back.
+	 */
+	{
+		size_t sysbuf_len = req.in_len;
+		void *sysbuf = NULL;
 
-	/* Allocate output buffer if the caller expects one */
-	if (req.out_len > 0) {
-		out_buf = kzalloc(req.out_len, GFP_KERNEL);
-		if (!out_buf) {
-			kfree(in_buf);
-			return -ENOMEM;
+		if (req.out_len > sysbuf_len)
+			sysbuf_len = req.out_len;
+
+		/* Cap userspace-specified buffer size to prevent DoS via
+		 * arbitrary kernel allocation. 16 MiB matches roughly the
+		 * per-IRP limit used in the read/write paths. */
+		if (sysbuf_len > (16UL << 20)) {
+			pr_warn("wdm_host: ioctl buffer size %zu too large, rejecting\n",
+				sysbuf_len);
+			return -EINVAL;
 		}
+
+		if (sysbuf_len > 0) {
+			sysbuf = kzalloc(sysbuf_len, GFP_KERNEL);
+			if (!sysbuf)
+				return -ENOMEM;
+			if (req.in_len > 0 && req.in_buf &&
+			    copy_from_user(sysbuf, req.in_buf, req.in_len)) {
+				kfree(sysbuf);
+				return -EFAULT;
+			}
+		}
+
+		in_buf = sysbuf;
+		out_buf = sysbuf;  /* Same buffer for METHOD_BUFFERED output */
 	}
 
 	/* Build the kernel-side IRP */
 	memset(&irp, 0, sizeof(irp));
 	irp.major_function = WDM_IRP_MJ_DEVICE_CONTROL;
 	irp.ioctl_code     = req.ioctl_code;
-	irp.system_buffer  = in_buf ? in_buf : out_buf;
+	irp.system_buffer  = in_buf;
 	irp.buffer_length  = req.in_len;
 	irp.user_buffer    = out_buf;
 	irp.output_length  = req.out_len;
@@ -194,8 +210,8 @@ static long wdm_dev_ioctl(struct file *filp, unsigned int cmd,
 			ret = -EFAULT;
 	}
 
+	/* in_buf and out_buf alias the same allocation in METHOD_BUFFERED */
 	kfree(in_buf);
-	kfree(out_buf);
 	return ret;
 }
 

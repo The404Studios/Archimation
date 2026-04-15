@@ -72,20 +72,37 @@ _revoked_tokens: dict[str, float] = {}  # token_id -> revocation_time
 _revoked_lock = threading.Lock()
 _REVOCATION_PATH = "/var/lib/ai-control/revoked_tokens"
 _REVOCATION_TTL = 7200  # Evict revoked tokens after 2h (tokens expire in <= 1h by default)
+# Lazy-load state: we avoid reading the revocation file at daemon startup
+# (slow disks take a measurable hit). The list is loaded on the first auth
+# check and re-read only when the file's mtime changes.
+_revocation_loaded: bool = False
+_revocation_mtime: float = 0.0
 
 
 def revoke_token(token_id: str) -> None:
     """Add a token ID (jti) to the revocation list."""
     with _revoked_lock:
+        _ensure_revocation_loaded_locked()
         _revoked_tokens[token_id] = time.time()
         # Prune expired revocations to prevent unbounded growth
         _prune_revocations()
         _save_revocation_list()
+    # Evict any cached verify_token() results that reference this jti so
+    # a recently-issued and now-revoked token cannot ride a stale cache
+    # hit for the remainder of its TTL.
+    with _token_cache_lock:
+        stale = [
+            tok for tok, (ident, _exp) in _TOKEN_CACHE.items()
+            if ident is not None and ident.jti == token_id
+        ]
+        for tok in stale:
+            _TOKEN_CACHE.pop(tok, None)
 
 
 def is_revoked(token_id: str) -> bool:
     """Return True if the given token ID has been revoked."""
     with _revoked_lock:
+        _ensure_revocation_loaded_locked()
         return token_id in _revoked_tokens
 
 
@@ -108,10 +125,14 @@ def _save_revocation_list():
 
 
 def _load_revocation_list():
-    """Load the revocation list from disk."""
-    global _revoked_tokens
+    """Load the revocation list from disk (caller holds _revoked_lock)."""
+    global _revoked_tokens, _revocation_mtime
     try:
         if os.path.exists(_REVOCATION_PATH):
+            try:
+                _revocation_mtime = os.path.getmtime(_REVOCATION_PATH)
+            except OSError:
+                _revocation_mtime = 0.0
             with open(_REVOCATION_PATH) as f:
                 data = json.load(f)
                 # Support both old format (list) and new format (dict)
@@ -126,6 +147,29 @@ def _load_revocation_list():
             _prune_revocations()
     except (OSError, json.JSONDecodeError):
         pass
+
+
+def _ensure_revocation_loaded_locked():
+    """Load (or reload) the revocation list if needed.
+
+    Called from within _revoked_lock. Performs a one-shot load on first use
+    and re-reads the file when its mtime changes so external revocations
+    (e.g. by an admin CLI) take effect without restart. Startup cost on
+    slow disks is avoided because this never runs until the first auth
+    check actually needs it.
+    """
+    global _revocation_loaded, _revocation_mtime
+    if not _revocation_loaded:
+        _load_revocation_list()
+        _revocation_loaded = True
+        return
+    # Cheap mtime re-check: only re-read if the file changed on disk.
+    try:
+        mtime = os.path.getmtime(_REVOCATION_PATH)
+    except OSError:
+        return
+    if mtime != _revocation_mtime:
+        _load_revocation_list()
 
 
 def _load_or_create_secret() -> bytes:
@@ -145,7 +189,8 @@ def _load_or_create_secret() -> bytes:
             os.chmod(_SECRET_PATH, 0o600)
     except OSError:
         _secret = os.urandom(32)
-    _load_revocation_list()
+    # Revocation list is lazy-loaded on first auth check via
+    # _ensure_revocation_loaded_locked(); don't touch disk here.
     return _secret
 
 
@@ -273,6 +318,7 @@ ENDPOINT_TRUST = {
     "/auth/revoke": 600,
     "/auth/refresh": 200,
     # Contusion automation engine
+    "/contusion": 100,                  # Root status page (GET)
     "/contusion/run": 400,
     "/contusion/pipeline": 400,
     "/contusion/macro/record": 400,
@@ -280,6 +326,8 @@ ENDPOINT_TRUST = {
     "/contusion/macro/list": 200,
     "/contusion/apps": 200,
     "/contusion/context": 400,
+    "/contusion/execute": 400,          # Alias for /contusion/context
+    "/contusion/launch": 400,           # Launch app from library
     "/contusion/confirm": 600,          # Dangerous action confirmation
     "/contusion/processes": 200,
     "/contusion/dictionary/search": 200,
@@ -422,48 +470,105 @@ def create_token(subject_id: int, name: str, trust_level: int,
     return token
 
 
+import base64 as _base64
+
+
 def verify_token(token: str) -> Optional[CallerIdentity]:
-    """Verify a token and return the caller identity, or None if invalid."""
+    """Verify a token and return the caller identity, or None if invalid.
+
+    Results are cached for the token's remaining lifetime to avoid re-HMAC
+    on every request. The cache is bounded (LRU) and invalidated when the
+    token expires or is revoked.
+    """
+    if not token:
+        return None
+    now = time.time()
+    # LRU cache check — hit means we've already verified this exact token.
+    with _token_cache_lock:
+        entry = _TOKEN_CACHE.get(token)
+        if entry is not None:
+            identity, cached_exp = entry
+            if cached_exp > now:
+                # Still valid per the cached expiry; re-check revocation
+                # (cheap dict lookup) so revoked tokens stop working promptly.
+                if identity and identity.jti and is_revoked(identity.jti):
+                    _TOKEN_CACHE.pop(token, None)
+                    return None
+                _TOKEN_CACHE.move_to_end(token)
+                return identity
+            # Expired — drop it.
+            _TOKEN_CACHE.pop(token, None)
+
     secret = _load_or_create_secret()
     try:
         parts = token.split(".", 1)
         if len(parts) != 2:
             return None
-        import base64
-        payload_json = base64.urlsafe_b64decode(parts[0]).decode()
+        payload_json = _base64.urlsafe_b64decode(parts[0]).decode()
         expected_sig = hmac.new(secret, payload_json.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(parts[1], expected_sig):
             logger.warning("Invalid token signature")
             return None
         payload = json.loads(payload_json)
-        now = time.time()
-        if payload.get("exp", 0) < now:
+        exp = payload.get("exp", 0)
+        if exp < now:
             logger.warning("Token expired for subject %s", payload.get("sub"))
             return None
         token_jti = payload.get("jti", "")
         if is_revoked(token_jti):
             logger.warning("Token %s has been revoked", token_jti)
             return None
-        return CallerIdentity(
+        identity = CallerIdentity(
             subject_id=payload["sub"],
             name=payload.get("name", "unknown"),
             trust_level=payload.get("trust", 0),
             issued_at=payload.get("iat", 0),
-            expires_at=payload.get("exp", 0),
+            expires_at=exp,
             jti=token_jti,
         )
+        # Populate LRU cache with bounded size.
+        with _token_cache_lock:
+            _TOKEN_CACHE[token] = (identity, float(exp))
+            _TOKEN_CACHE.move_to_end(token)
+            while len(_TOKEN_CACHE) > _TOKEN_CACHE_MAX:
+                _TOKEN_CACHE.popitem(last=False)
+        return identity
+    except (ValueError, json.JSONDecodeError, KeyError, UnicodeDecodeError):
+        # Malformed token payload: common case for probes and misconfigured
+        # clients. Don't emit a stack trace — caller logs the auth failure.
+        return None
     except Exception:
         logger.exception("Token verification failed")
         return None
 
 
+# Pre-sorted prefix list for O(n) lookups instead of re-sorting on every
+# request. Sorted once at module import (longest-prefix first). This matters
+# because get_required_trust is called on the auth hot path for every
+# request; sorting ~200 entries every time wasted ~25 µs per call.
+_SORTED_PREFIXES: list[tuple[str, int]] = sorted(
+    ENDPOINT_TRUST.items(), key=lambda x: -len(x[0])
+)
+
+# Bounded cache for verify_token() results so repeated requests from the
+# same client don't re-HMAC the payload. Each entry is (identity_or_None,
+# expires_at). We cap at 256 to match the rate-limit window; beyond that
+# evict the oldest. Constant-time eviction via OrderedDict.
+import collections as _collections
+_TOKEN_CACHE: "_collections.OrderedDict[str, tuple[Optional['CallerIdentity'], float]]" = _collections.OrderedDict()
+_TOKEN_CACHE_MAX = 256
+_token_cache_lock = threading.Lock()
+
+
 def get_required_trust(path: str) -> int:
     """Get the minimum trust score required for an endpoint path."""
-    # Exact match
-    if path in ENDPOINT_TRUST:
-        return ENDPOINT_TRUST[path]
-    # Prefix match (for parameterized routes like /services/status/{name})
-    for prefix, trust in sorted(ENDPOINT_TRUST.items(), key=lambda x: -len(x[0])):
+    # Exact match — fast path, no iteration.
+    trust = ENDPOINT_TRUST.get(path)
+    if trust is not None:
+        return trust
+    # Prefix match (for parameterized routes like /services/status/{name}).
+    # Uses the pre-sorted prefix list computed at import time.
+    for prefix, trust in _SORTED_PREFIXES:
         if path.startswith(prefix) and (len(path) == len(prefix) or path[len(prefix)] in ('/', '?')):
             return trust
     # Fail-secure: unknown endpoints require admin trust

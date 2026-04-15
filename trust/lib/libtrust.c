@@ -16,15 +16,61 @@
 #include "libtrust.h"
 #include "../include/trust_ioctl.h"
 
+/*
+ * g_trust_fd is written only while holding g_trust_lock (trust_init /
+ * trust_cleanup), and read lock-free from every ioctl wrapper.  This is
+ * deliberate — grabbing a mutex on every cap-check would be a latency
+ * regression and the read-then-ioctl sequence is safe even under a racing
+ * cleanup() because ioctl(-1, ...) just returns EBADF which our callers
+ * already treat as fail-closed.
+ *
+ * We use relaxed atomics (via __atomic_{load,store}_n) to silence TSAN
+ * and guarantee a torn-free read on 32-bit targets. No ordering is
+ * required because the kernel ioctl itself is the synchronization
+ * point.
+ */
 static int g_trust_fd = -1;
 static pthread_mutex_t g_trust_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline int trust_fd_load(void)
+{
+    return __atomic_load_n(&g_trust_fd, __ATOMIC_RELAXED);
+}
+
+static inline void trust_fd_store(int fd)
+{
+    __atomic_store_n(&g_trust_fd, fd, __ATOMIC_RELAXED);
+}
+
+/* Error logging is off by default; enable by setting LIBTRUST_DEBUG=1 in
+ * the environment.  Checked once on first use so we don't pay a getenv()
+ * per ioctl.  -1 = unchecked, 0 = disabled, 1 = enabled. */
+static int g_trust_debug = -1;
+
+static int libtrust_debug_enabled(void)
+{
+    if (g_trust_debug < 0) {
+        const char *e = getenv("LIBTRUST_DEBUG");
+        g_trust_debug = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return g_trust_debug;
+}
+
+#define LIBTRUST_LOG_IOCTL_ERR(op) do { \
+    if (libtrust_debug_enabled()) { \
+        int _e = errno; \
+        fprintf(stderr, "libtrust: %s: ioctl failed: %s (errno=%d)\n", \
+                (op), strerror(_e), _e); \
+        errno = _e; \
+    } \
+} while (0)
 
 int trust_init(void)
 {
     int fd;
 
     pthread_mutex_lock(&g_trust_lock);
-    if (g_trust_fd >= 0) {
+    if (trust_fd_load() >= 0) {
         pthread_mutex_unlock(&g_trust_lock);
         return 0; /* Already initialized */
     }
@@ -36,7 +82,7 @@ int trust_init(void)
         return -1;
     }
 
-    g_trust_fd = fd;
+    trust_fd_store(fd);
     pthread_mutex_unlock(&g_trust_lock);
     return 0;
 }
@@ -46,8 +92,8 @@ void trust_cleanup(void)
     int fd;
 
     pthread_mutex_lock(&g_trust_lock);
-    fd = g_trust_fd;
-    g_trust_fd = -1;
+    fd = trust_fd_load();
+    trust_fd_store(-1);
     pthread_mutex_unlock(&g_trust_lock);
 
     if (fd >= 0)
@@ -56,7 +102,7 @@ void trust_cleanup(void)
 
 int trust_available(void)
 {
-    return (g_trust_fd >= 0) ? 1 : 0;
+    return (trust_fd_load() >= 0) ? 1 : 0;
 }
 
 /* --- RISC fast-path --- */
@@ -64,16 +110,19 @@ int trust_available(void)
 int trust_check_capability(uint32_t subject_id, uint32_t capability)
 {
     trust_ioc_check_cap_t req;
+    int fd = trust_fd_load();
 
-    if (g_trust_fd < 0) return 1; /* No trust module = allow all */
+    if (fd < 0) return 1; /* No trust module = allow all */
 
     memset(&req, 0, sizeof(req));
     req.subject_id = subject_id;
     req.capability = capability;
     req.result = 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_CHECK_CAP, &req) < 0)
+    if (ioctl(fd, TRUST_IOC_CHECK_CAP, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("check_capability");
         return 0; /* Error = deny (fail-closed for security) */
+    }
 
     return req.result;
 }
@@ -81,14 +130,17 @@ int trust_check_capability(uint32_t subject_id, uint32_t capability)
 int32_t trust_get_score(uint32_t subject_id)
 {
     trust_ioc_get_score_t req;
+    int fd = trust_fd_load();
 
-    if (g_trust_fd < 0) return TRUST_SCORE_DEFAULT;
+    if (fd < 0) return TRUST_SCORE_DEFAULT;
 
     req.subject_id = subject_id;
     req.score = 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_GET_SCORE, &req) < 0)
+    if (ioctl(fd, TRUST_IOC_GET_SCORE, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("get_score");
         return 0;
+    }
 
     return req.score;
 }
@@ -96,16 +148,19 @@ int32_t trust_get_score(uint32_t subject_id)
 int32_t trust_record_action(uint32_t subject_id, uint32_t action, int result)
 {
     trust_ioc_record_t req;
+    int fd = trust_fd_load();
 
-    if (g_trust_fd < 0) return 0;
+    if (fd < 0) return 0;
 
     req.subject_id = subject_id;
     req.action_type = action;
     req.result = (uint32_t)result;
     req.new_score = 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_RECORD_ACTION, &req) < 0)
+    if (ioctl(fd, TRUST_IOC_RECORD_ACTION, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("record_action");
         return 0;
+    }
 
     return req.new_score;
 }
@@ -113,16 +168,19 @@ int32_t trust_record_action(uint32_t subject_id, uint32_t action, int result)
 int trust_threshold_check(uint32_t subject_id, uint32_t action)
 {
     trust_ioc_threshold_t req;
+    int fd = trust_fd_load();
 
-    if (g_trust_fd < 0) return TRUST_RESULT_ALLOW;
+    if (fd < 0) return TRUST_RESULT_ALLOW;
 
     memset(&req, 0, sizeof(req));
     req.subject_id = subject_id;
     req.action_type = action;
     req.result = TRUST_RESULT_DENY;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_THRESHOLD, &req) < 0)
+    if (ioctl(fd, TRUST_IOC_THRESHOLD, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("threshold_check");
         return TRUST_RESULT_DENY; /* Error = deny (fail-closed for security) */
+    }
 
     return req.result;
 }
@@ -148,8 +206,10 @@ int trust_register_subject_ex(uint32_t subject_id, uint16_t domain,
     req.authority = authority;
     req.initial_score = initial_score;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_REGISTER, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_REGISTER, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("register_subject");
         return -1;
+    }
 
     return 0;
 }
@@ -162,8 +222,10 @@ int trust_unregister_subject(uint32_t subject_id)
 
     req.subject_id = subject_id;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_UNREGISTER, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_UNREGISTER, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("unregister_subject");
         return -1;
+    }
 
     return 0;
 }
@@ -180,8 +242,10 @@ int trust_request_escalation(uint32_t subject_id, uint32_t authority)
     strncpy(req.justification, "userspace escalation request",
             sizeof(req.justification) - 1);
 
-    if (ioctl(g_trust_fd, TRUST_IOC_ESCALATE, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_ESCALATE, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("request_escalation");
         return -1;
+    }
 
     return req.result;
 }
@@ -196,8 +260,10 @@ int trust_policy_eval(uint32_t subject_id, uint32_t action)
     req.action_type = action;
     req.result = TRUST_RESULT_DENY;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_POLICY_EVAL, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_POLICY_EVAL, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("policy_eval");
         return TRUST_RESULT_DENY; /* Error = deny (fail-closed for security) */
+    }
 
     return req.result;
 }
@@ -215,8 +281,10 @@ int trust_domain_transfer(uint32_t subject_id, uint16_t from_domain,
     req.capabilities = capabilities;
     req.result = -1;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_DOMAIN_TRANSFER, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_DOMAIN_TRANSFER, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("domain_transfer");
         return -1;
+    }
 
     return req.result;
 }
@@ -230,8 +298,10 @@ int trust_get_subject(uint32_t subject_id, trust_subject_t *out)
     req.subject_id = subject_id;
     memset(&req.subject, 0, sizeof(req.subject));
 
-    if (ioctl(g_trust_fd, TRUST_IOC_GET_SUBJECT, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_GET_SUBJECT, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("get_subject");
         return -1;
+    }
 
     *out = req.subject;
     return 0;
@@ -246,8 +316,10 @@ int trust_propagate(uint32_t subject_id, int32_t delta)
     req.subject_id = subject_id;
     req.delta = delta;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_PROPAGATE, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_PROPAGATE, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("propagate");
         return -1;
+    }
 
     return 0;
 }
@@ -256,8 +328,10 @@ int trust_repartition(void)
 {
     if (g_trust_fd < 0) return 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_REPARTITION, 0) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_REPARTITION, 0UL) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("repartition");
         return -1;
+    }
 
     return 0;
 }
@@ -266,8 +340,10 @@ int trust_flush_tlb(void)
 {
     if (g_trust_fd < 0) return 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_FLUSH_TLB, 0) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_FLUSH_TLB, 0UL) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("flush_tlb");
         return -1;
+    }
 
     return 0;
 }
@@ -277,13 +353,19 @@ int trust_get_audit(trust_audit_entry_t *buf, uint32_t max_entries)
     trust_ioc_audit_t req;
 
     if (g_trust_fd < 0 || !buf) return -1;
+    /* max_entries of 0 is ambiguous; kernel promotes it to full ring size
+     * which can surprise callers. Reject it here — callers that want the
+     * whole buffer should pass TRUST_AUDIT_SIZE explicitly. */
+    if (max_entries == 0) return 0;
 
     req.max_entries = max_entries;
     req.returned = 0;
     req.buf = buf;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_GET_AUDIT, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_GET_AUDIT, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("get_audit");
         return -1;
+    }
 
     return (int)req.returned;
 }
@@ -300,8 +382,10 @@ int trust_dep_add(uint32_t subject_id, uint32_t depends_on)
     req.depends_on = depends_on;
     req.result = -1;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_DEP_ADD, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_DEP_ADD, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("dep_add");
         return -1;
+    }
 
     return req.result;
 }
@@ -315,8 +399,10 @@ int trust_dep_remove(uint32_t subject_id, uint32_t depends_on)
     req.subject_id = subject_id;
     req.depends_on = depends_on;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_DEP_REMOVE, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_DEP_REMOVE, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("dep_remove");
         return -1;
+    }
 
     return 0;
 }
@@ -333,8 +419,10 @@ int trust_escalation_poll(uint32_t *subject_id, uint32_t *requested_authority,
 
     memset(&req, 0, sizeof(req));
 
-    if (ioctl(g_trust_fd, TRUST_IOC_ESCALATION_POLL, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_ESCALATION_POLL, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("escalation_poll");
         return -1;
+    }
 
     if (!req.has_pending)
         return 0;
@@ -360,8 +448,10 @@ int trust_escalation_respond(uint32_t seq, int approved)
     req.seq = seq;
     req.approved = approved ? 1 : 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_ESCALATION_RESPOND, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_ESCALATION_RESPOND, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("escalation_respond");
         return -1;
+    }
 
     return 0;
 }
@@ -377,8 +467,10 @@ int trust_proof_mint(uint32_t subject_id, uint8_t *proof_out)
     memset(&req, 0, sizeof(req));
     req.subject_id = subject_id;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_PROOF_MINT, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_PROOF_MINT, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("proof_mint");
         return -1;
+    }
 
     if (req.result < 0)
         return req.result;
@@ -401,8 +493,10 @@ int trust_proof_consume(uint32_t subject_id, const uint8_t *current_proof,
     req.action_type = action_type;
     req.action_result = action_result;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_PROOF_CONSUME, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_PROOF_CONSUME, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("proof_consume");
         return -1;
+    }
 
     if (req.result < 0)
         return req.result;
@@ -420,8 +514,10 @@ int trust_proof_fence(uint32_t subject_id)
     req.subject_id = subject_id;
     req.result = 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_PROOF_FENCE, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_PROOF_FENCE, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("proof_fence");
         return -1;
+    }
 
     return req.result;
 }
@@ -435,8 +531,10 @@ int trust_proof_verify(uint32_t subject_id)
     memset(&req, 0, sizeof(req));
     req.subject_id = subject_id;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_PROOF_VERIFY, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_PROOF_VERIFY, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("proof_verify");
         return -1;
+    }
 
     return req.result;
 }
@@ -450,8 +548,10 @@ int trust_proof_get_nonce(uint32_t subject_id, uint64_t *nonce_out)
     req.subject_id = subject_id;
     req.nonce = 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_PROOF_NONCE, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_PROOF_NONCE, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("proof_nonce");
         return -1;
+    }
 
     *nonce_out = req.nonce;
     return 0;
@@ -469,8 +569,10 @@ int32_t trust_token_balance(uint32_t subject_id)
     req.balance = 0;
     req.max_balance = 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_TOKEN_BALANCE, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_TOKEN_BALANCE, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("token_balance");
         return 0;
+    }
 
     return req.balance;
 }
@@ -485,8 +587,10 @@ int32_t trust_token_max_balance(uint32_t subject_id)
     req.balance = 0;
     req.max_balance = 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_TOKEN_BALANCE, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_TOKEN_BALANCE, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("token_max_balance");
         return TRUST_TOKEN_MAX_DEFAULT;
+    }
 
     return req.max_balance;
 }
@@ -503,8 +607,10 @@ int trust_token_burn_action(uint32_t subject_id, uint32_t action_type,
     req.result = 0;
     req.remaining = 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_TOKEN_BURN, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_TOKEN_BURN, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("token_burn");
         return -1;
+    }
 
     if (remaining_out)
         *remaining_out = req.remaining;
@@ -524,8 +630,10 @@ int trust_token_transfer(uint32_t from_subject, uint32_t to_subject,
     req.amount = amount;
     req.result = 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_TOKEN_XFER, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_TOKEN_XFER, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("token_transfer");
         return -1;
+    }
 
     return req.result;
 }
@@ -539,8 +647,10 @@ uint32_t trust_token_get_cost(uint32_t action_type)
     req.action_type = action_type;
     req.cost = 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_TOKEN_COST, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_TOKEN_COST, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("token_get_cost");
         return 0;
+    }
 
     return req.cost;
 }
@@ -559,8 +669,10 @@ int trust_mitotic_divide(uint32_t parent_id, uint32_t child_id,
     req.result = 0;
     req.child_max_score = 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_MITOTIC_DIVIDE, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_MITOTIC_DIVIDE, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("mitotic_divide");
         return -1;
+    }
 
     if (child_max_score_out)
         *child_max_score_out = req.child_max_score;
@@ -580,8 +692,10 @@ int trust_meiotic_combine(uint32_t subject_a, uint32_t subject_b,
     req.result = 0;
     req.combined_score = 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_MEIOTIC_COMBINE, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_MEIOTIC_COMBINE, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("meiotic_combine");
         return -1;
+    }
 
     if (combined_score_out)
         *combined_score_out = req.combined_score;
@@ -598,8 +712,10 @@ int trust_meiotic_release(uint32_t subject_a, uint32_t subject_b)
     req.subject_a = subject_a;
     req.subject_b = subject_b;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_MEIOTIC_RELEASE, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_MEIOTIC_RELEASE, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("meiotic_release");
         return -1;
+    }
 
     return 0;
 }
@@ -613,8 +729,10 @@ int trust_apoptosis(uint32_t subject_id)
     req.subject_id = subject_id;
     req.result = 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_APOPTOSIS, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_APOPTOSIS, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("apoptosis");
         return -1;
+    }
 
     return req.result;
 }
@@ -630,8 +748,10 @@ int trust_get_chromosome(uint32_t subject_id, trust_chromosome_t *out)
     memset(&req, 0, sizeof(req));
     req.subject_id = subject_id;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_GET_CHROMOSOME, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_GET_CHROMOSOME, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("get_chromosome");
         return -1;
+    }
 
     if (req.result < 0)
         return req.result;
@@ -649,8 +769,10 @@ int trust_get_sex(uint32_t subject_id)
     memset(&req, 0, sizeof(req));
     req.subject_id = subject_id;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_GET_SEX, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_GET_SEX, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("get_sex");
         return -1;
+    }
 
     if (req.result < 0)
         return -1;
@@ -669,8 +791,10 @@ int trust_immune_status(uint32_t subject_id)
     memset(&req, 0, sizeof(req));
     req.subject_id = subject_id;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_IMMUNE_STATUS, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_IMMUNE_STATUS, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("immune_status");
         return -1;
+    }
 
     if (req.result < 0)
         return -1;
@@ -688,8 +812,10 @@ int trust_quarantine(uint32_t subject_id, uint32_t reason)
     req.reason = reason;
     req.result = 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_QUARANTINE, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_QUARANTINE, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("quarantine");
         return -1;
+    }
 
     return req.result;
 }
@@ -703,8 +829,10 @@ int trust_release_quarantine(uint32_t subject_id)
     req.subject_id = subject_id;
     req.result = 0;
 
-    if (ioctl(g_trust_fd, TRUST_IOC_RELEASE_QUARANTINE, &req) < 0)
+    if (ioctl(g_trust_fd, TRUST_IOC_RELEASE_QUARANTINE, &req) < 0) {
+        LIBTRUST_LOG_IOCTL_ERR("release_quarantine");
         return -1;
+    }
 
     return req.result;
 }

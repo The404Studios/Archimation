@@ -50,21 +50,26 @@ static int g_steam_initialized = 0;
 /* Generic stub vtable methods -- prevent NULL vtbl crashes */
 static __attribute__((ms_abi)) uint64_t steam_stub_return_0(void *self) { (void)self; return 0; }
 
-/* Generic vtable with enough entries to cover most Steam interface methods.
- * Every slot returns 0, which is safe for bool/int/pointer/uint64 returns. */
-static void *g_steam_vtbl[20] = {0};
+/* Generic vtable with enough entries to cover Steam interfaces.
+ * Real Steam interfaces can have 100+ methods; undersizing this causes OOB
+ * reads and crashes when a game invokes a high-slot method (e.g. ISteamUGC,
+ * ISteamNetworking). 256 slots covers all known Steamworks interfaces. */
+#define STEAM_VTBL_SLOTS 256
+static void *g_steam_vtbl[STEAM_VTBL_SLOTS] = {0};
 
 static void init_steam_vtbl(void)
 {
     static int done = 0;
     if (done) return;
-    for (int i = 0; i < 20; i++)
+    for (int i = 0; i < STEAM_VTBL_SLOTS; i++)
         g_steam_vtbl[i] = (void *)steam_stub_return_0;
     done = 1;
 }
 
 static void init_all_steam_interfaces(void)
 {
+    static int all_done = 0;
+    if (all_done) return;
     init_steam_vtbl();
     g_steam_client.vtbl = g_steam_vtbl;
     g_steam_user.vtbl = g_steam_vtbl;
@@ -78,6 +83,7 @@ static void init_all_steam_interfaces(void)
     g_steam_screenshots.vtbl = g_steam_vtbl;
     g_steam_controller.vtbl = g_steam_vtbl;
     g_steam_ugc.vtbl = g_steam_vtbl;
+    all_done = 1;
 }
 
 /* ================================================================== */

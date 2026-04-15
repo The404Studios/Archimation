@@ -136,6 +136,7 @@ struct IXAudio2SourceVoice {
     pthread_mutex_t lock;
     pthread_t thread;
     volatile int thread_running;
+    int thread_created;
 };
 
 static void *source_voice_thread(void *arg)
@@ -205,15 +206,18 @@ static __attribute__((ms_abi)) void sv_DestroyVoice(IXAudio2SourceVoice *s)
 {
     s->playing = 0;
     s->thread_running = 0;
-    if (s->thread) pthread_join(s->thread, NULL);
+    if (s->thread_created) {
+        pthread_join(s->thread, NULL);
+        s->thread_created = 0;
+    }
     if (s->stream && p_free) p_free(s->stream);
     /* Flush buffer queue */
     pthread_mutex_lock(&s->lock);
     buf_entry_t *b = s->buf_head;
     while (b) { buf_entry_t *n = b->next; free(b->data); free(b); b = n; }
+    s->buf_head = s->buf_tail = NULL;
     pthread_mutex_unlock(&s->lock);
     pthread_mutex_destroy(&s->lock);
-    free((void *)s->lpVtbl);
     free(s);
 }
 
@@ -223,7 +227,11 @@ static __attribute__((ms_abi)) HRESULT sv_Start(IXAudio2SourceVoice *s, uint32_t
     s->playing = 1;
     if (!s->thread_running && s->stream) {
         s->thread_running = 1;
-        pthread_create(&s->thread, NULL, source_voice_thread, s);
+        if (pthread_create(&s->thread, NULL, source_voice_thread, s) == 0) {
+            s->thread_created = 1;
+        } else {
+            s->thread_running = 0;
+        }
     }
     return S_OK;
 }
@@ -290,43 +298,43 @@ static __attribute__((ms_abi)) void sv_GetFrequencyRatio(IXAudio2SourceVoice *s,
 static __attribute__((ms_abi)) HRESULT sv_SetSourceSampleRate(IXAudio2SourceVoice *s, uint32_t r)
 { (void)s; (void)r; return S_OK; }
 
+static const IXAudio2SourceVoiceVtbl g_sv_vtbl = {
+    .GetVoiceDetails = sv_GetVoiceDetails,
+    .SetOutputVoices = sv_SetOutputVoices,
+    .SetEffectChain = sv_SetEffectChain,
+    .EnableEffect = sv_EnableEffect,
+    .DisableEffect = sv_DisableEffect,
+    .GetEffectState = sv_GetEffectState,
+    .SetEffectParameters = sv_SetEffectParams,
+    .GetEffectParameters = sv_GetEffectParams,
+    .SetFilterParameters = sv_SetFilterParams,
+    .GetFilterParameters = sv_GetFilterParams,
+    .SetOutputFilterParameters = sv_SetOutFilterParams,
+    .GetOutputFilterParameters = sv_GetOutFilterParams,
+    .SetVolume = sv_SetVolume,
+    .GetVolume = sv_GetVolume,
+    .SetChannelVolumes = sv_SetChannelVolumes,
+    .GetChannelVolumes = sv_GetChannelVolumes,
+    .SetOutputMatrix = sv_SetOutputMatrix,
+    .GetOutputMatrix = sv_GetOutputMatrix,
+    .DestroyVoice = sv_DestroyVoice,
+    .Start = sv_Start,
+    .Stop = sv_Stop,
+    .SubmitSourceBuffer = sv_SubmitSourceBuffer,
+    .FlushSourceBuffers = sv_FlushSourceBuffers,
+    .Discontinuity = sv_Discontinuity,
+    .ExitLoop = sv_ExitLoop,
+    .GetState = sv_GetState,
+    .SetFrequencyRatio = sv_SetFrequencyRatio,
+    .GetFrequencyRatio = sv_GetFrequencyRatio,
+    .SetSourceSampleRate = sv_SetSourceSampleRate,
+};
+
 static IXAudio2SourceVoice *create_source_voice(const WAVEFORMATEX_XA2 *fmt)
 {
-    IXAudio2SourceVoiceVtbl *v = calloc(1, sizeof(IXAudio2SourceVoiceVtbl));
-    if (!v) return NULL;
-    v->GetVoiceDetails = sv_GetVoiceDetails;
-    v->SetOutputVoices = sv_SetOutputVoices;
-    v->SetEffectChain = sv_SetEffectChain;
-    v->EnableEffect = sv_EnableEffect;
-    v->DisableEffect = sv_DisableEffect;
-    v->GetEffectState = sv_GetEffectState;
-    v->SetEffectParameters = sv_SetEffectParams;
-    v->GetEffectParameters = sv_GetEffectParams;
-    v->SetFilterParameters = sv_SetFilterParams;
-    v->GetFilterParameters = sv_GetFilterParams;
-    v->SetOutputFilterParameters = sv_SetOutFilterParams;
-    v->GetOutputFilterParameters = sv_GetOutFilterParams;
-    v->SetVolume = sv_SetVolume;
-    v->GetVolume = sv_GetVolume;
-    v->SetChannelVolumes = sv_SetChannelVolumes;
-    v->GetChannelVolumes = sv_GetChannelVolumes;
-    v->SetOutputMatrix = sv_SetOutputMatrix;
-    v->GetOutputMatrix = sv_GetOutputMatrix;
-    v->DestroyVoice = sv_DestroyVoice;
-    v->Start = sv_Start;
-    v->Stop = sv_Stop;
-    v->SubmitSourceBuffer = sv_SubmitSourceBuffer;
-    v->FlushSourceBuffers = sv_FlushSourceBuffers;
-    v->Discontinuity = sv_Discontinuity;
-    v->ExitLoop = sv_ExitLoop;
-    v->GetState = sv_GetState;
-    v->SetFrequencyRatio = sv_SetFrequencyRatio;
-    v->GetFrequencyRatio = sv_GetFrequencyRatio;
-    v->SetSourceSampleRate = sv_SetSourceSampleRate;
-
     IXAudio2SourceVoice *sv = calloc(1, sizeof(IXAudio2SourceVoice));
-    if (!sv) { free(v); return NULL; }
-    sv->lpVtbl = v;
+    if (!sv) return NULL;
+    sv->lpVtbl = &g_sv_vtbl;
     sv->volume = 1.0f;
     pthread_mutex_init(&sv->lock, NULL);
 
@@ -385,8 +393,8 @@ typedef struct IXAudio2_vtbl {
 } IXAudio2_vtbl;
 
 typedef struct {
-    IXAudio2_vtbl *lpVtbl;
-    int ref_count;
+    const IXAudio2_vtbl *lpVtbl;
+    volatile int ref_count;
 } IXAudio2_obj;
 
 static const unsigned char IID_IUnknown_bytes[16] = {
@@ -400,18 +408,19 @@ static __attribute__((ms_abi)) HRESULT xa2_qi(void *t, const void *r, void **p)
     *p = NULL;
     if (!r || memcmp(r, IID_IUnknown_bytes, 16) == 0) {
         *p = t;
-        ((IXAudio2_obj *)t)->ref_count++;
+        __sync_add_and_fetch(&((IXAudio2_obj *)t)->ref_count, 1);
         return S_OK;
     }
     return (HRESULT)0x80004002; /* E_NOINTERFACE */
 }
 static __attribute__((ms_abi)) uint32_t xa2_addref(void *t)
-{ return ++((IXAudio2_obj *)t)->ref_count; }
+{ return (uint32_t)__sync_add_and_fetch(&((IXAudio2_obj *)t)->ref_count, 1); }
 static __attribute__((ms_abi)) uint32_t xa2_release(void *t)
 {
     IXAudio2_obj *o = (IXAudio2_obj *)t;
-    if (--o->ref_count <= 0) { free(o->lpVtbl); free(o); return 0; }
-    return o->ref_count;
+    int ref = __sync_sub_and_fetch(&o->ref_count, 1);
+    if (ref <= 0) { free(o); return 0; }
+    return (uint32_t)ref;
 }
 static __attribute__((ms_abi)) HRESULT xa2_regcb(void *t, void *c) { (void)t; (void)c; return S_OK; }
 static __attribute__((ms_abi)) void xa2_unregcb(void *t, void *c) { (void)t; (void)c; }
@@ -450,31 +459,31 @@ static __attribute__((ms_abi)) HRESULT xa2_commit(void *t, uint32_t o) { (void)t
 static __attribute__((ms_abi)) void xa2_perf(void *t, void *d) { (void)t; if (d) memset(d, 0, 64); }
 static __attribute__((ms_abi)) void xa2_debug(void *t, const void *c, void *r) { (void)t; (void)c; (void)r; }
 
+static const IXAudio2_vtbl g_xa2_vtbl = {
+    .QueryInterface = xa2_qi,
+    .AddRef = xa2_addref,
+    .Release = xa2_release,
+    .RegisterForCallbacks = xa2_regcb,
+    .UnregisterForCallbacks = xa2_unregcb,
+    .CreateSourceVoice = xa2_create_sv,
+    .CreateSubmixVoice = xa2_create_submix,
+    .CreateMasteringVoice = xa2_create_mv,
+    .StartEngine = xa2_start,
+    .StopEngine = xa2_stop,
+    .CommitChanges = xa2_commit,
+    .GetPerformanceData = xa2_perf,
+    .SetDebugConfiguration = xa2_debug,
+};
+
 WINAPI_EXPORT HRESULT XAudio2Create(void **ppXAudio2, uint32_t Flags, uint32_t XAudio2Processor)
 {
     (void)Flags; (void)XAudio2Processor;
     fprintf(stderr, "[xaudio2] XAudio2Create\n");
     if (!ppXAudio2) return XAUDIO2_E_INVALID_CALL;
 
-    IXAudio2_vtbl *vtbl = calloc(1, sizeof(IXAudio2_vtbl));
-    if (!vtbl) return XAUDIO2_E_DEVICE_INVALIDATED;
-    vtbl->QueryInterface = xa2_qi;
-    vtbl->AddRef = xa2_addref;
-    vtbl->Release = xa2_release;
-    vtbl->RegisterForCallbacks = xa2_regcb;
-    vtbl->UnregisterForCallbacks = xa2_unregcb;
-    vtbl->CreateSourceVoice = xa2_create_sv;
-    vtbl->CreateSubmixVoice = xa2_create_submix;
-    vtbl->CreateMasteringVoice = xa2_create_mv;
-    vtbl->StartEngine = xa2_start;
-    vtbl->StopEngine = xa2_stop;
-    vtbl->CommitChanges = xa2_commit;
-    vtbl->GetPerformanceData = xa2_perf;
-    vtbl->SetDebugConfiguration = xa2_debug;
-
     IXAudio2_obj *obj = calloc(1, sizeof(IXAudio2_obj));
-    if (!obj) { free(vtbl); return XAUDIO2_E_DEVICE_INVALIDATED; }
-    obj->lpVtbl = vtbl;
+    if (!obj) return XAUDIO2_E_DEVICE_INVALIDATED;
+    obj->lpVtbl = &g_xa2_vtbl;
     obj->ref_count = 1;
     *ppXAudio2 = obj;
     return S_OK;

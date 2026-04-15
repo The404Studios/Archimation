@@ -114,6 +114,14 @@ static void msi_log(const char *fmt, ...) {
     fputc('\n', g_log_file); fflush(g_log_file); va_end(ap);
 }
 static HANDLE msi_handle_alloc(void *obj) {
+    /* Reuse freed slots first to prevent handle table exhaustion
+     * after MAX_MSI_HANDLES alloc/close cycles. */
+    for (int i = 0; i < g_msi_handle_count; i++) {
+        if (g_msi_handles[i] == NULL) {
+            g_msi_handles[i] = obj;
+            return (HANDLE)(uintptr_t)(i + 0x10000);
+        }
+    }
     if (g_msi_handle_count >= MAX_MSI_HANDLES) return NULL;
     int i = g_msi_handle_count++; g_msi_handles[i] = obj;
     return (HANDLE)(uintptr_t)(i + 0x10000);
@@ -543,6 +551,10 @@ WINAPI_EXPORT UINT MsiOpenDatabaseA(LPCSTR szPath, LPCSTR szPersist, HANDLE *phD
     msi_database_t *db = msi_open_db(lp);
     if (!db) return ERROR_INSTALL_PACKAGE_INVALID;
     *phDb = msi_handle_alloc(db);
+    if (!*phDb) {
+        msi_close_db(db);
+        return ERROR_OUTOFMEMORY;
+    }
     return ERROR_SUCCESS;
 }
 
@@ -575,6 +587,10 @@ WINAPI_EXPORT UINT MsiDatabaseOpenViewA(HANDLE hDb, LPCSTR szQuery, HANDLE *phVi
     if (!v) return ERROR_NOT_ENOUGH_MEMORY;
     v->magic = MSI_HANDLE_VIEW; v->db = db; v->table = table;
     *phView = msi_handle_alloc(v);
+    if (!*phView) {
+        free(v);
+        return ERROR_NOT_ENOUGH_MEMORY;
+    }
     return ERROR_SUCCESS;
 }
 
@@ -610,6 +626,11 @@ WINAPI_EXPORT UINT MsiViewFetch(HANDLE hView, HANDLE *phRec)
     }
     v->current_row++;
     *phRec = msi_handle_alloc(r);
+    if (!*phRec) {
+        for (int c = 0; c < r->field_count; c++) free(r->fields[c]);
+        free(r);
+        return ERROR_NOT_ENOUGH_MEMORY;
+    }
     return ERROR_SUCCESS;
 }
 

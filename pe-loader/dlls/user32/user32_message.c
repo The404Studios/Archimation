@@ -1007,7 +1007,11 @@ WINAPI_EXPORT HANDLE SetClipboardData(UINT uFormat, HANDLE hMem)
     /* Replace existing format if present */
     for (int i = 0; i < g_clipboard_count; i++) {
         if (g_clipboard[i].format == uFormat) {
-            free(g_clipboard[i].data);
+            /* Guard against caller passing the same pointer back
+             * (e.g. SetClipboardData(fmt, GetClipboardData(fmt))) —
+             * freeing it first would make hMem point to freed memory. */
+            if (g_clipboard[i].data != hMem)
+                free(g_clipboard[i].data);
             /* hMem is a HGLOBAL — treat as a pointer for simplicity */
             g_clipboard[i].data = hMem;
             g_clipboard[i].size = 0; /* size unknown without GlobalSize */

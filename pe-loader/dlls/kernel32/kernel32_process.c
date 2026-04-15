@@ -20,6 +20,7 @@
 #include <sys/syscall.h>
 #include <spawn.h>
 #include <errno.h>
+#include <signal.h>
 #define gettid() syscall(SYS_gettid)
 
 #include "common/dll_common.h"
@@ -166,24 +167,57 @@ typedef struct {
     WORD   wProcessorRevision;
 } SYSTEM_INFO;
 
+/* Cache sysconf() results: _SC_NPROCESSORS_ONLN opens /proc/cpuinfo on
+ * every call (verified via strace), and _SC_PAGESIZE reads auxv. Neither
+ * changes during process lifetime, so cache once. GetSystemInfo is hit
+ * by anti-cheat probes and CRT init dozens of times at startup. */
+static DWORD g_cached_page_size = 0;
+static DWORD g_cached_nproc = 0;
+static DWORD_PTR g_cached_affinity_mask = 0;
+
+static void ensure_sysconf_cached(void)
+{
+    /* Acquire-load pairs with the release-store of g_cached_nproc below so
+     * readers that see nproc != 0 also see fully-initialized page_size and
+     * affinity_mask. A double-init race is benign (values are deterministic)
+     * but ordering matters for the reader. */
+    if (__atomic_load_n(&g_cached_nproc, __ATOMIC_ACQUIRE)) return;
+    long ps = sysconf(_SC_PAGESIZE);
+    long np = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ps <= 0) ps = 4096;
+    if (np <= 0) np = 1;
+    DWORD_PTR mask;
+    if (np >= 64) mask = (DWORD_PTR)~0ULL;
+    else          mask = ((DWORD_PTR)1ULL << np) - 1;
+    g_cached_page_size = (DWORD)ps;
+    g_cached_affinity_mask = mask;
+    __atomic_store_n(&g_cached_nproc, (DWORD)np, __ATOMIC_RELEASE);
+}
+
 static void fill_system_info(SYSTEM_INFO *si)
 {
+    ensure_sysconf_cached();
     memset(si, 0, sizeof(*si));
     si->wProcessorArchitecture = 9; /* PROCESSOR_ARCHITECTURE_AMD64 */
-    si->dwPageSize = (DWORD)sysconf(_SC_PAGESIZE);
+    si->dwPageSize = g_cached_page_size;
     si->lpMinimumApplicationAddress = (LPVOID)(uintptr_t)0x00010000;
     si->lpMaximumApplicationAddress = (LPVOID)(uintptr_t)0x7FFFFFFEFFFF;
 
-    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
-    si->dwNumberOfProcessors = (DWORD)(nproc > 0 ? nproc : 1);
-    if (si->dwNumberOfProcessors >= 64)
-        si->dwActiveProcessorMask = (DWORD_PTR)~0ULL;
-    else
-        si->dwActiveProcessorMask = ((DWORD_PTR)1ULL << si->dwNumberOfProcessors) - 1;
+    si->dwNumberOfProcessors = g_cached_nproc;
+    si->dwActiveProcessorMask = g_cached_affinity_mask;
     si->dwProcessorType = 8664; /* PROCESSOR_AMD_X8664 */
     si->dwAllocationGranularity = 0x10000; /* 64KB */
     si->wProcessorLevel = 6;
     si->wProcessorRevision = 0;
+}
+
+/* Exported for other kernel32 sources (kernel32_thread.c etc.) that also
+ * hit sysconf on hot paths. Returns 0 if not yet cached — caller can
+ * fall back to direct sysconf() in that cold case. */
+DWORD kernel32_cached_nproc(void)
+{
+    ensure_sysconf_cached();
+    return g_cached_nproc;
 }
 
 WINAPI_EXPORT void GetSystemInfo(SYSTEM_INFO *lpSystemInfo)
@@ -393,7 +427,59 @@ WINAPI_EXPORT DWORD GetProcessId(HANDLE Process)
 {
     if (Process == (HANDLE)(intptr_t)-1 || Process == NULL)
         return (DWORD)getpid();
+    /* Try proper handle table resolution first */
+    handle_entry_t *e = handle_lookup(Process);
+    if (e && e->type == HANDLE_TYPE_PROCESS && e->data) {
+        process_data_t *pd = (process_data_t *)e->data;
+        if (pd->pid > 0) return (DWORD)pd->pid;
+    }
     return (DWORD)(uintptr_t)Process;
+}
+
+/* ----------------------------------------------------------------
+ * kernel32_process_handle_to_pid - internal helper
+ *
+ * Converts a Win32 process HANDLE to the real Linux PID.  Handles:
+ *   - pseudo-handle (HANDLE)-1 or NULL  -> current process (getpid())
+ *   - proper HANDLE_TYPE_PROCESS handle -> process_data_t->pid
+ *   - HANDLE_FLAG_DUP handle            -> borrowed process_data_t, still readable
+ *   - GetCurrentThread() pseudo (-2)    -> 0 (invalid; caller should reject)
+ *   - unknown/invalid                   -> 0
+ *
+ * Returns 0 on failure so callers can SetLastError(ERROR_INVALID_HANDLE).
+ * Returns pid > 0 on success.  NOT exported via WINAPI_EXPORT; this is
+ * for internal use only (job objects, etc.).
+ * ---------------------------------------------------------------- */
+int kernel32_process_handle_to_pid(HANDLE hProcess)
+{
+    /* Current-process pseudo-handle or NULL -> self */
+    if (hProcess == (HANDLE)(intptr_t)-1 || hProcess == NULL)
+        return (int)getpid();
+
+    /* Thread pseudo-handle is invalid for a process parameter. */
+    if (hProcess == (HANDLE)(intptr_t)-2)
+        return 0;
+
+    /* Look up in the handle table.  handle_lookup() returns the real
+     * entry even when HANDLE_FLAG_DUP is set (borrowed data is still
+     * readable via e->data). */
+    handle_entry_t *e = handle_lookup(hProcess);
+    if (e && e->type == HANDLE_TYPE_PROCESS && e->data) {
+        process_data_t *pd = (process_data_t *)e->data;
+        if (pd->pid > 0)
+            return (int)pd->pid;
+        return 0;
+    }
+
+    /* Last-ditch fallback: some legacy code paths stuff a raw PID into
+     * a HANDLE.  Only accept if it looks like a plausible live PID. */
+    uintptr_t v = (uintptr_t)hProcess;
+    if (v > 1 && v < 0x00400000UL) { /* sysctl kernel.pid_max <= 4194304 */
+        pid_t raw = (pid_t)v;
+        if (kill(raw, 0) == 0)
+            return (int)raw;
+    }
+    return 0;
 }
 
 WINAPI_EXPORT BOOL GetExitCodeProcess(HANDLE hProcess, LPDWORD lpExitCode)
@@ -612,7 +698,12 @@ WINAPI_EXPORT BOOL DuplicateHandle(
             handle_type_t type = entry ? entry->type : HANDLE_TYPE_FILE;
             *lpTargetHandle = handle_alloc(type, new_fd, NULL);
         } else {
-            /* dup failed, just copy the handle value */
+            /* dup failed: share the source handle by ref-counting it,
+             * otherwise DUPLICATE_CLOSE_SOURCE would close the returned
+             * "duplicate" out from under the caller. */
+            handle_entry_t *entry = handle_lookup(hSourceHandle);
+            if (entry)
+                entry->ref_count++;
             *lpTargetHandle = hSourceHandle;
         }
     } else {

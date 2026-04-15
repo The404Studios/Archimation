@@ -18,6 +18,7 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
@@ -42,6 +43,11 @@ extern int objectd_registry_handle(uint8_t req_type, const void *payload,
                                    uint64_t sequence,
                                    void *resp_buf, size_t resp_buf_size,
                                    size_t *resp_len);
+/* From pe-loader/registry/registry.c — used for disconnect cleanup of
+ * registry HKEYs that clients opened but never closed.  Takes HKEY
+ * (typedef void*); int32_t return is treated as ignored.
+ * The signature is declared loosely to avoid pulling in all of win32. */
+extern int32_t registry_close_key(void *hKey);
 
 /* --------------------------------------------------------------------------
  * Constants
@@ -52,6 +58,7 @@ extern int objectd_registry_handle(uint8_t req_type, const void *payload,
 #define RECV_BUF_SIZE      16384
 #define RESP_BUF_SIZE      16384
 #define MAX_CLIENT_HANDLES 512   /* Max open object handles per client */
+#define MAX_CLIENT_HKEYS   256   /* Max open registry HKEYs per client */
 
 /* --------------------------------------------------------------------------
  * Global state
@@ -78,9 +85,50 @@ typedef struct {
      */
     uint32_t obj_handles[MAX_CLIENT_HANDLES];
     int      obj_handle_count;
+
+    /*
+     * Per-client registry HKEY tracking for leak cleanup on disconnect.
+     * Each entry is a non-predefined HKEY value returned by a prior
+     * OBJ_REQ_REG_OPEN or OBJ_REQ_REG_CREATE.  Closed via
+     * registry_close_key() on disconnect.  Predefined HKEYs (>= 0x80000000
+     * special values) must never be tracked or auto-closed.
+     */
+    uint64_t hkey_handles[MAX_CLIENT_HKEYS];
+    int      hkey_handle_count;
 } client_state_t;
 
 static client_state_t g_clients[MAX_CLIENTS];
+
+/*
+ * fd -> client slot direct index.  Eliminates the linear scan of
+ * find_client_by_fd() on every epoll event -- on a busy broker with
+ * hundreds of open games, the scan dominated event dispatch.
+ *
+ * Bounded by the system RLIMIT_NOFILE; we cap at 8192 which covers all
+ * practical fd numbers for a broker process that has at most MAX_CLIENTS
+ * (256) connections plus ~20 internal fds.  Out-of-range fds fall back
+ * to the linear scan.
+ */
+#define FD_INDEX_SIZE 8192
+static int g_fd_to_slot[FD_INDEX_SIZE];  /* -1 = not tracked */
+
+static void fd_index_init(void)
+{
+    for (int i = 0; i < FD_INDEX_SIZE; i++)
+        g_fd_to_slot[i] = -1;
+}
+
+static inline void fd_index_set(int fd, int slot)
+{
+    if (fd >= 0 && fd < FD_INDEX_SIZE)
+        g_fd_to_slot[fd] = slot;
+}
+
+static inline void fd_index_clear(int fd)
+{
+    if (fd >= 0 && fd < FD_INDEX_SIZE)
+        g_fd_to_slot[fd] = -1;
+}
 
 /* --------------------------------------------------------------------------
  * Signal handlers
@@ -220,6 +268,42 @@ static void client_untrack_handle(client_state_t *cl, uint32_t handle)
      * the tracking list overflowed earlier.  Not fatal. */
 }
 
+/*
+ * Predefined HKEYs are well-known values that are shared by the whole
+ * process and must never be closed via registry_close_key().  They sit
+ * in the top of the 32-bit address space (e.g., 0x80000000+).
+ */
+static int hkey_is_predefined(uint64_t hk)
+{
+    return (hk >= 0x80000000ULL && hk < 0x80000100ULL) || hk == 0;
+}
+
+static void client_track_hkey(client_state_t *cl, uint64_t hkey)
+{
+    if (!cl || hkey_is_predefined(hkey))
+        return;
+    if (cl->hkey_handle_count >= MAX_CLIENT_HKEYS) {
+        fprintf(stderr, "[objectd] Client fd=%d exceeded max hkey tracking "
+                "(%d), HKEY 0x%llx will NOT be auto-closed on disconnect\n",
+                cl->fd, MAX_CLIENT_HKEYS, (unsigned long long)hkey);
+        return;
+    }
+    cl->hkey_handles[cl->hkey_handle_count++] = hkey;
+}
+
+static void client_untrack_hkey(client_state_t *cl, uint64_t hkey)
+{
+    if (!cl)
+        return;
+    for (int i = 0; i < cl->hkey_handle_count; i++) {
+        if (cl->hkey_handles[i] == hkey) {
+            cl->hkey_handles[i] = cl->hkey_handles[cl->hkey_handle_count - 1];
+            cl->hkey_handle_count--;
+            return;
+        }
+    }
+}
+
 /* --------------------------------------------------------------------------
  * Request dispatch
  * -------------------------------------------------------------------------- */
@@ -296,6 +380,23 @@ static void handle_object_request(client_state_t *cl,
             break;
         }
         const obj_close_payload_t *p = (const obj_close_payload_t *)payload;
+
+        /* Verify the client actually holds this handle before closing.
+         * Without this check, any client could send CLOSE for any handle
+         * and drop refs on objects it does not own, causing premature
+         * destruction and potential use-after-free in peer clients. */
+        int owns = 0;
+        for (int ci = 0; ci < cl->obj_handle_count; ci++) {
+            if (cl->obj_handles[ci] == p->handle) { owns = 1; break; }
+        }
+        if (!owns) {
+            fprintf(stderr, "[objectd] Client fd=%d pid=%d attempted to close "
+                    "unowned handle %u; rejecting\n",
+                    cl->fd, (int)cl->verified_pid, p->handle);
+            resp->status = OBJ_STATUS_INVALID;
+            break;
+        }
+
         uint8_t status;
         objects_close(p->handle, &status);
         resp->status = status;
@@ -314,6 +415,17 @@ static void handle_object_request(client_state_t *cl,
         objectd_registry_handle(req->request_type, payload, payload_len,
                                 req->pid, req->sequence,
                                 resp_buf, sizeof(resp_buf), &resp_len);
+        /* Track the returned HKEY so it gets closed on client disconnect.
+         * The 64-bit value lives at the start of the response payload. */
+        objectd_response_t *r = (objectd_response_t *)resp_buf;
+        if (r->status == OBJ_STATUS_OK &&
+            r->payload_len >= sizeof(uint64_t) &&
+            resp_len >= sizeof(objectd_response_t) + sizeof(uint64_t)) {
+            uint64_t hk_val;
+            memcpy(&hk_val, (uint8_t *)resp_buf + sizeof(objectd_response_t),
+                   sizeof(hk_val));
+            client_track_hkey(cl, hk_val);
+        }
         send_response(cl->fd, resp_buf, resp_len, -1);
         return;
     }
@@ -354,13 +466,25 @@ static void handle_object_request(client_state_t *cl,
     }
     case OBJ_REQ_REG_CLOSE:
     case OBJ_REQ_REG_ENUM_KEY:
-    case OBJ_REQ_REG_ENUM_VALUE:
+    case OBJ_REQ_REG_ENUM_VALUE: {
         /* These payloads contain no string fields needing null-termination */
         objectd_registry_handle(req->request_type, payload, payload_len,
                                 req->pid, req->sequence,
                                 resp_buf, sizeof(resp_buf), &resp_len);
+        /* Untrack HKEY on successful REG_CLOSE so the disconnect sweep
+         * doesn't try to close it a second time. */
+        if (req->request_type == OBJ_REQ_REG_CLOSE &&
+            payload_len >= sizeof(uint64_t)) {
+            objectd_response_t *r = (objectd_response_t *)resp_buf;
+            if (r->status == OBJ_STATUS_OK) {
+                uint64_t hk_val;
+                memcpy(&hk_val, payload, sizeof(hk_val));
+                client_untrack_hkey(cl, hk_val);
+            }
+        }
         send_response(cl->fd, resp_buf, resp_len, -1);
         return;
+    }
 
     /* --- Namespace operations --- */
     case OBJ_REQ_NS_RESOLVE:
@@ -422,6 +546,14 @@ static client_state_t *find_client_slot(void)
 
 static client_state_t *find_client_by_fd(int fd)
 {
+    /* O(1) fast path via fd index */
+    if (fd >= 0 && fd < FD_INDEX_SIZE) {
+        int slot = g_fd_to_slot[fd];
+        if (slot >= 0 && slot < MAX_CLIENTS &&
+            g_clients[slot].active && g_clients[slot].fd == fd)
+            return &g_clients[slot];
+    }
+    /* Fallback linear scan for fds outside the index range */
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (g_clients[i].active && g_clients[i].fd == fd)
             return &g_clients[i];
@@ -454,9 +586,27 @@ static void client_disconnect(client_state_t *cl)
         cl->obj_handle_count = 0;
     }
 
+    /*
+     * Release all registry HKEYs this client opened but never closed.
+     * Without this the underlying handle_entry_t and reg_key_data_t
+     * allocations leak on every PE process that crashes.
+     */
+    if (cl->hkey_handle_count > 0) {
+        fprintf(stderr, "[objectd] Client fd=%d pid=%d disconnecting with "
+                "%d leaked HKEY(s), closing...\n",
+                cl->fd, (int)cl->verified_pid, cl->hkey_handle_count);
+        for (int i = 0; i < cl->hkey_handle_count; i++) {
+            if (hkey_is_predefined(cl->hkey_handles[i]))
+                continue;
+            registry_close_key((void *)(uintptr_t)cl->hkey_handles[i]);
+        }
+        cl->hkey_handle_count = 0;
+    }
+
     fprintf(stderr, "[objectd] Client disconnected (fd=%d, pid=%d)\n",
             cl->fd, (int)cl->verified_pid);
     epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, cl->fd, NULL);
+    fd_index_clear(cl->fd);
     close(cl->fd);
     cl->fd = -1;
     cl->active = 0;
@@ -701,6 +851,10 @@ static void accept_new_client(void)
     cl->recv_pos = 0;
     cl->verified_pid = 0;
     cl->obj_handle_count = 0;
+    cl->hkey_handle_count = 0;
+
+    /* Record in fd index for O(1) lookup during event dispatch */
+    fd_index_set(client_fd, (int)(cl - g_clients));
 
     struct epoll_event ev;
     ev.events = EPOLLIN | EPOLLET;
@@ -708,6 +862,7 @@ static void accept_new_client(void)
     if (epoll_ctl(g_epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
         fprintf(stderr, "[objectd] epoll_ctl(ADD) failed: %s\n",
                 strerror(errno));
+        fd_index_clear(client_fd);
         cl->active = 0;
         close(client_fd);
         return;
@@ -817,8 +972,9 @@ int main(int argc, char **argv)
 
     signal(SIGPIPE, SIG_IGN);
 
-    /* Initialize client table */
+    /* Initialize client table and fd->slot direct index */
     memset(g_clients, 0, sizeof(g_clients));
+    fd_index_init();
 
     /* Initialize subsystems */
     objects_init();

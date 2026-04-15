@@ -148,7 +148,7 @@ int cortex_cmd_connect(int timeout_ms)
     if (stat(CORTEX_CMD_SOCK, &st) < 0)
         return -1;
 
-    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
         return -1;
 

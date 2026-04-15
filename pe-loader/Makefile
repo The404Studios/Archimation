@@ -1,12 +1,22 @@
 # PE Loader - Top-level Makefile
 #
 # Builds: peloader binary, stub DLL shared libraries, kernel module
+# Supports parallel builds via `make -jN`. Header dep tracking via -MMD -MP
+# avoids spurious recompiles when an unrelated header's timestamp changes.
 
 .PHONY: all loader dlls kernel tests tools clean install trust_lib
 
-CC = gcc
-NASM = nasm
-CFLAGS = -Wall -Wextra -Werror -Wno-stringop-truncation -Wno-format-truncation -O2 -fPIC -I$(CURDIR)/include -I$(TRUST_DIR)/include
+# Allow the caller (top-level Makefile or scripts) to pass CC=ccache gcc.
+# Otherwise default to gcc.
+CC ?= gcc
+NASM ?= nasm
+# x86_64 baseline — do NOT use -march=native. The ISO targets both old
+# (Westmere-era) and new hardware; the loader must run on any x86_64 CPU.
+# -pipe: assemble via pipes not temp files (~5-10% faster on WSL/NTFS).
+# -MMD -MP: emit .d dep files so changed headers trigger only affected .o rebuilds.
+CFLAGS = -Wall -Wextra -Werror -Wno-stringop-truncation -Wno-format-truncation \
+         -O2 -fPIC -pipe -MMD -MP \
+         -I$(CURDIR)/include -I$(TRUST_DIR)/include
 TRUST_DIR = $(CURDIR)/../trust
 LDFLAGS = -ldl -lpthread
 LOADER_LDFLAGS = $(LDFLAGS) -rdynamic -L$(TRUST_DIR)/lib -ltrust -lm -lrt -Wl,-rpath,/usr/lib
@@ -50,8 +60,11 @@ LOADER_OBJS := $(LOADER_OBJS:.S=.o)
 
 loader: loader/peloader
 
-loader/peloader: $(LOADER_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LOADER_LDFLAGS)
+# Explicit order-only dep on trust_lib — safe under `make -j` (loader/peloader
+# linker step needs ../trust/lib/libtrust.so; without this, parallel make can
+# race trust_lib against loader compile/link and fail with "cannot find -ltrust")
+loader/peloader: $(LOADER_OBJS) | trust_lib
+	$(CC) $(CFLAGS) -o $@ $(LOADER_OBJS) $(LOADER_LDFLAGS)
 
 loader/%.o: loader/%.c
 	$(CC) $(CFLAGS) -I$(CURDIR)/dlls -c -o $@ $<
@@ -113,7 +126,9 @@ K32_SRCS = dlls/kernel32/kernel32_console.c \
            dlls/kernel32/kernel32_debug.c \
            dlls/kernel32/kernel32_notify.c \
            dlls/kernel32/kernel32_async.c \
-           dlls/kernel32/kernel32_locale.c
+           dlls/kernel32/kernel32_locale.c \
+           dlls/kernel32/kernel32_toolhelp.c \
+           dlls/kernel32/kernel32_job.c
 K32_OBJS = $(K32_SRCS:.c=.o)
 
 dlls/kernel32/%.o: dlls/kernel32/%.c
@@ -156,7 +171,8 @@ dlls/libpe_msvcrt.so: $(MSVCRT_OBJS) $(COMMON_OBJS)
 ADVAPI32_SRCS = dlls/advapi32/advapi32_registry.c \
                 dlls/advapi32/advapi32_service.c \
                 dlls/advapi32/advapi32_security.c \
-                dlls/advapi32/advapi32_crypto.c
+                dlls/advapi32/advapi32_crypto.c \
+                dlls/advapi32/advapi32_credman.c
 ADVAPI32_OBJS = $(ADVAPI32_SRCS:.c=.o)
 
 dlls/advapi32/%.o: dlls/advapi32/%.c
@@ -597,10 +613,16 @@ install: all
 
 # --- Clean ---
 clean:
-	rm -f loader/peloader loader/*.o
-	rm -f dlls/*/*.o dlls/*.so
-	rm -f graphics/*.o
-	rm -f registry/*.o
-	rm -f tools/pe_dump tools/*.o
+	rm -f loader/peloader loader/*.o loader/*.d
+	rm -f dlls/*/*.o dlls/*/*.d dlls/*.so
+	rm -f graphics/*.o graphics/*.d
+	rm -f registry/*.o registry/*.d
+	rm -f tools/pe_dump tools/*.o tools/*.d
 	rm -f kernel/*.o kernel/*.ko kernel/*.mod* kernel/.*.cmd
 	rm -rf kernel/.tmp_versions kernel/Module.symvers kernel/modules.order
+
+# --- Auto-generated header dependencies (from -MMD -MP) ---
+# -include silences the error when .d files don't exist yet on a fresh checkout.
+# Correct incremental rebuilds: changing a single header only recompiles TUs
+# that actually include it, NOT the whole tree.
+-include $(shell find loader dlls graphics registry tools -name '*.d' 2>/dev/null)

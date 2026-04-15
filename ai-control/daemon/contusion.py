@@ -13,6 +13,15 @@ from typing import Optional
 logger = logging.getLogger("ai-control.contusion")
 MACRO_DIR = Path.home() / ".contusion" / "macros"
 
+# Pre-compiled regexes used by _route_fallback -- moved to module level so
+# repeated route() calls don't re-compile on each invocation.
+_RE_SCREENSHOT = re.compile(r"\bscreenshot\b")
+_RE_INSTALL = re.compile(r"\binstall\s+([\w.-]+)")
+_RE_OPEN_APP = re.compile(r"\b(?:open|launch|start|run)\s+([\w.-]+)")
+_RE_GO_TO_URL = re.compile(r"\bgo\s+to\s+(https?://\S+|[\w.-]+\.\w+\S*)")
+_RE_TYPE_CMD = re.compile(r"\btype\s+[\"']?(.+?)[\"']?\s*$")
+_RE_PRESS_CMD = re.compile(r"\bpress\s+([\w+]+)")
+
 # Import the dictionary/context engine for NLP-powered command resolution
 try:
     from contusion_dictionary import (
@@ -73,6 +82,31 @@ APP_LIBRARY: dict[str, dict] = {
     "ip":          {"launch": "ip", "type": "cli", "commands": {"addr": "addr", "route": "route", "link": "link"}},
     "nmcli":       {"launch": "nmcli", "type": "cli", "commands": {
                         "status": "general status", "wifi": "device wifi list", "connect": "connection up"}},
+    # Round 3 additions -- commonly requested apps the user might say:
+    # "launch thunderbird", "open chrome", "start file manager".
+    "thunderbird": {"launch": "thunderbird", "type": "gui", "shortcuts": {
+                        "compose": "ctrl+n", "reply": "ctrl+r", "send": "ctrl+Return"}},
+    "chromium":    {"launch": "chromium", "type": "gui", "shortcuts": {
+                        "new_tab": "ctrl+t", "close_tab": "ctrl+w", "incognito": "ctrl+shift+n"}},
+    "chrome":      {"launch": "sh -c 'google-chrome-stable 2>/dev/null || chromium'",
+                    "type": "gui"},
+    "google-chrome": {"launch": "sh -c 'google-chrome-stable 2>/dev/null || chromium'",
+                      "type": "gui"},
+    "files":       {"launch": "thunar", "type": "gui"},
+    "file-manager":{"launch": "thunar", "type": "gui"},
+    "file_manager":{"launch": "thunar", "type": "gui"},
+    "vscode":      {"launch": "code", "type": "gui"},
+    "krita":       {"launch": "krita", "type": "gui"},
+    "spotify":     {"launch": "spotify", "type": "gui"},
+    "telegram":    {"launch": "telegram-desktop", "type": "gui"},
+    "signal":      {"launch": "signal-desktop", "type": "gui"},
+    "evince":      {"launch": "evince", "type": "gui"},
+    "flameshot":   {"launch": "flameshot", "type": "gui"},
+    "mpv":         {"launch": "mpv", "type": "gui"},
+    "alacritty":   {"launch": "alacritty", "type": "gui"},
+    "kitty":       {"launch": "kitty", "type": "gui"},
+    "btop":        {"launch": "btop", "type": "tui"},
+    "lutris":      {"launch": "lutris", "type": "gui"},
 }
 
 # -- Subprocess helpers -----------------------------------------------------
@@ -119,6 +153,9 @@ class Contusion:
         MACRO_DIR.mkdir(parents=True, exist_ok=True)
         self._recording: Optional[str] = None
         self._recorded_actions: list[dict] = []
+        # Monotonic timestamp of the last recorded event -- used to
+        # compute inter-event delays so macro playback preserves timing.
+        self._last_record_time: Optional[float] = None
 
     # -- 1. Process Control -------------------------------------------------
 
@@ -177,13 +214,16 @@ class Contusion:
         env = _display_env()
         r = await _run_exec(["xdotool", "type", "--clearmodifiers", "--delay", str(delay_ms), text],
                             env=env, timeout=max(30, len(text) // 10))
-        self._record("type_text", text=text)
+        # Use the dispatcher key ("type") so recorded macros replay
+        # without hitting "Unknown action kind".
+        self._record("type", text=text)
         return {"success": r["returncode"] == 0}
 
     async def press_key(self, key: str) -> dict:
         env = _display_env()
         r = await _run_exec(["xdotool", "key", "--clearmodifiers", key], env=env)
-        self._record("press_key", key=key)
+        # Use the dispatcher key ("press") so recorded macros replay.
+        self._record("press", key=key)
         return {"success": r["returncode"] == 0}
 
     async def find_window(self, name: str) -> list[dict]:
@@ -231,7 +271,9 @@ class Contusion:
     # -- 3. Macro System ----------------------------------------------------
 
     def record_macro(self, name: str) -> dict:
-        self._recording = name; self._recorded_actions = []
+        self._recording = name
+        self._recorded_actions = []
+        self._last_record_time = time.monotonic()
         logger.info("Macro recording started: %s", name)
         return {"recording": True, "name": name}
 
@@ -241,19 +283,40 @@ class Contusion:
         macro_path = MACRO_DIR / f"{self._recording}.json"
         macro_path.write_text(json.dumps(self._recorded_actions, indent=2))
         count, name = len(self._recorded_actions), self._recording
-        self._recording = None; self._recorded_actions = []
+        self._recording = None
+        self._recorded_actions = []
+        self._last_record_time = None
         logger.info("Macro saved: %s (%d actions)", name, count)
         return {"success": True, "name": name, "actions": count, "path": str(macro_path)}
 
-    async def play_macro(self, name: str) -> dict:
+    async def play_macro(self, name: str, speed: float = 1.0,
+                          max_delay: float = 10.0) -> dict:
+        """Replay a recorded macro, honoring inter-event timing.
+
+        `speed` > 1 plays faster, < 1 slower. `max_delay` caps any single
+        inter-event sleep so a recording with a long pause doesn't hang
+        playback indefinitely.
+        """
         macro_path = MACRO_DIR / f"{name}.json"
         if not macro_path.exists():
             return {"success": False, "error": f"Macro not found: {name}"}
         actions = json.loads(macro_path.read_text())
+        if not isinstance(actions, list):
+            return {"success": False, "error": "Malformed macro file"}
         results = []
         for act in actions:
+            if not isinstance(act, dict):
+                continue
+            # Honor recorded inter-event delay (seconds since previous
+            # event). Cap at max_delay to avoid runaway waits.
+            delay = float(act.get("_delay", 0) or 0) / max(speed, 0.01)
+            if delay > 0:
+                await asyncio.sleep(min(delay, max_delay))
             kind = act.get("_kind", "unknown")
-            action_params = {k: v for k, v in act.items() if k != "_kind"}
+            action_params = {
+                k: v for k, v in act.items()
+                if not k.startswith("_")
+            }
             results.append({"kind": kind, **(await self._dispatch_action(kind, action_params))})
         return {"success": True, "name": name, "steps": len(results), "results": results}
 
@@ -269,7 +332,16 @@ class Contusion:
 
     def _record(self, kind: str, **kwargs):
         if self._recording:
-            self._recorded_actions.append({"_kind": kind, **kwargs})
+            now = time.monotonic()
+            delay = 0.0
+            if self._last_record_time is not None:
+                delay = max(0.0, now - self._last_record_time)
+            self._last_record_time = now
+            self._recorded_actions.append({
+                "_kind": kind,
+                "_delay": round(delay, 3),
+                **kwargs,
+            })
 
     # -- 4. Application Library ---------------------------------------------
 
@@ -277,7 +349,27 @@ class Contusion:
         return APP_LIBRARY
 
     def get_app(self, name: str) -> Optional[dict]:
-        return APP_LIBRARY.get(name.lower())
+        if not name:
+            return None
+        key = name.lower().strip()
+        # Direct hit
+        if key in APP_LIBRARY:
+            return APP_LIBRARY[key]
+        # Normalize spaces/punctuation to underscore and dash variants
+        for variant in (key.replace(" ", "-"), key.replace(" ", "_"),
+                        key.replace("-", "_"), key.replace("_", "-")):
+            if variant in APP_LIBRARY:
+                return APP_LIBRARY[variant]
+        # Fall through to dictionary profile if available -- that module
+        # has a richer alias table (APP_ALIASES, display-name matching).
+        if _HAS_DICTIONARY:
+            profile = _dict_app_profile(name)
+            if profile:
+                return {
+                    "launch": profile.launch_cmd.split()[0] if profile.launch_cmd else "",
+                    "type": profile.app_type,
+                }
+        return None
 
     async def launch_app(self, name: str, args: list[str] = None) -> dict:
         app = self.get_app(name)
@@ -390,6 +482,12 @@ class Contusion:
         if act.type == "run":
             return await self.run_command(act.value, timeout=120)
         elif act.type == "launch":
+            # If the launch value contains shell metacharacters (pipes,
+            # redirects, subshells, &&, ||) we must run it via bash
+            # rather than splitting on whitespace. Important for
+            # fallback launchers like "sh -c 'google-chrome || chromium'".
+            if act.value and re.search(r'[|&;<>`$()\\]', act.value):
+                return await self.run_command(act.value, timeout=30)
             # Try app library first, fall back to raw command
             app_name = act.value.split()[0] if act.value else ""
             app = self.get_app(app_name)
@@ -423,11 +521,11 @@ class Contusion:
         text = instruction.lower().strip()
         results: list[dict] = []
 
-        if re.search(r"\bscreenshot\b", text):
+        if _RE_SCREENSHOT.search(text):
             r = await self.screenshot()
             return {"success": True, "results": [{"action": "screenshot", **r}]}
 
-        m = re.search(r"\binstall\s+([\w.-]+)", text)
+        m = _RE_INSTALL.search(text)
         if m:
             pkg = m.group(1)
             r = await self.run_command(f"pacman -S --noconfirm {shlex.quote(pkg)}", timeout=300)
@@ -436,11 +534,11 @@ class Contusion:
                 results.append({"action": "launch", **(await self.launch_app(pkg))})
             return {"success": True, "results": results}
 
-        m = re.search(r"\b(?:open|launch|start|run)\s+([\w.-]+)", text)
+        m = _RE_OPEN_APP.search(text)
         if m:
             app_name = m.group(1)
             results.append({"action": "launch", **(await self.launch_app(app_name))})
-            url_m = re.search(r"\bgo\s+to\s+(https?://\S+|[\w.-]+\.\w+\S*)", text)
+            url_m = _RE_GO_TO_URL.search(text)
             if url_m:
                 url = url_m.group(1)
                 if not url.startswith("http"):
@@ -453,10 +551,10 @@ class Contusion:
                 results.append({"action": "navigate", "url": url})
             return {"success": True, "results": results}
 
-        m = re.search(r"\btype\s+[\"']?(.+?)[\"']?\s*$", text)
+        m = _RE_TYPE_CMD.search(text)
         if m:
             return {"success": True, "results": [{"action": "type", **(await self.type_text(m.group(1)))}]}
-        m = re.search(r"\bpress\s+([\w+]+)", text)
+        m = _RE_PRESS_CMD.search(text)
         if m:
             return {"success": True, "results": [{"action": "press", **(await self.press_key(m.group(1)))}]}
 

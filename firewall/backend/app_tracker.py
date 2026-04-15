@@ -18,6 +18,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+try:
+    # Local import avoided at module top-level so import failures don't
+    # block app_tracker use on systems without cgroup v2 support.
+    from . import cgroup_manager as _cgroup_manager  # type: ignore
+except ImportError:  # pragma: no cover - fallback for non-package loading
+    try:
+        import cgroup_manager as _cgroup_manager  # type: ignore
+    except ImportError:
+        _cgroup_manager = None  # type: ignore
+
 logger = logging.getLogger("firewall.app_tracker")
 
 # ---------------------------------------------------------------------------
@@ -37,6 +47,10 @@ TCP_STATES = {
     "0A": "LISTEN",
     "0B": "CLOSING",
 }
+
+# Precompiled -- was re-compiled on every /proc/*/fd entry (thousands of times
+# per refresh on busy systems).
+_SOCKET_INODE_RE = re.compile(r"socket:\[(\d+)\]")
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +113,9 @@ class AppTracker:
     MAX_HISTORY_PER_APP = 500
     # Maximum number of distinct applications to track
     MAX_TRACKED_APPS = 2000
+    # inode_map TTL -- walking /proc/*/fd is expensive; callers that refresh
+    # rapidly (GUI 2s timer + connection_monitor 2s poll) share the result.
+    _INODE_MAP_TTL: float = 1.0
 
     def __init__(self) -> None:
         # app_path -> AppHistory
@@ -109,6 +126,19 @@ class AppTracker:
         self._allowed_apps: set[str] = set()
         # Set of app paths that are explicitly blocked
         self._blocked_apps: set[str] = set()
+        # Cached inode -> (pid, name, exe) map
+        self._inode_map_cache: Optional[dict[int, tuple[int, str, str]]] = None
+        self._inode_map_cache_time: float = 0.0
+        # Memoise (pid, app_name) pairs we've already cgrouped so we
+        # don't hammer cgroup.procs on every 2-second refresh.  The
+        # cgroup membership is sticky for the lifetime of the process
+        # unless something external moves it, so one successful move
+        # per (pid,app) is enough.
+        self._cgrouped_pids: set[tuple[int, str]] = set()
+        # Set of app path prefixes we want to auto-scope.  The firewall
+        # frontend populates this via register_rule_target() when a
+        # per-app rule is added.  Empty set == no scoping attempted.
+        self._rule_target_apps: set[str] = set()
 
     # ------------------------------------------------------------------
     # Public API
@@ -121,7 +151,7 @@ class AppTracker:
         ``/proc/net/udp6`` and maps each socket to its owning process.
         """
         sockets = self._read_all_sockets()
-        inode_map = self._build_inode_map()
+        inode_map = self._get_inode_map()
         connections: list[AppConnection] = []
 
         for sock in sockets:
@@ -142,6 +172,11 @@ class AppTracker:
             )
             connections.append(conn)
             self._record_history(conn)
+            # If this PID belongs to an app we have rules for, ensure
+            # it lives in the correct cgroup so nft `socket cgroupv2`
+            # predicates actually match.  Cheap no-op after first call
+            # per (pid, app_name) thanks to _cgrouped_pids memoisation.
+            self._maybe_scope_pid(pid, exe)
 
         return connections
 
@@ -181,13 +216,125 @@ class AppTracker:
         """Explicitly allow an application."""
         self._allowed_apps.add(app_path)
         self._blocked_apps.discard(app_path)
+        self.register_rule_target(app_path)
         logger.info("App allowed: %s", app_path)
 
     def block_app(self, app_path: str) -> None:
         """Explicitly block an application."""
         self._blocked_apps.add(app_path)
         self._allowed_apps.discard(app_path)
+        self.register_rule_target(app_path)
         logger.info("App blocked: %s", app_path)
+
+    def register_rule_target(self, app_path: str) -> None:
+        """Tell the tracker that a firewall rule targets *app_path*.
+
+        When a tracked connection's exe matches, the owning PID is moved
+        into ``pe-compat.slice/<appname>.scope`` so the nft
+        ``socket cgroupv2`` predicate will match.  Idempotent.
+        """
+        if not app_path:
+            return
+        self._rule_target_apps.add(app_path)
+        # Invalidate memoisation for this app so any already-running
+        # processes get re-checked on the next enumeration pass.
+        prefix = None
+        if _cgroup_manager is not None:
+            prefix = _cgroup_manager.app_name_from_path(app_path)
+        if prefix is not None:
+            self._cgrouped_pids = {
+                (pid, app) for pid, app in self._cgrouped_pids if app != prefix
+            }
+
+    def unregister_rule_target(self, app_path: str) -> None:
+        """Stop auto-scoping *app_path*'s processes.  Idempotent."""
+        self._rule_target_apps.discard(app_path)
+
+    def on_rule_changed(self, app_path: str, added: bool) -> None:
+        """Callback suitable for :meth:`NftManager.add_app_rule_listener`.
+
+        Wires the nft rule lifecycle to the tracker's scoping set: when
+        the firewall starts matching on a new ``rule.application``, we
+        begin auto-scoping that app's PIDs; when the last rule for an
+        app is removed, we stop.  Multiple rules per app are OK -- the
+        tracker's set is idempotent, and we only drop the target on the
+        dedicated ``added=False`` path from load_rules() which already
+        computes set differences.
+        """
+        if not app_path:
+            return
+        if added:
+            self.register_rule_target(app_path)
+        else:
+            self.unregister_rule_target(app_path)
+
+    def attach_to_nft_manager(self, nft_manager) -> None:
+        """Register this tracker's :meth:`on_rule_changed` with *nft_manager*.
+
+        Convenience wrapper so the firewall orchestrator (daemon or GUI)
+        can hook tracker → nft in a single line without importing the
+        listener callable directly.  Also eagerly syncs the tracker's
+        target set with any rules already present in the NftManager so
+        a reload-after-attach path still works.
+        """
+        if nft_manager is None:
+            return
+        add_listener = getattr(nft_manager, "add_app_rule_listener", None)
+        if callable(add_listener):
+            add_listener(self.on_rule_changed)
+        # Prime the target set with existing rules.  Guard against the
+        # list_rules API changing shape; we only need .application here.
+        try:
+            rules = nft_manager.list_rules(enabled_only=False)
+        except Exception:  # pragma: no cover - defensive
+            rules = []
+        for r in rules:
+            app = getattr(r, "application", None)
+            if app:
+                self.register_rule_target(app)
+
+    def _maybe_scope_pid(self, pid: int, exe_path: str) -> None:
+        """Place *pid* in its app's cgroup scope if a rule targets it.
+
+        Silent no-op when:
+          * cgroup_manager module missing
+          * exe_path empty or not in registered targets
+          * cgroup v2 unavailable / daemon not root
+          * we already moved this (pid, app) pair in this run
+        """
+        if _cgroup_manager is None:
+            return
+        if not exe_path or not self._rule_target_apps:
+            return
+
+        # Match exe by exact path OR by basename.  Rules may store
+        # either "firefox" or "/usr/bin/firefox"; normalise.
+        matched_target: Optional[str] = None
+        exe_basename = os.path.basename(exe_path)
+        for target in self._rule_target_apps:
+            if target == exe_path or os.path.basename(target) == exe_basename:
+                matched_target = target
+                break
+        if matched_target is None:
+            return
+
+        app_name = _cgroup_manager.app_name_from_path(matched_target)
+        if app_name is None:
+            return
+
+        key = (pid, app_name)
+        if key in self._cgrouped_pids:
+            return
+        # Mark as attempted BEFORE the call so a persistent failure
+        # (e.g. kernel thread, permission denied) doesn't spam logs on
+        # every poll cycle.
+        self._cgrouped_pids.add(key)
+
+        if _cgroup_manager.ensure_app_scoped(pid, app_name):
+            logger.debug(
+                "Scoped pid %d (%s) -> pe-compat.slice/%s.scope",
+                pid, exe_path, app_name,
+            )
 
     def clear_app_rule(self, app_path: str) -> None:
         """Remove explicit allow/block for an application."""
@@ -219,52 +366,63 @@ class AppTracker:
         return sockets
 
     def _parse_proc_net(self, protocol: str, path: str) -> list[SocketInfo]:
-        """Parse a ``/proc/net/tcp``-style file."""
+        """Parse a ``/proc/net/tcp``-style file.
+
+        Streams the file line-by-line rather than loading it entirely
+        with ``readlines()`` -- the TCP table can be large on busy
+        systems, and the transient list doubled memory use for no gain.
+        """
         sockets: list[SocketInfo] = []
         try:
-            with open(path, "r") as fh:
-                lines = fh.readlines()
+            fh = open(path, "r")
         except (FileNotFoundError, PermissionError) as exc:
             logger.debug("Cannot read %s: %s", path, exc)
             return sockets
 
-        # Skip header line
-        for line in lines[1:]:
-            line = line.strip()
-            if not line:
-                continue
+        is_v6 = "6" in protocol
+        is_udp = protocol.startswith("udp")
+        try:
+            # Skip header line
             try:
+                next(fh)
+            except StopIteration:
+                return sockets
+            for line in fh:
                 parts = line.split()
-                # Columns: sl  local_address  rem_address  st  ...  inode
-                local_addr_hex = parts[1]
-                remote_addr_hex = parts[2]
-                state_hex = parts[3]
-                inode = int(parts[9])
+                if len(parts) < 10:
+                    continue
+                try:
+                    local_addr_hex = parts[1]
+                    remote_addr_hex = parts[2]
+                    state_hex = parts[3]
+                    inode = int(parts[9])
 
-                is_v6 = "6" in protocol
-                local_addr, local_port = self._decode_address(
-                    local_addr_hex, ipv6=is_v6
-                )
-                remote_addr, remote_port = self._decode_address(
-                    remote_addr_hex, ipv6=is_v6
-                )
+                    local_addr, local_port = self._decode_address(
+                        local_addr_hex, ipv6=is_v6
+                    )
+                    remote_addr, remote_port = self._decode_address(
+                        remote_addr_hex, ipv6=is_v6
+                    )
 
-                state = TCP_STATES.get(state_hex, state_hex)
-                if protocol.startswith("udp"):
-                    state = "UNCONN" if state_hex == "07" else "ESTABLISHED"
+                    if is_udp:
+                        state = "UNCONN" if state_hex == "07" else "ESTABLISHED"
+                    else:
+                        state = TCP_STATES.get(state_hex, state_hex)
 
-                sockets.append(SocketInfo(
-                    protocol=protocol,
-                    local_addr=local_addr,
-                    local_port=local_port,
-                    remote_addr=remote_addr,
-                    remote_port=remote_port,
-                    state=state,
-                    inode=inode,
-                ))
-            except (IndexError, ValueError) as exc:
-                logger.debug("Skipping malformed line in %s: %s", path, exc)
-                continue
+                    sockets.append(SocketInfo(
+                        protocol=protocol,
+                        local_addr=local_addr,
+                        local_port=local_port,
+                        remote_addr=remote_addr,
+                        remote_port=remote_port,
+                        state=state,
+                        inode=inode,
+                    ))
+                except (IndexError, ValueError) as exc:
+                    logger.debug("Skipping malformed line in %s: %s", path, exc)
+                    continue
+        finally:
+            fh.close()
 
         return sockets
 
@@ -300,53 +458,78 @@ class AppTracker:
     # inode -> process mapper
     # ------------------------------------------------------------------
 
+    def _get_inode_map(self) -> dict[int, tuple[int, str, str]]:
+        """Return the inode map, rebuilding at most once per _INODE_MAP_TTL.
+
+        Monotonic clock so the cache can't be invalidated early (or held
+        forever) by a wall-clock adjustment while the firewall is running
+        -- common on laptops coming out of suspend.
+        """
+        now = time.monotonic()
+        if (self._inode_map_cache is not None
+                and now - self._inode_map_cache_time < self._INODE_MAP_TTL):
+            return self._inode_map_cache
+        self._inode_map_cache = self._build_inode_map()
+        self._inode_map_cache_time = now
+        return self._inode_map_cache
+
     def _build_inode_map(self) -> dict[int, tuple[int, str, str]]:
         """Build a mapping of socket inode -> (pid, process_name, exe_path).
 
         Scans ``/proc/[pid]/fd/`` for symlinks to ``socket:[inode]``.
+        Optimised variant: collect sockets first with
+        :func:`os.scandir`, then only open ``comm``/``exe`` for PIDs
+        that actually hold a socket fd.  Most PIDs (kernel workers,
+        long-lived session daemons) never do, which saves two opens
+        per uninteresting PID -- on a typical laptop with ~500 PIDs
+        this halves the per-poll syscall count.
         """
         inode_map: dict[int, tuple[int, str, str]] = {}
 
         try:
-            pids = [
-                entry for entry in os.listdir("/proc")
-                if entry.isdigit()
-            ]
+            proc_entries = os.listdir("/proc")
         except (FileNotFoundError, PermissionError):
             return inode_map
 
-        for pid_str in pids:
-            pid = int(pid_str)
-            fd_dir = f"/proc/{pid}/fd"
+        for pid_str in proc_entries:
+            if not pid_str[0:1].isdigit() or not pid_str.isdigit():
+                continue
+            fd_dir = f"/proc/{pid_str}/fd"
 
-            # Read process name and exe path
+            sockets: list[int] = []
             try:
-                with open(f"/proc/{pid}/comm", "r") as f:
-                    proc_name = f.read().strip()
-            except (FileNotFoundError, PermissionError):
-                proc_name = ""
-
-            try:
-                exe_path = os.readlink(f"/proc/{pid}/exe")
-            except (FileNotFoundError, PermissionError, OSError):
-                exe_path = ""
-
-            # Scan file descriptors for socket inodes
-            try:
-                fds = os.listdir(fd_dir)
+                with os.scandir(fd_dir) as it:
+                    for fd_entry in it:
+                        try:
+                            link = os.readlink(fd_entry.path)
+                        except (FileNotFoundError, PermissionError, OSError):
+                            continue
+                        # Cheap prefix filter before regex.
+                        if not link.startswith("socket:"):
+                            continue
+                        match = _SOCKET_INODE_RE.match(link)
+                        if match:
+                            sockets.append(int(match.group(1)))
             except (FileNotFoundError, PermissionError):
                 continue
 
-            for fd in fds:
-                try:
-                    link = os.readlink(os.path.join(fd_dir, fd))
-                except (FileNotFoundError, PermissionError, OSError):
-                    continue
+            if not sockets:
+                continue
 
-                match = re.match(r"socket:\[(\d+)\]", link)
-                if match:
-                    inode = int(match.group(1))
-                    inode_map[inode] = (pid, proc_name, exe_path)
+            try:
+                with open(f"/proc/{pid_str}/comm", "r") as f:
+                    proc_name = f.read().strip()
+            except (FileNotFoundError, PermissionError):
+                proc_name = ""
+            try:
+                exe_path = os.readlink(f"/proc/{pid_str}/exe")
+            except (FileNotFoundError, PermissionError, OSError):
+                exe_path = ""
+
+            pid = int(pid_str)
+            info = (pid, proc_name, exe_path)
+            for inode in sockets:
+                inode_map[inode] = info
 
         return inode_map
 

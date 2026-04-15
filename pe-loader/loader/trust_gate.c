@@ -396,7 +396,7 @@ int trust_gate_init(void)
         g_debug = 1;
 
     /* Try to open /dev/trust */
-    g_trust_fd = open("/dev/trust", O_RDWR);
+    g_trust_fd = open("/dev/trust", O_RDWR | O_CLOEXEC);
     if (g_trust_fd < 0) {
         /* Kernel module not loaded - operate in permissive dev mode.
          * All trust_gate_check() calls will return TRUST_ALLOW with

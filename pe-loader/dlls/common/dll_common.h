@@ -40,6 +40,13 @@ typedef enum {
 
 /* Per-handle flags (stored in handle_entry_t.flags) */
 #define HANDLE_FLAG_OVERLAPPED  0x01  /* Opened with FILE_FLAG_OVERLAPPED */
+#define HANDLE_FLAG_DUP         0x02  /* Handle borrows data/fd from another
+                                       * slot (e.g. NtDuplicateObject).
+                                       * handle_close() must NOT close(fd),
+                                       * must NOT free(data), must NOT run
+                                       * the type destructor.  The original
+                                       * owner (without this flag) cleans up
+                                       * when its own ref_count hits zero. */
 
 typedef struct {
     handle_type_t type;
@@ -48,6 +55,23 @@ typedef struct {
     int           ref_count;
     unsigned int  flags;        /* HANDLE_FLAG_* bitmask */
 } handle_entry_t;
+
+/*
+ * Handle destructor: DLLs that own a handle type can register a destructor
+ * that handle_close() will call just before reclaiming the slot (but only
+ * when ref_count hits zero AND HANDLE_FLAG_DUP is clear).  The destructor
+ * is responsible for destroying any embedded pthread/sem primitives inside
+ * entry->data and then free()ing it -- handle_close() will NOT call free()
+ * on data when a destructor is registered for the type.
+ *
+ * The destructor runs OUTSIDE the handle-table locks, with the slot already
+ * cleared and returned to the freelist, so it is safe to call arbitrary
+ * pthread destroy routines.  The entry pointer passed in is a local snapshot
+ * (on the caller's stack); only entry->type, entry->fd, entry->data, and
+ * entry->flags are populated.
+ */
+typedef void (*handle_dtor_t)(const handle_entry_t *entry);
+void handle_register_dtor(handle_type_t type, handle_dtor_t fn);
 
 #define MAX_HANDLES 16384
 
@@ -78,6 +102,11 @@ int handle_get_fd(HANDLE h);
 
 /* Check if a HANDLE was opened with FILE_FLAG_OVERLAPPED */
 int handle_is_overlapped(HANDLE h);
+
+/* Check if a HANDLE is a duplicate (borrows resources from another slot).
+ * Callers should skip fd-keyed cleanup (share tables, delete-on-close,
+ * close(fd)) on duplicates since the original slot owns those. */
+int handle_is_dup(HANDLE h);
 
 /*
  * Per-thread error code (Windows GetLastError/SetLastError)
@@ -114,6 +143,8 @@ int utf8_to_utf16(const char *src, int src_len, WCHAR *dst, int dst_size);
 #define HANDLE_TYPE_INOTIFY          23
 #define HANDLE_TYPE_ASYNC_IO         24
 #define HANDLE_TYPE_IOCP             25
+#define HANDLE_TYPE_TOOLHELP         26
+#define HANDLE_TYPE_JOB              27
 
 /*
  * Standard handle management

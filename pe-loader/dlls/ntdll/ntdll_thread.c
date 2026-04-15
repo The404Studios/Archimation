@@ -40,15 +40,22 @@ static void *nt_thread_wrapper(void *arg)
     /* Allocate PE TLS data for this thread (populates TEB TLS slots) */
     pe_tls_alloc_thread();
 
+    /* Snapshot the start routine and parameter BEFORE any suspend wait so
+     * we don't re-read them after releasing the mutex.  The caller may
+     * close the thread handle at any time; handle_close frees `data`, so
+     * touching data after the start call would be a UAF.  The suspended
+     * polling loop still has to read data->suspended while the mutex is
+     * held, which requires data to stay alive -- see common/ notes on the
+     * handle/close TOCTOU. */
+    PUSER_THREAD_START_ROUTINE start = data->start_routine;
+    PVOID param = data->parameter;
+
     if (data->suspended) {
         pthread_mutex_lock(&data->suspend_lock);
         while (data->suspended)
             pthread_cond_wait(&data->suspend_cond, &data->suspend_lock);
         pthread_mutex_unlock(&data->suspend_lock);
     }
-
-    PUSER_THREAD_START_ROUTINE start = data->start_routine;
-    PVOID param = data->parameter;
 
     DWORD result = (DWORD)abi_call_win64_1((void *)start, (uint64_t)(uintptr_t)param);
 
@@ -91,18 +98,29 @@ WINAPI_EXPORT NTSTATUS RtlCreateUserThread(
         pthread_attr_setstacksize(&attr, *StackReserve);
     else if (StackCommit && *StackCommit > 0)
         pthread_attr_setstacksize(&attr, *StackCommit);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+    /* Detached: we never call pthread_join on these threads, so joinable
+     * state would leak the pthread stack + TLS on exit. */
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
     pthread_t thread;
     int ret = pthread_create(&thread, &attr, nt_thread_wrapper, data);
     pthread_attr_destroy(&attr);
 
     if (ret != 0) {
+        pthread_mutex_destroy(&data->suspend_lock);
+        pthread_cond_destroy(&data->suspend_cond);
         free(data);
         return STATUS_UNSUCCESSFUL;
     }
 
-    *ThreadHandle = handle_alloc(HANDLE_TYPE_THREAD, -1, data);
+    HANDLE h = handle_alloc(HANDLE_TYPE_THREAD, -1, data);
+    if (h == INVALID_HANDLE_VALUE) {
+        /* Handle table exhausted. Thread is already running detached;
+         * we can't recall it, but mark the output so caller sees failure. */
+        *ThreadHandle = NULL;
+        return STATUS_UNSUCCESSFUL;
+    }
+    *ThreadHandle = h;
     return STATUS_SUCCESS;
 }
 
@@ -154,17 +172,22 @@ WINAPI_EXPORT NTSTATUS NtResumeThread(HANDLE ThreadHandle, PULONG PreviousSuspen
         return STATUS_INVALID_HANDLE;
 
     nt_thread_data_t *data = (nt_thread_data_t *)entry->data;
-    if (data && data->suspended) {
-        pthread_mutex_lock(&data->suspend_lock);
+    if (!data) {
+        if (PreviousSuspendCount) *PreviousSuspendCount = 0;
+        return STATUS_SUCCESS;
+    }
+    /* Check under the lock so we don't race with a concurrent suspend that
+     * just set suspended=1 after our unsynchronised read saw 0 -- that would
+     * skip the wake and leave the thread blocked forever in the wrapper. */
+    pthread_mutex_lock(&data->suspend_lock);
+    int was_suspended = data->suspended;
+    if (was_suspended) {
         data->suspended = 0;
         pthread_cond_signal(&data->suspend_cond);
-        pthread_mutex_unlock(&data->suspend_lock);
-        if (PreviousSuspendCount)
-            *PreviousSuspendCount = 1;
-    } else {
-        if (PreviousSuspendCount)
-            *PreviousSuspendCount = 0;
     }
+    pthread_mutex_unlock(&data->suspend_lock);
+    if (PreviousSuspendCount)
+        *PreviousSuspendCount = was_suspended ? 1 : 0;
 
     return STATUS_SUCCESS;
 }
@@ -219,13 +242,15 @@ static NTSTATUS wait_result_to_ntstatus(DWORD result)
 
 /*
  * Forward declaration: calls into kernel32's WaitForSingleObject.
- * We declare this weak so it links even if kernel32 isn't loaded yet.
+ * kernel32 exports use ms_abi (WINAPI_EXPORT), so the extern here must
+ * match the ABI or the call corrupts the stack / registers.
+ * We declare these weak so they link even if kernel32 isn't loaded yet.
  */
 DWORD WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds)
-    __attribute__((weak));
+    __attribute__((weak, ms_abi));
 DWORD WaitForMultipleObjects(DWORD nCount, const HANDLE *lpHandles,
     BOOL bWaitAll, DWORD dwMilliseconds)
-    __attribute__((weak));
+    __attribute__((weak, ms_abi));
 
 WINAPI_EXPORT NTSTATUS NtWaitForSingleObject(
     HANDLE Handle,

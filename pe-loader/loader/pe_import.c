@@ -53,8 +53,25 @@ static struct pe_module_entry {
     char      name[64];       /* DLL name, lowercased, with .dll suffix */
     uint8_t  *image_base;     /* mmap'd base of the PE image */
     uint32_t  image_size;     /* SizeOfImage from optional header */
+    uint32_t  name_hash;      /* FNV-1a(name) -- skips strcmp when mismatched */
 } g_pe_modules[MAX_PE_MODULES];
 static int g_pe_module_count = 0;
+
+/* Cheap ASCII-lowering FNV-1a for DLL name comparison.
+ * Defined here because find_pe_module() is called before the DLL-mapping
+ * hash's FNV helper is declared. */
+static inline uint32_t pe_mod_fnv1a_lower(const char *s)
+{
+    uint32_t h = 0x811C9DC5u;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        unsigned lc = c - 'A';
+        c = (lc < 26u) ? (c | 0x20u) : c;
+        h ^= c;
+        h *= 0x01000193u;
+    }
+    return h;
+}
 
 /* Extract SizeOfImage from a mapped PE image's optional header.
  * Returns 0 on any parse error.  Hot helper -- called frequently
@@ -86,44 +103,73 @@ void pe_register_pe_module(const char *dll_name, void *base, uint32_t size)
         return;
     }
     struct pe_module_entry *e = &g_pe_modules[g_pe_module_count];
-    /* Copy + lowercase */
+    /* Single-pass lowercase copy -- avoids two-walk strncpy+tolower loop. */
     size_t i;
-    for (i = 0; dll_name[i] && i < sizeof(e->name) - 1; i++)
-        e->name[i] = tolower((unsigned char)dll_name[i]);
+    for (i = 0; dll_name[i] && i < sizeof(e->name) - 1; i++) {
+        unsigned char c = (unsigned char)dll_name[i];
+        unsigned lc = c - 'A';
+        e->name[i] = (lc < 26u) ? (char)(c | 0x20) : (char)c;
+    }
     e->name[i] = '\0';
-    /* Ensure .dll suffix */
-    if (!strstr(e->name, ".dll") && !strstr(e->name, ".exe") &&
-        !strstr(e->name, ".sys") && !strstr(e->name, ".drv")) {
-        size_t len = strlen(e->name);
-        if (len + 4 < sizeof(e->name)) {
-            memcpy(e->name + len, ".dll", 5);
-        }
+    size_t len = i;
+
+    /* Ensure .dll suffix -- check tail 4 bytes instead of 4 x strstr (O(n) each). */
+    int has_suffix = 0;
+    if (len >= 4) {
+        const char *tail = e->name + len - 4;
+        if (tail[0] == '.' &&
+            (memcmp(tail, ".dll", 4) == 0 || memcmp(tail, ".exe", 4) == 0 ||
+             memcmp(tail, ".sys", 4) == 0 || memcmp(tail, ".drv", 4) == 0))
+            has_suffix = 1;
+    }
+    if (!has_suffix && len + 4 < sizeof(e->name)) {
+        memcpy(e->name + len, ".dll", 5);
+        len += 4;
     }
     e->image_base = (uint8_t *)base;
     e->image_size = size ? size : pe_image_size_from_headers((const uint8_t *)base);
+    e->name_hash  = pe_mod_fnv1a_lower(e->name);
     g_pe_module_count++;
     printf(LOG_PREFIX "Registered PE module: %s @ %p (size 0x%x)\n",
            e->name, base, e->image_size);
 }
 
-/* Find a PE module by (lowercased) name. Returns entry or NULL. */
+/* Find a PE module by (lowercased) name. Returns entry or NULL.
+ *
+ * Hot: called from every forwarder hop and every PE-to-PE import resolution.
+ * We pre-hash the query once and then do a hash-compare check before strcmp,
+ * which skips the memcmp/strcmp for 99%+ of mismatches. */
 static struct pe_module_entry *find_pe_module(const char *dll_name)
 {
     char lower[64];
     size_t i;
-    for (i = 0; dll_name[i] && i < sizeof(lower) - 1; i++)
-        lower[i] = tolower((unsigned char)dll_name[i]);
-    lower[i] = '\0';
-    /* Ensure .dll suffix for matching */
-    if (!strstr(lower, ".dll") && !strstr(lower, ".exe") &&
-        !strstr(lower, ".sys") && !strstr(lower, ".drv")) {
-        size_t len = strlen(lower);
-        if (len + 4 < sizeof(lower)) {
-            memcpy(lower + len, ".dll", 5);
-        }
+    for (i = 0; dll_name[i] && i < sizeof(lower) - 1; i++) {
+        unsigned char c = (unsigned char)dll_name[i];
+        unsigned lc = c - 'A';
+        lower[i] = (lc < 26u) ? (char)(c | 0x20) : (char)c;
     }
-    for (int j = 0; j < g_pe_module_count; j++) {
-        if (strcmp(g_pe_modules[j].name, lower) == 0)
+    lower[i] = '\0';
+    size_t len = i;
+
+    /* Ensure .dll suffix -- memcmp on last 4 bytes instead of 4 strstr calls. */
+    int has_suffix = 0;
+    if (len >= 4) {
+        const char *tail = lower + len - 4;
+        if (tail[0] == '.' &&
+            (memcmp(tail, ".dll", 4) == 0 || memcmp(tail, ".exe", 4) == 0 ||
+             memcmp(tail, ".sys", 4) == 0 || memcmp(tail, ".drv", 4) == 0))
+            has_suffix = 1;
+    }
+    if (!has_suffix && len + 4 < sizeof(lower)) {
+        memcpy(lower + len, ".dll", 5);
+        len += 4;
+    }
+
+    uint32_t hash = pe_mod_fnv1a_lower(lower);
+    int count = g_pe_module_count;
+    for (int j = 0; j < count; j++) {
+        if (g_pe_modules[j].name_hash == hash &&
+            strcmp(g_pe_modules[j].name, lower) == 0)
             return &g_pe_modules[j];
     }
     return NULL;
@@ -525,24 +571,37 @@ static pthread_mutex_t g_stub_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---- Structured stub call log for AI stub discovery engine ----
  *
- * Writes JSONL (one JSON object per line) to /tmp/pe-stub-calls.jsonl so the
- * AI daemon's stub discovery engine can parse unresolved API calls and decide
- * what to implement next.  Line-buffered so each entry is immediately visible
- * to readers even if the PE process crashes.
+ * Writes JSONL (one JSON object per line) to /tmp/pe-stub-calls-<pid>.jsonl so
+ * the AI daemon's stub discovery engine can parse unresolved API calls and
+ * decide what to implement next.  Line-buffered so each entry is immediately
+ * visible to readers even if the PE process crashes.
+ *
+ * Per-PID split (Option B): each PE process writes its own file so long-running
+ * daemons don't grow a single unbounded log.  Reader (stub_discovery.py) must
+ * glob /tmp/pe-stub-calls-*.jsonl to cover all processes.  For backward compat
+ * the legacy shared path /tmp/pe-stub-calls.jsonl is still used if the per-PID
+ * open fails (disk full, permissions).
  *
  * Thread-safe: all writes go through g_stub_log_lock.
  */
 static FILE *g_stub_log_fd = NULL;
 static pthread_mutex_t g_stub_log_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_stub_log_count = 0;
-#define STUB_LOG_PATH      "/tmp/pe-stub-calls.jsonl"
+#define STUB_LOG_LEGACY    "/tmp/pe-stub-calls.jsonl"
 #define STUB_LOG_MAX       50000
 #define STUB_MANIFEST_PATH "/tmp/pe-imports-manifest.jsonl"
 
 static void stub_log_init(void)
 {
     if (!g_stub_log_fd) {
-        g_stub_log_fd = fopen(STUB_LOG_PATH, "a");
+        char per_pid_path[64];
+        snprintf(per_pid_path, sizeof(per_pid_path),
+                 "/tmp/pe-stub-calls-%d.jsonl", (int)getpid());
+        g_stub_log_fd = fopen(per_pid_path, "a");
+        /* Fall back to legacy shared path if per-PID open fails (e.g. /tmp
+         * is read-only).  The legacy reader will still see entries. */
+        if (!g_stub_log_fd)
+            g_stub_log_fd = fopen(STUB_LOG_LEGACY, "a");
         if (g_stub_log_fd)
             setvbuf(g_stub_log_fd, NULL, _IOLBF, 0);  /* Line-buffered */
     }
@@ -599,6 +658,10 @@ void stub_log_summary(void)
     pthread_mutex_unlock(&g_stub_log_lock);
 }
 
+#define CATCHALL_CACHE_SIZE 32
+static struct { const char *so_name; void *handle; } g_catchall_cache[CATCHALL_CACHE_SIZE];
+static int g_catchall_cache_count = 0;
+
 /*
  * pe_import_cleanup - Release all dlopen'd .so handles.
  *
@@ -619,6 +682,14 @@ void pe_import_cleanup(void)
             g_dll_mappings[i].handle = NULL;
         }
     }
+    /* Close catch-all cache handles (each was a separate dlopen refcount bump) */
+    for (int i = 0; i < g_catchall_cache_count; i++) {
+        if (g_catchall_cache[i].handle) {
+            dlclose(g_catchall_cache[i].handle);
+            g_catchall_cache[i].handle = NULL;
+        }
+    }
+    g_catchall_cache_count = 0;
 }
 
 /*
@@ -778,7 +849,11 @@ void pe_import_emit_manifest(const pe_image_t *image)
             if (!ilt)
                 continue;
 
-            for (int i = 0; ilt[i] != 0 && i < 65536; i++) {
+            uint32_t ilt_cap = (image->mapped_size > ilt_rva)
+                ? (uint32_t)((image->mapped_size - ilt_rva) / sizeof(uint64_t)) : 0;
+            if (ilt_cap > 65536) ilt_cap = 65536;
+
+            for (uint32_t i = 0; i < ilt_cap && ilt[i] != 0; i++) {
                 const char *func_name = NULL;
                 char ordinal_buf[32];
 
@@ -790,8 +865,17 @@ void pe_import_emit_manifest(const pe_image_t *image)
                     uint32_t hint_rva = (uint32_t)(ilt[i] & 0x7FFFFFFF);
                     const pe_import_by_name_t *hint =
                         (const pe_import_by_name_t *)pe_rva_to_ptr(image, hint_rva);
-                    if (hint)
-                        func_name = hint->name;
+                    /* Require a NUL terminator within the mapped image so the
+                     * %s conversion below can't walk off the end. */
+                    if (hint) {
+                        uint32_t name_rva = hint_rva + 2;
+                        if (name_rva > hint_rva && name_rva < image->mapped_size) {
+                            size_t rem = image->mapped_size - name_rva;
+                            if (rem > 512) rem = 512;
+                            if (memchr(hint->name, '\0', rem))
+                                func_name = hint->name;
+                        }
+                    }
                 }
 
                 if (func_name) {
@@ -805,7 +889,11 @@ void pe_import_emit_manifest(const pe_image_t *image)
             if (!ilt)
                 continue;
 
-            for (int i = 0; ilt[i] != 0 && i < 65536; i++) {
+            uint32_t ilt_cap = (image->mapped_size > ilt_rva)
+                ? (uint32_t)((image->mapped_size - ilt_rva) / sizeof(uint32_t)) : 0;
+            if (ilt_cap > 65536) ilt_cap = 65536;
+
+            for (uint32_t i = 0; i < ilt_cap && ilt[i] != 0; i++) {
                 const char *func_name = NULL;
                 char ordinal_buf[32];
 
@@ -817,8 +905,15 @@ void pe_import_emit_manifest(const pe_image_t *image)
                     uint32_t hint_rva = ilt[i] & 0x7FFFFFFF;
                     const pe_import_by_name_t *hint =
                         (const pe_import_by_name_t *)pe_rva_to_ptr(image, hint_rva);
-                    if (hint)
-                        func_name = hint->name;
+                    if (hint) {
+                        uint32_t name_rva = hint_rva + 2;
+                        if (name_rva > hint_rva && name_rva < image->mapped_size) {
+                            size_t rem = image->mapped_size - name_rva;
+                            if (rem > 512) rem = 512;
+                            if (memchr(hint->name, '\0', rem))
+                                func_name = hint->name;
+                        }
+                    }
                 }
 
                 if (func_name) {
@@ -1315,16 +1410,67 @@ static const crt_abi_wrapper_t g_crt_wrappers[] = {
 };
 
 /*
+ * ---- CRT wrapper fast-path hash index ----
+ *
+ * The wrapper table has ~180 entries and is consulted FIRST on every
+ * named import from an MSVCRT-family DLL (malloc/memcpy/printf/etc.).
+ * Linear strcmp across 180 entries for every import is ~O(N*M) where
+ * M is avg name length; FNV-1a + open addressing takes it to O(1).
+ *
+ * The table is const and immutable, so we build the hash lazily once.
+ * Case-sensitive -- CRT function names are always in a known canonical
+ * form ("memset", "_strdup", "_vsnprintf", etc.).
+ */
+#define CRT_HASH_BUCKETS 1024
+#define CRT_HASH_MASK    (CRT_HASH_BUCKETS - 1)
+
+static int16_t g_crt_hash[CRT_HASH_BUCKETS];
+static int g_crt_hash_built = 0;
+
+static inline uint32_t crt_fnv1a(const char *s)
+{
+    uint32_t h = 0x811C9DC5u;
+    for (; *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= 0x01000193u;
+    }
+    return h;
+}
+
+static void crt_hash_build(void)
+{
+    if (g_crt_hash_built) return;
+    memset(g_crt_hash, 0, sizeof(g_crt_hash));
+    for (int n = 0; g_crt_wrappers[n].name != NULL; n++) {
+        uint32_t h = crt_fnv1a(g_crt_wrappers[n].name) & CRT_HASH_MASK;
+        while (g_crt_hash[h] != 0)
+            h = (h + 1) & CRT_HASH_MASK;
+        g_crt_hash[h] = (int16_t)(n + 1);
+    }
+    __atomic_store_n(&g_crt_hash_built, 1, __ATOMIC_RELEASE);
+}
+
+/*
  * Look up a CRT function name in the ms_abi wrapper table.
  * Returns wrapper address or NULL if not found.
  * Non-static so PE DLL import resolution in kernel32_module_pe.c
  * can access it via -rdynamic weak symbol linkage.
  */
+__attribute__((hot))
 void *pe_find_crt_wrapper(const char *name)
 {
-    for (int i = 0; g_crt_wrappers[i].name; i++) {
-        if (strcmp(g_crt_wrappers[i].name, name) == 0)
-            return g_crt_wrappers[i].wrapper;
+    if (__builtin_expect(!__atomic_load_n(&g_crt_hash_built, __ATOMIC_ACQUIRE), 0))
+        crt_hash_build();
+
+    /* Fast early-out on common CRT name pattern: most are 3-10 bytes.
+     * Cheap length cap avoids hashing arbitrarily long names. */
+    uint32_t h = crt_fnv1a(name) & CRT_HASH_MASK;
+    for (int probes = 0; probes < CRT_HASH_BUCKETS; probes++) {
+        int idx = g_crt_hash[h];
+        if (idx == 0) return NULL;
+        if (strcmp(g_crt_wrappers[idx - 1].name, name) == 0)
+            return g_crt_wrappers[idx - 1].wrapper;
+        h = (h + 1) & CRT_HASH_MASK;
     }
     return NULL;
 }
@@ -1478,68 +1624,165 @@ static void str_lower(char *s)
         *s = tolower((unsigned char)*s);
 }
 
+/*
+ * ---- DLL mapping fast-path hash index ----
+ *
+ * g_dll_mappings[] has ~190 entries.  Every PE import descriptor and every
+ * forwarder hop does a full strcmp() linear scan over this table.  For a
+ * typical 64-DLL application with 2000 imports that's ~380,000 strcmp
+ * calls just during import resolution.
+ *
+ * We build a 1024-bucket FNV-1a hash index at first call (single thread on
+ * the hot path -- callers serialise the import loop) and use it for O(1)
+ * average lookup.  The bucket count is a power-of-two so modulo is a mask.
+ * The hash uses only the lowercased name, so case-folding still has to
+ * happen -- but that's O(strlen) once, not O(N * strlen).
+ */
+#define DLL_HASH_BUCKETS 1024
+#define DLL_HASH_MASK    (DLL_HASH_BUCKETS - 1)
+
+/* Small open-addressed index: g_dll_mappings index + 1, 0 = empty. */
+static int16_t g_dll_hash[DLL_HASH_BUCKETS];
+static int g_dll_hash_built = 0;
+
+static inline uint32_t dll_fnv1a(const char *s)
+{
+    uint32_t h = 0x811C9DC5u;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        /* Cheap tolower on ASCII: bit-or 0x20 only when 'A'..'Z'.
+         * Stays branchless and matches the canonical lowercased keys. */
+        unsigned lc = c - 'A';
+        c = (lc < 26u) ? (c | 0x20u) : c;
+        h ^= c;
+        h *= 0x01000193u;
+    }
+    return h;
+}
+
+static void dll_hash_build(void)
+{
+    if (g_dll_hash_built) return;
+    memset(g_dll_hash, 0, sizeof(g_dll_hash));
+    for (int n = 0; g_dll_mappings[n].win_name != NULL; n++) {
+        uint32_t h = dll_fnv1a(g_dll_mappings[n].win_name) & DLL_HASH_MASK;
+        /* Linear probe for open addressing; table is 1024 / ~190 ≈ 5x
+         * larger than population so probe chains stay short (<4 typical). */
+        while (g_dll_hash[h] != 0)
+            h = (h + 1) & DLL_HASH_MASK;
+        /* Store index+1 so 0 means empty */
+        g_dll_hash[h] = (int16_t)(n + 1);
+    }
+    __atomic_store_n(&g_dll_hash_built, 1, __ATOMIC_RELEASE);
+}
+
+/* Look up a pre-lowercased, suffixed name in the hash index.
+ * Returns index into g_dll_mappings or -1 if not found. */
+static int dll_hash_lookup(const char *lower)
+{
+    if (__builtin_expect(!__atomic_load_n(&g_dll_hash_built, __ATOMIC_ACQUIRE), 0))
+        dll_hash_build();
+
+    uint32_t h = dll_fnv1a(lower) & DLL_HASH_MASK;
+    for (int probes = 0; probes < DLL_HASH_BUCKETS; probes++) {
+        int idx = g_dll_hash[h];
+        if (idx == 0) return -1;
+        if (strcmp(g_dll_mappings[idx - 1].win_name, lower) == 0)
+            return idx - 1;
+        h = (h + 1) & DLL_HASH_MASK;
+    }
+    return -1;
+}
+
 /* Find the .so library for a Windows DLL name */
 static void *find_dll_library(const char *dll_name)
 {
     char lower[256];
-    strncpy(lower, dll_name, sizeof(lower) - 1);
-    lower[sizeof(lower) - 1] = '\0';
-    str_lower(lower);
+    size_t i;
+    /* Single-pass lowercase during copy; avoids strncpy+str_lower two-pass. */
+    for (i = 0; i < sizeof(lower) - 5 && dll_name[i]; i++) {
+        unsigned char c = (unsigned char)dll_name[i];
+        unsigned lc = c - 'A';
+        lower[i] = (lc < 26u) ? (char)(c | 0x20) : (char)c;
+    }
+    lower[i] = '\0';
+    size_t llen = i;
 
-    for (int i = 0; g_dll_mappings[i].win_name != NULL; i++) {
-        if (strcmp(lower, g_dll_mappings[i].win_name) == 0) {
-            /* Return cached handle if already loaded */
-            if (g_dll_mappings[i].handle)
-                return g_dll_mappings[i].handle;
+    /* Normalize: a PE binary may import "kernel32" without the .dll suffix
+     * (forwarder strings commonly drop it).  Our mapping table keys all
+     * carry the suffix, so append one when none of the known suffixes is
+     * present.  This is also what Windows LoadLibrary does implicitly.
+     * Inline suffix check avoids 5 strstr() calls (each O(n)). */
+    if (llen >= 4) {
+        const char *tail = lower + llen - 4;
+        if (tail[0] == '.' &&
+            (memcmp(tail, ".dll", 4) == 0 || memcmp(tail, ".exe", 4) == 0 ||
+             memcmp(tail, ".sys", 4) == 0 || memcmp(tail, ".drv", 4) == 0 ||
+             memcmp(tail, ".ocx", 4) == 0)) {
+            /* Already has a known suffix */
+        } else if (llen + 4 < sizeof(lower)) {
+            memcpy(lower + llen, ".dll", 5);
+            llen += 4;
+        }
+    } else if (llen > 0 && llen + 4 < sizeof(lower)) {
+        memcpy(lower + llen, ".dll", 5);
+        llen += 4;
+    }
 
-            /* Trust check: verify FILE_READ capability before loading DLL */
-            if (trust_available()) {
-                uint32_t pid = (uint32_t)getpid();
-                if (!trust_check_capability(pid, TRUST_CAP_FILE_READ)) {
-                    fprintf(stderr, LOG_PREFIX "  TRUST DENIED: PID %u lacks FILE_READ for %s\n",
+    int idx = dll_hash_lookup(lower);
+    if (idx >= 0) {
+        dll_mapping_t *m = &g_dll_mappings[idx];
+        /* Return cached handle if already loaded */
+        if (m->handle)
+            return m->handle;
+
+        /* Trust check: verify FILE_READ capability before loading DLL */
+        if (trust_available()) {
+            uint32_t pid = (uint32_t)getpid();
+            if (!trust_check_capability(pid, TRUST_CAP_FILE_READ)) {
+                fprintf(stderr, LOG_PREFIX "  TRUST DENIED: PID %u lacks FILE_READ for %s\n",
+                        pid, dll_name);
+                trust_record_action(pid, TRUST_ACTION_FILE_OPEN, 1);
+                return NULL;
+            }
+            /* Check NET_CONNECT for network DLLs */
+            if (strcmp(lower, "ws2_32.dll") == 0 ||
+                strcmp(lower, "wsock32.dll") == 0 ||
+                strcmp(lower, "winhttp.dll") == 0 ||
+                strcmp(lower, "wininet.dll") == 0 ||
+                strcmp(lower, "iphlpapi.dll") == 0) {
+                if (!trust_check_capability(pid, TRUST_CAP_NET_CONNECT)) {
+                    fprintf(stderr, LOG_PREFIX "  TRUST DENIED: PID %u lacks NET_CONNECT for %s\n",
                             pid, dll_name);
-                    trust_record_action(pid, TRUST_ACTION_FILE_OPEN, 1);
+                    trust_record_action(pid, TRUST_ACTION_NET_CONNECT, 1);
                     return NULL;
                 }
-                /* Check NET_CONNECT for network DLLs */
-                if (strcmp(lower, "ws2_32.dll") == 0 ||
-                    strcmp(lower, "wsock32.dll") == 0 ||
-                    strcmp(lower, "winhttp.dll") == 0 ||
-                    strcmp(lower, "wininet.dll") == 0 ||
-                    strcmp(lower, "iphlpapi.dll") == 0) {
-                    if (!trust_check_capability(pid, TRUST_CAP_NET_CONNECT)) {
-                        fprintf(stderr, LOG_PREFIX "  TRUST DENIED: PID %u lacks NET_CONNECT for %s\n",
-                                pid, dll_name);
-                        trust_record_action(pid, TRUST_ACTION_NET_CONNECT, 1);
-                        return NULL;
-                    }
-                }
-                /* Check KERNEL_CALL for kernel-mode driver DLLs */
-                if (strcmp(lower, "ntoskrnl.exe") == 0 ||
-                    strcmp(lower, "hal.dll") == 0 ||
-                    strcmp(lower, "ndis.sys") == 0) {
-                    if (!trust_check_capability(pid, TRUST_CAP_KERNEL_CALL)) {
-                        fprintf(stderr, LOG_PREFIX "  TRUST DENIED: PID %u lacks KERNEL_CALL for %s\n",
-                                pid, dll_name);
-                        trust_record_action(pid, TRUST_ACTION_PROCESS_CREATE, 1);
-                        return NULL;
-                    }
+            }
+            /* Check KERNEL_CALL for kernel-mode driver DLLs */
+            if (strcmp(lower, "ntoskrnl.exe") == 0 ||
+                strcmp(lower, "hal.dll") == 0 ||
+                strcmp(lower, "ndis.sys") == 0) {
+                if (!trust_check_capability(pid, TRUST_CAP_KERNEL_CALL)) {
+                    fprintf(stderr, LOG_PREFIX "  TRUST DENIED: PID %u lacks KERNEL_CALL for %s\n",
+                            pid, dll_name);
+                    trust_record_action(pid, TRUST_ACTION_PROCESS_CREATE, 1);
+                    return NULL;
                 }
             }
-
-            /* Try to dlopen the .so file via all search paths */
-            void *handle = search_and_open(g_dll_mappings[i].so_name);
-            if (handle) {
-                g_dll_mappings[i].handle = handle;
-                printf(LOG_PREFIX "  Loaded stub library: %s -> %s\n",
-                       dll_name, g_dll_mappings[i].so_name);
-                anticheat_bridge_on_load_library(dll_name);
-            } else {
-                fprintf(stderr, LOG_PREFIX "  WARNING: Could not load stub for %s: %s\n",
-                        dll_name, dlerror());
-            }
-            return handle;
         }
+
+        /* Try to dlopen the .so file via all search paths */
+        void *handle = search_and_open(m->so_name);
+        if (handle) {
+            m->handle = handle;
+            printf(LOG_PREFIX "  Loaded stub library: %s -> %s\n",
+                   dll_name, m->so_name);
+            anticheat_bridge_on_load_library(dll_name);
+        } else {
+            fprintf(stderr, LOG_PREFIX "  WARNING: Could not load stub for %s: %s\n",
+                    dll_name, dlerror());
+        }
+        return handle;
     }
 
     /*
@@ -1590,14 +1833,10 @@ static void *find_dll_library(const char *dll_name)
         fprintf(stderr, LOG_PREFIX "  Catch-all: mapping '%s' -> %s\n", dll_name, fallback_so);
 
         /* Check the catch-all handle cache first to avoid redundant dlopen calls */
-#define CATCHALL_CACHE_SIZE 32
-        static struct { const char *so_name; void *handle; } catchall_cache[CATCHALL_CACHE_SIZE];
-        static int catchall_cache_count = 0;
-
-        for (int ci = 0; ci < catchall_cache_count; ci++) {
-            if (catchall_cache[ci].so_name == fallback_so) {
+        for (int ci = 0; ci < g_catchall_cache_count; ci++) {
+            if (g_catchall_cache[ci].so_name == fallback_so) {
                 /* Cache hit -- fallback_so is a string literal, pointer compare is safe */
-                return catchall_cache[ci].handle;
+                return g_catchall_cache[ci].handle;
             }
         }
 
@@ -1608,10 +1847,10 @@ static void *find_dll_library(const char *dll_name)
             anticheat_bridge_on_load_library(dll_name);
 
             /* Cache the handle for future lookups with the same .so */
-            if (catchall_cache_count < CATCHALL_CACHE_SIZE) {
-                catchall_cache[catchall_cache_count].so_name = fallback_so;
-                catchall_cache[catchall_cache_count].handle = handle;
-                catchall_cache_count++;
+            if (g_catchall_cache_count < CATCHALL_CACHE_SIZE) {
+                g_catchall_cache[g_catchall_cache_count].so_name = fallback_so;
+                g_catchall_cache[g_catchall_cache_count].handle = handle;
+                g_catchall_cache_count++;
             }
         }
         return handle;
@@ -1659,13 +1898,19 @@ static struct {
 static int g_loading_depth = 0;
 
 /* Check if a DLL is already on the loading stack (circular dependency).
- * Returns 1 if found (currently being loaded), 0 otherwise. */
+ * Returns 1 if found (currently being loaded), 0 otherwise.
+ *
+ * Stack depth is bounded at MAX_DLL_LOAD_DEPTH (32) so a linear scan is
+ * always cheap; we still skip mismatched entries via hash-first test. */
 static int loading_stack_find(const char *dll_name)
 {
     char lower[64];
     size_t i;
-    for (i = 0; dll_name[i] && i < sizeof(lower) - 1; i++)
-        lower[i] = tolower((unsigned char)dll_name[i]);
+    for (i = 0; dll_name[i] && i < sizeof(lower) - 1; i++) {
+        unsigned char c = (unsigned char)dll_name[i];
+        unsigned lc = c - 'A';
+        lower[i] = (lc < 26u) ? (char)(c | 0x20) : (char)c;
+    }
     lower[i] = '\0';
 
     for (int j = 0; j < g_loading_depth; j++) {
@@ -1685,8 +1930,11 @@ static int loading_stack_push(const char *dll_name)
     }
     char *dst = g_loading_stack[g_loading_depth].name;
     size_t i;
-    for (i = 0; dll_name[i] && i < 63; i++)
-        dst[i] = tolower((unsigned char)dll_name[i]);
+    for (i = 0; dll_name[i] && i < 63; i++) {
+        unsigned char c = (unsigned char)dll_name[i];
+        unsigned lc = c - 'A';
+        dst[i] = (lc < 26u) ? (char)(c | 0x20) : (char)c;
+    }
     dst[i] = '\0';
     g_loading_depth++;
     return 0;
@@ -1715,6 +1963,117 @@ static int str_casecmp(const char *a, const char *b)
         a++; b++;
     }
     return tolower((unsigned char)*a) - tolower((unsigned char)*b);
+}
+
+/*
+/* ---- Export directory cache ----
+ *
+ * resolve_pe_export_by_name / _by_ordinal re-walk the MZ/PE/optional header
+ * every call to find the export directory.  When a PE imports 200 symbols
+ * from the same DLL we do that walk 200 times -- wasteful.
+ *
+ * A small 4-slot LRU cache of (image_base -> unpacked export dir) keyed
+ * on the mapped base pointer amortises those header walks to O(1) once
+ * the entry is warm.  Thread-local because import resolution is typically
+ * serialised, and a per-thread cache avoids any lock overhead.
+ *
+ * Invalidated implicitly: if an image is unmapped, the image_base pointer
+ * becomes invalid for any lookup anyway (the dll_name lookup that produced
+ * it would have returned NULL), so no explicit invalidation is needed.
+ */
+typedef struct {
+    const uint8_t *image_base;   /* NULL = empty slot */
+    uint32_t       image_size;
+    uint32_t       export_rva;
+    uint32_t       export_size;
+    uint32_t       num_functions;
+    uint32_t       num_names;
+    uint32_t       func_table_rva;
+    uint32_t       name_table_rva;
+    uint32_t       ord_table_rva;
+    uint32_t       ordinal_base;
+} pe_export_cache_t;
+
+#define PE_EXPORT_CACHE_SLOTS 4
+static __thread pe_export_cache_t g_export_cache[PE_EXPORT_CACHE_SLOTS];
+
+/* Populate `out` for (image_base, image_size).  Returns 0 on success, -1 if
+ * the image isn't a valid PE or has no export directory. */
+static int pe_export_cache_fill(pe_export_cache_t *out,
+                                const uint8_t *image_base,
+                                uint32_t image_size)
+{
+    if (!image_base || image_size < 0x40) return -1;
+    if (*(const uint16_t *)image_base != 0x5A4D) return -1;
+    uint32_t pe_off = *(const uint32_t *)(image_base + 0x3C);
+    if (!PE_RVA_VALID(image_base, image_size, pe_off, 4 + 20)) return -1;
+    if (*(const uint32_t *)(image_base + pe_off) != 0x00004550) return -1;
+
+    const uint8_t *opt = image_base + pe_off + 4 + 20;
+    uint16_t magic = *(const uint16_t *)opt;
+    int is64 = (magic == 0x020B);
+    int dd_off = is64 ? 112 : 96;
+    uint32_t num_dd = is64 ? *(const uint32_t *)(opt + 108)
+                           : *(const uint32_t *)(opt + 92);
+    if (num_dd < 1) return -1;
+
+    uint32_t export_rva  = *(const uint32_t *)(opt + dd_off);
+    uint32_t export_size = *(const uint32_t *)(opt + dd_off + 4);
+    if (export_rva == 0 || export_size == 0) return -1;
+    if (!PE_RVA_VALID(image_base, image_size, export_rva, export_size))
+        return -1;
+    if (!PE_RVA_VALID(image_base, image_size, export_rva,
+                      sizeof(pe_export_directory_t)))
+        return -1;
+
+    const pe_export_directory_t *ed = PE_RVA_PTR(image_base, export_rva,
+                                                 const pe_export_directory_t *);
+    uint32_t num_functions = ed->number_of_functions;
+    uint32_t num_names     = ed->number_of_names;
+    uint32_t func_table    = ed->address_of_functions_rva;
+    uint32_t name_table    = ed->address_of_names_rva;
+    uint32_t ord_table     = ed->address_of_name_ordinals_rva;
+
+    if (!PE_RVA_VALID(image_base, image_size, func_table, num_functions * 4u) ||
+        !PE_RVA_VALID(image_base, image_size, name_table, num_names * 4u) ||
+        !PE_RVA_VALID(image_base, image_size, ord_table,  num_names * 2u))
+        return -1;
+
+    out->image_base     = image_base;
+    out->image_size     = image_size;
+    out->export_rva     = export_rva;
+    out->export_size    = export_size;
+    out->num_functions  = num_functions;
+    out->num_names      = num_names;
+    out->func_table_rva = func_table;
+    out->name_table_rva = name_table;
+    out->ord_table_rva  = ord_table;
+    out->ordinal_base   = ed->ordinal_base;
+    return 0;
+}
+
+/* Look up (image_base, image_size) in the thread-local export cache.
+ * Returns a pointer into g_export_cache on hit; populates + returns on miss. */
+static const pe_export_cache_t *pe_export_cache_get(const uint8_t *image_base,
+                                                     uint32_t image_size)
+{
+    /* Search existing slots.  Four slots = small enough to unroll; compiler
+     * picks up the tight loop. */
+    for (int i = 0; i < PE_EXPORT_CACHE_SLOTS; i++) {
+        if (g_export_cache[i].image_base == image_base &&
+            g_export_cache[i].image_size == image_size)
+            return &g_export_cache[i];
+    }
+    /* Miss: replace the slot whose image_base is NULL, or slot 0 as LRU proxy. */
+    int victim = 0;
+    for (int i = 0; i < PE_EXPORT_CACHE_SLOTS; i++) {
+        if (g_export_cache[i].image_base == NULL) { victim = i; break; }
+    }
+    pe_export_cache_t fresh;
+    if (pe_export_cache_fill(&fresh, image_base, image_size) != 0)
+        return NULL;
+    g_export_cache[victim] = fresh;
+    return &g_export_cache[victim];
 }
 
 /*
@@ -1747,57 +2106,19 @@ static void *resolve_pe_export_by_name(const uint8_t *image_base,
     if (out_is_forwarder)
         *out_is_forwarder = 0;
 
-    /* Verify MZ signature */
-    if (*(const uint16_t *)image_base != 0x5A4D)
-        return NULL;
+    const pe_export_cache_t *ec = pe_export_cache_get(image_base, image_size);
+    if (!ec) return NULL;
 
-    /* Get PE header offset -- bounds-check before dereference */
-    uint32_t pe_off = *(const uint32_t *)(image_base + 0x3C);
-    if (!PE_RVA_VALID(image_base, image_size, pe_off, 4 + 20))
-        return NULL;
+    uint32_t export_rva    = ec->export_rva;
+    uint32_t export_size   = ec->export_size;
+    uint32_t num_functions = ec->num_functions;
+    uint32_t num_names     = ec->num_names;
 
-    /* Verify PE signature */
-    if (*(const uint32_t *)(image_base + pe_off) != 0x00004550)
-        return NULL;
-
-    /* Optional header */
-    const uint8_t *opt = image_base + pe_off + 4 + 20;
-    uint16_t magic = *(const uint16_t *)opt;
-    int is64 = (magic == 0x020B);
-    int dd_off = is64 ? 112 : 96;
-    uint32_t num_dd = is64 ? *(const uint32_t *)(opt + 108) : *(const uint32_t *)(opt + 92);
-
-    /* Need at least the export directory entry */
-    if (num_dd < 1)
-        return NULL;
-
-    uint32_t export_rva  = *(const uint32_t *)(opt + dd_off);
-    uint32_t export_size = *(const uint32_t *)(opt + dd_off + 4);
-    if (export_rva == 0 || export_size == 0)
-        return NULL;
-    if (!PE_RVA_VALID(image_base, image_size, export_rva, export_size))
-        return NULL;
-
-    /* Export directory table -- pe_export_directory_t is 40 bytes */
-    if (!PE_RVA_VALID(image_base, image_size, export_rva, sizeof(pe_export_directory_t)))
-        return NULL;
-    const pe_export_directory_t *ed = PE_RVA_PTR(image_base, export_rva,
-                                                   const pe_export_directory_t *);
-    uint32_t num_functions  = ed->number_of_functions;
-    uint32_t num_names      = ed->number_of_names;
-    uint32_t func_table_rva = ed->address_of_functions_rva;
-    uint32_t name_table_rva = ed->address_of_names_rva;
-    uint32_t ord_table_rva  = ed->address_of_name_ordinals_rva;
-
-    /* Bounds check all three table extents */
-    if (!PE_RVA_VALID(image_base, image_size, func_table_rva, num_functions * 4) ||
-        !PE_RVA_VALID(image_base, image_size, name_table_rva, num_names * 4) ||
-        !PE_RVA_VALID(image_base, image_size, ord_table_rva,  num_names * 2))
-        return NULL;
-
-    const uint32_t *func_table = PE_RVA_PTR(image_base, func_table_rva, const uint32_t *);
-    const uint32_t *name_table = PE_RVA_PTR(image_base, name_table_rva, const uint32_t *);
-    const uint16_t *ord_table  = PE_RVA_PTR(image_base, ord_table_rva,  const uint16_t *);
+    /* Table bounds were already validated in pe_export_cache_fill() so we
+     * can lift the pointer conversions directly without another bounds walk. */
+    const uint32_t *func_table = PE_RVA_PTR(image_base, ec->func_table_rva, const uint32_t *);
+    const uint32_t *name_table = PE_RVA_PTR(image_base, ec->name_table_rva, const uint32_t *);
+    const uint16_t *ord_table  = PE_RVA_PTR(image_base, ec->ord_table_rva,  const uint16_t *);
 
     /* ---- Fast path: binary search (case-sensitive, O(log n)) ----
      * PE export name pointer tables are required to be sorted in ascending
@@ -1893,40 +2214,15 @@ static void *resolve_pe_export_by_ordinal(const uint8_t *image_base,
     if (out_is_forwarder)
         *out_is_forwarder = 0;
 
-    /* Verify MZ + PE */
-    if (*(const uint16_t *)image_base != 0x5A4D)
-        return NULL;
-    uint32_t pe_off = *(const uint32_t *)(image_base + 0x3C);
-    if (!PE_RVA_VALID(image_base, image_size, pe_off, 4 + 20))
-        return NULL;
-    if (*(const uint32_t *)(image_base + pe_off) != 0x00004550)
-        return NULL;
+    /* Use the shared export-directory cache -- same image scanned by
+     * _by_name will already be warm when _by_ordinal is called. */
+    const pe_export_cache_t *ec = pe_export_cache_get(image_base, image_size);
+    if (!ec) return NULL;
 
-    const uint8_t *opt = image_base + pe_off + 4 + 20;
-    uint16_t magic = *(const uint16_t *)opt;
-    int is64 = (magic == 0x020B);
-    int dd_off = is64 ? 112 : 96;
-    uint32_t num_dd = is64 ? *(const uint32_t *)(opt + 108) : *(const uint32_t *)(opt + 92);
-
-    if (num_dd < 1) return NULL;
-
-    uint32_t export_rva  = *(const uint32_t *)(opt + dd_off);
-    uint32_t export_size = *(const uint32_t *)(opt + dd_off + 4);
-    if (export_rva == 0 || export_size == 0) return NULL;
-    if (!PE_RVA_VALID(image_base, image_size, export_rva, export_size))
-        return NULL;
-
-    /* Export directory (typed access) */
-    if (!PE_RVA_VALID(image_base, image_size, export_rva, sizeof(pe_export_directory_t)))
-        return NULL;
-    const pe_export_directory_t *ed = PE_RVA_PTR(image_base, export_rva,
-                                                   const pe_export_directory_t *);
-    uint32_t ordinal_base   = ed->ordinal_base;
-    uint32_t num_functions  = ed->number_of_functions;
-    uint32_t func_table_rva = ed->address_of_functions_rva;
-
-    if (!PE_RVA_VALID(image_base, image_size, func_table_rva, num_functions * 4))
-        return NULL;
+    uint32_t export_rva    = ec->export_rva;
+    uint32_t export_size   = ec->export_size;
+    uint32_t num_functions = ec->num_functions;
+    uint32_t ordinal_base  = ec->ordinal_base;
 
     /* Subtract ordinal base to get the index into AddressOfFunctions */
     if (ordinal < ordinal_base)
@@ -1935,7 +2231,8 @@ static void *resolve_pe_export_by_ordinal(const uint8_t *image_base,
     if (index >= num_functions)
         return NULL;
 
-    const uint32_t *func_table = PE_RVA_PTR(image_base, func_table_rva, const uint32_t *);
+    const uint32_t *func_table = PE_RVA_PTR(image_base, ec->func_table_rva,
+                                             const uint32_t *);
     uint32_t func_rva = func_table[index];
     if (func_rva == 0)
         return NULL;
@@ -2287,15 +2584,36 @@ static void *resolve_import_symbol(void *so_handle,
         addr = dlsym(so_handle, lookup_name);
         if (addr) return addr;
 
-        /* 2b. Try C++ mangled names */
-        if (func_name[0] == '?') {
+        /* 2b. Try C++ mangled names -- MSVC decorators start with '?' (C++
+         *     mangling) or '@' (stdcall export), occasionally '_' with a
+         *     trailing "@N" fastcall.  Covering all three keeps MFC/ATL
+         *     builds from hitting the stub path for trivial operators. */
+        if (func_name[0] == '?' || func_name[0] == '@' ||
+            (func_name[0] == '_' && strchr(func_name, '@'))) {
             addr = find_mangled_name(func_name, so_handle);
             if (addr) return addr;
         }
+
+        /* 2c. Some PE binaries import a stdcall-decorated name "Func@12"
+         *     against our undecorated C implementation.  Strip the trailing
+         *     "@N" and retry once before falling through. */
+        {
+            const char *at = strchr(func_name, '@');
+            if (at && at != func_name && (at - func_name) < 127) {
+                char undec[128];
+                size_t n = (size_t)(at - func_name);
+                memcpy(undec, func_name, n);
+                undec[n] = '\0';
+                addr = dlsym(so_handle, undec);
+                if (addr) return addr;
+            }
+        }
     }
 
-    /* 3. PE export directory (local module table + kernel32_module_pe.c) */
-    addr = try_pe_export_resolution(dll_name, func_name);
+    /* 3. PE export directory (local module table + kernel32_module_pe.c)
+     *    Uses the translated lookup_name so PE imports of "socket" resolve
+     *    against our "ws2_socket" implementation (same rule as dlsym). */
+    addr = try_pe_export_resolution(dll_name, lookup_name);
     if (addr) return addr;
 
     /* 4. RTLD_DEFAULT -- search all loaded .so files */
@@ -2327,6 +2645,35 @@ static void *resolve_import_ordinal(void *so_handle,
     if (addr) return addr;
 
     return NULL;
+}
+
+/*
+ * Safe accessor for the flexible array member pe_import_by_name_t.name.
+ * Returns a pointer to a NUL-terminated function name located entirely
+ * within the mapped image, or NULL if:
+ *   - hint_rva is out of image bounds,
+ *   - there is no NUL terminator within the remaining mapped bytes
+ *     (capped at 512 -- Windows MAX_IMPORT_NAME is 255 practically).
+ *
+ * Without this cap, resolve_import_symbol -> strcmp on hint->name can walk
+ * off the end of the last PE section when a crafted or truncated image has
+ * no NUL terminator.  Returning NULL makes the caller fall into the
+ * diagnostic-stub path instead of faulting.
+ */
+static const char *pe_safe_hint_name(const pe_image_t *image, uint32_t hint_rva)
+{
+    const pe_import_by_name_t *hint =
+        (const pe_import_by_name_t *)pe_rva_to_ptr(image, hint_rva);
+    if (!hint) return NULL;
+    /* The name starts at offset 2 (after the 16-bit hint index). */
+    uint32_t name_rva = hint_rva + 2;
+    if (name_rva < hint_rva) return NULL;              /* RVA wraparound */
+    if (name_rva >= image->mapped_size) return NULL;
+    size_t remaining = image->mapped_size - name_rva;
+    if (remaining > 512) remaining = 512;
+    const char *s = (const char *)hint->name;
+    if (!memchr(s, '\0', remaining)) return NULL;
+    return s;
 }
 
 int pe_resolve_imports(pe_image_t *image)
@@ -2388,41 +2735,44 @@ int pe_resolve_imports(pe_image_t *image)
                 continue;
             }
 
-            for (int i = 0; ilt[i] != 0 && i < 65536; i++) {
+            uint32_t ilt_max = (image->mapped_size > ilt_rva)
+                ? (uint32_t)((image->mapped_size - ilt_rva) / sizeof(uint64_t)) : 0;
+            uint32_t iat_max = (image->mapped_size > iat_rva)
+                ? (uint32_t)((image->mapped_size - iat_rva) / sizeof(uint64_t)) : 0;
+            uint32_t ilt_cap = ilt_max < 65536 ? ilt_max : 65536;
+            if (iat_max < ilt_cap) ilt_cap = iat_max;
+
+            for (uint32_t i = 0; i < ilt_cap && ilt[i] != 0; i++) {
                 void *func_addr = NULL;
+                const char *resolved_name = NULL;
 
                 if (ilt[i] & PE_IMPORT_ORDINAL_FLAG64) {
                     /* Import by ordinal */
                     uint16_t ordinal = ilt[i] & 0xFFFF;
                     func_addr = resolve_import_ordinal(lib, ordinal, dll_name);
                 } else {
-                    /* Import by name */
+                    /* Import by name -- pe_safe_hint_name validates the
+                     * name string is NUL-terminated within the image. */
                     uint32_t hint_rva = (uint32_t)(ilt[i] & 0x7FFFFFFF);
-                    pe_import_by_name_t *hint = (pe_import_by_name_t *)
-                        pe_rva_to_ptr(image, hint_rva);
+                    resolved_name = pe_safe_hint_name(image, hint_rva);
 
-                    if (!hint) {
-                        fprintf(stderr, LOG_PREFIX "    Invalid hint/name RVA\n");
+                    if (!resolved_name) {
+                        fprintf(stderr, LOG_PREFIX "    Invalid/unbounded hint/name RVA 0x%x\n", hint_rva);
                         iat[i] = (uint64_t)(uintptr_t)create_diagnostic_stub(dll_name, "?bad_rva");
                         total_unresolved++;
                         continue;
                     }
 
-                    func_addr = resolve_import_symbol(lib, hint->name, dll_name);
+                    func_addr = resolve_import_symbol(lib, resolved_name, dll_name);
                 }
 
                 if (func_addr) {
                     iat[i] = (uint64_t)(uintptr_t)func_addr;
                     total_resolved++;
                 } else {
-                    const char *name;
-                    if (ilt[i] & 0x8000000000000000ULL) {
-                        name = "ordinal";
-                    } else {
-                        pe_import_by_name_t *hint = (pe_import_by_name_t *)
-                            pe_rva_to_ptr(image, (uint32_t)(ilt[i] & 0x7FFFFFFF));
-                        name = hint ? hint->name : "?unknown";
-                    }
+                    const char *name = (ilt[i] & PE_IMPORT_ORDINAL_FLAG64)
+                                       ? "ordinal"
+                                       : (resolved_name ? resolved_name : "?unknown");
                     iat[i] = (uint64_t)(uintptr_t)create_diagnostic_stub(dll_name, name);
                     total_unresolved++;
                 }
@@ -2437,38 +2787,40 @@ int pe_resolve_imports(pe_image_t *image)
                 continue;
             }
 
-            for (int i = 0; ilt[i] != 0 && i < 65536; i++) {
+            uint32_t ilt_max = (image->mapped_size > ilt_rva)
+                ? (uint32_t)((image->mapped_size - ilt_rva) / sizeof(uint32_t)) : 0;
+            uint32_t iat_max = (image->mapped_size > iat_rva)
+                ? (uint32_t)((image->mapped_size - iat_rva) / sizeof(uint32_t)) : 0;
+            uint32_t ilt_cap = ilt_max < 65536 ? ilt_max : 65536;
+            if (iat_max < ilt_cap) ilt_cap = iat_max;
+
+            for (uint32_t i = 0; i < ilt_cap && ilt[i] != 0; i++) {
                 void *func_addr = NULL;
+                const char *resolved_name = NULL;
 
                 if (ilt[i] & PE_IMPORT_ORDINAL_FLAG32) {
                     uint16_t ordinal = ilt[i] & 0xFFFF;
                     func_addr = resolve_import_ordinal(lib, ordinal, dll_name);
                 } else {
                     uint32_t hint_rva = ilt[i] & 0x7FFFFFFF;
-                    pe_import_by_name_t *hint = (pe_import_by_name_t *)
-                        pe_rva_to_ptr(image, hint_rva);
+                    resolved_name = pe_safe_hint_name(image, hint_rva);
 
-                    if (!hint) {
+                    if (!resolved_name) {
                         iat[i] = (uint32_t)(uintptr_t)create_diagnostic_stub(dll_name, "?bad_rva");
                         total_unresolved++;
                         continue;
                     }
 
-                    func_addr = resolve_import_symbol(lib, hint->name, dll_name);
+                    func_addr = resolve_import_symbol(lib, resolved_name, dll_name);
                 }
 
                 if (func_addr) {
                     iat[i] = (uint32_t)(uintptr_t)func_addr;
                     total_resolved++;
                 } else {
-                    const char *name;
-                    if (ilt[i] & PE_IMPORT_ORDINAL_FLAG32) {
-                        name = "ordinal";
-                    } else {
-                        pe_import_by_name_t *hint = (pe_import_by_name_t *)
-                            pe_rva_to_ptr(image, ilt[i] & 0x7FFFFFFF);
-                        name = hint ? hint->name : "?unknown";
-                    }
+                    const char *name = (ilt[i] & PE_IMPORT_ORDINAL_FLAG32)
+                                       ? "ordinal"
+                                       : (resolved_name ? resolved_name : "?unknown");
                     iat[i] = (uint32_t)(uintptr_t)create_diagnostic_stub(dll_name, name);
                     total_unresolved++;
                 }
@@ -2496,50 +2848,67 @@ int pe_resolve_imports(pe_image_t *image)
                         break;
                     if (ddesc->name_rva == 0)
                         break;
+
+                    /* Delay-import descriptor has two address formats:
+                     *   V1 (attributes bit 0 == 0): name/INT/IAT/module-handle
+                     *                               fields are absolute VAs
+                     *                               relative to image_base.
+                     *   V2 (attributes bit 0 == 1): all four fields are true
+                     *                               RVAs.
+                     * Dereferencing a V1 name_rva as an RVA points at the
+                     * wrong bytes -- we must normalize name_rva too, not just
+                     * the INT/IAT pair. */
+                    uint32_t name_rva_norm = ddesc->name_rva;
+                    uint32_t int_rva = ddesc->delay_int_rva;
+                    uint32_t iat_rva2 = ddesc->delay_iat_rva;
+
+                    if (!(ddesc->attributes & 1)) {
+                        uint32_t base32 = (uint32_t)(image->image_base & 0xFFFFFFFF);
+                        if (name_rva_norm < base32 ||
+                            int_rva < base32 || iat_rva2 < base32) {
+                            fprintf(stderr, LOG_PREFIX "  Delay-import VA->RVA conversion underflow (V1 format)\n");
+                            continue;
+                        }
+                        name_rva_norm -= base32;
+                        int_rva       -= base32;
+                        iat_rva2      -= base32;
+                    }
+
                     const char *dll_name2 = (const char *)
-                        pe_rva_to_ptr(image, ddesc->name_rva);
+                        pe_rva_to_ptr(image, name_rva_norm);
                     if (!dll_name2) continue;
 
                     printf(LOG_PREFIX "Resolving delay-load imports from: %s\n", dll_name2);
 
                     void *lib2 = find_dll_library(dll_name2);
 
-                    /* Delay-load INT (Import Name Table) and IAT */
-                    uint32_t int_rva = ddesc->delay_int_rva;
-                    uint32_t iat_rva2 = ddesc->delay_iat_rva;
-
-                    /* Adjust RVAs: if attributes bit 0 is set, these are RVAs;
-                     * if not set (older format), they are VAs and need base subtraction */
-                    if (!(ddesc->attributes & 1)) {
-                        uint32_t base32 = (uint32_t)(image->image_base & 0xFFFFFFFF);
-                        if (int_rva < base32 || iat_rva2 < base32) {
-                            fprintf(stderr, LOG_PREFIX "  Delay-import RVA conversion underflow for %s\n", dll_name2);
-                            continue;
-                        }
-                        int_rva -= base32;
-                        iat_rva2 -= base32;
-                    }
-
                     if (image->is_pe32plus) {
                         uint64_t *dint = (uint64_t *)pe_rva_to_ptr(image, int_rva);
                         uint64_t *diat = (uint64_t *)pe_rva_to_ptr(image, iat_rva2);
                         if (!dint || !diat) continue;
 
-                        for (int i = 0; dint[i] != 0 && i < 65536; i++) {
+                        uint32_t dint_max = (image->mapped_size > int_rva)
+                            ? (uint32_t)((image->mapped_size - int_rva) / sizeof(uint64_t)) : 0;
+                        uint32_t diat_max = (image->mapped_size > iat_rva2)
+                            ? (uint32_t)((image->mapped_size - iat_rva2) / sizeof(uint64_t)) : 0;
+                        uint32_t dcap = dint_max < 65536 ? dint_max : 65536;
+                        if (diat_max < dcap) dcap = diat_max;
+
+                        for (uint32_t i = 0; i < dcap && dint[i] != 0; i++) {
                             void *func = NULL;
+                            const char *dname = NULL;
 
                             if (dint[i] & PE_IMPORT_ORDINAL_FLAG64) {
                                 uint16_t ordinal = dint[i] & 0xFFFF;
                                 func = resolve_import_ordinal(lib2, ordinal, dll_name2);
                             } else {
                                 uint32_t hint_rva2 = (uint32_t)(dint[i] & 0x7FFFFFFF);
-                                pe_import_by_name_t *hint2 = (pe_import_by_name_t *)
-                                    pe_rva_to_ptr(image, hint_rva2);
-                                if (hint2) {
-                                    func = resolve_import_symbol(lib2, hint2->name, dll_name2);
+                                dname = pe_safe_hint_name(image, hint_rva2);
+                                if (dname) {
+                                    func = resolve_import_symbol(lib2, dname, dll_name2);
                                     if (!func)
                                         fprintf(stderr, LOG_PREFIX "    DELAY UNRESOLVED: %s!%s\n",
-                                                dll_name2, hint2->name);
+                                                dll_name2, dname);
                                 }
                             }
 
@@ -2547,7 +2916,8 @@ int pe_resolve_imports(pe_image_t *image)
                                 diat[i] = (uint64_t)(uintptr_t)func;
                                 delay_resolved++;
                             } else {
-                                diat[i] = (uint64_t)(uintptr_t)create_diagnostic_stub(dll_name2, "delay-import");
+                                const char *why = dname ? dname : "delay-import";
+                                diat[i] = (uint64_t)(uintptr_t)create_diagnostic_stub(dll_name2, why);
                                 delay_unresolved++;
                             }
                         }
@@ -2556,18 +2926,25 @@ int pe_resolve_imports(pe_image_t *image)
                         uint32_t *diat = (uint32_t *)pe_rva_to_ptr(image, iat_rva2);
                         if (!dint || !diat) continue;
 
-                        for (int i = 0; dint[i] != 0 && i < 65536; i++) {
+                        uint32_t dint_max = (image->mapped_size > int_rva)
+                            ? (uint32_t)((image->mapped_size - int_rva) / sizeof(uint32_t)) : 0;
+                        uint32_t diat_max = (image->mapped_size > iat_rva2)
+                            ? (uint32_t)((image->mapped_size - iat_rva2) / sizeof(uint32_t)) : 0;
+                        uint32_t dcap = dint_max < 65536 ? dint_max : 65536;
+                        if (diat_max < dcap) dcap = diat_max;
+
+                        for (uint32_t i = 0; i < dcap && dint[i] != 0; i++) {
                             void *func = NULL;
+                            const char *dname = NULL;
 
                             if (dint[i] & PE_IMPORT_ORDINAL_FLAG32) {
                                 uint16_t ordinal = dint[i] & 0xFFFF;
                                 func = resolve_import_ordinal(lib2, ordinal, dll_name2);
                             } else {
                                 uint32_t hint_rva2 = dint[i] & 0x7FFFFFFF;
-                                pe_import_by_name_t *hint2 = (pe_import_by_name_t *)
-                                    pe_rva_to_ptr(image, hint_rva2);
-                                if (hint2) {
-                                    func = resolve_import_symbol(lib2, hint2->name, dll_name2);
+                                dname = pe_safe_hint_name(image, hint_rva2);
+                                if (dname) {
+                                    func = resolve_import_symbol(lib2, dname, dll_name2);
                                 }
                             }
 
@@ -2575,17 +2952,29 @@ int pe_resolve_imports(pe_image_t *image)
                                 diat[i] = (uint32_t)(uintptr_t)func;
                                 delay_resolved++;
                             } else {
-                                diat[i] = (uint32_t)(uintptr_t)create_diagnostic_stub(dll_name2, "delay-import");
+                                const char *why = dname ? dname : "delay-import";
+                                diat[i] = (uint32_t)(uintptr_t)create_diagnostic_stub(dll_name2, why);
                                 delay_unresolved++;
                             }
                         }
                     }
 
-                    /* Store module handle for the delay-loaded DLL */
+                    /* Store module handle for the delay-loaded DLL.
+                     * V1 format (attributes bit 0 == 0): module_handle_rva is
+                     * an absolute VA, not an RVA -- normalize with the same
+                     * image_base subtraction as the name/INT/IAT fields.
+                     * Guard against underflow so a malformed descriptor can't
+                     * produce a wild pointer. */
                     if (lib2 && ddesc->module_handle_rva) {
                         uint32_t mh_rva = ddesc->module_handle_rva;
-                        if (!(ddesc->attributes & 1))
-                            mh_rva -= (uint32_t)(image->image_base & 0xFFFFFFFF);
+                        if (!(ddesc->attributes & 1)) {
+                            uint32_t base32 = (uint32_t)(image->image_base & 0xFFFFFFFF);
+                            if (mh_rva < base32) {
+                                /* Underflow: descriptor field doesn't match V1 semantics */
+                                continue;
+                            }
+                            mh_rva -= base32;
+                        }
                         void **mh_ptr = (void **)pe_rva_to_ptr(image, mh_rva);
                         if (mh_ptr)
                             *mh_ptr = lib2;

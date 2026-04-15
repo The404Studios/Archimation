@@ -12,10 +12,19 @@ import json
 import logging
 import re
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Optional
+
+try:
+    from . import cgroup_manager as _cgroup_manager  # type: ignore
+except ImportError:  # pragma: no cover - fallback when loaded as a script
+    try:
+        import cgroup_manager as _cgroup_manager  # type: ignore
+    except ImportError:
+        _cgroup_manager = None  # type: ignore
 
 logger = logging.getLogger("firewall.nft_manager")
 
@@ -44,6 +53,23 @@ def _validate_address(addr: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _address_family(addr: str) -> str:
+    """Return ``"ip"`` or ``"ip6"`` for the nftables family keyword.
+
+    Must be called only on strings that already pass :func:`_validate_address`.
+    Returns ``"ip"`` on failure to avoid KeyError, but callers should guard
+    upstream via validate_rule_fields().
+    """
+    try:
+        if '/' in addr:
+            net = ipaddress.ip_network(addr, strict=False)
+            return "ip6" if net.version == 6 else "ip"
+        ip = ipaddress.ip_address(addr)
+        return "ip6" if ip.version == 6 else "ip"
+    except ValueError:
+        return "ip"
 
 
 def _validate_port_range(port_str: str) -> bool:
@@ -174,11 +200,29 @@ class NftManager:
     compiled into nft statements and applied atomically.
     """
 
+    # Cache TTL for is_enabled() so the GUI status bar / periodic pollers
+    # don't shell out to `nft list table` multiple times per second.
+    _IS_ENABLED_TTL: float = 1.5
+
     def __init__(self, nft_bin: str = NFT_BIN) -> None:
         self._nft_bin = nft_bin
         self._rules: dict[str, FirewallRule] = {}
         self._default_inbound_action: Action = Action.BLOCK
         self._default_outbound_action: Action = Action.ALLOW
+        self._is_enabled_cache: Optional[bool] = None
+        self._is_enabled_cache_time: float = 0.0
+        # When True, emit `log prefix "..."` before a drop verdict so the
+        # ProfileManager's log_blocked flag actually produces kernel log
+        # output.  Toggled via apply_profile() or set_log_blocked().
+        self._log_blocked: bool = False
+        # Listeners fired when a rule with a non-empty ``application``
+        # field is added, loaded, or removed.  Exists so the AppTracker
+        # can be told to place running PIDs of that app into its cgroup
+        # scope -- without it the ``socket cgroupv2`` predicate emitted
+        # by _compile_rule would never match any traffic.
+        #
+        # Callback signature: ``fn(app_path: str, added: bool) -> None``.
+        self._app_rule_listeners: list = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -195,6 +239,7 @@ class NftManager:
             rule.id = str(uuid.uuid4())
         self._rules[rule.id] = rule
         logger.info("Added rule %s (%s)", rule.id, rule.name)
+        self._notify_app_rule_listeners(rule, added=True)
         return rule
 
     def remove_rule(self, rule_id: str) -> bool:
@@ -202,9 +247,56 @@ class NftManager:
         removed = self._rules.pop(rule_id, None)
         if removed:
             logger.info("Removed rule %s (%s)", rule_id, removed.name)
+            self._notify_app_rule_listeners(removed, added=False)
             return True
         logger.warning("Rule %s not found for removal", rule_id)
         return False
+
+    # ------------------------------------------------------------------
+    # App-rule listener plumbing
+    # ------------------------------------------------------------------
+
+    def add_app_rule_listener(self, callback) -> None:
+        """Register *callback* to be notified of application-bound rule changes.
+
+        The callback receives ``(app_path: str, added: bool)`` whenever
+        a rule with a non-empty ``application`` field is added, loaded,
+        or removed.  Duplicate registrations are deduplicated.
+
+        This is how :class:`~firewall.backend.app_tracker.AppTracker`
+        learns which exes it needs to auto-scope into
+        ``pe-compat.slice/<app>.scope`` so the nft
+        ``socket cgroupv2`` predicate actually matches.
+        """
+        if callback not in self._app_rule_listeners:
+            self._app_rule_listeners.append(callback)
+
+    def remove_app_rule_listener(self, callback) -> bool:
+        """Unregister *callback*.  Returns True if it was present."""
+        try:
+            self._app_rule_listeners.remove(callback)
+            return True
+        except ValueError:
+            return False
+
+    def _notify_app_rule_listeners(
+        self, rule: FirewallRule, added: bool,
+    ) -> None:
+        """Fire listeners for *rule* if it targets an application.
+
+        Errors in listeners are caught so an observer blowing up in a
+        callback can't abort a rule add / remove.
+        """
+        app = getattr(rule, "application", None)
+        if not app or not self._app_rule_listeners:
+            return
+        for cb in list(self._app_rule_listeners):
+            try:
+                cb(app, added)
+            except Exception:
+                logger.exception(
+                    "app-rule listener raised for %s (added=%s)", app, added,
+                )
 
     def enable_rule(self, rule_id: str) -> bool:
         """Enable a previously disabled rule."""
@@ -253,6 +345,8 @@ class NftManager:
         # Only flush if the table actually exists to avoid nft errors
         if self.is_enabled():
             self._exec_nft(["flush", "table", "inet", TABLE_NAME])
+            # flush leaves the empty table around; is_enabled stays
+            # True, so no cache invalidation needed for that predicate.
         logger.info("Flushed all rules")
 
     def set_default_actions(
@@ -263,6 +357,57 @@ class NftManager:
         """Set the default policy for inbound/outbound chains."""
         self._default_inbound_action = inbound
         self._default_outbound_action = outbound
+
+    def set_log_blocked(self, enabled: bool) -> None:
+        """Toggle ``log prefix`` emission on drop verdicts."""
+        self._log_blocked = bool(enabled)
+
+    def apply_profile(self, profile) -> bool:
+        """Apply *profile*'s defaults (inbound/outbound policy, log flag)
+        and rebuild the nftables ruleset atomically.
+
+        Previously switching profile from the GUI called ``apply_rules(profile=...)``
+        which filtered rules but kept whatever default_inbound_action was
+        last set via ``set_default_actions()``.  The profile's own
+        ``inbound_default`` / ``outbound_default`` were silently ignored,
+        so switching from private -> public left the chain policy at the
+        private value.  This helper plumbs the profile's defaults through
+        before applying.
+
+        *profile* may be a :class:`NetworkProfile` or a profile name string.
+        """
+        name: str
+        inbound_default: str
+        outbound_default: str
+        log_blocked: bool
+
+        if isinstance(profile, str):
+            # Late binding: avoid circular import of profiles at module load
+            from .profiles import ProfileManager as _PM
+            mgr = _PM()
+            np = mgr.get_profile(profile)
+            if np is None:
+                logger.warning("apply_profile: unknown profile %s", profile)
+                return False
+            name = np.name
+            inbound_default = np.inbound_default
+            outbound_default = np.outbound_default
+            log_blocked = bool(np.log_blocked)
+        else:
+            name = profile.name
+            inbound_default = profile.inbound_default
+            outbound_default = profile.outbound_default
+            log_blocked = bool(profile.log_blocked)
+
+        try:
+            self._default_inbound_action = Action(inbound_default)
+            self._default_outbound_action = Action(outbound_default)
+        except ValueError as exc:
+            logger.error("apply_profile: bad default action in %s: %s", name, exc)
+            return False
+
+        self._log_blocked = log_blocked
+        return self.apply_rules(profile=name)
 
     # ------------------------------------------------------------------
     # Ruleset generation
@@ -323,7 +468,14 @@ class NftManager:
         """
         ruleset = self.generate_ruleset(profile)
         logger.debug("Applying ruleset:\n%s", ruleset)
-        return self._apply_ruleset(ruleset)
+        ok = self._apply_ruleset(ruleset)
+        # A successful apply creates/updates the table, so the cached
+        # is_enabled() result (which may be a stale "False") must be
+        # invalidated -- the status bar polls this and will otherwise
+        # show "OFF" for up to _IS_ENABLED_TTL seconds after enable.
+        if ok:
+            self._invalidate_enabled_cache()
+        return ok
 
     # ------------------------------------------------------------------
     # Live nftables queries
@@ -374,29 +526,41 @@ class NftManager:
             else:
                 parts.append(f"meta l4proto {proto}")
 
-        # Address matches
+        # Address matches -- pick family keyword (ip/ip6) per address so
+        # a rule like "block outbound to fe80::1" emits "ip6 daddr ..."
+        # instead of the invalid "ip daddr fe80::1" that nftables rejects.
         if rule.direction == Direction.INBOUND.value:
             if rule.remote_address:
-                parts.append(f"ip saddr {rule.remote_address}")
+                fam = _address_family(rule.remote_address)
+                parts.append(f"{fam} saddr {rule.remote_address}")
             if rule.local_address:
-                parts.append(f"ip daddr {rule.local_address}")
+                fam = _address_family(rule.local_address)
+                parts.append(f"{fam} daddr {rule.local_address}")
         else:
             if rule.local_address:
-                parts.append(f"ip saddr {rule.local_address}")
+                fam = _address_family(rule.local_address)
+                parts.append(f"{fam} saddr {rule.local_address}")
             if rule.remote_address:
-                parts.append(f"ip daddr {rule.remote_address}")
+                fam = _address_family(rule.remote_address)
+                parts.append(f"{fam} daddr {rule.remote_address}")
 
-        # Port matches (only for tcp/udp)
-        if rule.port and proto in (Protocol.TCP.value, Protocol.UDP.value):
-            if rule.direction == Direction.INBOUND.value:
-                parts.append(f"{proto} dport {rule.port}")
+        # Port matches: if the user gave a port but protocol=any, we cannot
+        # emit `any dport 443` -- nft has no such syntax.  Previously this
+        # SILENTLY dropped the port filter, so "block port 443" became a
+        # no-op.  Now we refuse to emit the rule rather than produce a
+        # wrong one that looks correct in the GUI.
+        port_val = rule.port if rule.port else rule.port_range
+        if port_val is not None:
+            if proto in (Protocol.TCP.value, Protocol.UDP.value):
+                # nft accepts both single port and "a-b" range as dport
+                parts.append(f"{proto} dport {port_val}")
             else:
-                parts.append(f"{proto} dport {rule.port}")
-        elif rule.port_range and proto in (Protocol.TCP.value, Protocol.UDP.value):
-            if rule.direction == Direction.INBOUND.value:
-                parts.append(f"{proto} dport {rule.port_range}")
-            else:
-                parts.append(f"{proto} dport {rule.port_range}")
+                logger.warning(
+                    "Rule %s (%s) specifies port %s with protocol=%s; "
+                    "a port match requires tcp or udp -- rule skipped",
+                    rule.id, rule.name, port_val, proto,
+                )
+                return ""
 
         # Application match via cgroup (Linux equivalent of app filtering)
         if rule.application:
@@ -411,6 +575,17 @@ class NftManager:
         # Counter for logging/stats
         parts.append("counter")
 
+        # Optional log action for blocked rules so log_blocked profile
+        # setting actually produces kernel log output.  Prefix is short
+        # enough to fit the 127-byte nft log prefix cap after UTF-8.
+        if getattr(rule, "_log", False) or (
+                rule.action == Action.BLOCK.value
+                and getattr(self, "_log_blocked", False)):
+            # log + drop both fire; nft evaluates the log as a statement
+            # then continues to the final verdict.
+            prefix = f"pefw-{rule.direction[:3]}-{rule.action[:3]}: "
+            parts.append(f'log prefix "{prefix}"')
+
         # Action
         action = "accept" if rule.action == Action.ALLOW.value else "drop"
         parts.append(action)
@@ -421,14 +596,25 @@ class NftManager:
     def _app_to_cgroup(app_path: str) -> Optional[str]:
         """Map an application binary path to a cgroup v2 path.
 
-        In production this would look up the systemd slice for the
-        application.  For now we derive a deterministic cgroup name.
+        Derives a deterministic ``pe-compat.slice/<app>.scope`` path.
+        The :mod:`cgroup_manager` module places the target application's
+        PIDs into this exact cgroup so that the nft
+        ``socket cgroupv2 level 2 "..."`` predicate actually matches at
+        packet classification time.
         """
         if not app_path:
             return None
-        # Use the binary name as the cgroup leaf
+        if _cgroup_manager is not None:
+            app_name = _cgroup_manager.app_name_from_path(app_path)
+            if app_name is not None:
+                return _cgroup_manager.cgroup_path_for_app(app_name)
+            return None
+        # Fallback when cgroup_manager isn't importable -- keep the
+        # legacy mapping so rule compilation doesn't silently change.
         import os
         basename = os.path.basename(app_path).replace(".", "_")
+        if not basename:
+            return None
         return f"pe-compat.slice/{basename}.scope"
 
     def _apply_ruleset(self, ruleset: str) -> bool:
@@ -502,10 +688,39 @@ class NftManager:
     # ------------------------------------------------------------------
 
     def load_rules(self, rules: list[FirewallRule]) -> None:
-        """Replace all in-memory rules with *rules*."""
+        """Replace all in-memory rules with *rules*.
+
+        Fires the app-rule listener for each application-bound rule
+        (after clearing) so the AppTracker can re-register its set of
+        auto-scoped exes.  Previously old targets would linger in the
+        tracker across a store reload; now they get re-announced.
+        """
+        old_apps: set[str] = {
+            r.application for r in self._rules.values()
+            if getattr(r, "application", None)
+        }
         self._rules.clear()
+        new_apps: set[str] = set()
         for rule in rules:
             self._rules[rule.id] = rule
+            app = getattr(rule, "application", None)
+            if app:
+                new_apps.add(app)
+        # Announce removals for apps only in the old set, additions for
+        # apps only in the new set.  Apps in both sets are unchanged and
+        # don't need to be re-announced.
+        for app in old_apps - new_apps:
+            for cb in list(self._app_rule_listeners):
+                try:
+                    cb(app, False)
+                except Exception:
+                    logger.exception("app-rule listener raised on load_rules removal")
+        for app in new_apps - old_apps:
+            for cb in list(self._app_rule_listeners):
+                try:
+                    cb(app, True)
+                except Exception:
+                    logger.exception("app-rule listener raised on load_rules add")
         logger.info("Loaded %d rules", len(rules))
 
     def export_rules_json(self) -> str:
@@ -516,13 +731,30 @@ class NftManager:
         )
 
     def import_rules_json(self, data: str) -> int:
-        """Import rules from a JSON string.  Returns count imported."""
+        """Import rules from a JSON string.  Returns count imported.
+
+        Each imported rule passes through :func:`validate_rule_fields`
+        so a malicious export can't sneak nft-injection payloads past
+        the usual ``add_rule()`` gate by going through import.  Invalid
+        rules are skipped with a logger warning rather than aborting the
+        whole import.
+        """
         items = json.loads(data)
+        if not isinstance(items, list):
+            raise ValueError("import_rules_json expects a JSON array of rules")
         count = 0
         for item in items:
-            rule = FirewallRule.from_dict(item)
+            try:
+                rule = FirewallRule.from_dict(item)
+                validate_rule_fields(rule)
+            except (RuleValidationError, TypeError) as exc:
+                logger.warning("Skipping invalid rule during import: %s", exc)
+                continue
+            if not rule.id:
+                rule.id = str(uuid.uuid4())
             self._rules[rule.id] = rule
             count += 1
+            self._notify_app_rule_listeners(rule, added=True)
         logger.info("Imported %d rules from JSON", count)
         return count
 
@@ -531,45 +763,108 @@ class NftManager:
     # ------------------------------------------------------------------
 
     def is_enabled(self) -> bool:
-        """Check if the firewall is active (our nftables table exists)."""
+        """Check if the firewall is active (our nftables table exists).
+
+        Result is cached briefly to avoid spamming ``nft list table`` from
+        callers that poll status on a timer (GUI status bar, etc.).
+        """
+        now = time.monotonic()
+        if (self._is_enabled_cache is not None
+                and now - self._is_enabled_cache_time < self._IS_ENABLED_TTL):
+            return self._is_enabled_cache
         try:
             output = self._exec_nft(["list", "table", "inet", TABLE_NAME], capture=True)
-            return TABLE_NAME in output
+            result = TABLE_NAME in output
         except Exception:
-            return False
+            result = False
+        self._is_enabled_cache = result
+        self._is_enabled_cache_time = now
+        return result
+
+    def _invalidate_enabled_cache(self) -> None:
+        """Invalidate the is_enabled() cache after state-changing operations."""
+        self._is_enabled_cache = None
 
     def enable(self) -> None:
         """Apply rules to activate the firewall."""
         self.apply_rules()
+        self._invalidate_enabled_cache()
         logger.info("Firewall enabled")
 
     def disable(self) -> None:
-        """Flush the nftables table to deactivate the firewall."""
-        self._exec_nft(["flush", "table", "inet", TABLE_NAME])
-        self._exec_nft(["delete", "table", "inet", TABLE_NAME])
+        """Flush the nftables table to deactivate the firewall.
+
+        Batched into a single ``nft -f -`` invocation so we only pay one
+        fork/exec of the nft binary instead of two -- matters on slow
+        disks where each nft startup costs tens of milliseconds.
+        """
+        script = (
+            f"flush table inet {TABLE_NAME}\n"
+            f"delete table inet {TABLE_NAME}\n"
+        )
+        try:
+            subprocess.run(
+                [self._nft_bin, "-f", "-"],
+                input=script,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception as exc:
+            logger.error("nft disable failed: %s", exc)
+        self._invalidate_enabled_cache()
         logger.info("Firewall disabled")
 
+    # Cache TTL for active_connection_count() -- GUI polls this on a timer.
+    _CONN_COUNT_TTL: float = 1.5
+
     def active_connection_count(self) -> int:
-        """Return the count of tracked connections via conntrack or /proc."""
-        # Try conntrack tool first
-        try:
-            result = subprocess.run(
-                ["conntrack", "-C"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                count_str = result.stdout.strip()
-                if count_str.isdigit():
-                    return int(count_str)
-        except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
-            pass
+        """Return the count of tracked connections via conntrack or /proc.
+
+        Cached briefly to avoid shelling out to ``conntrack`` or re-reading
+        ``/proc/net/nf_conntrack`` on every poll.  If ``conntrack`` is
+        not installed the negative result is remembered so we don't pay
+        the fork+exec cost on every call -- it's a ~10 ms hit on old
+        spinning-disk hardware and was firing every status-bar tick.
+        """
+        now = time.monotonic()
+        cached = getattr(self, "_conn_count_cache", None)
+        cached_time = getattr(self, "_conn_count_cache_time", 0.0)
+        if cached is not None and now - cached_time < self._CONN_COUNT_TTL:
+            return cached
+
+        count = 0
+        # Try conntrack tool first -- but only if we haven't already
+        # established that it's missing from $PATH.
+        if getattr(self, "_conntrack_missing", False) is False:
+            try:
+                result = subprocess.run(
+                    ["conntrack", "-C"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    count_str = result.stdout.strip()
+                    if count_str.isdigit():
+                        count = int(count_str)
+                        self._conn_count_cache = count
+                        self._conn_count_cache_time = now
+                        return count
+            except FileNotFoundError:
+                # conntrack-tools not installed -- latch False so we
+                # skip the subprocess entirely on subsequent calls.
+                self._conntrack_missing = True
+            except (ValueError, subprocess.TimeoutExpired):
+                pass
         # Fallback: count entries in /proc/net/nf_conntrack
         try:
             with open("/proc/net/nf_conntrack", "r") as fh:
-                return sum(1 for _ in fh)
+                count = sum(1 for _ in fh)
         except (FileNotFoundError, PermissionError):
-            pass
-        return 0
+            count = 0
+
+        self._conn_count_cache = count
+        self._conn_count_cache_time = now
+        return count
 
     def reload(self) -> None:
         """Re-apply rules from the in-memory rule set."""

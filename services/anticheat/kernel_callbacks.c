@@ -184,13 +184,25 @@ static int register_callback(kcb_type_t type, void *callback, void *context,
 
     pthread_mutex_lock(&g_kcb.lock);
 
-    if (g_kcb.num_callbacks >= MAX_CALLBACKS) {
-        fprintf(stderr, KCB_LOG_PREFIX "register_callback: callback table full\n");
-        pthread_mutex_unlock(&g_kcb.lock);
-        return -1;
+    /* Reuse an inactive slot before growing */
+    int slot = -1;
+    for (int i = 0; i < g_kcb.num_callbacks; i++) {
+        if (!g_kcb.callbacks[i].active) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        if (g_kcb.num_callbacks >= MAX_CALLBACKS) {
+            fprintf(stderr, KCB_LOG_PREFIX "register_callback: callback table full\n");
+            pthread_mutex_unlock(&g_kcb.lock);
+            return -1;
+        }
+        slot = g_kcb.num_callbacks++;
     }
 
-    kcb_entry_t *entry = &g_kcb.callbacks[g_kcb.num_callbacks];
+    kcb_entry_t *entry = &g_kcb.callbacks[slot];
+    memset(entry, 0, sizeof(*entry));
     entry->type = type;
     entry->callback = callback;
     entry->context = context;
@@ -203,8 +215,6 @@ static int register_callback(kcb_type_t type, void *callback, void *context,
         strncpy(entry->owner, owner, sizeof(entry->owner) - 1);
     else
         strncpy(entry->owner, "unknown", sizeof(entry->owner) - 1);
-
-    g_kcb.num_callbacks++;
 
     fprintf(stderr, KCB_LOG_PREFIX "Registered %s callback #%d (owner: %s)\n",
             kcb_type_name(type), entry->id, entry->owner);

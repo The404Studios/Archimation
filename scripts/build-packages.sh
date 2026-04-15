@@ -9,6 +9,35 @@ HASH_DIR="$REPO_DIR/.build-hashes"
 
 mkdir -p "$REPO_DIR" "$HASH_DIR"
 
+# Step timing for CI-friendly output — shows which phase dominates wall time.
+_step_start() { STEP_NAME="$1"; STEP_T0=$(date +%s); echo "=== [$(date +%H:%M:%S)] $STEP_NAME ==="; }
+_step_end()   { local dt=$(( $(date +%s) - STEP_T0 )); echo "=== [$(date +%H:%M:%S)] $STEP_NAME done (${dt}s) ==="; }
+
+# Propagate JOBS / MAKEFLAGS down to each makepkg() build().
+# makepkg does NOT set MAKEFLAGS by default; inject via /etc/makepkg.conf or env.
+: "${JOBS:=$(nproc 2>/dev/null || echo 4)}"
+export MAKEFLAGS="${MAKEFLAGS:--j$JOBS}"
+
+# Route ccache (if installed) through makepkg's build() so C compiles reuse the
+# on-disk cache. Safe no-op if ccache absent.
+if command -v ccache >/dev/null 2>&1; then
+    export PATH="/usr/lib/ccache/bin:$PATH"
+    export CCACHE_DIR="${CCACHE_DIR:-$HOME/.cache/ccache-ai-arch}"
+    export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-5G}"
+    mkdir -p "$CCACHE_DIR"
+fi
+
+# Fail early if /tmp is low on space — ISO + package mirror need ~8-12 GB.
+_check_tmp_space() {
+    local avail_mb
+    avail_mb=$(df -m /tmp 2>/dev/null | awk 'NR==2 {print $4}')
+    if [ -n "$avail_mb" ] && [ "$avail_mb" -lt 4096 ]; then
+        echo "WARNING: /tmp has only ${avail_mb} MB free. Package builds may fail." >&2
+        echo "         Recommended: 4+ GB free for makepkg src/, 8+ GB for ISO build." >&2
+    fi
+}
+_check_tmp_space
+
 # ── Rebuild-needed check ────────────────────────────────────────────────────
 # Hash the package source directory.  Skip rebuilding when sources haven't
 # changed.  Pass --force or set FORCE_REBUILD=1 to bypass this check.
@@ -55,8 +84,9 @@ _clean_stale_versions() {
 
         # Extract package name: everything before -<digit> pattern that starts
         # the version component.  Use sed to grab the longest non-version prefix.
+        # Escape the literal dots in .pkg.tar.zst so they don't match any char.
         local name
-        name=$(echo "$base" | sed 's/-[0-9][^-]*-[0-9][^-]*-[a-z_][a-z0-9_]*.pkg.tar.zst$//')
+        name=$(echo "$base" | sed 's/-[0-9][^-]*-[0-9][^-]*-[a-z_][a-z0-9_]*\.pkg\.tar\.zst$//')
 
         # Deduplicate names
         local already_seen=0
@@ -134,7 +164,16 @@ if [ "$(id -u)" = "0" ]; then
 
         chown -R buildpkg: "$bld_pkg"
         # runuser is root-only and bypasses PAM (unlike su which needs a tty+PAM in WSL)
-        runuser -u buildpkg -- bash -c "cd '$bld_pkg' && makepkg -f --nodeps --noconfirm 2>&1 | tail -10"
+        # PKGEXT defaults to .pkg.tar.zst which zstd --long-compresses (great ratio).
+        # We don't override COMPRESSZST here — the *final* .pkg.tar.zst compression
+        # wants to stay strong because these ship in the ISO. Parallel makepkg is
+        # controlled by MAKEFLAGS (propagated in the enclosing env).
+        runuser -u buildpkg --preserve-environment -- bash -c "
+            cd '$bld_pkg' && \
+            MAKEFLAGS='${MAKEFLAGS}' \
+            PKGDEST='$bld_pkg' \
+            makepkg -f --nodeps --noconfirm 2>&1 | tail -10
+        "
 
         # Copy the resulting package tarball back to the source dir and repo
         cp -f "$bld_pkg"/*.pkg.tar.zst "$src_pkg/" 2>/dev/null || true
@@ -143,11 +182,11 @@ else
     _run_makepkg() {
         local pkg_name="$1"
         (cd "$PROJECT_DIR/packages/$pkg_name" && \
-            makepkg -f --nodeps --noconfirm 2>&1 | tail -10)
+            MAKEFLAGS="${MAKEFLAGS}" makepkg -f --nodeps --noconfirm 2>&1 | tail -10)
     }
 fi
 
-echo "=== Building custom Arch packages ==="
+_step_start "Building custom Arch packages (JOBS=$JOBS, ccache=$(command -v ccache >/dev/null && echo yes || echo no))"
 
 # Build order: pe-loader must come first (other packages depend on it),
 # then windows-services, then everything else
@@ -164,7 +203,9 @@ for pkg_name in "${BUILD_ORDER[@]}"; do
             rm -f "$REPO_DIR/${pkg_name}-"*.pkg.tar.zst 2>/dev/null || true
             cp -f "$pkg_dir"/*.pkg.tar.zst "$REPO_DIR/" 2>/dev/null || true
             # Add to repo immediately so subsequent packages can find this one
-            repo-add "$REPO_DIR/pe-compat.db.tar.gz" "$REPO_DIR"/${pkg_name}-*.pkg.tar.zst 2>/dev/null || true
+            # -n: only add new packages (skip already-indexed versions)
+            # -R: remove old versions of this package from repo (incremental cleanup)
+            repo-add -n -R -q "$REPO_DIR/pe-compat.db.tar.gz" "$REPO_DIR"/${pkg_name}-*.pkg.tar.zst 2>/dev/null || true
         else
             echo "  Skipping (unchanged): $pkg_name"
         fi
@@ -200,8 +241,8 @@ for pkg_dir in "$PROJECT_DIR"/packages/*/; do
     fi
 done
 
-echo ""
-echo "=== Finalizing package repository ==="
+_step_end
+_step_start "Finalizing package repository"
 
 # Clean stale versions before finalizing (keeps only the newest per package)
 _clean_stale_versions
@@ -221,8 +262,11 @@ done
 # Rebuild the repo database from scratch so it reflects exactly what is on disk
 rm -f "$REPO_DIR/pe-compat.db"* "$REPO_DIR/pe-compat.files"* 2>/dev/null || true
 if compgen -G "$REPO_DIR"/*.pkg.tar.zst >/dev/null 2>&1; then
-    repo-add "$REPO_DIR/pe-compat.db.tar.gz" "$REPO_DIR"/*.pkg.tar.zst 2>/dev/null || true
+    # -q quiet; -n new-only; -R remove-obsolete — final pass is authoritative
+    repo-add -q -n -R "$REPO_DIR/pe-compat.db.tar.gz" "$REPO_DIR"/*.pkg.tar.zst 2>/dev/null || true
 fi
+
+_step_end
 
 # Summary
 echo ""
@@ -230,5 +274,5 @@ echo "=== Package build complete ==="
 echo "Repository: $REPO_DIR"
 echo "Packages:"
 for p in "$REPO_DIR"/*.pkg.tar.zst; do
-    [ -f "$p" ] && echo "  $(basename "$p")"
+    [ -f "$p" ] && printf "  %-50s %s\n" "$(basename "$p")" "$(du -h "$p" | cut -f1)"
 done

@@ -141,14 +141,39 @@ WINAPI_EXPORT NTSTATUS NtDuplicateObject(HANDLE SourceProcessHandle,
     handle_entry_t *entry = handle_lookup(SourceHandle);
     if (!entry) return STATUS_INVALID_HANDLE;
 
-    /* Duplicate by allocating a new handle pointing to same data.
-     * Increment source ref_count so the shared data/fd isn't freed
-     * when the duplicate is closed. */
-    entry->ref_count++;
+    /* Snapshot fields while the entry is presumed valid, then increment
+     * ref_count atomically. handle_close does its decrement + free under
+     * the handle table lock; we can't take that lock here, but aligned
+     * 32-bit atomic RMW matches the decrement's memory access granularity
+     * so neither increment nor decrement is lost. The residual TOCTOU
+     * window (close racing with our lookup) is documented in common/. */
+    handle_type_t type = entry->type;
+    int fd = entry->fd;
+    void *data = entry->data;
+    __atomic_fetch_add(&entry->ref_count, 1, __ATOMIC_ACQ_REL);
 
-    HANDLE dup = handle_alloc(entry->type, entry->fd, entry->data);
+    /* HANDLE_FLAG_DUP: the new slot has its OWN ref_count=1, but it borrows
+     * fd and data from the source slot.  When this duplicate is closed,
+     * handle_close() will reclaim the slot but will NOT close(fd), destroy
+     * pthread primitives, or free(data) -- the source still owns those.
+     *
+     * This fixes a double-free + UAF: previously both slots had independent
+     * ref_count=1 sharing the same data pointer.  Whichever closed first
+     * free()d data; the other slot then either referenced freed memory
+     * (UAF) or freed it again (double-free on close).
+     *
+     * NOTE: the source ref_count++ above keeps the source slot alive as
+     * long as the duplicate exists.  If the source is closed before the
+     * duplicate, the source ref_count drops to 1 (not 0) so its data stays
+     * alive.  When the duplicate later closes, its slot is reclaimed but
+     * source ref_count stays at 1 -- the source's data leaks until its
+     * next explicit close.  This is a memory leak, not a safety issue;
+     * making data refcount-shared across slots would require a larger
+     * change to handle_entry_t. */
+    HANDLE dup = handle_alloc_flags(type, fd, data, HANDLE_FLAG_DUP);
     if (dup == INVALID_HANDLE_VALUE) {
-        entry->ref_count--;
+        __atomic_fetch_sub(&entry->ref_count, 1, __ATOMIC_ACQ_REL);
+        *TargetHandle = NULL;
         return STATUS_INVALID_HANDLE;
     }
 

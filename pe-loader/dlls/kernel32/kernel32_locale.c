@@ -50,11 +50,14 @@ WINAPI_EXPORT DWORD FormatMessageA(DWORD dwFlags, LPCVOID lpSource,
         /* Allocate buffer and return pointer */
         size_t len = strlen(msg) + 1;
         char *alloc = (char *)LocalAlloc(0, len);
-        if (alloc) {
-            memcpy(alloc, msg, len);
-            *(char **)lpBuffer = alloc;
+        if (!alloc) {
+            if (lpBuffer) *(char **)lpBuffer = NULL;
+            set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+            return 0;
         }
-        return (DWORD)strlen(msg);
+        memcpy(alloc, msg, len);
+        if (lpBuffer) *(char **)lpBuffer = alloc;
+        return (DWORD)(len - 1);
     }
 
     if (lpBuffer && nSize > 0) {
@@ -79,11 +82,14 @@ WINAPI_EXPORT DWORD FormatMessageW(DWORD dwFlags, LPCVOID lpSource,
 
     if (dwFlags & FORMAT_MESSAGE_ALLOCATE_BUFFER) {
         uint16_t *alloc = (uint16_t *)LocalAlloc(0, (len + 1) * 2);
-        if (alloc) {
-            for (DWORD i = 0; i <= len; i++)
-                alloc[i] = (uint16_t)(unsigned char)narrow[i];
-            *(uint16_t **)lpBuffer = alloc;
+        if (!alloc) {
+            if (lpBuffer) *(uint16_t **)lpBuffer = NULL;
+            set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+            return 0;
         }
+        for (DWORD i = 0; i <= len; i++)
+            alloc[i] = (uint16_t)(unsigned char)narrow[i];
+        if (lpBuffer) *(uint16_t **)lpBuffer = alloc;
         return len;
     }
 
@@ -197,12 +203,25 @@ WINAPI_EXPORT BOOL GetStringTypeA(DWORD dwInfoType, LPCSTR lpSrcStr,
 {
     if (!lpSrcStr || !lpCharType) return FALSE;
     int len = cchSrc < 0 ? (int)strlen(lpSrcStr) : cchSrc;
+    if (len <= 0) return TRUE;
 
-    /* Convert to wide and delegate */
-    uint16_t *wide = (uint16_t *)alloca(len * sizeof(uint16_t));
+    /* Convert to wide and delegate. For large inputs malloc to avoid
+     * blowing the stack; alloca for small strings to stay fast. */
+    uint16_t stack_wide[256];
+    uint16_t *wide;
+    int heap_alloc = 0;
+    if ((size_t)len <= sizeof(stack_wide) / sizeof(stack_wide[0])) {
+        wide = stack_wide;
+    } else {
+        wide = (uint16_t *)malloc((size_t)len * sizeof(uint16_t));
+        if (!wide) return FALSE;
+        heap_alloc = 1;
+    }
     for (int i = 0; i < len; i++)
         wide[i] = (uint16_t)(unsigned char)lpSrcStr[i];
-    return GetStringTypeW(dwInfoType, wide, len, lpCharType);
+    BOOL ret = GetStringTypeW(dwInfoType, wide, len, lpCharType);
+    if (heap_alloc) free(wide);
+    return ret;
 }
 
 WINAPI_EXPORT DWORD GetUserDefaultLCID(void) { return 0x0409; /* en-US */ }

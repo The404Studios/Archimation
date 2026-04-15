@@ -8,11 +8,12 @@ and the option to create an allow rule directly from a notification.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import subprocess
 import time
 from collections import deque
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import gi
 
@@ -59,8 +60,13 @@ class NotificationManager:
         self._history: deque[float] = deque()
         self._last_sent: float = 0.0
 
-        # Pending "allow from notification" callback registry
-        self._pending_allows: Dict[str, Dict[str, Any]] = {}
+        # Pending "allow from notification" callback registry.
+        # Each entry is (rule_data, created_at) so stale pending allows can
+        # be expired even if the user dismisses the notification without
+        # clicking -- otherwise this dict grows without bound.
+        self._pending_allows: Dict[str, Tuple[Dict[str, Any], float]] = {}
+        self._pending_allow_ttl: float = 600.0  # 10 minutes
+        self._pending_allow_counter = itertools.count()
 
         # Register the "allow" action on the application if available
         if self._app is not None:
@@ -93,7 +99,15 @@ class NotificationManager:
     def _record_sent(self) -> None:
         now = time.monotonic()
         self._last_sent = now
-        self._history.append(now)
+        # Opportunistically evict entries older than 60 s so the deque
+        # doesn't grow unboundedly when the rate limiter is disabled
+        # (max_per_minute <= 0) or when notifications come faster than
+        # the suppressor checks.  Bounded at max_per_minute + 1 entries.
+        cutoff = now - 60.0
+        hist = self._history
+        while hist and hist[0] < cutoff:
+            hist.popleft()
+        hist.append(now)
 
     # -- Public API --------------------------------------------------------
 
@@ -145,11 +159,15 @@ class NotificationManager:
 
         body = "\n".join(body_parts)
 
-        # Unique key for the allow action
+        # Unique key for the allow action.  Use a monotonically incrementing
+        # counter rather than time.monotonic() to guarantee uniqueness even
+        # when notifications fire faster than the clock resolution.
         allow_key: Optional[str] = None
         if rule_data is not None:
-            allow_key = f"{protocol}-{remote_address}-{remote_port}-{time.monotonic()}"
-            self._pending_allows[allow_key] = rule_data
+            self._purge_expired_allows()
+            seq = next(self._pending_allow_counter)
+            allow_key = f"{protocol}-{remote_address}-{remote_port}-{seq}"
+            self._pending_allows[allow_key] = (rule_data, time.monotonic())
 
         # Try Gio.Notification first, fall back to notify-send
         if self._app is not None:
@@ -210,15 +228,44 @@ class NotificationManager:
 
     # -- Allow action handler ----------------------------------------------
 
+    _MAX_PENDING_ALLOWS: int = 128
+
+    def _purge_expired_allows(self) -> None:
+        """Drop pending allow entries older than the configured TTL.
+
+        Without this, entries registered by notifications the user never
+        interacts with leak forever.  Also enforces a hard cap
+        (``_MAX_PENDING_ALLOWS``) so a pathological burst of blocks
+        can't pin arbitrary amounts of memory even within the TTL
+        window.
+        """
+        if not self._pending_allows:
+            return
+        cutoff = time.monotonic() - self._pending_allow_ttl
+        expired = [
+            k for k, (_, created) in self._pending_allows.items()
+            if created < cutoff
+        ]
+        for k in expired:
+            self._pending_allows.pop(k, None)
+        # Hard cap: if we still have too many, drop the oldest.  dict
+        # preserves insertion order in Python 3.7+, so iterating keys
+        # gives us age order.
+        overflow = len(self._pending_allows) - self._MAX_PENDING_ALLOWS
+        if overflow > 0:
+            for key in list(self._pending_allows.keys())[:overflow]:
+                self._pending_allows.pop(key, None)
+
     def _on_allow_action(
         self, _action: Gio.SimpleAction, param: GLib.Variant
     ) -> None:
         """Handle the 'Allow' button pressed in a notification."""
         allow_key = param.get_string()
-        rule_data = self._pending_allows.pop(allow_key, None)
-        if rule_data is None:
+        entry = self._pending_allows.pop(allow_key, None)
+        if entry is None:
             logger.warning("Allow action key not found: %s", allow_key)
             return
+        rule_data, _created = entry
 
         # Convert the blocked-connection info into an allow rule and persist it
         try:
@@ -232,10 +279,18 @@ class NotificationManager:
             rule_data["enabled"] = True
 
             from backend.nft_manager import FirewallRule  # noqa: E402
-            store = RuleStore()
-            fw_rule = FirewallRule.from_dict(rule_data)
-            store.add_rule(fw_rule)
-            NftManager().reload()
+            # Use context manager so the SQLite connection is always closed.
+            with RuleStore() as store:
+                fw_rule = FirewallRule.from_dict(rule_data)
+                store.add_rule(fw_rule)
+                # Re-sync NftManager from the store.  A fresh NftManager
+                # has an empty in-memory rule set, so calling .reload()
+                # here would flush all rules -- we must load_rules() first
+                # or we'd destroy the user's ruleset with a click of
+                # "Allow" on a notification.
+                nft = NftManager()
+                nft.load_rules(store.list_rules())
+                nft.apply_rules()
             logger.info("Allow rule created from notification: %s", rule_data["name"])
         except Exception as exc:
             logger.error("Failed to create allow rule from notification: %s", exc)

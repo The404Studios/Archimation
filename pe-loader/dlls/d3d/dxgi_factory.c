@@ -13,6 +13,7 @@
 #include <string.h>
 #include <dlfcn.h>
 #include <dirent.h>
+#include <pthread.h>
 
 #include "common/dll_common.h"
 
@@ -30,6 +31,7 @@ typedef struct {
 static void detect_gpu(gpu_info_t *info);
 static gpu_info_t g_gpu_cache;
 static int g_gpu_detected = 0;
+static pthread_mutex_t g_gpu_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define S_OK 0
 #define E_NOINTERFACE        ((long)0x80004002)
@@ -334,7 +336,9 @@ static __attribute__((ms_abi)) long output_get_desc1(IDXGIOutput *self, DXGI_OUT
          * We still report HDR to the game — DXVK will gracefully fall back to
          * SDR swapchain if the Vulkan extension isn't available. This avoids
          * breaking games that gate content behind GetDesc1 HDR checks. */
+        pthread_mutex_lock(&g_gpu_cache_lock);
         if (!g_gpu_detected) { detect_gpu(&g_gpu_cache); g_gpu_detected = 1; }
+        pthread_mutex_unlock(&g_gpu_cache_lock);
         if (g_gpu_cache.vendor_id == 0x10DE && !getenv("GAMESCOPE_WAYLAND_DISPLAY"))
             fprintf(stderr, LOG_PREFIX "GetDesc1: NVIDIA+X11 detected — Vulkan HDR may not be available "
                     "(VK_EXT_swapchain_colorspace requires Wayland or gamescope). "
@@ -474,15 +478,14 @@ static __attribute__((ms_abi)) long adapter_get_parent(IDXGIAdapter *s, const GU
 static __attribute__((ms_abi)) long adapter_enum_outputs(IDXGIAdapter *self, UINT output_idx, void **ppOutput)
 {
     (void)self;
-    if (output_idx > 0) {
-        if (ppOutput) *ppOutput = NULL;
-        return DXGI_ERROR_NOT_FOUND;
-    }
+    if (!ppOutput) return E_INVALIDARG;
+    *ppOutput = NULL;
+    if (output_idx > 0) return DXGI_ERROR_NOT_FOUND;
 
     /* Return our HDR-capable output for index 0 */
     IDXGIOutput *out = create_output();
     if (!out) return E_FAIL;
-    if (ppOutput) *ppOutput = out;
+    *ppOutput = out;
 
     fprintf(stderr, LOG_PREFIX "EnumOutputs(0): returning HDR-aware output\n");
     return S_OK;
@@ -597,10 +600,12 @@ static __attribute__((ms_abi)) long adapter_get_desc(IDXGIAdapter *self, DXGI_AD
     memset(desc, 0, sizeof(*desc));
 
     /* Auto-detect GPU on first call, cache result */
+    pthread_mutex_lock(&g_gpu_cache_lock);
     if (!g_gpu_detected) {
         detect_gpu(&g_gpu_cache);
         g_gpu_detected = 1;
     }
+    pthread_mutex_unlock(&g_gpu_cache_lock);
 
     /* Copy GPU name as WCHAR */
     for (int i = 0; i < 127 && g_gpu_cache.name[i]; i++)
@@ -703,14 +708,13 @@ static __attribute__((ms_abi)) long factory_get_parent(IDXGIFactory *s, const GU
 static __attribute__((ms_abi)) long factory_enum_adapters(IDXGIFactory *self, UINT adapter_idx, void **ppAdapter)
 {
     (void)self;
-    if (adapter_idx > 0) {
-        if (ppAdapter) *ppAdapter = NULL;
-        return DXGI_ERROR_NOT_FOUND;
-    }
+    if (!ppAdapter) return E_INVALIDARG;
+    *ppAdapter = NULL;
+    if (adapter_idx > 0) return DXGI_ERROR_NOT_FOUND;
 
     IDXGIAdapter *adapter = create_adapter();
     if (!adapter) return E_FAIL;
-    if (ppAdapter) *ppAdapter = adapter;
+    *ppAdapter = adapter;
 
     fprintf(stderr, LOG_PREFIX "EnumAdapters(0): returning Vulkan-compatible adapter\n");
     return S_OK;
@@ -838,14 +842,9 @@ WINAPI_EXPORT long CreateDXGIFactory2(UINT Flags, const GUID *riid, void **ppFac
 }
 
 /*
- * dxgi_cleanup - Release the DXVK DXGI dlopen handle at process exit.
+ * dxgi_cleanup - Intentionally does NOT dlclose the DXVK DXGI handle.
+ *
+ * Callers hold IDXGIFactory/IDXGIAdapter/IDXGIOutput pointers whose vtables
+ * live in DXVK's dxgi.so. Closing the handle at exit would unmap those pages
+ * before final Release() calls unwind, causing SIGSEGV. OS reclaims it anyway.
  */
-__attribute__((destructor))
-void dxgi_cleanup(void)
-{
-    if (g_dxvk_dxgi) {
-        dlclose(g_dxvk_dxgi);
-        g_dxvk_dxgi = NULL;
-        g_dxvk_dxgi_tried = 0;
-    }
-}

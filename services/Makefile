@@ -98,7 +98,7 @@ drivers-kernel:
 clean:
 	rm -f scm/*.o scm/scm_daemon scm/sc
 	rm -f async/*.o
-	rm -f drivers/stubs/*.o
+	rm -f drivers/stubs/*.o drivers/stubs/*.so
 	rm -f drivers/userspace/*.o drivers/userspace/devcon
 	rm -f anticheat/*.o anticheat/*.so
 	$(MAKE) -C objectd clean

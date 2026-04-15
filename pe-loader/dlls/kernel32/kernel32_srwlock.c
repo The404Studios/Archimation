@@ -45,9 +45,13 @@ WINAPI_EXPORT void InitializeSRWLock(void *SRWLock)
 {
     void **ptr = (void **)SRWLock;
     srwlock_data_t *data = calloc(1, sizeof(srwlock_data_t));
-    if (data) {
-        pthread_rwlock_init(&data->rwlock, NULL);
-        *ptr = data;
+    if (!data) return;
+    pthread_rwlock_init(&data->rwlock, NULL);
+    /* Race-safe install; drop ours if another thread won, so a double-
+     * initialize doesn't leak the prior struct. */
+    if (!__sync_bool_compare_and_swap(ptr, NULL, data)) {
+        pthread_rwlock_destroy(&data->rwlock);
+        free(data);
     }
 }
 
@@ -207,10 +211,15 @@ WINAPI_EXPORT void InitializeConditionVariable(void *ConditionVariable)
 {
     void **ptr = (void **)ConditionVariable;
     condvar_data_t *data = calloc(1, sizeof(condvar_data_t));
-    if (data) {
-        pthread_cond_init(&data->cond, NULL);
-        pthread_mutex_init(&data->mutex, NULL);
-        *ptr = data;
+    if (!data) return;
+    pthread_cond_init(&data->cond, NULL);
+    pthread_mutex_init(&data->mutex, NULL);
+    /* Race-safe install; drop ours if another thread won, so a double-
+     * initialize doesn't leak the prior struct. */
+    if (!__sync_bool_compare_and_swap(ptr, NULL, data)) {
+        pthread_cond_destroy(&data->cond);
+        pthread_mutex_destroy(&data->mutex);
+        free(data);
     }
 }
 

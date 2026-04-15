@@ -35,6 +35,46 @@ static module_entry_t g_modules[MAX_MODULES];
 static int g_module_count = 0;
 static pthread_mutex_t g_module_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Monotonic generation bumped whenever g_modules[] is mutated
+ * (add/remove/swap). TLS last-hit caches compare this under the lock
+ * to detect invalidation without per-thread coordination. */
+static volatile unsigned int g_module_gen = 0;
+
+/* TLS last-hit cache for find_module(): hot PE apps repeatedly resolve
+ * the same DLL names via GetModuleHandle/GetProcAddress during startup.
+ * A 1-entry per-thread cache is sufficient to eliminate most lookups
+ * without touching the mutation path.
+ *
+ * Safety: must be read under g_module_lock. The cached pointer is only
+ * used if (tls_gen == g_module_gen) — since both mutations and cache
+ * reads happen under the lock, a stale entry cannot be dereferenced. */
+static __thread unsigned int tls_fm_gen = (unsigned int)-1;
+static __thread char         tls_fm_name[260];
+static __thread module_entry_t *tls_fm_hit = NULL;
+
+/* TLS last-hit cache for by-handle scans (GetProcAddress hot path).
+ * Same generation protocol. */
+static __thread unsigned int    tls_fh_gen    = (unsigned int)-1;
+static __thread HANDLE          tls_fh_handle = NULL;
+static __thread module_entry_t *tls_fh_hit    = NULL;
+
+/* Caller MUST hold g_module_lock. */
+static module_entry_t *find_module_by_handle(HANDLE h)
+{
+    if (tls_fh_gen == g_module_gen && tls_fh_hit && tls_fh_handle == h) {
+        return tls_fh_hit;
+    }
+    for (int i = 0; i < g_module_count; i++) {
+        if (g_modules[i].win_handle == h) {
+            tls_fh_gen = g_module_gen;
+            tls_fh_handle = h;
+            tls_fh_hit = &g_modules[i];
+            return &g_modules[i];
+        }
+    }
+    return NULL;
+}
+
 /*
  * Translate a Windows DLL name (e.g. "kernel32.dll") to our stub .so path.
  * Searches PE_COMPAT_DLL_PATH or falls back to /usr/lib/pe-compat/.
@@ -264,12 +304,21 @@ static void *open_stub_so(const char *base_name)
     return NULL;
 }
 
-/* Look up already-loaded module by base name */
+/* Look up already-loaded module by base name. Caller MUST hold g_module_lock. */
 static module_entry_t *find_module(const char *base_name)
 {
+    if (tls_fm_gen == g_module_gen && tls_fm_hit &&
+        strcasecmp(tls_fm_name, base_name) == 0) {
+        return tls_fm_hit;
+    }
     for (int i = 0; i < g_module_count; i++) {
-        if (strcasecmp(g_modules[i].name, base_name) == 0)
+        if (strcasecmp(g_modules[i].name, base_name) == 0) {
+            tls_fm_gen = g_module_gen;
+            strncpy(tls_fm_name, base_name, sizeof(tls_fm_name) - 1);
+            tls_fm_name[sizeof(tls_fm_name) - 1] = '\0';
+            tls_fm_hit = &g_modules[i];
             return &g_modules[i];
+        }
     }
     return NULL;
 }
@@ -316,13 +365,18 @@ WINAPI_EXPORT HMODULE LoadLibraryA(LPCSTR lpLibFileName)
             pe_base = pe_dll_load(dll_with_ext);
         if (pe_base) {
             pthread_mutex_lock(&g_module_lock);
-            if (g_module_count < MAX_MODULES) {
-                module_entry_t *mod = &g_modules[g_module_count++];
-                snprintf(mod->name, sizeof(mod->name), "%s", base);
-                mod->handle = NULL;
-                mod->win_handle = (HANDLE)pe_base;
-            } else {
-                fprintf(stderr, "[kernel32] WARNING: module table full, %s untracked\n", base);
+            /* Re-check: another thread may have registered this base while
+             * we were in pe_dll_load without our lock held. */
+            if (!find_module(base)) {
+                if (g_module_count < MAX_MODULES) {
+                    module_entry_t *mod = &g_modules[g_module_count++];
+                    snprintf(mod->name, sizeof(mod->name), "%s", base);
+                    mod->handle = NULL;
+                    mod->win_handle = (HANDLE)pe_base;
+                    g_module_gen++;
+                } else {
+                    fprintf(stderr, "[kernel32] WARNING: module table full, %s untracked\n", base);
+                }
             }
             pthread_mutex_unlock(&g_module_lock);
             return (HMODULE)pe_base;
@@ -333,6 +387,14 @@ WINAPI_EXPORT HMODULE LoadLibraryA(LPCSTR lpLibFileName)
     void *handle = open_stub_so(base);
     if (handle) {
         pthread_mutex_lock(&g_module_lock);
+        /* Re-check: another thread may have loaded it concurrently. */
+        module_entry_t *dup = find_module(base);
+        if (dup) {
+            HMODULE ret = (HMODULE)dup->win_handle;
+            pthread_mutex_unlock(&g_module_lock);
+            dlclose(handle);   /* drop our extra ref */
+            return ret;
+        }
         if (g_module_count >= MAX_MODULES) {
             pthread_mutex_unlock(&g_module_lock);
             dlclose(handle);
@@ -344,6 +406,7 @@ WINAPI_EXPORT HMODULE LoadLibraryA(LPCSTR lpLibFileName)
         snprintf(mod->name, sizeof(mod->name), "%s", base);
         mod->handle = handle;
         mod->win_handle = (HANDLE)handle;
+        g_module_gen++;
         HMODULE ret = (HMODULE)mod->win_handle;
         pthread_mutex_unlock(&g_module_lock);
         return ret;
@@ -354,13 +417,16 @@ WINAPI_EXPORT HMODULE LoadLibraryA(LPCSTR lpLibFileName)
         void *pe_base = pe_dll_load(lpLibFileName);
         if (pe_base) {
             pthread_mutex_lock(&g_module_lock);
-            if (g_module_count < MAX_MODULES) {
-                module_entry_t *mod = &g_modules[g_module_count++];
-                snprintf(mod->name, sizeof(mod->name), "%s", base);
-                mod->handle = NULL;
-                mod->win_handle = (HANDLE)pe_base;
-            } else {
-                fprintf(stderr, "[kernel32] WARNING: module table full, %s untracked\n", base);
+            if (!find_module(base)) {
+                if (g_module_count < MAX_MODULES) {
+                    module_entry_t *mod = &g_modules[g_module_count++];
+                    snprintf(mod->name, sizeof(mod->name), "%s", base);
+                    mod->handle = NULL;
+                    mod->win_handle = (HANDLE)pe_base;
+                    g_module_gen++;
+                } else {
+                    fprintf(stderr, "[kernel32] WARNING: module table full, %s untracked\n", base);
+                }
             }
             pthread_mutex_unlock(&g_module_lock);
             return (HMODULE)pe_base;
@@ -527,10 +593,12 @@ WINAPI_EXPORT FARPROC GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
         snprintf(ordinal_name, sizeof(ordinal_name), "__ordinal_%u", ordinal);
 
         pthread_mutex_lock(&g_module_lock);
-        for (int i = 0; i < g_module_count; i++) {
-            if (g_modules[i].win_handle == (HANDLE)hModule) {
-                void *sym = dlsym(g_modules[i].handle, ordinal_name);
+        {
+            module_entry_t *mod = find_module_by_handle((HANDLE)hModule);
+            if (mod) {
+                void *dl = mod->handle;
                 pthread_mutex_unlock(&g_module_lock);
+                void *sym = dlsym(dl, ordinal_name);
                 if (sym)
                     return (FARPROC)sym;
                 goto ordinal_pe_fallback;
@@ -556,10 +624,12 @@ ordinal_pe_fallback:
 
     /* Import by name - first try our stub .so modules */
     pthread_mutex_lock(&g_module_lock);
-    for (int i = 0; i < g_module_count; i++) {
-        if (g_modules[i].win_handle == (HANDLE)hModule) {
-            void *sym = dlsym(g_modules[i].handle, lpProcName);
+    {
+        module_entry_t *mod = find_module_by_handle((HANDLE)hModule);
+        if (mod) {
+            void *dl = mod->handle;
             pthread_mutex_unlock(&g_module_lock);
+            void *sym = dlsym(dl, lpProcName);
             if (sym)
                 return (FARPROC)sym;
             goto name_pe_fallback;
@@ -584,11 +654,14 @@ name_pe_fallback:;
 WINAPI_EXPORT BOOL FreeLibrary(HMODULE hLibModule)
 {
     pthread_mutex_lock(&g_module_lock);
-    for (int i = 0; i < g_module_count; i++) {
-        if (g_modules[i].win_handle == (HANDLE)hLibModule) {
+    {
+        module_entry_t *mod = find_module_by_handle((HANDLE)hLibModule);
+        if (mod) {
+            int i = (int)(mod - g_modules);
             void *dl_handle = g_modules[i].handle;
             /* PE DLLs (handle==NULL) stay mapped — munmap not safe */
             g_modules[i] = g_modules[--g_module_count];
+            g_module_gen++;
             pthread_mutex_unlock(&g_module_lock);
             if (dl_handle)  /* .so stub — dlclose it */
                 dlclose(dl_handle);
@@ -607,13 +680,12 @@ WINAPI_EXPORT BOOL FreeLibrary(HMODULE hLibModule)
 int kernel32_find_module_name(void *handle, char *buf, size_t bufsz)
 {
     pthread_mutex_lock(&g_module_lock);
-    for (int i = 0; i < g_module_count; i++) {
-        if (g_modules[i].win_handle == (HANDLE)handle) {
-            /* Return a Windows-style system DLL path */
-            snprintf(buf, bufsz, "C:\\Windows\\System32\\%s.dll", g_modules[i].name);
-            pthread_mutex_unlock(&g_module_lock);
-            return 0;
-        }
+    module_entry_t *mod = find_module_by_handle((HANDLE)handle);
+    if (mod) {
+        /* Return a Windows-style system DLL path */
+        snprintf(buf, bufsz, "C:\\Windows\\System32\\%s.dll", mod->name);
+        pthread_mutex_unlock(&g_module_lock);
+        return 0;
     }
     pthread_mutex_unlock(&g_module_lock);
     return -1;

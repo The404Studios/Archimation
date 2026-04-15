@@ -315,11 +315,21 @@ WINAPI_EXPORT BOOL CreatePipe(
     }
 
     *hReadPipe = handle_alloc(HANDLE_TYPE_PIPE, pipefd[0], NULL);
-    *hWritePipe = handle_alloc(HANDLE_TYPE_PIPE, pipefd[1], NULL);
-
-    if (!*hReadPipe || !*hWritePipe) {
+    if (!*hReadPipe || *hReadPipe == INVALID_HANDLE_VALUE) {
         close(pipefd[0]);
         close(pipefd[1]);
+        *hReadPipe = NULL;
+        *hWritePipe = NULL;
+        set_last_error(ERROR_OUTOFMEMORY);
+        return FALSE;
+    }
+
+    *hWritePipe = handle_alloc(HANDLE_TYPE_PIPE, pipefd[1], NULL);
+    if (!*hWritePipe || *hWritePipe == INVALID_HANDLE_VALUE) {
+        handle_close(*hReadPipe);   /* releases pipefd[0] via handle table */
+        close(pipefd[1]);
+        *hReadPipe = NULL;
+        *hWritePipe = NULL;
         set_last_error(ERROR_OUTOFMEMORY);
         return FALSE;
     }

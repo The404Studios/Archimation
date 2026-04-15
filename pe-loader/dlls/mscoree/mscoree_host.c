@@ -12,6 +12,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <pthread.h>
 
 #include "common/dll_common.h"
 
@@ -57,10 +58,16 @@ static mono_jit_exec_fn      pfn_mono_jit_exec = NULL;
 static mono_domain_assembly_open_fn pfn_mono_domain_assembly_open = NULL;
 static mono_jit_cleanup_fn   pfn_mono_jit_cleanup = NULL;
 
+static pthread_mutex_t g_mono_init_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static int try_load_mono(void)
 {
-    if (g_mono_init_attempted)
-        return g_mono_handle ? 0 : -1;
+    pthread_mutex_lock(&g_mono_init_lock);
+    if (g_mono_init_attempted) {
+        int result = g_mono_handle ? 0 : -1;
+        pthread_mutex_unlock(&g_mono_init_lock);
+        return result;
+    }
 
     g_mono_init_attempted = 1;
 
@@ -87,6 +94,7 @@ static int try_load_mono(void)
                 dlsym(g_mono_handle, "mono_jit_cleanup");
 
             if (pfn_mono_jit_init && pfn_mono_jit_exec) {
+                pthread_mutex_unlock(&g_mono_init_lock);
                 return 0;
             }
 
@@ -98,6 +106,7 @@ static int try_load_mono(void)
 
     fprintf(stderr, "[mscoree] WARNING: .NET CLR not available. "
             "Install Mono (mono-runtime) or .NET to run managed executables.\n");
+    pthread_mutex_unlock(&g_mono_init_lock);
     return -1;
 }
 
@@ -125,18 +134,18 @@ static __attribute__((ms_abi)) HRESULT stub_QueryInterface(void *This, const GUI
 static __attribute__((ms_abi)) ULONG stub_AddRef(void *This)
 {
     stub_meta_host_t *host = (stub_meta_host_t *)This;
-    return ++host->ref_count;
+    return (ULONG)__sync_add_and_fetch(&host->ref_count, 1);
 }
 
 static __attribute__((ms_abi)) ULONG stub_Release(void *This)
 {
     stub_meta_host_t *host = (stub_meta_host_t *)This;
-    int rc = --host->ref_count;
+    int rc = __sync_sub_and_fetch(&host->ref_count, 1);
     if (rc <= 0) {
         free(host->vtable);
         free(host);
     }
-    return rc;
+    return (ULONG)rc;
 }
 
 static __attribute__((ms_abi)) HRESULT stub_GetRuntime(void *This, LPCWSTR version, const GUID *riid, void **ppv)

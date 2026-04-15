@@ -13,13 +13,60 @@ All subprocess operations are async to avoid blocking the FastAPI event loop.
 import asyncio
 import logging
 import os
+import re
 import signal
+import time
 
 logger = logging.getLogger("ai-control.system")
+
+# os.uname() and os.cpu_count() are static after boot — cache once.
+_uname = os.uname()
+_HOSTNAME = _uname.nodename
+_KERNEL = _uname.release
+_CPU_COUNT = os.cpu_count() or 1
+
+# PIDs we never allow to be signalled from the API boundary.
+_PROTECTED_PIDS = {0, 1}
+
+
+def _sanitize_log(s) -> str:
+    if not isinstance(s, str):
+        s = str(s)
+    return s.replace("\r", "\\r").replace("\n", "\\n").replace("\x00", "\\0")[:512]
+
+
+def _validate_unit_name(name: str) -> bool:
+    """Validate a systemd unit name. Rejects flag-like / shell-metachar names."""
+    if not isinstance(name, str) or not name or name.startswith("-"):
+        return False
+    if any(c in name for c in "\x00\n\r \t;|&$`<>*?\\\"'"):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9._@:\-]{1,253}", name))
+
+
+def _validate_package_name(name: str) -> bool:
+    """Validate a pacman package name or search query."""
+    if not isinstance(name, str) or not name or name.startswith("-"):
+        return False
+    if "/" in name or "\\" in name:
+        return False
+    if any(c in name for c in "\x00\n\r \t;|&$`<>*?\"'"):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9._+\-]{1,128}", name))
+
+
+def _validate_search_query(q: str) -> bool:
+    """Search queries can include spaces but no shell metachars or flag leads."""
+    if not isinstance(q, str) or not q or q.startswith("-"):
+        return False
+    if any(c in q for c in "\x00\n\r;|&$`<>"):
+        return False
+    return len(q) <= 128
 
 
 async def _run_async(*args, timeout: int = 30, shell: bool = False) -> dict:
     """Run a subprocess asynchronously and return result dict."""
+    proc = None
     try:
         if shell:
             proc = await asyncio.create_subprocess_shell(
@@ -42,8 +89,15 @@ async def _run_async(*args, timeout: int = 30, shell: bool = False) -> dict:
             "stderr": stderr.decode(errors="replace"),
         }
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()  # Reap the killed process to prevent zombies
+        if proc is not None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()  # Reap the killed process to prevent zombies
+            except Exception:
+                pass
         return {"returncode": -1, "stdout": "", "stderr": "timeout"}
     except FileNotFoundError as exc:
         return {"returncode": -1, "stdout": "", "stderr": str(exc)}
@@ -54,29 +108,63 @@ class SystemController:
 
     def __init__(self):
         self.is_root = os.geteuid() == 0
+        # Short-TTL caches for expensive queries that get polled by
+        # dashboards. Process list is the biggest win: /system/processes
+        # was running `ps aux` (fork + full /proc scan + formatting) on
+        # every request.
+        self._proc_list_cache: tuple[list, float] | None = None
+        self._PROC_LIST_TTL = 2.0
+        self._services_cache: tuple[list, float] | None = None
+        self._SERVICES_TTL = 5.0
+        self._installed_cache: tuple[list, float] | None = None
+        self._INSTALLED_TTL = 30.0
 
     # --- Package Management ---
 
+    def _invalidate_package_cache(self) -> None:
+        """Drop cached pacman -Q output after install/remove/update."""
+        self._installed_cache = None
+
     async def install_package(self, package: str) -> dict:
-        r = await _run_async("pacman", "-S", "--noconfirm", package, timeout=300)
+        if not _validate_package_name(package):
+            return {"success": False, "stdout": "", "stderr": "invalid package name"}
+        r = await _run_async("pacman", "-S", "--noconfirm", "--", package, timeout=300)
+        if r["returncode"] == 0:
+            self._invalidate_package_cache()
         return {"success": r["returncode"] == 0, "stdout": r["stdout"], "stderr": r["stderr"]}
 
     async def remove_package(self, package: str) -> dict:
-        r = await _run_async("pacman", "-R", "--noconfirm", package, timeout=120)
+        if not _validate_package_name(package):
+            return {"success": False, "stdout": "", "stderr": "invalid package name"}
+        r = await _run_async("pacman", "-R", "--noconfirm", "--", package, timeout=120)
+        if r["returncode"] == 0:
+            self._invalidate_package_cache()
         return {"success": r["returncode"] == 0, "stdout": r["stdout"], "stderr": r["stderr"]}
 
     async def update_system(self) -> dict:
         r = await _run_async("pacman", "-Syu", "--noconfirm", timeout=600)
+        if r["returncode"] == 0:
+            self._invalidate_package_cache()
         return {"success": r["returncode"] == 0, "stdout": r["stdout"], "stderr": r["stderr"]}
 
     async def search_packages(self, query: str) -> dict:
-        r = await _run_async("pacman", "-Ss", query, timeout=30)
+        if not _validate_search_query(query):
+            return {"success": False, "results": "invalid search query"}
+        r = await _run_async("pacman", "-Ss", "--", query, timeout=30)
         return {"success": r["returncode"] == 0, "results": r["stdout"]}
 
     async def list_installed(self) -> list[str]:
+        # Installed packages change only when pacman runs. Cache aggressively
+        # so repeated /packages/installed polls don't shell out each time.
+        now = time.monotonic()
+        cached = self._installed_cache
+        if cached is not None and (now - cached[1]) < self._INSTALLED_TTL:
+            return cached[0]
         r = await _run_async("pacman", "-Q", timeout=30)
         if r["returncode"] == 0:
-            return r["stdout"].strip().split("\n")
+            result = r["stdout"].strip().split("\n")
+            self._installed_cache = (result, now)
+            return result
         return []
 
     # --- Update Checking ---
@@ -100,26 +188,45 @@ class SystemController:
     # --- Service Control ---
 
     async def start_service(self, service: str) -> dict:
-        r = await _run_async("systemctl", "start", service, timeout=30)
+        if not _validate_unit_name(service):
+            return {"success": False, "stderr": "invalid service name"}
+        r = await _run_async("systemctl", "start", "--", service, timeout=30)
+        self._services_cache = None  # state changed, drop stale cache
         return {"success": r["returncode"] == 0, "stderr": r["stderr"]}
 
     async def stop_service(self, service: str) -> dict:
-        r = await _run_async("systemctl", "stop", service, timeout=30)
+        if not _validate_unit_name(service):
+            return {"success": False, "stderr": "invalid service name"}
+        r = await _run_async("systemctl", "stop", "--", service, timeout=30)
+        self._services_cache = None
         return {"success": r["returncode"] == 0, "stderr": r["stderr"]}
 
     async def restart_service(self, service: str) -> dict:
-        r = await _run_async("systemctl", "restart", service, timeout=30)
+        if not _validate_unit_name(service):
+            return {"success": False, "stderr": "invalid service name"}
+        r = await _run_async("systemctl", "restart", "--", service, timeout=30)
+        self._services_cache = None
         return {"success": r["returncode"] == 0, "stderr": r["stderr"]}
 
     async def enable_service(self, service: str) -> dict:
-        r = await _run_async("systemctl", "enable", service, timeout=30)
+        if not _validate_unit_name(service):
+            return {"success": False, "stderr": "invalid service name"}
+        r = await _run_async("systemctl", "enable", "--", service, timeout=30)
         return {"success": r["returncode"] == 0, "stderr": r["stderr"]}
 
     async def service_status(self, service: str) -> dict:
-        r = await _run_async("systemctl", "status", service, timeout=10)
+        if not _validate_unit_name(service):
+            return {"active": False, "output": "invalid service name"}
+        r = await _run_async("systemctl", "status", "--", service, timeout=10)
         return {"active": r["returncode"] == 0, "output": r["stdout"]}
 
     async def list_services(self) -> list[dict]:
+        # Cache the systemctl list — dashboards poll this several times per
+        # second, but service state rarely changes that fast.
+        now = time.monotonic()
+        cached = self._services_cache
+        if cached is not None and (now - cached[1]) < self._SERVICES_TTL:
+            return cached[0]
         r = await _run_async(
             "systemctl", "list-units", "--type=service", "--no-pager",
             "--plain", "--no-legend", timeout=10
@@ -135,11 +242,20 @@ class SystemController:
                     "sub": parts[3],
                     "description": parts[4] if len(parts) > 4 else "",
                 })
+        self._services_cache = (services, now)
         return services
 
     # --- Process Management ---
 
     async def list_processes(self) -> list[dict]:
+        # Cache process list. /system/processes is hit several times per
+        # second by some dashboards. Running `ps aux` each time is wasteful:
+        # fork + /proc enumeration + formatting. A 2s TTL is invisible to
+        # humans but dramatically reduces subprocess load.
+        now = time.monotonic()
+        cached = self._proc_list_cache
+        if cached is not None and (now - cached[1]) < self._PROC_LIST_TTL:
+            return cached[0]
         r = await _run_async("ps", "aux", "--no-headers", timeout=10)
         processes = []
         for line in r["stdout"].strip().split("\n"):
@@ -155,9 +271,22 @@ class SystemController:
                     })
                 except (ValueError, IndexError):
                     continue
+        self._proc_list_cache = (processes, now)
         return processes
 
     def kill_process(self, pid: int, sig: int = signal.SIGTERM) -> bool:
+        # Reject protected PIDs (init, kernel), negative PIDs (process groups),
+        # and our own PID so a bad call can't take down the daemon itself.
+        try:
+            pid = int(pid)
+            sig = int(sig)
+        except (TypeError, ValueError):
+            return False
+        if pid in _PROTECTED_PIDS or pid <= 1 or pid == os.getpid():
+            logger.warning("Blocked kill of protected pid %s", pid)
+            return False
+        if sig < 0 or sig > 64:
+            return False
         try:
             os.kill(pid, sig)
             return True
@@ -166,10 +295,25 @@ class SystemController:
 
     async def run_command(self, command: str, timeout: int = 60) -> dict:
         import shlex
+        if not isinstance(command, str) or not command:
+            return {"status": "error", "error": "command must be a non-empty string",
+                    "returncode": -1, "stdout": "", "stderr": ""}
         try:
             args = shlex.split(command)
         except ValueError as e:
-            return {"status": "error", "error": f"Invalid command syntax: {e}", "returncode": -1, "stdout": "", "stderr": ""}
+            return {"status": "error",
+                    "error": f"Invalid command syntax: {e}",
+                    "returncode": -1, "stdout": "", "stderr": ""}
+        if not args:
+            return {"status": "error", "error": "empty command",
+                    "returncode": -1, "stdout": "", "stderr": ""}
+        # Clamp timeout — caller-controlled values shouldn't be able to pin
+        # subprocess slots for hours or produce integer-overflow surprises.
+        try:
+            timeout = int(timeout)
+        except (TypeError, ValueError):
+            timeout = 60
+        timeout = max(1, min(timeout, 3600))
         r = await _run_async(*args, timeout=timeout, shell=False)
         return {"returncode": r["returncode"], "stdout": r["stdout"], "stderr": r["stderr"]}
 
@@ -181,8 +325,8 @@ class SystemController:
 
     def _get_system_info_sync(self) -> dict:
         info = {}
-        info["hostname"] = os.uname().nodename
-        info["kernel"] = os.uname().release
+        info["hostname"] = _HOSTNAME
+        info["kernel"] = _KERNEL
 
         try:
             with open("/proc/uptime", "r") as f:
@@ -207,7 +351,7 @@ class SystemController:
         except OSError:
             info["memory"] = {"total_kb": 0, "available_kb": 0, "free_kb": 0}
 
-        info["cpu_count"] = os.cpu_count() or 1
+        info["cpu_count"] = _CPU_COUNT
 
         try:
             load1, load5, load15 = os.getloadavg()

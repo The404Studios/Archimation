@@ -259,6 +259,11 @@ def create_app(config: dict):
     _ws_clients: set = set()
     _ws_queues: dict = {}  # ws -> asyncio.Queue
     _WS_QUEUE_MAX = 64  # max queued messages per client; oldest dropped when full
+    # Strong references to fire-and-forget broadcast tasks so the GC does not
+    # collect them mid-run. Each task auto-removes itself on completion.
+    _bg_broadcast_tasks: set = set()
+    # Shared aiohttp client session for cortex proxy (lifespan shutdown closes it)
+    _cortex_session_holder: dict = {"session": None, "aiohttp": None}
 
     @asynccontextmanager
     async def lifespan(app):
@@ -316,6 +321,13 @@ def create_app(config: dict):
                 _mouse.close()
             except Exception as e:
                 logger.error("Mouse controller failed to close: %s", e)
+        # Close the shared cortex aiohttp session (opened lazily; may be None).
+        _cx_session = _cortex_session_holder.get("session")
+        if _cx_session is not None and not _cx_session.closed:
+            try:
+                await _cx_session.close()
+            except Exception as e:
+                logger.debug("cortex session close failed: %s", e)
 
     app = FastAPI(
         title="AI Control Daemon",
@@ -617,7 +629,8 @@ def create_app(config: dict):
     @app.get("/screen/capture")
     async def screen_capture():
         sc = _require(_screen, "screen")
-        data = sc.capture_full()
+        # Screen capture runs sync subprocess (scrot/grim) -- offload to thread pool
+        data = await asyncio.get_running_loop().run_in_executor(None, sc.capture_full)
         if data:
             return Response(content=data, media_type="image/png")
         raise HTTPException(status_code=500, detail="Screen capture failed")
@@ -625,7 +638,7 @@ def create_app(config: dict):
     @app.get("/screen/capture/base64")
     async def screen_capture_base64():
         sc = _require(_screen, "screen")
-        b64 = sc.capture_base64()
+        b64 = await asyncio.get_running_loop().run_in_executor(None, sc.capture_base64)
         if b64:
             return {"image": b64}
         raise HTTPException(status_code=500, detail="Screen capture failed")
@@ -633,7 +646,10 @@ def create_app(config: dict):
     @app.post("/screen/capture/region")
     async def screen_capture_region(req: ScreenRegionRequest):
         sc = _require(_screen, "screen")
-        data = sc.capture_region(req.x, req.y, req.width, req.height)
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(
+            None, sc.capture_region, req.x, req.y, req.width, req.height
+        )
         if data:
             return Response(content=data, media_type="image/png")
         raise HTTPException(status_code=500, detail="Region capture failed")
@@ -641,7 +657,7 @@ def create_app(config: dict):
     @app.get("/screen/size")
     async def screen_size():
         sc = _require(_screen, "screen")
-        w, h = sc.get_screen_size()
+        w, h = await asyncio.get_running_loop().run_in_executor(None, sc.get_screen_size)
         return {"width": w, "height": h}
 
     # --- System ---
@@ -800,33 +816,45 @@ def create_app(config: dict):
     @app.post("/filesystem/read")
     async def filesystem_read(req: FileReadRequest):
         fs = _require(_filesystem, "filesystem")
-        return fs.read_file(req.path, req.encoding)
+        # Sync file I/O -- offload to thread pool to avoid blocking event loop
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, fs.read_file, req.path, req.encoding)
 
     @app.post("/filesystem/write")
     async def filesystem_write(req: FileWriteRequest):
         fs = _require(_filesystem, "filesystem")
-        return fs.write_file(req.path, req.content, req.encoding)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, fs.write_file, req.path, req.content, req.encoding
+        )
 
     @app.post("/filesystem/list")
     async def filesystem_list(req: FileListRequest):
         fs = _require(_filesystem, "filesystem")
-        return fs.list_directory(req.path)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, fs.list_directory, req.path)
 
     @app.post("/filesystem/delete")
     async def filesystem_delete(req: FileDeleteRequest):
         fs = _require(_filesystem, "filesystem")
-        return fs.delete_file(req.path)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, fs.delete_file, req.path)
 
     @app.post("/filesystem/mkdir")
     async def filesystem_mkdir(req: FileMkdirRequest):
         fs = _require(_filesystem, "filesystem")
-        return fs.create_directory(req.path)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, fs.create_directory, req.path)
 
     # --- Firewall ---
 
     class FirewallRuleRequest(BaseModel):
         chain: str = "input_filter"
-        rule: str
+        # rule is the raw nft expression. If omitted, the handler builds
+        # a rule from (protocol, port, remote_address, direction). The
+        # old required-string schema made the structured form unreachable
+        # because Pydantic 422'd before the handler could construct it.
+        rule: Optional[str] = None
         direction: str = "inbound"
         protocol: str = "any"
         port: Optional[int] = None
@@ -860,11 +888,22 @@ def create_app(config: dict):
                     try:
                         ipaddress.ip_address(req.remote_address)
                     except ValueError:
-                        return {"status": "error", "error": f"Invalid address: {req.remote_address}"}
+                        # 400 (client sent bad data) — previously returned 200
+                        # with an error body, hiding the failure from naive
+                        # clients that only checked HTTP status.
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Invalid address: {req.remote_address}",
+                        )
                 prefix = "ip saddr" if req.direction == "inbound" else "ip daddr"
                 parts.append(f"{prefix} {req.remote_address}")
             parts.append("accept")
-            rule = " ".join(parts)
+            rule = " ".join(parts).strip()
+            if not rule or rule == "accept":
+                raise HTTPException(
+                    status_code=422,
+                    detail="Provide 'rule' or at least one of protocol/port/remote_address",
+                )
         fw = _require(_firewall, "firewall")
         return await fw.add_rule(req.chain, rule)
 
@@ -987,73 +1026,149 @@ def create_app(config: dict):
         }
 
     # --- Drivers / Kernel Modules ---
+    #
+    # /drivers/loaded was calling `lsmod` via subprocess every request. That
+    # command forks, reads /proc/modules, formats a table, and returns — all
+    # of which we can do ourselves in pure Python without the fork cost.
+    # Plus kernel modules rarely change between requests, so we cache the
+    # parsed result for a few seconds.
+
+    _pe_related_module_names = frozenset({"trust", "pe_compat", "binfmt_misc"})
+    _gpu_module_prefixes = ("nvidia", "amdgpu", "i915", "nouveau")
+    _drivers_cache: dict = {"data": None, "ts": 0.0}
+    _DRIVERS_TTL = 5.0
+
+    def _parse_proc_modules_sync() -> list:
+        modules = []
+        try:
+            with open("/proc/modules", "r") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+                    name = parts[0]
+                    try:
+                        size = int(parts[1])
+                        used_by = int(parts[2])
+                    except (ValueError, IndexError):
+                        continue
+                    modules.append({
+                        "name": name,
+                        "size": size,
+                        "used_by": used_by,
+                        "pe_related": name in _pe_related_module_names,
+                        "gpu": name.startswith(_gpu_module_prefixes),
+                    })
+        except (FileNotFoundError, PermissionError):
+            pass
+        return modules
 
     @app.get("/drivers/loaded")
     async def drivers_loaded():
-        """List loaded kernel modules with PE-relevant ones highlighted."""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "lsmod",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-        except asyncio.TimeoutError:
-            raise HTTPException(status_code=504, detail="lsmod timed out")
-        except FileNotFoundError:
-            raise HTTPException(status_code=503, detail="lsmod not found")
+        """List loaded kernel modules with PE-relevant ones highlighted.
 
-        pe_related_names = {"trust", "pe_compat", "binfmt_misc"}
-        gpu_prefixes = ("nvidia", "amdgpu", "i915", "nouveau")
-        modules = []
-        for line in stdout.decode(errors="replace").split("\n")[1:]:
-            parts = line.split()
-            if len(parts) >= 3:
-                name = parts[0]
-                try:
-                    size = int(parts[1])
-                    used_by = int(parts[2])
-                except (ValueError, IndexError):
-                    continue
-                modules.append({
-                    "name": name,
-                    "size": size,
-                    "used_by": used_by,
-                    "pe_related": name in pe_related_names,
-                    "gpu": name.startswith(gpu_prefixes),
-                })
-        return {"status": "ok", "modules": modules, "count": len(modules)}
+        Reads /proc/modules directly (no subprocess) and caches the result
+        for _DRIVERS_TTL seconds. Modules load/unload rarely, so a ~5s TTL
+        is invisible to callers.
+        """
+        now = time.monotonic()
+        cached = _drivers_cache["data"]
+        if cached is not None and (now - _drivers_cache["ts"]) < _DRIVERS_TTL:
+            return cached
+        modules = await asyncio.get_running_loop().run_in_executor(
+            None, _parse_proc_modules_sync)
+        if not modules:
+            # /proc/modules absent (extremely unusual) — fall back to lsmod.
+            proc = None
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "lsmod",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            except asyncio.TimeoutError:
+                if proc is not None:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except (ProcessLookupError, OSError):
+                        pass
+                raise HTTPException(status_code=504, detail="lsmod timed out")
+            except FileNotFoundError:
+                raise HTTPException(status_code=503, detail="lsmod not found")
+            for line in stdout.decode(errors="replace").split("\n")[1:]:
+                parts = line.split()
+                if len(parts) >= 3:
+                    name = parts[0]
+                    try:
+                        size = int(parts[1])
+                        used_by = int(parts[2])
+                    except (ValueError, IndexError):
+                        continue
+                    modules.append({
+                        "name": name,
+                        "size": size,
+                        "used_by": used_by,
+                        "pe_related": name in _pe_related_module_names,
+                        "gpu": name.startswith(_gpu_module_prefixes),
+                    })
+        result = {"status": "ok", "modules": modules, "count": len(modules)}
+        _drivers_cache["data"] = result
+        _drivers_cache["ts"] = now
+        return result
 
     # --- Hardware Summary ---
+    #
+    # CPU/GPU/storage topology is effectively immutable for the daemon's
+    # lifetime. Memory pressure changes, so we update /proc/meminfo every
+    # call but cache the subprocess-heavy bits (lscpu/lspci/lsblk, ~3 forks,
+    # ~50-200 ms total on slow hardware).
+    _hw_cache: dict = {"static": None, "ts": 0.0}
+    _HW_STATIC_TTL = 60.0  # lscpu/lspci/lsblk refresh every 60s
 
     @app.get("/hardware/summary")
     async def hardware_summary():
         """System hardware summary -- GPU, CPU, memory, storage."""
-        result: dict = {}
+        now = time.monotonic()
+        cached_static = _hw_cache["static"]
+        use_cache = (cached_static is not None
+                     and (now - _hw_cache["ts"]) < _HW_STATIC_TTL)
+        result: dict = dict(cached_static) if use_cache else {}
 
-        # CPU info via lscpu
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "lscpu",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            cpu_info = {}
-            for line in stdout.decode(errors="replace").split("\n"):
-                if ":" in line:
-                    key, val = line.split(":", 1)
-                    cpu_info[key.strip()] = val.strip()
-            result["cpu"] = {
-                "model": cpu_info.get("Model name", "unknown"),
-                "architecture": cpu_info.get("Architecture", "unknown"),
-                "cores": cpu_info.get("CPU(s)", "unknown"),
-                "threads_per_core": cpu_info.get("Thread(s) per core", "unknown"),
-                "max_mhz": cpu_info.get("CPU max MHz", "unknown"),
-                "min_mhz": cpu_info.get("CPU min MHz", "unknown"),
-            }
-        except (asyncio.TimeoutError, FileNotFoundError):
-            result["cpu"] = {"error": "lscpu unavailable"}
+        # CPU info via lscpu (cached, topology is immutable)
+        if not use_cache:
+            proc_cpu = None
+            try:
+                proc_cpu = await asyncio.create_subprocess_exec(
+                    "lscpu",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc_cpu.communicate(), timeout=10)
+                cpu_info = {}
+                for line in stdout.decode(errors="replace").split("\n"):
+                    if ":" in line:
+                        key, val = line.split(":", 1)
+                        cpu_info[key.strip()] = val.strip()
+                result["cpu"] = {
+                    "model": cpu_info.get("Model name", "unknown"),
+                    "architecture": cpu_info.get("Architecture", "unknown"),
+                    "cores": cpu_info.get("CPU(s)", "unknown"),
+                    "threads_per_core": cpu_info.get("Thread(s) per core", "unknown"),
+                    "max_mhz": cpu_info.get("CPU max MHz", "unknown"),
+                    "min_mhz": cpu_info.get("CPU min MHz", "unknown"),
+                }
+            except asyncio.TimeoutError:
+                if proc_cpu is not None:
+                    try:
+                        proc_cpu.kill()
+                        await proc_cpu.wait()
+                    except (ProcessLookupError, OSError):
+                        pass
+                result["cpu"] = {"error": "lscpu unavailable"}
+            except FileNotFoundError:
+                result["cpu"] = {"error": "lscpu unavailable"}
 
         # Memory via /proc/meminfo (fast, no subprocess needed)
         try:
@@ -1079,38 +1194,65 @@ def create_app(config: dict):
         except OSError:
             result["memory"] = {"error": "meminfo unavailable"}
 
-        # GPU via lspci
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "lspci", "-nn",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            gpus = []
-            for line in stdout.decode(errors="replace").split("\n"):
-                lower = line.lower()
-                if "vga" in lower or "3d controller" in lower or "display" in lower:
-                    gpus.append(line.strip())
-            result["gpu"] = gpus if gpus else ["No GPU detected"]
-        except (asyncio.TimeoutError, FileNotFoundError):
-            result["gpu"] = ["lspci unavailable"]
-
-        # Storage via lsblk
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "lsblk", "-J", "-o", "NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        # GPU via lspci (cached; PCI topology is immutable)
+        if not use_cache:
+            proc_gpu = None
             try:
-                storage_data = json.loads(stdout.decode(errors="replace"))
-                result["storage"] = storage_data.get("blockdevices", [])
-            except json.JSONDecodeError:
-                result["storage"] = {"error": "failed to parse lsblk output"}
-        except (asyncio.TimeoutError, FileNotFoundError):
-            result["storage"] = {"error": "lsblk unavailable"}
+                proc_gpu = await asyncio.create_subprocess_exec(
+                    "lspci", "-nn",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc_gpu.communicate(), timeout=10)
+                gpus = []
+                for line in stdout.decode(errors="replace").split("\n"):
+                    lower = line.lower()
+                    if "vga" in lower or "3d controller" in lower or "display" in lower:
+                        gpus.append(line.strip())
+                result["gpu"] = gpus if gpus else ["No GPU detected"]
+            except asyncio.TimeoutError:
+                if proc_gpu is not None:
+                    try:
+                        proc_gpu.kill()
+                        await proc_gpu.wait()
+                    except (ProcessLookupError, OSError):
+                        pass
+                result["gpu"] = ["lspci unavailable"]
+            except FileNotFoundError:
+                result["gpu"] = ["lspci unavailable"]
+
+        # Storage via lsblk (cached; partition table changes rarely)
+        if not use_cache:
+            proc_stor = None
+            try:
+                proc_stor = await asyncio.create_subprocess_exec(
+                    "lsblk", "-J", "-o", "NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc_stor.communicate(), timeout=10)
+                try:
+                    storage_data = json.loads(stdout.decode(errors="replace"))
+                    result["storage"] = storage_data.get("blockdevices", [])
+                except json.JSONDecodeError:
+                    result["storage"] = {"error": "failed to parse lsblk output"}
+            except asyncio.TimeoutError:
+                if proc_stor is not None:
+                    try:
+                        proc_stor.kill()
+                        await proc_stor.wait()
+                    except (ProcessLookupError, OSError):
+                        pass
+                result["storage"] = {"error": "lsblk unavailable"}
+            except FileNotFoundError:
+                result["storage"] = {"error": "lsblk unavailable"}
+
+            # Freeze the static parts (cpu/gpu/storage) into the cache so the
+            # next request only pays for the fast /proc/meminfo read.
+            _hw_cache["static"] = {
+                k: result[k] for k in ("cpu", "gpu", "storage") if k in result
+            }
+            _hw_cache["ts"] = now
 
         return {"status": "ok", "hardware": result}
 
@@ -1181,6 +1323,13 @@ def create_app(config: dict):
 
     @app.get("/audit/recent")
     async def audit_recent(count: int = 50):
+        # Clamp count to sane bounds. Negative/zero values used to hit
+        # _audit.get_recent(count) which returns list[-N:] (i.e. tail N
+        # with negative index wrap) — silently returning the wrong slice.
+        if count <= 0:
+            count = 50
+        if count > 1000:
+            count = 1000
         if _audit:
             return _audit.get_recent(count)
         return []
@@ -1375,19 +1524,29 @@ def create_app(config: dict):
     @app.get("/ai/status")
     async def ai_status():
         llm = _require(_llm, "llm")
-        return llm.get_status()
+        # get_status() does sync os.listdir on model dir -- offload
+        return await asyncio.get_running_loop().run_in_executor(None, llm.get_status)
 
     @app.get("/ai/models")
     async def ai_models():
         llm = _require(_llm, "llm")
-        return llm.list_models()
+        return await asyncio.get_running_loop().run_in_executor(None, llm.list_models)
 
     @app.post("/ai/load")
     async def ai_load(body: dict):
         llm = _require(_llm, "llm")
         model_path = body.get("model_path", "")
+        if not model_path or not isinstance(model_path, str):
+            raise HTTPException(
+                status_code=422,
+                detail="model_path is required (path to a .gguf file)",
+            )
         n_ctx = body.get("n_ctx", 2048)
         n_gpu_layers = body.get("n_gpu_layers", -1)
+        if not isinstance(n_ctx, int) or n_ctx <= 0:
+            raise HTTPException(status_code=422, detail="n_ctx must be a positive integer")
+        if not isinstance(n_gpu_layers, int):
+            raise HTTPException(status_code=422, detail="n_gpu_layers must be an integer")
         return await llm.load_model(model_path, n_ctx, n_gpu_layers)
 
     @app.post("/ai/unload")
@@ -1399,9 +1558,15 @@ def create_app(config: dict):
     async def ai_query(body: dict):
         llm = _require(_llm, "llm")
         prompt = body.get("prompt", "")
+        if not prompt or not isinstance(prompt, str):
+            raise HTTPException(status_code=422, detail="prompt is required")
         max_tokens = body.get("max_tokens", 512)
         temperature = body.get("temperature", 0.7)
         stop = body.get("stop", None)
+        if not isinstance(max_tokens, int) or max_tokens <= 0:
+            raise HTTPException(status_code=422, detail="max_tokens must be a positive integer")
+        if not isinstance(temperature, (int, float)) or temperature < 0:
+            raise HTTPException(status_code=422, detail="temperature must be a non-negative number")
         return await llm.query(prompt, max_tokens, temperature, stop)
 
     # ---- Compositor endpoints ----
@@ -1409,17 +1574,19 @@ def create_app(config: dict):
     @app.get("/compositor/info")
     async def compositor_info():
         comp = _require(_compositor, "compositor")
+        # get_info() is pure env reads -- cheap, no I/O
         return comp.get_info()
 
     @app.get("/compositor/windows")
     async def compositor_windows():
         comp = _require(_compositor, "compositor")
-        return comp.get_windows()
+        # Sync subprocess call -- offload to thread pool to avoid blocking event loop
+        return await asyncio.get_running_loop().run_in_executor(None, comp.get_windows)
 
     @app.get("/compositor/active")
     async def compositor_active():
         comp = _require(_compositor, "compositor")
-        result = comp.get_active_window()
+        result = await asyncio.get_running_loop().run_in_executor(None, comp.get_active_window)
         if result is None:
             return {"error": "no active window", "title": None}
         return result
@@ -1427,30 +1594,46 @@ def create_app(config: dict):
     @app.post("/compositor/focus")
     async def compositor_focus(body: dict):
         comp = _require(_compositor, "compositor")
-        return {"success": comp.focus_window(body.get("id", ""))}
+        wid = body.get("id", "")
+        if not wid or not isinstance(wid, str):
+            raise HTTPException(status_code=422, detail="Field 'id' (window identifier) is required")
+        ok = await asyncio.get_running_loop().run_in_executor(None, comp.focus_window, wid)
+        return {"success": ok}
 
     @app.post("/compositor/close")
     async def compositor_close(body: dict):
         comp = _require(_compositor, "compositor")
-        return {"success": comp.close_window(body.get("id", ""))}
+        wid = body.get("id", "")
+        if not wid or not isinstance(wid, str):
+            raise HTTPException(status_code=422, detail="Field 'id' (window identifier) is required")
+        ok = await asyncio.get_running_loop().run_in_executor(None, comp.close_window, wid)
+        return {"success": ok}
 
     @app.post("/compositor/layout")
     async def compositor_layout(body: dict):
         comp = _require(_compositor, "compositor")
-        return comp.set_layout(body.get("layout", "productivity"))
+        layout = body.get("layout", "productivity")
+        return await asyncio.get_running_loop().run_in_executor(None, comp.set_layout, layout)
 
     @app.get("/compositor/workspaces")
     async def compositor_workspaces():
         comp = _require(_compositor, "compositor")
-        return comp.get_workspaces()
+        return await asyncio.get_running_loop().run_in_executor(None, comp.get_workspaces)
 
     # --- Auth token management ---
 
     class TokenRequest(BaseModel):
         subject_id: int
         name: str
-        trust_level: int = 1
-        ttl: int = 3600
+        # Trust levels in this system fit comfortably under 1000
+        # (root-of-authority bands: 100/200/400/600/800). Cap at 1000
+        # to prevent a compromised 600-level remote admin from issuing
+        # an unbounded super-admin token.
+        trust_level: int = Field(default=1, ge=0, le=1000)
+        # Cap TTL at 30 days. Long-lived tokens defeat the revocation
+        # model — the daemon keeps the revocation list in memory and
+        # operators rotate it.
+        ttl: int = Field(default=3600, ge=1, le=86400 * 30)
 
     from fastapi import Request as _FastAPIRequest
 
@@ -1483,12 +1666,22 @@ def create_app(config: dict):
 
     @app.post("/auth/revoke")
     async def auth_revoke(req: RevokeRequest):
-        """Revoke an auth token by verifying it and adding its jti to the revocation list."""
+        """Revoke an auth token by verifying it and adding its jti to the revocation list.
+
+        Returns ``revoked=True`` if the token was valid and its ``jti`` was
+        placed on the revocation list. ``revoked=False`` means the caller
+        submitted an invalid / expired / already-revoked token, or the
+        token had no ``jti``. Clients relying on revocation MUST check
+        ``revoked`` — a blanket ``status=ok`` previously hid silent
+        failures where a typoed token looked successfully revoked.
+        """
         from auth import verify_token, revoke_token
         identity = verify_token(req.token)
         if identity and identity.jti:
             revoke_token(identity.jti)
-        return {"status": "ok"}
+            return {"status": "ok", "revoked": True, "jti": identity.jti}
+        return {"status": "ok", "revoked": False,
+                "reason": "invalid_or_expired_token"}
 
     @app.post("/auth/refresh")
     async def auth_refresh(request: _FastAPIRequest):
@@ -1546,14 +1739,20 @@ def create_app(config: dict):
             running_loop = None
 
         if running_loop is not None:
-            # Called from the event loop thread -- schedule directly
+            # Called from the event loop thread -- schedule directly.
+            # Hold a strong reference to the task until it finishes so the
+            # GC cannot collect it mid-run.
             _main_loop = running_loop
-            asyncio.ensure_future(_enqueue_all(msg))
+            t = asyncio.ensure_future(_enqueue_all(msg))
+            _bg_broadcast_tasks.add(t)
+            t.add_done_callback(_bg_broadcast_tasks.discard)
         elif _main_loop is not None and _main_loop.is_running():
             # Called from a background thread -- use thread-safe scheduling
-            _main_loop.call_soon_threadsafe(
-                lambda t=msg: asyncio.ensure_future(_enqueue_all(t))
-            )
+            def _schedule(text=msg):
+                t2 = asyncio.ensure_future(_enqueue_all(text))
+                _bg_broadcast_tasks.add(t2)
+                t2.add_done_callback(_bg_broadcast_tasks.discard)
+            _main_loop.call_soon_threadsafe(_schedule)
 
     if _trust_observer:
         _trust_observer.add_event_callback(_broadcast_trust_event)
@@ -1689,48 +1888,66 @@ def create_app(config: dict):
         return auto.get_history(count)
 
     # --- Cortex integration: proxy status from cortex (port 8421) ---
+    #
+    # Reuse a single aiohttp.ClientSession across cortex proxy calls. Creating
+    # a new session per call (old behavior) did a full connection-pool setup,
+    # SSL ctx probe, and TCP handshake every time — ~5 ms on each hit, on top
+    # of the actual cortex request. A shared session is ~20× faster for the
+    # /dashboard fanout which issues 3 cortex calls back-to-back.
+    # (_cortex_session_holder is declared near the top of create_app so the
+    # lifespan shutdown hook can close it.)
+    _cortex_session_lock = asyncio.Lock()
+
+    async def _get_cortex_session():
+        """Return a shared aiohttp.ClientSession, creating it lazily."""
+        async with _cortex_session_lock:
+            session = _cortex_session_holder["session"]
+            if session is not None and not session.closed:
+                return session, _cortex_session_holder["aiohttp"]
+            try:
+                import aiohttp
+            except ImportError:
+                return None, None
+            # Short-TTL keepalive connector so stale cortex restarts don't
+            # wedge this pool forever.
+            connector = aiohttp.TCPConnector(limit=4, ttl_dns_cache=30, enable_cleanup_closed=True)
+            session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=2),
+            )
+            _cortex_session_holder["session"] = session
+            _cortex_session_holder["aiohttp"] = aiohttp
+            return session, aiohttp
+
+    async def _cortex_get(path: str, default: dict) -> dict:
+        session, _ah = await _get_cortex_session()
+        if session is None:
+            return {**default, "error": "aiohttp not installed"}
+        try:
+            async with session.get(f"http://127.0.0.1:8421{path}") as resp:
+                return await resp.json()
+        except (asyncio.TimeoutError, OSError):
+            return default
+        except Exception:
+            return default
 
     @app.get("/cortex/status")
     async def cortex_status():
         """Proxy cortex status from its REST API on port 8421."""
-        try:
-            import aiohttp
-        except ImportError:
-            return {"status": "unavailable", "error": "aiohttp not installed"}
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("http://127.0.0.1:8421/status", timeout=aiohttp.ClientTimeout(total=2)) as resp:
-                    return await resp.json()
-        except Exception:
-            return {"status": "unavailable", "error": "cortex not reachable on port 8421"}
+        return await _cortex_get("/status",
+                                 {"status": "unavailable",
+                                  "error": "cortex not reachable on port 8421"})
 
     @app.get("/cortex/autonomy")
     async def cortex_autonomy():
         """Proxy cortex autonomy level."""
-        try:
-            import aiohttp
-        except ImportError:
-            return {"status": "unavailable", "error": "aiohttp not installed"}
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("http://127.0.0.1:8421/autonomy", timeout=aiohttp.ClientTimeout(total=2)) as resp:
-                    return await resp.json()
-        except Exception:
-            return {"status": "unavailable"}
+        return await _cortex_get("/autonomy", {"status": "unavailable"})
 
     @app.get("/cortex/decisions")
     async def cortex_decisions():
         """Proxy pending cortex decisions."""
-        try:
-            import aiohttp
-        except ImportError:
-            return {"decisions": [], "status": "unavailable", "error": "aiohttp not installed"}
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("http://127.0.0.1:8421/decisions/pending", timeout=aiohttp.ClientTimeout(total=2)) as resp:
-                    return await resp.json()
-        except Exception:
-            return {"decisions": [], "status": "unavailable"}
+        return await _cortex_get("/decisions/pending",
+                                 {"decisions": [], "status": "unavailable"})
 
     # --- AI Assistant Automation Endpoints (/auto/*) ---
 
@@ -2023,7 +2240,20 @@ def create_app(config: dict):
         command: str
 
     class ContusionContextRequest(BaseModel):
-        request: str
+        # Accept any of these field names from clients. The GTK Contusion
+        # app sends "prompt", the `ai automate` shell sends "description",
+        # and the canonical API is "request". Without multi-alias handling
+        # Pydantic returns 422 and the UI silently fails with "does not open".
+        request: Optional[str] = None
+        prompt: Optional[str] = None
+        description: Optional[str] = None
+
+        def resolve(self) -> str:
+            return self.request or self.prompt or self.description or ""
+
+    class ContusionLaunchRequest(BaseModel):
+        app: str
+        args: Optional[list[str]] = None
 
     @app.post("/contusion/run")
     async def contusion_run(req: ContusionRunRequest):
@@ -2109,13 +2339,76 @@ def create_app(config: dict):
         needs_confirmation=True without executing.
         """
         cn = _require(_contusion, "contusion")
+        instruction = req.resolve()
+        if not instruction:
+            raise HTTPException(
+                status_code=422,
+                detail="Missing instruction (field 'request', 'prompt', or 'description')",
+            )
         try:
-            result = await cn.route(req.request, caller_trust=400)
-            _audit_contusion("context", req.request[:120], result.get("success", False))
+            result = await cn.route(instruction, caller_trust=400)
+            _audit_contusion("context", instruction[:120], result.get("success", False))
             return {"status": "ok", "result": result}
         except Exception as e:
             _audit_contusion("context", f"failed: {e}", False)
             raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/contusion/execute")
+    async def contusion_execute(req: ContusionContextRequest):
+        """Alias for /contusion/context. The `ai automate` shell helper
+        calls this path after a preview round-trip."""
+        return await contusion_context(req)
+
+    @app.post("/contusion/launch")
+    async def contusion_launch(req: ContusionLaunchRequest):
+        """Launch an app from the Contusion app library by name.
+
+        Used by `ai launch <app>` and the right-click menu. Without this
+        endpoint the shell falls back to a blind gtk-launch which usually
+        fails inside QEMU/headless sessions.
+        """
+        cn = _require(_contusion, "contusion")
+        try:
+            result = await cn.launch_app(req.app, req.args)
+            _audit_contusion("launch", req.app, result.get("success", False))
+            return {"status": "ok", "result": result}
+        except Exception as e:
+            _audit_contusion("launch", f"{req.app} failed: {e}", False)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/contusion")
+    async def contusion_root():
+        """Root Contusion status endpoint.
+
+        The desktop right-click menu uses `xdg-open http://127.0.0.1:8420/contusion`;
+        without this route the browser would 404 and users would think
+        "contusion does not open".
+        """
+        if _contusion is None:
+            return {"status": "unavailable",
+                    "error": "Contusion engine failed to initialize",
+                    "hint": "Check /var/log/ai-control-daemon.log"}
+        try:
+            stats = _contusion.get_dictionary_stats()
+            apps = len(_contusion.get_app_library())
+            macros = len(_contusion.list_macros())
+        except Exception as e:
+            stats, apps, macros = {"error": str(e)}, -1, -1
+        return {
+            "status": "ok",
+            "engine": "contusion",
+            "apps": apps,
+            "macros": macros,
+            "dictionary": stats,
+            "endpoints": [
+                "/contusion/context", "/contusion/execute", "/contusion/launch",
+                "/contusion/run", "/contusion/pipeline", "/contusion/apps",
+                "/contusion/processes", "/contusion/macro/record",
+                "/contusion/macro/stop", "/contusion/macro/play",
+                "/contusion/macro/list", "/contusion/workflows",
+                "/contusion/dictionary/search", "/contusion/dictionary/stats",
+            ],
+        }
 
     @app.post("/contusion/confirm")
     async def contusion_confirm(req: ContusionConfirmRequest):
@@ -2291,27 +2584,45 @@ def create_app(config: dict):
     async def trust_history_list(limit: int = 50):
         """List trust history records for all PE executables."""
         history_dir = "/var/lib/pe-compat/trust-history"
-        records = []
-        for f in sorted(
-            glob.glob(os.path.join(history_dir, "*.json")),
-            key=os.path.getmtime,
-            reverse=True,
-        )[:limit]:
-            try:
-                with open(f) as fh:
-                    records.append(json.load(fh))
-            except (json.JSONDecodeError, OSError):
-                continue
+
+        def _load_records():
+            out = []
+            for f in sorted(
+                glob.glob(os.path.join(history_dir, "*.json")),
+                key=os.path.getmtime,
+                reverse=True,
+            )[:limit]:
+                try:
+                    with open(f) as fh:
+                        out.append(json.load(fh))
+                except (json.JSONDecodeError, OSError):
+                    continue
+            return out
+
+        records = await asyncio.get_running_loop().run_in_executor(None, _load_records)
         return {"status": "ok", "records": records}
 
     @app.get("/trust-history/{path_hash}")
     async def trust_history_detail(path_hash: str):
         """Get detailed trust history for a specific executable."""
+        # Sanitize path_hash to prevent directory traversal: allow only
+        # hex / alnum / dash / underscore. A path_hash is produced from
+        # sha256/xxhash digests, so real values never contain '/'. '.', etc.
+        import re
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", path_hash):
+            raise HTTPException(status_code=400, detail="Invalid path_hash")
         history_file = f"/var/lib/pe-compat/trust-history/{path_hash}.json"
         if not os.path.exists(history_file):
             raise HTTPException(status_code=404, detail="Record not found")
-        with open(history_file) as f:
-            return {"status": "ok", "record": json.load(f)}
+
+        def _load():
+            with open(history_file) as f:
+                return json.load(f)
+        try:
+            record = await asyncio.get_running_loop().run_in_executor(None, _load)
+        except (json.JSONDecodeError, OSError) as e:
+            raise HTTPException(status_code=500, detail=f"Failed to read trust history: {e}")
+        return {"status": "ok", "record": record}
 
     # --- Dashboard ---
 
@@ -2453,7 +2764,7 @@ def create_app(config: dict):
     async def scanner_scan(pid: int):
         """Scan a specific process's memory for all known patterns."""
         sc = _require(_scanner, "scanner")
-        matches = await asyncio.get_event_loop().run_in_executor(
+        matches = await asyncio.get_running_loop().run_in_executor(
             None, sc.scan_process, pid
         )
         return {
@@ -2477,7 +2788,7 @@ def create_app(config: dict):
     async def scanner_analyze(pid: int):
         """High-level behavioral analysis of a PE process."""
         sc = _require(_scanner, "scanner")
-        analysis = await asyncio.get_event_loop().run_in_executor(
+        analysis = await asyncio.get_running_loop().run_in_executor(
             None, sc.analyze_process, pid
         )
         return {"status": "ok", "analysis": analysis}
@@ -2638,6 +2949,10 @@ def create_app(config: dict):
     class MemoryScanRequest(BaseModel):
         pattern_hex: str  # hex-encoded byte pattern, e.g. "4d5a9000"
         max_results: int = 100
+        # Optional: pid can also be supplied in the request body. This is
+        # a convenience override — callers may still pass ?pid=NNN as a
+        # query parameter (backwards compatibility with older clients).
+        pid: Optional[int] = None
 
     @app.get("/memory/processes")
     async def memory_processes():
@@ -2700,9 +3015,21 @@ def create_app(config: dict):
         return {"status": "ok", **result}
 
     @app.post("/memory/scan")
-    async def memory_scan(req: MemoryScanRequest, pid: int):
-        """Scan a process's memory for a byte pattern."""
+    async def memory_scan(req: MemoryScanRequest, pid: Optional[int] = None):
+        """Scan a process's memory for a byte pattern.
+
+        ``pid`` may be supplied either in the request body or as a query
+        parameter (``?pid=1234``). The body field takes precedence when
+        both are provided. Omitting both returns a 422.
+        """
         mo = _require(_memory_observer, "memory_observer")
+        # Prefer body.pid (explicit) over query-string pid (legacy).
+        target_pid = req.pid if req.pid is not None else pid
+        if target_pid is None:
+            raise HTTPException(
+                status_code=422,
+                detail="pid is required (body field 'pid' or query param ?pid=...)",
+            )
         try:
             pattern = bytes.fromhex(req.pattern_hex)
         except ValueError:
@@ -2715,13 +3042,18 @@ def create_app(config: dict):
                 status_code=400,
                 detail="Pattern must be at least 2 bytes",
             )
-        matches = await mo.search_pattern(pid, pattern)
+        if req.max_results <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="max_results must be positive",
+            )
+        matches = await mo.search_pattern(target_pid, pattern)
         # Respect max_results cap
         truncated = len(matches) > req.max_results
         matches = matches[:req.max_results]
         return {
             "status": "ok",
-            "pid": pid,
+            "pid": target_pid,
             "pattern_hex": req.pattern_hex,
             "matches": matches,
             "count": len(matches),
@@ -2982,7 +3314,7 @@ def create_app(config: dict):
         """
         db = _require(_binary_signatures, "binary_signatures")
         exe_path = "/" + path if not path.startswith("/") else path
-        profile = await asyncio.get_event_loop().run_in_executor(
+        profile = await asyncio.get_running_loop().run_in_executor(
             None, db.identify, exe_path
         )
         if profile is None:
@@ -3098,7 +3430,7 @@ def create_app(config: dict):
         }
 
     @app.get("/api-db/unimplemented")
-    async def api_db_unimplemented(dll: str = None):
+    async def api_db_unimplemented(dll: Optional[str] = None):
         """List unimplemented Windows APIs, optionally filtered by DLL."""
         db = _require(_win_api_db, "win_api_db")
         results = db.get_unimplemented(dll)
@@ -3503,7 +3835,7 @@ def create_app(config: dict):
         # Pattern scanner: byte-pattern matches
         if _scanner:
             try:
-                matches = await asyncio.get_event_loop().run_in_executor(
+                matches = await asyncio.get_running_loop().run_in_executor(
                     None, _scanner.scan_process, pid
                 )
                 results["patterns"] = {
@@ -3534,7 +3866,7 @@ def create_app(config: dict):
         if _binary_signatures:
             try:
                 exe_path = f"/proc/{pid}/exe"
-                profile = await asyncio.get_event_loop().run_in_executor(
+                profile = await asyncio.get_running_loop().run_in_executor(
                     None, _binary_signatures.identify, exe_path
                 )
                 results["signature"] = profile.to_dict() if profile else None
@@ -3586,13 +3918,35 @@ def create_app(config: dict):
 
 
 async def start_server(app, host: str, port: int):
-    """Start the uvicorn server."""
+    """Start the uvicorn server.
+
+    access_log is intentionally disabled: every request already gets audit-
+    logged (see audit.py) with full caller identity, path, and status. The
+    uvicorn access log was a redundant second write + format pass per
+    request — ~5-10% of CPU on tiny endpoints like /health under load.
+    Pick httptools + uvloop where available for additional throughput.
+    """
     import uvicorn
 
-    config = uvicorn.Config(
-        app, host=host, port=port,
-        log_level="info",
-        access_log=True,
-    )
+    kwargs = {
+        "app": app,
+        "host": host,
+        "port": port,
+        "log_level": "info",
+        "access_log": False,
+    }
+    # Prefer uvloop/httptools when installed; Uvicorn silently falls back
+    # on systems that don't have them (e.g. headless QEMU smoke tests).
+    try:
+        import uvloop  # noqa: F401
+        kwargs["loop"] = "uvloop"
+    except ImportError:
+        pass
+    try:
+        import httptools  # noqa: F401
+        kwargs["http"] = "httptools"
+    except ImportError:
+        pass
+    config = uvicorn.Config(**kwargs)
     server = uvicorn.Server(config)
     await server.serve()

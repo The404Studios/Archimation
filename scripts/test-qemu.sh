@@ -8,11 +8,17 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cleanup() {
     if [ -n "${QEMU_PID:-}" ]; then
         kill "$QEMU_PID" 2>/dev/null || true
-        sleep 1
+        # Give QEMU up to 5s to exit gracefully before SIGKILL — prevents
+        # orphan QEMU processes holding port 2222/8421 on test failure.
+        for _ in 1 2 3 4 5; do
+            kill -0 "$QEMU_PID" 2>/dev/null || break
+            sleep 1
+        done
         kill -9 "$QEMU_PID" 2>/dev/null || true
+        wait "$QEMU_PID" 2>/dev/null || true
     fi
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 # build-iso.sh outputs to $PROJECT_DIR/output/ — use that as the canonical ISO location.
 # Override by setting ISO_DIR env var before running this script.
 ISO_DIR="${ISO_DIR:-${PROJECT_DIR}/output}"
@@ -28,9 +34,15 @@ fi
 echo "ISO: ${ISO_FILE}"
 echo "Size: $(du -h "$ISO_FILE" | cut -f1)"
 
-# Kill stale QEMU
-pkill -9 qemu-system 2>/dev/null || true
-sleep 1
+# Kill stale QEMU (no sleep — wait for actual termination instead)
+if pgrep -x qemu-system-x86_64 >/dev/null 2>&1; then
+    pkill -9 qemu-system 2>/dev/null || true
+    # Wait up to 3s for port to be released; skip sleep if it's already free
+    for _ in 1 2 3; do
+        pgrep -x qemu-system-x86_64 >/dev/null 2>&1 || break
+        sleep 1
+    done
+fi
 
 # Clean up
 rm -rf "$EXTRACT_DIR"
@@ -97,14 +109,20 @@ nohup qemu-system-x86_64 \
 
 QEMU_PID=$!
 echo "QEMU PID: $QEMU_PID"
-sleep 2
 
-# Check if QEMU is still running
-if ! kill -0 $QEMU_PID 2>/dev/null; then
-    echo "ERROR: QEMU died immediately"
-    cat /tmp/qemu-stdout.log
-    exit 1
-fi
+# Poll for QEMU aliveness instead of fixed 2s sleep. Most launches fail
+# in the first ~200 ms (bad kernel args, missing files); we can detect that
+# much faster by polling at 100 ms intervals for up to 2s.
+for _ in $(seq 1 20); do
+    if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+        echo "ERROR: QEMU died immediately"
+        cat /tmp/qemu-stdout.log 2>/dev/null
+        exit 1
+    fi
+    # Any serial output means QEMU is actually booting
+    [ -s "$SERIAL_LOG" ] && break
+    sleep 0.1
+done
 
 # Wait for the system to boot
 echo ""
@@ -151,14 +169,25 @@ while true; do
     printf "\r  Waiting... %ds" "$ELAPSED"
 done
 
-# In TCG (software emulation) sshd Type=notify-reload can take 60-90s to fully bind.
-# KVM needs ~15s; TCG needs ~90s. Use the same timeout variable we set earlier.
-STABILIZE_WAIT=15
-if [ -z "$KVM_FLAG" ]; then
-    STABILIZE_WAIT=90
-fi
-echo "Waiting ${STABILIZE_WAIT}s for services to stabilize (TCG is slow)..."
-sleep "$STABILIZE_WAIT"
+# Wait for sshd to actually bind port 2222 instead of sleeping a fixed time.
+# KVM: port usually up in <15s. TCG: often 30-60s but can be 90s.
+# Polling saves 30-70s on fast setups — huge win for CI.
+STABILIZE_MAX=15
+[ -z "$KVM_FLAG" ] && STABILIZE_MAX=120  # TCG: bigger envelope but still polls
+echo "Polling for sshd readiness (max ${STABILIZE_MAX}s)..."
+STABILIZE_T0=$(date +%s)
+while : ; do
+    ELAPSED=$(( $(date +%s) - STABILIZE_T0 ))
+    if [ "$ELAPSED" -ge "$STABILIZE_MAX" ]; then
+        echo "  sshd stabilization timeout — proceeding with tests anyway"
+        break
+    fi
+    if timeout 2 bash -c "echo > /dev/tcp/127.0.0.1/2222" 2>/dev/null; then
+        echo "  sshd accepting connections after ${ELAPSED}s"
+        break
+    fi
+    sleep 1
+done
 
 # === Smoke Tests ===
 echo ""

@@ -38,8 +38,13 @@ WINAPI_EXPORT LARGE_INTEGER KeQueryPerformanceCounter(
 
 WINAPI_EXPORT void KeStallExecutionProcessor(ULONG MicroSeconds)
 {
-    if (MicroSeconds > 0)
-        usleep(MicroSeconds);
+    /* usleep rejects values >= 1000000; chunk the sleep */
+    ULONG remaining = MicroSeconds;
+    while (remaining > 0) {
+        ULONG chunk = remaining > 999999U ? 999999U : remaining;
+        usleep(chunk);
+        remaining -= chunk;
+    }
 }
 
 /* ===== Fast spinlock (Kf* variants) ===== */

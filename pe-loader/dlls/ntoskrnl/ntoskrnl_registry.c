@@ -63,9 +63,12 @@ WINAPI_EXPORT NTSTATUS ZwOpenKey(
     (void)null_str;
 
     /* Return a dummy handle */
-    *KeyHandle = handle_alloc(HANDLE_TYPE_REGISTRY_KEY, -1, NULL);
-    if (!*KeyHandle)
+    HANDLE h = handle_alloc(HANDLE_TYPE_REGISTRY_KEY, -1, NULL);
+    if (!h || h == (HANDLE)-1) {
+        *KeyHandle = NULL;
         return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    *KeyHandle = h;
 
     return STATUS_SUCCESS;
 }
@@ -146,7 +149,12 @@ WINAPI_EXPORT NTSTATUS ZwCreateKey(
     if (!KeyHandle || !ObjectAttributes)
         return STATUS_INVALID_PARAMETER;
 
-    *KeyHandle = handle_alloc(HANDLE_TYPE_REGISTRY_KEY, -1, NULL);
+    HANDLE h = handle_alloc(HANDLE_TYPE_REGISTRY_KEY, -1, NULL);
+    if (!h || h == (HANDLE)-1) {
+        *KeyHandle = NULL;
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    *KeyHandle = h;
     if (Disposition)
         *Disposition = 1; /* REG_CREATED_NEW_KEY */
 

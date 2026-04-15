@@ -193,11 +193,11 @@ struct pe_import_descriptor {
 } __packed;
 
 /* ============================================================================
- * Global Driver List
+ * Global Driver List - defined in wdm_host_main.c as wdm_driver_list and
+ * wdm_driver_lock. We alias the lock name here for local readability.
  * ============================================================================ */
 
-static LIST_HEAD(wdm_driver_list);
-static DEFINE_MUTEX(wdm_driver_list_lock);
+#define wdm_driver_list_lock wdm_driver_lock
 
 /* ============================================================================
  * File I/O Helpers
@@ -760,10 +760,11 @@ int wdm_load_driver(const char *path, const char *name)
 	drv->entry_point = (address_of_entry_point < size_of_image)
 			   ? (void *)(image + address_of_entry_point)
 			   : NULL;
-	drv->is_64bit = is_64bit;
-	drv->preferred_base = preferred_image_base;
-	drv->unload_fn = NULL;
-	INIT_LIST_HEAD(&drv->device_list);
+	drv->unload_func = NULL;
+	drv->state = WDM_STATE_LOADED;
+	(void)is_64bit;                 /* retained as local for relocation step */
+	(void)preferred_image_base;     /* relocation delta already applied */
+	INIT_LIST_HEAD(&drv->devices);
 	INIT_LIST_HEAD(&drv->list);
 	memset(drv->dispatch_table, 0, sizeof(drv->dispatch_table));
 
@@ -835,17 +836,24 @@ int wdm_unload_driver(const char *name)
 	}
 
 	/* Step 2: Call unload function if registered */
-	if (drv->unload_fn) {
+	if (drv->unload_func) {
+		typedef void (*unload_fn_t)(void *);
+		unload_fn_t unload = (unload_fn_t)drv->unload_func;
+
 		pr_info("[wdm_host] Calling unload function for '%s'\n",
 			drv->name);
-		drv->unload_fn(drv);
+		unload(drv);
 	}
 
-	/* Step 3: Delete all devices owned by this driver */
-	list_for_each_entry_safe(dev, tmp_dev, &drv->device_list, list) {
+	/* Step 3: Delete all devices owned by this driver.
+	 * Note: use wdm_delete_device() for proper cdev teardown; however
+	 * here we only detach bookkeeping because device lifecycle is owned
+	 * by wdm_host_device.c. Callers should have removed devices first.
+	 */
+	list_for_each_entry_safe(dev, tmp_dev, &drv->devices, driver_list) {
 		pr_info("[wdm_host] Removing device '%s' from driver '%s'\n",
-			dev->name, drv->name);
-		list_del(&dev->list);
+			dev->device_name, drv->name);
+		list_del(&dev->driver_list);
 		if (dev->device_extension)
 			kfree(dev->device_extension);
 		kfree(dev);
@@ -936,8 +944,8 @@ void wdm_host_loader_exit(void)
 		pr_info("[wdm_host] Force-unloading driver '%s'\n", drv->name);
 
 		/* Clean up devices */
-		list_for_each_entry_safe(dev, tmp_dev, &drv->device_list, list) {
-			list_del(&dev->list);
+		list_for_each_entry_safe(dev, tmp_dev, &drv->devices, driver_list) {
+			list_del(&dev->driver_list);
 			if (dev->device_extension)
 				kfree(dev->device_extension);
 			kfree(dev);

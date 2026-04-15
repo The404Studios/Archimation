@@ -10,6 +10,7 @@ All subprocess operations are async to avoid blocking the FastAPI event loop.
 
 import asyncio
 import logging
+import os
 import shlex
 from typing import Optional
 
@@ -111,16 +112,26 @@ class WindowsServiceController:
         # Try to get uptime from /proc if PID is available
         if details["pid"] > 0:
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    "ps", "-o", "etimes=", "-p", str(details["pid"]),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-                uptime_str = stdout.decode().strip()
-                if uptime_str.isdigit():
-                    details["uptime"] = int(uptime_str)
-            except (asyncio.TimeoutError, FileNotFoundError):
+                with open(f"/proc/{details['pid']}/stat", "r") as f:
+                    stat_line = f.read()
+                # field 22 (1-indexed) is starttime in clock ticks since boot.
+                # comm (field 2) may contain spaces/parens; split after last ')'.
+                rparen = stat_line.rfind(")")
+                if rparen != -1:
+                    fields = stat_line[rparen + 1:].split()
+                    # Overall field 22 -> fields[19] (0-indexed, post-comm)
+                    if len(fields) > 19:
+                        starttime_ticks = int(fields[19])
+                        with open("/proc/uptime", "r") as uf:
+                            uptime_seconds = float(uf.read().split()[0])
+                        try:
+                            clk_tck = os.sysconf("SC_CLK_TCK")
+                        except (ValueError, OSError):
+                            clk_tck = 100
+                        proc_uptime = int(uptime_seconds - (starttime_ticks / clk_tck))
+                        if proc_uptime >= 0:
+                            details["uptime"] = proc_uptime
+            except (FileNotFoundError, ProcessLookupError, ValueError, IndexError, PermissionError):
                 pass
 
         return {"status": "ok", "service": details}
@@ -132,6 +143,8 @@ class WindowsServiceController:
         the unit isn't known to systemd.
         """
         lines = min(max(lines, 1), 500)  # clamp to 1..500
+        proc = None
+        proc2 = None
         try:
             # First try exact unit match
             proc = await asyncio.create_subprocess_exec(
@@ -163,6 +176,13 @@ class WindowsServiceController:
                 "count": len(log_lines),
             }
         except asyncio.TimeoutError:
+            for p in (proc, proc2):
+                if p is not None:
+                    try:
+                        p.kill()
+                        await p.wait()
+                    except Exception:
+                        pass
             return {"status": "error", "error": "timeout reading logs"}
         except FileNotFoundError:
             return {"status": "error", "error": "journalctl not found"}
@@ -211,6 +231,7 @@ class WindowsServiceController:
     # ------------------------------------------------------------------
 
     async def scm_status(self) -> dict:
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "systemctl", "is-active", "scm-daemon.service",
@@ -220,10 +241,19 @@ class WindowsServiceController:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
             status = stdout.decode().strip()
             return {"running": status == "active", "status": status}
-        except (asyncio.TimeoutError, FileNotFoundError) as exc:
+        except asyncio.TimeoutError:
+            if proc is not None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+            return {"running": False, "error": "timeout"}
+        except FileNotFoundError as exc:
             return {"running": False, "error": str(exc)}
 
     async def scm_restart(self) -> dict:
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "systemctl", "restart", "scm-daemon.service",
@@ -235,7 +265,15 @@ class WindowsServiceController:
                 "success": proc.returncode == 0,
                 "stderr": stderr.decode().strip(),
             }
-        except (asyncio.TimeoutError, FileNotFoundError) as exc:
+        except asyncio.TimeoutError:
+            if proc is not None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+            return {"success": False, "error": "timeout"}
+        except FileNotFoundError as exc:
             return {"success": False, "error": str(exc)}
 
     # ------------------------------------------------------------------
@@ -244,6 +282,7 @@ class WindowsServiceController:
 
     async def _sc(self, args: str) -> dict:
         argv = [self._sc_bin] + shlex.split(args)
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -259,6 +298,12 @@ class WindowsServiceController:
             }
         except asyncio.TimeoutError:
             logger.error("sc command timed out: %s", argv)
+            if proc is not None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
             return {"success": False, "error": "timeout"}
         except FileNotFoundError:
             logger.error("sc binary not found at %s", self._sc_bin)

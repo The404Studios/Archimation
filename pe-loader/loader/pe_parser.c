@@ -5,6 +5,7 @@
  * from a PE executable file into a pe_image_t structure.
  */
 
+#define _GNU_SOURCE  /* pread */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +37,22 @@ static int read_exact(int fd, void *buf, size_t count)
     return 0;
 }
 
+/* pread-based variant: avoids seek + read syscall pair. */
+static int pread_exact_p(int fd, void *buf, size_t count, off_t off)
+{
+    size_t total = 0;
+    while (total < count) {
+        ssize_t n = pread(fd, (char *)buf + total, count - total, off + total);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        total += n;
+    }
+    return 0;
+}
+
 int pe_parse_file(const char *filename, pe_image_t *image)
 {
     struct stat st;
@@ -45,7 +62,7 @@ int pe_parse_file(const char *filename, pe_image_t *image)
     image->fd = -1;
 
     /* Open the PE file */
-    image->fd = open(filename, O_RDONLY);
+    image->fd = open(filename, O_RDONLY | O_CLOEXEC);
     if (image->fd < 0) {
         fprintf(stderr, LOG_PREFIX "Failed to open '%s': %s\n",
                 filename, strerror(errno));
@@ -65,11 +82,24 @@ int pe_parse_file(const char *filename, pe_image_t *image)
         goto fail;
     }
 
-    /* Read DOS header */
-    if (read_exact(image->fd, &image->dos_header, sizeof(pe_dos_header_t)) < 0) {
-        fprintf(stderr, LOG_PREFIX "Failed to read DOS header\n");
+    /*
+     * Read DOS header + PE sig + COFF header in a SINGLE pread when
+     * e_lfanew is small enough that all three live within the first 4KB.
+     * Most PE files have e_lfanew == 0x80 or 0xF0, so this fires on
+     * virtually every real-world binary -- saves two syscalls on the
+     * common path.
+     *
+     * Fallback: if e_lfanew is anomalously large (>= 4KB - sizeof(all headers))
+     * we fall back to a second pread for the PE sig + COFF.
+     */
+    uint8_t header_buf[4096];
+    size_t hdr_read_size = image->file_size < sizeof(header_buf)
+                            ? image->file_size : sizeof(header_buf);
+    if (pread_exact_p(image->fd, header_buf, hdr_read_size, 0) < 0) {
+        fprintf(stderr, LOG_PREFIX "Failed to read initial header block\n");
         goto fail;
     }
+    memcpy(&image->dos_header, header_buf, sizeof(pe_dos_header_t));
 
     if (image->dos_header.e_magic != PE_DOS_MAGIC) {
         fprintf(stderr, LOG_PREFIX "Invalid DOS magic: 0x%04X (expected 0x%04X)\n",
@@ -77,7 +107,6 @@ int pe_parse_file(const char *filename, pe_image_t *image)
         goto fail;
     }
 
-    /* Seek to PE signature */
     if (image->dos_header.e_lfanew < 0 ||
         (uint32_t)image->dos_header.e_lfanew >= image->file_size) {
         fprintf(stderr, LOG_PREFIX "Invalid e_lfanew offset: %d\n",
@@ -85,15 +114,31 @@ int pe_parse_file(const char *filename, pe_image_t *image)
         goto fail;
     }
 
-    if (lseek(image->fd, image->dos_header.e_lfanew, SEEK_SET) < 0) {
-        fprintf(stderr, LOG_PREFIX "Failed to seek to PE header\n");
+    /* PE signature + COFF header -- 4 + 20 = 24 bytes at e_lfanew */
+    uint32_t lfanew = (uint32_t)image->dos_header.e_lfanew;
+    /* Overflow-safe: lfanew < file_size (validated above) so adding 24 is safe
+     * as long as file_size fits in uint32_t; for huge PEs the `else` branch
+     * below still works via pread at the explicit offset. */
+    if (lfanew > UINT32_MAX - 24) {
+        fprintf(stderr, LOG_PREFIX "e_lfanew too large: %u\n", lfanew);
         goto fail;
     }
+    uint32_t needed = lfanew + 4 + 20;
 
-    /* Read and validate PE signature */
-    if (read_exact(image->fd, &pe_sig, sizeof(pe_sig)) < 0) {
-        fprintf(stderr, LOG_PREFIX "Failed to read PE signature\n");
-        goto fail;
+    if (needed <= hdr_read_size) {
+        /* Everything fits in our single-block read -- no extra syscall. */
+        memcpy(&pe_sig, header_buf + lfanew, sizeof(pe_sig));
+        memcpy(&image->file_header, header_buf + lfanew + 4,
+               sizeof(pe_file_header_t));
+    } else {
+        /* Large e_lfanew: second pread covering PE sig + COFF header. */
+        uint8_t ph[4 + sizeof(pe_file_header_t)];
+        if (pread_exact_p(image->fd, ph, sizeof(ph), lfanew) < 0) {
+            fprintf(stderr, LOG_PREFIX "Failed to read PE signature\n");
+            goto fail;
+        }
+        memcpy(&pe_sig, ph, sizeof(pe_sig));
+        memcpy(&image->file_header, ph + 4, sizeof(pe_file_header_t));
     }
 
     if (pe_sig != PE_NT_SIGNATURE) {
@@ -101,9 +146,10 @@ int pe_parse_file(const char *filename, pe_image_t *image)
         goto fail;
     }
 
-    /* Read COFF file header */
-    if (read_exact(image->fd, &image->file_header, sizeof(pe_file_header_t)) < 0) {
-        fprintf(stderr, LOG_PREFIX "Failed to read COFF header\n");
+    /* Position for subsequent lseek-based reads (optional header, sections). */
+    if (lseek(image->fd, (off_t)lfanew + 4 + sizeof(pe_file_header_t),
+              SEEK_SET) < 0) {
+        fprintf(stderr, LOG_PREFIX "Failed to seek past COFF header\n");
         goto fail;
     }
 
@@ -122,8 +168,11 @@ int pe_parse_file(const char *filename, pe_image_t *image)
         goto fail;
     }
 
-    /* Seek back to re-read the full optional header */
-    if (lseek(image->fd, -sizeof(opt_magic), SEEK_CUR) < 0) {
+    /* Seek back to re-read the full optional header.
+     * Explicit signed cast avoids `-sizeof(x)` unsigned underflow which
+     * the C standard leaves implementation-defined (works on x86_64 by
+     * accident via two's-complement wrap). */
+    if (lseek(image->fd, -(off_t)sizeof(opt_magic), SEEK_CUR) < 0) {
         fprintf(stderr, LOG_PREFIX "Failed to seek back\n");
         goto fail;
     }
@@ -284,11 +333,12 @@ void pe_image_free(pe_image_t *image)
     }
 }
 
+__attribute__((hot))
 void *pe_rva_to_ptr(const pe_image_t *image, uint32_t rva)
 {
-    if (!image->mapped_base)
+    if (__builtin_expect(!image->mapped_base, 0))
         return NULL;
-    if (rva >= image->mapped_size)
+    if (__builtin_expect(rva >= image->mapped_size, 0))
         return NULL;
     return image->mapped_base + rva;
 }

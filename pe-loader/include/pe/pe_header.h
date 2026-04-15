@@ -172,8 +172,14 @@ int pe_parse_file(const char *filename, pe_image_t *image);
 /* Free resources associated with a parsed PE image */
 void pe_image_free(pe_image_t *image);
 
-/* Get a pointer to data at an RVA within the mapped image */
-void *pe_rva_to_ptr(const pe_image_t *image, uint32_t rva);
+/* Get a pointer to data at an RVA within the mapped image.
+ *
+ * HOT: called in every import/ILT walk.  Marked pure + hot so the compiler
+ * can CSE repeated calls with the same args; -O2 will typically inline it
+ * across the TU boundary because it's small and the bounds check is
+ * branch-predictable. */
+void *pe_rva_to_ptr(const pe_image_t *image, uint32_t rva)
+    __attribute__((pure));
 
 /* Get the entry point address */
 void *pe_get_entry_point(const pe_image_t *image);

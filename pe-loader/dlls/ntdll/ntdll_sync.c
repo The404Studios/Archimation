@@ -13,6 +13,10 @@
 
 #include "common/dll_common.h"
 
+#ifndef STATUS_MUTANT_NOT_OWNED
+#define STATUS_MUTANT_NOT_OWNED ((NTSTATUS)0xC0000046)
+#endif
+
 /* Event data for NT events */
 typedef struct {
     pthread_mutex_t mutex;
@@ -75,7 +79,15 @@ WINAPI_EXPORT NTSTATUS NtCreateEvent(
     evt->signaled = InitialState ? 1 : 0;
     evt->manual_reset = (EventType == 0) ? 1 : 0; /* NotificationEvent=0, SynchronizationEvent=1 */
 
-    *EventHandle = handle_alloc(HANDLE_TYPE_EVENT, -1, evt);
+    HANDLE h = handle_alloc(HANDLE_TYPE_EVENT, -1, evt);
+    if (h == INVALID_HANDLE_VALUE) {
+        pthread_cond_destroy(&evt->cond);
+        pthread_mutex_destroy(&evt->mutex);
+        free(evt);
+        *EventHandle = NULL;
+        return STATUS_UNSUCCESSFUL;
+    }
+    *EventHandle = h;
     return STATUS_SUCCESS;
 }
 
@@ -86,6 +98,8 @@ WINAPI_EXPORT NTSTATUS NtSetEvent(HANDLE EventHandle, PLONG PreviousState)
         return STATUS_INVALID_HANDLE;
 
     nt_event_data_t *evt = (nt_event_data_t *)entry->data;
+    if (!evt)
+        return STATUS_INVALID_HANDLE;
     pthread_mutex_lock(&evt->mutex);
     int prev = evt->signaled;
     evt->signaled = 1;
@@ -107,6 +121,8 @@ WINAPI_EXPORT NTSTATUS NtResetEvent(HANDLE EventHandle, PLONG PreviousState)
         return STATUS_INVALID_HANDLE;
 
     nt_event_data_t *evt = (nt_event_data_t *)entry->data;
+    if (!evt)
+        return STATUS_INVALID_HANDLE;
     pthread_mutex_lock(&evt->mutex);
     int prev = evt->signaled;
     evt->signaled = 0;
@@ -124,6 +140,8 @@ WINAPI_EXPORT NTSTATUS NtPulseEvent(HANDLE EventHandle, PLONG PreviousState)
         return STATUS_INVALID_HANDLE;
 
     nt_event_data_t *evt = (nt_event_data_t *)entry->data;
+    if (!evt)
+        return STATUS_INVALID_HANDLE;
     pthread_mutex_lock(&evt->mutex);
     int prev = evt->signaled;
     evt->signaled = 1;
@@ -168,7 +186,16 @@ WINAPI_EXPORT NTSTATUS NtCreateMutant(
         mtx->count = 1;
     }
 
-    *MutantHandle = handle_alloc(HANDLE_TYPE_MUTEX, -1, mtx);
+    HANDLE h = handle_alloc(HANDLE_TYPE_MUTEX, -1, mtx);
+    if (h == INVALID_HANDLE_VALUE) {
+        if (InitialOwner)
+            pthread_mutex_unlock(&mtx->mutex);
+        pthread_mutex_destroy(&mtx->mutex);
+        free(mtx);
+        *MutantHandle = NULL;
+        return STATUS_UNSUCCESSFUL;
+    }
+    *MutantHandle = h;
     return STATUS_SUCCESS;
 }
 
@@ -179,11 +206,19 @@ WINAPI_EXPORT NTSTATUS NtReleaseMutant(HANDLE MutantHandle, PLONG PreviousCount)
         return STATUS_INVALID_HANDLE;
 
     nt_mutant_data_t *mtx = (nt_mutant_data_t *)entry->data;
+    if (!mtx)
+        return STATUS_INVALID_HANDLE;
     if (PreviousCount)
         *PreviousCount = mtx->count;
-    if (mtx->count > 0)
+    /* Only actually release if we held it. Recursive pthread_mutex_unlock on
+     * an unheld mutex returns EPERM and leaves state intact — calling it
+     * anyway raises warnings and clobbers errno for no benefit. */
+    if (mtx->count > 0) {
         mtx->count--;
-    pthread_mutex_unlock(&mtx->mutex);
+        pthread_mutex_unlock(&mtx->mutex);
+    } else {
+        return STATUS_MUTANT_NOT_OWNED;
+    }
     return STATUS_SUCCESS;
 }
 
@@ -211,7 +246,15 @@ WINAPI_EXPORT NTSTATUS NtCreateSemaphore(
     sem->count = InitialCount;
     sem->max_count = MaximumCount;
 
-    *SemaphoreHandle = handle_alloc(HANDLE_TYPE_SEMAPHORE, -1, sem);
+    HANDLE h = handle_alloc(HANDLE_TYPE_SEMAPHORE, -1, sem);
+    if (h == INVALID_HANDLE_VALUE) {
+        pthread_cond_destroy(&sem->cond);
+        pthread_mutex_destroy(&sem->mutex);
+        free(sem);
+        *SemaphoreHandle = NULL;
+        return STATUS_UNSUCCESSFUL;
+    }
+    *SemaphoreHandle = h;
     return STATUS_SUCCESS;
 }
 
@@ -225,6 +268,8 @@ WINAPI_EXPORT NTSTATUS NtReleaseSemaphore(
         return STATUS_INVALID_HANDLE;
 
     nt_semaphore_data_t *sem = (nt_semaphore_data_t *)entry->data;
+    if (!sem)
+        return STATUS_INVALID_HANDLE;
     pthread_mutex_lock(&sem->mutex);
 
     if (PreviousCount)
@@ -234,8 +279,14 @@ WINAPI_EXPORT NTSTATUS NtReleaseSemaphore(
     if (sem->count > sem->max_count)
         sem->count = sem->max_count;
 
-    for (LONG i = 0; i < ReleaseCount; i++)
+    /* Wake exactly one waiter for a single release, otherwise broadcast.
+     * The previous N-signal loop could wake 1 real waiter plus consume
+     * spurious-wakeup budget on empty queues; broadcast is both faster
+     * and lets every sleeper re-check sem->count under the mutex. */
+    if (ReleaseCount <= 1)
         pthread_cond_signal(&sem->cond);
+    else
+        pthread_cond_broadcast(&sem->cond);
 
     pthread_mutex_unlock(&sem->mutex);
     return STATUS_SUCCESS;
@@ -344,46 +395,79 @@ typedef struct {
     pthread_rwlock_t rwlock;
 } srw_internal_t;
 
+/*
+ * Windows SRWLOCK can be zero-initialized via SRWLOCK_INIT; PE binaries
+ * frequently acquire such locks without calling InitializeSRWLock first.
+ * Lazily allocate the pthread backing on first use via a double-CAS so
+ * concurrent first-acquirers don't leak duplicate internals.
+ */
+static srw_internal_t *srw_get_or_init(PVOID SRWLock)
+{
+    srw_internal_t *cur = __atomic_load_n((srw_internal_t **)SRWLock,
+                                          __ATOMIC_ACQUIRE);
+    if (cur)
+        return cur;
+
+    srw_internal_t *new_lock = calloc(1, sizeof(srw_internal_t));
+    if (!new_lock)
+        return NULL;
+    pthread_rwlock_init(&new_lock->rwlock, NULL);
+
+    srw_internal_t *expected = NULL;
+    if (__atomic_compare_exchange_n((srw_internal_t **)SRWLock,
+                                    &expected, new_lock,
+                                    0, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_ACQUIRE)) {
+        return new_lock;
+    }
+
+    /* Lost the race: free our unused struct and use the winner's */
+    pthread_rwlock_destroy(&new_lock->rwlock);
+    free(new_lock);
+    return expected;
+}
+
 WINAPI_EXPORT void RtlInitializeSRWLock(PVOID SRWLock)
 {
-    /* SRWLock is PVOID-sized; we store a pointer to our struct */
-    srw_internal_t *internal = calloc(1, sizeof(srw_internal_t));
-    if (internal)
-        pthread_rwlock_init(&internal->rwlock, NULL);
-    *(PVOID *)SRWLock = internal;
+    /* Idempotent: srw_get_or_init will allocate lazily. Explicit init is
+     * still supported so callers that do InitializeSRWLock get the backing
+     * ready before first acquire. */
+    (void)srw_get_or_init(SRWLock);
 }
 
 WINAPI_EXPORT void RtlAcquireSRWLockExclusive(PVOID SRWLock)
 {
-    srw_internal_t *internal = *(srw_internal_t **)SRWLock;
+    srw_internal_t *internal = srw_get_or_init(SRWLock);
     if (internal)
         pthread_rwlock_wrlock(&internal->rwlock);
 }
 
 WINAPI_EXPORT void RtlReleaseSRWLockExclusive(PVOID SRWLock)
 {
-    srw_internal_t *internal = *(srw_internal_t **)SRWLock;
+    srw_internal_t *internal = __atomic_load_n((srw_internal_t **)SRWLock,
+                                                __ATOMIC_ACQUIRE);
     if (internal)
         pthread_rwlock_unlock(&internal->rwlock);
 }
 
 WINAPI_EXPORT void RtlAcquireSRWLockShared(PVOID SRWLock)
 {
-    srw_internal_t *internal = *(srw_internal_t **)SRWLock;
+    srw_internal_t *internal = srw_get_or_init(SRWLock);
     if (internal)
         pthread_rwlock_rdlock(&internal->rwlock);
 }
 
 WINAPI_EXPORT void RtlReleaseSRWLockShared(PVOID SRWLock)
 {
-    srw_internal_t *internal = *(srw_internal_t **)SRWLock;
+    srw_internal_t *internal = __atomic_load_n((srw_internal_t **)SRWLock,
+                                                __ATOMIC_ACQUIRE);
     if (internal)
         pthread_rwlock_unlock(&internal->rwlock);
 }
 
 WINAPI_EXPORT BOOL RtlTryAcquireSRWLockExclusive(PVOID SRWLock)
 {
-    srw_internal_t *internal = *(srw_internal_t **)SRWLock;
+    srw_internal_t *internal = srw_get_or_init(SRWLock);
     if (internal)
         return pthread_rwlock_trywrlock(&internal->rwlock) == 0;
     return FALSE;
@@ -391,7 +475,7 @@ WINAPI_EXPORT BOOL RtlTryAcquireSRWLockExclusive(PVOID SRWLock)
 
 WINAPI_EXPORT BOOL RtlTryAcquireSRWLockShared(PVOID SRWLock)
 {
-    srw_internal_t *internal = *(srw_internal_t **)SRWLock;
+    srw_internal_t *internal = srw_get_or_init(SRWLock);
     if (internal)
         return pthread_rwlock_tryrdlock(&internal->rwlock) == 0;
     return FALSE;
@@ -403,12 +487,35 @@ typedef struct {
     pthread_cond_t cond;
 } cv_internal_t;
 
+/* Same zero-init-safe pattern as SRW: CONDITION_VARIABLE_INIT is NULL. */
+static cv_internal_t *cv_get_or_init(PVOID ConditionVariable)
+{
+    cv_internal_t *cur = __atomic_load_n((cv_internal_t **)ConditionVariable,
+                                          __ATOMIC_ACQUIRE);
+    if (cur)
+        return cur;
+
+    cv_internal_t *new_cv = calloc(1, sizeof(cv_internal_t));
+    if (!new_cv)
+        return NULL;
+    pthread_cond_init(&new_cv->cond, NULL);
+
+    cv_internal_t *expected = NULL;
+    if (__atomic_compare_exchange_n((cv_internal_t **)ConditionVariable,
+                                    &expected, new_cv,
+                                    0, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_ACQUIRE)) {
+        return new_cv;
+    }
+
+    pthread_cond_destroy(&new_cv->cond);
+    free(new_cv);
+    return expected;
+}
+
 WINAPI_EXPORT void RtlInitializeConditionVariable(PVOID ConditionVariable)
 {
-    cv_internal_t *internal = calloc(1, sizeof(cv_internal_t));
-    if (internal)
-        pthread_cond_init(&internal->cond, NULL);
-    *(PVOID *)ConditionVariable = internal;
+    (void)cv_get_or_init(ConditionVariable);
 }
 
 WINAPI_EXPORT NTSTATUS RtlSleepConditionVariableCS(
@@ -416,8 +523,9 @@ WINAPI_EXPORT NTSTATUS RtlSleepConditionVariableCS(
     RTL_CRITICAL_SECTION *CriticalSection,
     PLARGE_INTEGER Timeout)
 {
-    cv_internal_t *cv = *(cv_internal_t **)ConditionVariable;
-    cs_internal_t *cs = (cs_internal_t *)CriticalSection->DebugInfo;
+    cv_internal_t *cv = cv_get_or_init(ConditionVariable);
+    cs_internal_t *cs = CriticalSection ?
+        (cs_internal_t *)CriticalSection->DebugInfo : NULL;
 
     if (!cv || !cs)
         return STATUS_INVALID_PARAMETER;
@@ -444,14 +552,18 @@ WINAPI_EXPORT NTSTATUS RtlSleepConditionVariableCS(
 
 WINAPI_EXPORT void RtlWakeConditionVariable(PVOID ConditionVariable)
 {
-    cv_internal_t *cv = *(cv_internal_t **)ConditionVariable;
+    /* Wake is a no-op if no one ever waited (no backing cv allocated).
+     * Use a plain atomic load so we don't allocate on wake-only callsites. */
+    cv_internal_t *cv = __atomic_load_n((cv_internal_t **)ConditionVariable,
+                                         __ATOMIC_ACQUIRE);
     if (cv)
         pthread_cond_signal(&cv->cond);
 }
 
 WINAPI_EXPORT void RtlWakeAllConditionVariable(PVOID ConditionVariable)
 {
-    cv_internal_t *cv = *(cv_internal_t **)ConditionVariable;
+    cv_internal_t *cv = __atomic_load_n((cv_internal_t **)ConditionVariable,
+                                         __ATOMIC_ACQUIRE);
     if (cv)
         pthread_cond_broadcast(&cv->cond);
 }

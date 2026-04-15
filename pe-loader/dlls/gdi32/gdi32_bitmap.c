@@ -291,7 +291,16 @@ WINAPI_EXPORT BOOL DeleteBitmap(HBITMAP hbm)
 }
 
 /* --------------------------------------------------------------------------
- * GetObject (for bitmaps)
+ * GetObject (dispatches by handle range; owner of the WINAPI export)
+ *
+ * Session 23 bug: old GetObjectA only knew about bitmaps; pen/brush/font
+ * handles returned 0 -- callers that used GetObject to inspect selected
+ * objects failed silently.
+ *
+ * Handle ranges:
+ *   0x80000000-0x800003FF : gdi_object_t pool (pens/brushes) -> gdi32_dc.c
+ *   0xB0000000-0xBFFFFFFF : bitmap pool (here)
+ *   0xF1000000-0xF1FFFFFF : font pool (gdi32_font.c)
  * -------------------------------------------------------------------------- */
 
 typedef struct tagBITMAP {
@@ -304,24 +313,54 @@ typedef struct tagBITMAP {
     LPVOID  bmBits;
 } BITMAP, *PBITMAP, *LPBITMAP;
 
+/* Dispatchers in other TUs (same .so) */
+extern __attribute__((ms_abi)) int gdi32_dc_get_object_info(HGDIOBJ h, int cb, void *pv);
+extern __attribute__((ms_abi)) int GetObjectA_Font(HANDLE h, int cb, LPVOID pv);
+
+static int bitmap_get_object_info(HBITMAP hbm, int c, LPVOID pv)
+{
+    bitmap_data_t *bmp = lookup_bitmap(hbm);
+    if (!bmp)
+        return 0;
+
+    /* Query-size mode: pv==NULL -> return required size */
+    if (!pv)
+        return (int)sizeof(BITMAP);
+    if (c < (int)sizeof(BITMAP))
+        return 0;
+
+    BITMAP *pbm = (BITMAP *)pv;
+    memset(pbm, 0, sizeof(BITMAP));
+    pbm->bmType = 0;
+    pbm->bmWidth = bmp->width;
+    pbm->bmHeight = bmp->height;
+    pbm->bmWidthBytes = bmp->stride;
+    pbm->bmPlanes = 1;
+    pbm->bmBitsPixel = bmp->bpp;
+    pbm->bmBits = bmp->data;
+    return (int)sizeof(BITMAP);
+}
+
 WINAPI_EXPORT int GetObjectA(HANDLE h, int c, LPVOID pv)
 {
     if (!h)
         return 0;
 
-    /* Check if it's a bitmap */
-    bitmap_data_t *bmp = lookup_bitmap((HBITMAP)h);
-    if (bmp && pv && c >= (int)sizeof(BITMAP)) {
-        BITMAP *pbm = (BITMAP *)pv;
-        memset(pbm, 0, sizeof(BITMAP));
-        pbm->bmType = 0;
-        pbm->bmWidth = bmp->width;
-        pbm->bmHeight = bmp->height;
-        pbm->bmWidthBytes = bmp->stride;
-        pbm->bmPlanes = 1;
-        pbm->bmBitsPixel = bmp->bpp;
-        pbm->bmBits = bmp->data;
-        return sizeof(BITMAP);
+    uintptr_t hv = (uintptr_t)h;
+
+    /* Bitmap range */
+    if (hv >= 0xB0000000UL && hv < 0xC0000000UL) {
+        return bitmap_get_object_info((HBITMAP)h, c, pv);
+    }
+
+    /* Font range -- delegate to gdi32_font.c */
+    if (hv >= 0xF1000000UL && hv < 0xF2000000UL) {
+        return GetObjectA_Font(h, c, pv);
+    }
+
+    /* gdi_object_t pool (pens/brushes) -- delegate to gdi32_dc.c */
+    if (hv >= 0x80000000UL && hv < 0x80000400UL) {
+        return gdi32_dc_get_object_info((HGDIOBJ)h, c, pv);
     }
 
     return 0;
@@ -330,6 +369,31 @@ WINAPI_EXPORT int GetObjectA(HANDLE h, int c, LPVOID pv)
 WINAPI_EXPORT int GetObjectW(HANDLE h, int c, LPVOID pv)
 {
     return GetObjectA(h, c, pv);
+}
+
+/* --------------------------------------------------------------------------
+ * gdi32_bitmap_select_on_dc
+ *
+ * Called by gdi32_dc.c:SelectObject when the handle is in the bitmap range.
+ * Validates the handle is a known bitmap, then asks gdi32_dc.c to swap the
+ * DC's selected_bitmap slot and return the old handle.
+ *
+ * Returns the previously-selected bitmap handle (NULL on first select).
+ * -------------------------------------------------------------------------- */
+
+extern __attribute__((ms_abi)) HGDIOBJ gdi32_dc_set_selected(HDC hdc, int obj_type, HGDIOBJ new_h);
+
+#ifndef OBJ_BITMAP
+#define OBJ_BITMAP 7
+#endif
+
+__attribute__((ms_abi)) HBITMAP gdi32_bitmap_select_on_dc(HDC hdc, HBITMAP new_hbm)
+{
+    if (!hdc || !new_hbm)
+        return NULL;
+    if (!lookup_bitmap(new_hbm))
+        return NULL;  /* Unknown/freed bitmap handle */
+    return (HBITMAP)gdi32_dc_set_selected(hdc, OBJ_BITMAP, (HGDIOBJ)new_hbm);
 }
 
 /* --------------------------------------------------------------------------

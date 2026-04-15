@@ -5,12 +5,28 @@ The cortex's autonomy is itself governed by the Root of Authority trust system.
 Higher trust score = more autonomous. Mistakes reduce autonomy.
 """
 import logging
+import os
 import time
+from collections import deque
 from enum import IntEnum
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Callable, Deque, Dict, List, Optional
 
 logger = logging.getLogger("cortex.autonomy")
+
+
+def _is_old_hw() -> bool:
+    """Lightweight old-HW probe (<=2 cores or <2GB RAM)."""
+    try:
+        cpus = os.cpu_count() or 1
+    except Exception:
+        cpus = 1
+    mem_gb = 1.0
+    try:
+        mem_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)
+    except (ValueError, OSError, AttributeError):
+        pass
+    return cpus <= 2 or mem_gb < 2.0
 
 
 class AutonomyLevel(IntEnum):
@@ -65,7 +81,22 @@ DEFAULT_DOMAIN_LEVELS: Dict[str, int] = {
 
 @dataclass
 class Decision:
-    """A decision made by the cortex."""
+    """A decision made by the cortex.
+
+    Fields added for Session 25 approval follow-through wiring:
+      pid            -- process ID associated with this gate (if any).  Set
+                        when a handler freezes a process while awaiting
+                        approval so the resolution path can resume/kill it.
+      resume_action  -- optional zero-arg callable invoked on approve().
+                        Typical use: resume a SIGSTOP'd PE process.
+      reject_action  -- optional zero-arg callable invoked on deny/expire.
+                        Typical use: SIGKILL a frozen PE process.
+      expires_at     -- absolute time (seconds, time.time()) after which a
+                        pending decision should auto-resolve to its default
+                        (deny).  None = never expire.
+      resolved_by    -- one of "human", "auto-expire", "" (still pending).
+                        Informational only; never affects gate behavior.
+    """
     domain: str
     action: str
     description: str
@@ -73,6 +104,11 @@ class Decision:
     timestamp: float = field(default_factory=time.time)
     approved: Optional[bool] = None  # None = pending, True = approved, False = denied
     human_override: bool = False
+    pid: Optional[int] = None
+    resume_action: Optional[Callable[[], None]] = None
+    reject_action: Optional[Callable[[], None]] = None
+    expires_at: Optional[float] = None
+    resolved_by: str = ""
 
 
 class AutonomyController:
@@ -121,9 +157,17 @@ class AutonomyController:
             self._configured_levels[domain] = min(raw, MAX_AUTONOMY_LEVEL)
 
         self._score: int = max(0, min(100, initial_score))
-        self._decisions: List[Decision] = []
+        # HW-tier aware history caps -- old HW keeps less history to limit
+        # Python heap growth under hours of uptime; new HW keeps more for
+        # richer /scores history windows.
+        old_hw = _is_old_hw()
+        decisions_cap = 2000 if old_hw else 5000
+        score_history_cap = 500 if old_hw else 2000
+        # deque(maxlen) gives O(1) bounded append; the list-based approach
+        # copied the tail every N inserts.
+        self._decisions: Deque[Decision] = deque(maxlen=decisions_cap)
         self._pending: List[Decision] = []
-        self._score_history: List[dict] = []
+        self._score_history: Deque[dict] = deque(maxlen=score_history_cap)
 
         # Dead-man switch state
         self._init_time: float = time.time()
@@ -219,6 +263,10 @@ class AutonomyController:
 
         This is the panic button. Score is set to 0 so the ceiling stays
         at OBSERVE until a human explicitly raises it.
+
+        Reject callbacks are fired OUTSIDE the pending-list mutation so a
+        misbehaving callback cannot leave the autonomy controller in a
+        half-emergency state (pending still populated but domains at OBSERVE).
         """
         logger.critical("EMERGENCY STOP: %s", reason)
         for domain in ALL_DOMAINS:
@@ -233,7 +281,15 @@ class AutonomyController:
             "reason": f"EMERGENCY STOP: {reason}",
         })
         self._emergency_stopped = True
-        self._pending.clear()
+        # Swap the pending list atomically before iterating so any callback
+        # that calls back into create_decision() sees an empty pending list
+        # and doesn't get its new decision dropped in a recursive sweep.
+        leftover = self._pending
+        self._pending = []
+        for d in leftover:
+            d.approved = False
+            d.resolved_by = "emergency-stop"
+            self._safe_call(d.reject_action, "reject (emergency-stop)")
 
     @property
     def is_emergency_stopped(self) -> bool:
@@ -263,18 +319,14 @@ class AutonomyController:
         old_ceil = self._score_to_ceiling(old)
         new_ceil = self._score_to_ceiling(self._score)
 
-        entry = {
+        # deque(maxlen=...) bounds automatically -- no slice-rebuild cost.
+        self._score_history.append({
             "timestamp": time.time(),
             "old_score": old,
             "new_score": self._score,
             "delta": delta,
             "reason": reason,
-        }
-        self._score_history.append(entry)
-
-        # Keep history bounded
-        if len(self._score_history) > 1000:
-            self._score_history = self._score_history[-500:]
+        })
 
         if old_ceil != new_ceil:
             logger.warning(
@@ -291,6 +343,10 @@ class AutonomyController:
 
     def create_decision(
         self, domain: str, action: str, description: str,
+        pid: Optional[int] = None,
+        resume_action: Optional[Callable[[], None]] = None,
+        reject_action: Optional[Callable[[], None]] = None,
+        pending_ttl_s: Optional[float] = None,
     ) -> Decision:
         """
         Create a decision record for the given domain.
@@ -299,6 +355,14 @@ class AutonomyController:
         - approved=True   if level >= ACT_REPORT (auto-approved)
         - approved=None   if level == ADVISE (pending human approval)
         - approved=False  if level == OBSERVE (no action taken)
+
+        Optional follow-through wiring (used when the caller freezes a
+        process while awaiting approval):
+          pid            -- process ID this decision gates.
+          resume_action  -- invoked on approve_pending() (e.g. SIGCONT the pid).
+          reject_action  -- invoked on deny_pending() or auto-expiry (e.g. SIGKILL).
+          pending_ttl_s  -- seconds until auto-deny (default DEFAULT_PENDING_TTL_S).
+                            Only applies if the decision ends up pending.
         """
         level = self.effective_level(domain)
         decision = Decision(
@@ -306,55 +370,145 @@ class AutonomyController:
             action=action,
             description=description,
             autonomy_level=level,
+            pid=pid,
+            resume_action=resume_action,
+            reject_action=reject_action,
         )
 
         if level >= AutonomyLevel.ACT_REPORT:
             decision.approved = True
         elif level == AutonomyLevel.ADVISE:
             decision.approved = None  # Pending human approval
+            ttl = self.DEFAULT_PENDING_TTL_S if pending_ttl_s is None else pending_ttl_s
+            if ttl is not None and ttl > 0:
+                decision.expires_at = decision.timestamp + ttl
             self._pending.append(decision)
         else:
             decision.approved = False  # Observe only -- no action
 
-        # Cap pending list to prevent unbounded growth
-        self._pending = [d for d in self._pending if d.approved is None]
+        # Cap pending list to prevent unbounded growth.  When we trim the
+        # oldest entries we MUST fire their reject callbacks -- otherwise
+        # any frozen PE process gated by an evicted decision leaks as a
+        # SIGSTOP'd ghost forever.  (This was a latent Session 25-class bug.)
         if len(self._pending) > self.MAX_PENDING:
-            self._pending = self._pending[-self.MAX_PENDING:]
+            overflow = len(self._pending) - self.MAX_PENDING
+            evicted = self._pending[:overflow]
+            self._pending = self._pending[overflow:]
+            for d in evicted:
+                if d.approved is None:
+                    d.approved = False
+                    d.resolved_by = "pending-overflow"
+                    self._safe_call(d.reject_action, "reject (pending-overflow)")
 
+        # deque(maxlen=decisions_cap) handles the bound automatically; no
+        # manual slice-resize needed (and slicing a deque would blow up).
         self._decisions.append(decision)
-
-        # Keep decisions bounded
-        if len(self._decisions) > 5000:
-            self._decisions = self._decisions[-2500:]
 
         return decision
 
     # -- Pending decision management --
 
+    # Default TTL for pending decisions if the caller doesn't set expires_at.
+    # 300s = 5 minutes.  If a human doesn't approve within this window,
+    # expire_overdue_pending() auto-applies the reject_action (e.g. SIGKILL
+    # a frozen PE process) so we don't leak SIGSTOP'd zombies.
+    DEFAULT_PENDING_TTL_S: float = 300.0
+
     def get_pending(self) -> List[Decision]:
         """Return list of decisions awaiting human approval."""
         return list(self._pending)
 
+    @staticmethod
+    def _safe_call(cb: Optional[Callable[[], None]], label: str) -> None:
+        """Run a callback swallowing all exceptions so a bad callback can't
+        break the autonomy flow (or the API request)."""
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:
+            # Log but don't propagate -- the caller (API or expiry loop)
+            # must never crash because a resume/reject callback misbehaved.
+            logger.exception("Decision %s callback raised", label)
+
     def approve_pending(self, index: int) -> bool:
-        """Approve a pending decision by index. Returns True on success."""
+        """Approve a pending decision by index. Returns True on success.
+
+        If the decision was gating a frozen PID, its resume_action callback
+        (registered by the handler that froze the process) is invoked here
+        so the PE process can actually run.  Without this, a SIGSTOP'd
+        process stays frozen forever.
+        """
         if 0 <= index < len(self._pending):
-            self._pending[index].approved = True
+            decision = self._pending[index]
+            decision.approved = True
+            decision.resolved_by = "human"
             self._pending.pop(index)
             self.record_human_interaction()
+            # Fire the resume callback OUTSIDE the list mutation so any
+            # exception it throws doesn't corrupt pending list state.
+            self._safe_call(decision.resume_action, "resume")
             return True
         return False
 
     def deny_pending(self, index: int) -> bool:
-        """Deny a pending decision and record false positive. Returns True on success."""
+        """Deny a pending decision and record false positive. Returns True on success.
+
+        If the decision was gating a frozen PID, its reject_action callback
+        (registered by the handler that froze the process) is invoked here
+        so the PE process is killed rather than left as a SIGSTOP'd ghost.
+        """
         if 0 <= index < len(self._pending):
             decision = self._pending[index]
             decision.approved = False
             decision.human_override = True
+            decision.resolved_by = "human"
             self._pending.pop(index)
             self.record_false_positive()
             self.record_human_interaction()
+            self._safe_call(decision.reject_action, "reject")
             return True
         return False
+
+    def expire_overdue_pending(self, now: Optional[float] = None) -> int:
+        """Auto-expire any pending decisions past their expires_at deadline.
+
+        Expired decisions are treated as DENIED (reject_action fires).
+        This prevents frozen PE processes from leaking forever if the
+        human never clicks approve/deny.
+
+        Returns the number of decisions that were expired.
+        """
+        if now is None:
+            now = time.time()
+        if not self._pending:
+            return 0
+
+        expired: List[Decision] = []
+        kept: List[Decision] = []
+        for d in self._pending:
+            if d.expires_at is not None and now >= d.expires_at:
+                expired.append(d)
+            else:
+                kept.append(d)
+
+        if not expired:
+            return 0
+
+        self._pending = kept
+        for d in expired:
+            d.approved = False
+            d.resolved_by = "auto-expire"
+            # Expiry defaults to DENY.  Fire reject callback so the
+            # frozen process doesn't leak.  No human_override flag
+            # (this wasn't a human decision) -- don't penalize the
+            # cortex score for its own inaction.
+            logger.warning(
+                "Pending decision auto-expired: %s (%s) -- applying reject action",
+                d.action, d.description,
+            )
+            self._safe_call(d.reject_action, "reject (auto-expire)")
+        return len(expired)
 
     def clear_resolved_pending(self) -> int:
         """Remove pending decisions that have been resolved. Returns count removed."""
@@ -375,6 +529,11 @@ class AutonomyController:
     @property
     def state(self) -> dict:
         """Export full controller state for API/dashboard."""
+        # deque doesn't support slice, so take the last 10 via itertools.islice.
+        from itertools import islice
+        hist_len = len(self._score_history)
+        start = max(0, hist_len - 10)
+        recent_history = list(islice(self._score_history, start, hist_len))
         return {
             "score": self._score,
             "ceiling": self.ceiling,
@@ -390,8 +549,8 @@ class AutonomyController:
             },
             "pending_decisions": len(self._pending),
             "total_decisions": len(self._decisions),
-            "score_history_len": len(self._score_history),
-            "recent_score_history": self._score_history[-10:],
+            "score_history_len": hist_len,
+            "recent_score_history": recent_history,
             "emergency_stopped": self._emergency_stopped,
             "dead_man_tripped": self._dead_man_tripped,
             "dead_man_timeout_s": self.DEAD_MAN_TIMEOUT_S,

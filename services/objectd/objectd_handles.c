@@ -63,7 +63,8 @@ static int handle_cleanup_stale(void)
                 free(g_handles[i].data);
                 g_handles[i].data = NULL;
             }
-            if (g_handles[i].fd >= 0) {
+            /* Guard against closing stdin/stdout/stderr */
+            if (g_handles[i].fd > 2) {
                 close(g_handles[i].fd);
             }
             memset(&g_handles[i], 0, sizeof(g_handles[i]));
@@ -164,7 +165,9 @@ int handle_close(HANDLE h)
             free(g_handles[idx].data);
             g_handles[idx].data = NULL;
         }
-        if (g_handles[idx].fd >= 0) {
+        /* Guard against closing stdin/stdout/stderr if an allocator ever
+         * passed fd 0/1/2.  objectd itself uses those for its journal. */
+        if (g_handles[idx].fd > 2) {
             close(g_handles[idx].fd);
         }
         memset(&g_handles[idx], 0, sizeof(handle_entry_t));

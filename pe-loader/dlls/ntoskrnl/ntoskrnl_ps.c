@@ -107,21 +107,33 @@ WINAPI_EXPORT NTSTATUS ObReferenceObjectByHandle(
     (void)AccessMode;
     (void)HandleInformation;
 
+    if (!Object)
+        return STATUS_INVALID_PARAMETER;
+
     handle_entry_t *entry = handle_lookup(Handle);
     if (!entry) {
         *Object = NULL;
         return STATUS_INVALID_HANDLE;
     }
 
-    entry->ref_count++;
+    __sync_fetch_and_add(&entry->ref_count, 1);
     *Object = entry->data;
     return STATUS_SUCCESS;
 }
 
 WINAPI_EXPORT void ObDereferenceObject(PVOID Object)
 {
-    (void)Object;
-    /* In a full implementation, would decrement refcount and free */
+    /* Best-effort: if Object happens to be a valid HANDLE value (e.g. the
+     * caller passes back the same HANDLE they got from another API), try to
+     * decrement that handle's refcount. Otherwise (a raw data pointer from
+     * ObReferenceObjectByHandle), we can't map back to a handle slot and
+     * the refcount leak persists -- but that still matches the historic
+     * no-op behavior, so nothing regresses. */
+    if (!Object)
+        return;
+    handle_entry_t *entry = handle_lookup((HANDLE)Object);
+    if (entry)
+        __sync_sub_and_fetch(&entry->ref_count, 1);
 }
 
 WINAPI_EXPORT NTSTATUS ObReferenceObjectByPointer(

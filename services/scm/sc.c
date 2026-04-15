@@ -56,6 +56,14 @@ static int scm_send_command(const char *action, const char *name)
     else
         cmd_len = snprintf(cmd_buf, sizeof(cmd_buf), "%s\n", action);
 
+    /* Clamp: snprintf returns "would have" on truncation; never write past buffer. */
+    if (cmd_len < 0) {
+        close(fd);
+        return 1;
+    }
+    if ((size_t)cmd_len >= sizeof(cmd_buf))
+        cmd_len = (int)sizeof(cmd_buf) - 1;
+
     if (write(fd, cmd_buf, cmd_len) != cmd_len) {
         fprintf(stderr, "[SC] Failed to send command\n");
         close(fd);
@@ -122,11 +130,13 @@ static int read_service_config(const char *name, char *display, char *binary,
         if (!eq) continue;
         *eq = '\0';
 
-        if (strcmp(line, "display_name") == 0 && display)
+        if (strcmp(line, "display_name") == 0 && display) {
             strncpy(display, eq + 1, 255);
-        else if (strcmp(line, "binary_path") == 0 && binary)
+            display[255] = '\0';
+        } else if (strcmp(line, "binary_path") == 0 && binary) {
             strncpy(binary, eq + 1, 4095);
-        else if (strcmp(line, "type") == 0 && type)
+            binary[4095] = '\0';
+        } else if (strcmp(line, "type") == 0 && type)
             *type = atoi(eq + 1);
         else if (strcmp(line, "start_type") == 0 && start_type)
             *start_type = atoi(eq + 1);
@@ -136,13 +146,14 @@ static int read_service_config(const char *name, char *display, char *binary,
     return 0;
 }
 
-/* Check if a service is running */
-static int is_service_running(const char *name)
+/* Read the current state from the status file (returns SERVICE_STOPPED if
+ * no status file exists or cannot be parsed). */
+static int read_service_state(const char *name)
 {
     char path[4096];
     snprintf(path, sizeof(path), "%s/%s.status", SCM_RUN_PATH, name);
     FILE *f = fopen(path, "r");
-    if (!f) return 0;
+    if (!f) return SERVICE_STOPPED;
 
     int state = SERVICE_STOPPED;
     char line[256];
@@ -151,7 +162,13 @@ static int is_service_running(const char *name)
             state = atoi(line + 6);
     }
     fclose(f);
-    return state == SERVICE_RUNNING;
+    return state;
+}
+
+/* Check if a service is running */
+static int is_service_running(const char *name)
+{
+    return read_service_state(name) == SERVICE_RUNNING;
 }
 
 static int cmd_query(const char *name)
@@ -164,7 +181,7 @@ static int cmd_query(const char *name)
         return 1;
     }
 
-    int running = is_service_running(name);
+    int state = read_service_state(name);
 
     printf("SERVICE_NAME: %s\n", name);
     if (display[0])
@@ -174,10 +191,18 @@ static int cmd_query(const char *name)
     if (type == 1) type_str = "KERNEL_DRIVER";
     else if (type == 2) type_str = "FILE_SYSTEM_DRIVER";
 
+    const char *state_str;
+    switch (state) {
+    case SERVICE_RUNNING:       state_str = "RUNNING"; break;
+    case SERVICE_START_PENDING: state_str = "START_PENDING"; break;
+    case SERVICE_STOP_PENDING:  state_str = "STOP_PENDING"; break;
+    case SERVICE_PAUSED:        state_str = "PAUSED"; break;
+    case SERVICE_STOPPED:
+    default:                    state_str = "STOPPED"; state = SERVICE_STOPPED; break;
+    }
+
     printf("        TYPE               : %-3d  %s\n", type, type_str);
-    printf("        STATE              : %-3d  %s\n",
-           running ? 4 : 1,
-           running ? "RUNNING" : "STOPPED");
+    printf("        STATE              : %-3d  %s\n", state, state_str);
     printf("        BINARY_PATH_NAME   : %s\n", binary);
 
     const char *start_str = "DEMAND_START";
@@ -328,10 +353,26 @@ int main(int argc, char *argv[])
         {
             char install_args[4096];
             int ia_len = snprintf(install_args, sizeof(install_args), "%s %s", argv[2], argv[3]);
-            if (argc > 4)
-                ia_len += snprintf(install_args + ia_len, sizeof(install_args) - ia_len, " %s", argv[4]);
-            if (argc > 5)
-                ia_len += snprintf(install_args + ia_len, sizeof(install_args) - ia_len, " %s", argv[5]);
+            if (ia_len < 0 || (size_t)ia_len >= sizeof(install_args))
+                ia_len = (int)sizeof(install_args) - 1;
+            if (argc > 4 && (size_t)ia_len < sizeof(install_args) - 1) {
+                int w = snprintf(install_args + ia_len, sizeof(install_args) - ia_len, " %s", argv[4]);
+                if (w > 0) {
+                    if ((size_t)w >= sizeof(install_args) - ia_len)
+                        ia_len = (int)sizeof(install_args) - 1;
+                    else
+                        ia_len += w;
+                }
+            }
+            if (argc > 5 && (size_t)ia_len < sizeof(install_args) - 1) {
+                int w = snprintf(install_args + ia_len, sizeof(install_args) - ia_len, " %s", argv[5]);
+                if (w > 0) {
+                    if ((size_t)w >= sizeof(install_args) - ia_len)
+                        ia_len = (int)sizeof(install_args) - 1;
+                    else
+                        ia_len += w;
+                }
+            }
 
             int rc = scm_send_command("install", install_args);
             if (rc != 0) {

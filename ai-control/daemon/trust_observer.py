@@ -284,9 +284,30 @@ class TrustObserver:
 
     # ── Subject tracking ──
 
+    # Cap tracked subjects to prevent unbounded growth when short-lived
+    # PE processes repeatedly register without matching unregister.
+    MAX_TRACKED_SUBJECTS = 4096
+
     def register_subject(self, subject_id: int, domain: int = TRUST_DOMAIN_LINUX):
-        """Start tracking a subject."""
+        """Start tracking a subject.
+
+        Uses dict-insertion-order as an implicit LRU: the first key in
+        self._profiles is the oldest tracked subject. Evicting that is O(1)
+        via iter(dict), avoiding the previous O(n) min() scan over all
+        subjects every time a new one registers (noticeable when thousands
+        of short-lived PE processes spin up).
+        """
         if subject_id not in self._profiles:
+            # Evict the oldest-registered profile if we'd exceed the cap.
+            # dict iteration order == insertion order (guaranteed 3.7+),
+            # so next(iter(...)) is the oldest.
+            if len(self._profiles) >= self.MAX_TRACKED_SUBJECTS:
+                try:
+                    oldest_sid = next(iter(self._profiles))
+                    self._profiles.pop(oldest_sid, None)
+                    self._freeze_timers.pop(oldest_sid, None)
+                except StopIteration:
+                    pass
             self._profiles[subject_id] = SubjectProfile(
                 subject_id=subject_id,
                 domain=domain,
@@ -627,6 +648,12 @@ class TrustObserver:
         if not p:
             return None
 
+        # Grab last 20 snapshots without materializing the whole deque.
+        import itertools
+        hist_len = len(p.history)
+        hist_start = max(0, hist_len - 20)
+        history_slice = itertools.islice(p.history, hist_start, hist_len)
+
         return {
             "subject_id": p.subject_id,
             "domain": p.domain,
@@ -637,7 +664,7 @@ class TrustObserver:
             "avg_score": round(p.avg_score, 1),
             "history": [
                 {"score": s.score, "timestamp": s.timestamp, "direction": s.direction}
-                for s in list(p.history)[-20:]  # Last 20 snapshots
+                for s in history_slice
             ],
         }
 

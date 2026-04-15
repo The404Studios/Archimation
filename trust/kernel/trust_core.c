@@ -117,34 +117,45 @@ static int32_t subject_token_max(u32 subject_id)
  * Atomic token transfer between two subjects.
  * Acquires both TLB set locks in consistent order (lower set index first)
  * to prevent deadlocks and TOCTOU races.
+ *
+ * MUST use spin_lock_irqsave: the TLB set locks are taken from softirq
+ * context by trust_decay_timer_fn (-> trust_risc_decay_tick /
+ * trust_immune_tick). A plain spin_lock() here allows a softirq to
+ * deadlock on a lock held by preempted process context on the same CPU.
  */
 static int subject_token_transfer(u32 from_id, u32 to_id, int32_t amount)
 {
     u32 from_set_idx, to_set_idx;
     trust_tlb_set_t *set_a, *set_b;
     trust_subject_t *from_p = NULL, *to_p = NULL;
+    unsigned long flags_a, flags_b = 0;
     int i;
 
     if (amount <= 0)
         return -EINVAL;
     if (!g_trust_tlb.sets)
         return -ENOMEM;
+    /* Reject self-transfer: would double-count total_burned AND
+     * total_regenerated on the same subject via aliased from_p/to_p. */
+    if (from_id == to_id)
+        return -EINVAL;
 
-    from_set_idx = from_id % TRUST_TLB_SETS;
-    to_set_idx = to_id % TRUST_TLB_SETS;
+    /* Must match tlb_hash() inside trust_tlb.c */
+    from_set_idx = trust_tlb_set_of(from_id);
+    to_set_idx = trust_tlb_set_of(to_id);
 
     /* Lock sets in consistent order (lower index first) to prevent deadlock */
     if (from_set_idx <= to_set_idx) {
         set_a = &g_trust_tlb.sets[from_set_idx];
         set_b = &g_trust_tlb.sets[to_set_idx];
-        spin_lock(&set_a->lock);
+        spin_lock_irqsave(&set_a->lock, flags_a);
         if (from_set_idx != to_set_idx)
-            spin_lock(&set_b->lock);
+            spin_lock_irqsave(&set_b->lock, flags_b);
     } else {
         set_a = &g_trust_tlb.sets[to_set_idx];
         set_b = &g_trust_tlb.sets[from_set_idx];
-        spin_lock(&set_a->lock);
-        spin_lock(&set_b->lock);
+        spin_lock_irqsave(&set_a->lock, flags_a);
+        spin_lock_irqsave(&set_b->lock, flags_b);
     }
 
     /* Find source subject */
@@ -169,30 +180,40 @@ static int subject_token_transfer(u32 from_id, u32 to_id, int32_t amount)
 
     if (!from_p || !to_p) {
         if (from_set_idx != to_set_idx)
-            spin_unlock(&set_b->lock);
-        spin_unlock(&set_a->lock);
+            spin_unlock_irqrestore(&set_b->lock, flags_b);
+        spin_unlock_irqrestore(&set_a->lock, flags_a);
         return -ENOENT;
     }
 
     if (from_p->tokens.balance < amount) {
         if (from_set_idx != to_set_idx)
-            spin_unlock(&set_b->lock);
-        spin_unlock(&set_a->lock);
+            spin_unlock_irqrestore(&set_b->lock, flags_b);
+        spin_unlock_irqrestore(&set_a->lock, flags_a);
         return -ENOSPC;
     }
 
     from_p->tokens.balance -= amount;
-    from_p->tokens.total_burned += amount;
+    /* Cap lifetime counters at UINT32_MAX to prevent silent overflow. */
+    if (from_p->tokens.total_burned > UINT32_MAX - (u32)amount)
+        from_p->tokens.total_burned = UINT32_MAX;
+    else
+        from_p->tokens.total_burned += (u32)amount;
     /* Prevent signed overflow: clamp before addition */
     if (to_p->tokens.balance > to_p->tokens.max_balance - amount)
         to_p->tokens.balance = to_p->tokens.max_balance;
     else
         to_p->tokens.balance += amount;
-    to_p->tokens.total_regenerated += amount;
+    if (to_p->tokens.total_regenerated > UINT32_MAX - (u32)amount)
+        to_p->tokens.total_regenerated = UINT32_MAX;
+    else
+        to_p->tokens.total_regenerated += (u32)amount;
+    /* Clear starvation if balance becomes positive */
+    if (to_p->tokens.starved && to_p->tokens.balance > 0)
+        to_p->tokens.starved = 0;
 
     if (from_set_idx != to_set_idx)
-        spin_unlock(&set_b->lock);
-    spin_unlock(&set_a->lock);
+        spin_unlock_irqrestore(&set_b->lock, flags_b);
+    spin_unlock_irqrestore(&set_a->lock, flags_a);
     return 0;
 }
 
@@ -309,8 +330,15 @@ static long trust_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
         trust_tlb_insert(&subj);
 
-        /* Create proof chain for this subject */
-        trust_ape_create_entity(req.subject_id, NULL, 0);
+        /* Create proof chain for this subject.  If the APE pool is full we
+         * still allow registration but warn loudly — proof-using ops will
+         * return -ENOENT later. */
+        {
+            int ape_ret = trust_ape_create_entity(req.subject_id, NULL, 0);
+            if (ape_ret && ape_ret != -EEXIST)
+                pr_warn("trust: proof chain not created for subject %u (%d)\n",
+                        req.subject_id, ape_ret);
+        }
 
         pr_info("trust: registered subject %u domain=%u auth=%u score=%d "
                 "(RoA: chromosome+proof+tokens initialized)\n",

@@ -51,7 +51,15 @@ static HANDLE broker_mmap_handle(int shm_fd, handle_type_t type)
     if (shm == MAP_FAILED)
         return NULL;
 
-    return handle_alloc(type, BROKER_HANDLE_FD_SENTINEL, shm);
+    HANDLE h = handle_alloc(type, BROKER_HANDLE_FD_SENTINEL, shm);
+    /* handle_alloc returns INVALID_HANDLE_VALUE on failure, but named-object
+     * Create* contract returns NULL on failure. Normalize so callers checking
+     * if (h) / if (!h) behave correctly (INVALID_HANDLE_VALUE = -1 is truthy). */
+    if (!h || h == INVALID_HANDLE_VALUE) {
+        munmap(shm, 4096);
+        return NULL;
+    }
+    return h;
 }
 
 /* Helper: check if a handle entry is broker-backed. */
@@ -80,14 +88,47 @@ static named_obj_entry_t g_named_objs[NAMED_OBJ_MAX];
 static int               g_named_obj_count = 0;
 static pthread_mutex_t   g_named_obj_lock  = PTHREAD_MUTEX_INITIALIZER;
 
+/* Monotonic generation bumped whenever g_named_objs[] is mutated (append
+ * via register or swap-with-last via unregister). TLS last-hit caches
+ * compare this under g_named_obj_lock to detect invalidation without
+ * per-thread coordination. All inline lookup/register sites in
+ * CreateEventA/CreateMutexA/CreateSemaphoreA also bump this counter. */
+static volatile unsigned int g_named_obj_gen = 0;
+
+/* TLS last-hit cache for named_obj_lookup(). PE apps routinely call
+ * OpenEvent/OpenMutex by the same name in tight loops (e.g. shared-
+ * memory heartbeat polling, anti-cheat probe checks). A 1-entry
+ * per-thread cache eliminates most lookups without touching the
+ * mutation path.
+ *
+ * Safety: read under g_named_obj_lock. The cached pointer is only
+ * used if (tls_gen == g_named_obj_gen) — since both mutations and
+ * cache reads happen under the lock, a stale entry cannot be returned. */
+static __thread unsigned int tls_no_gen          = (unsigned int)-1;
+static __thread char         tls_no_name[260];
+static __thread int          tls_no_type         = 0;
+static __thread HANDLE       tls_no_hit          = NULL;
+
 static HANDLE named_obj_lookup(const char *name, int type)
 {
     if (!name || !name[0]) return NULL;
     pthread_mutex_lock(&g_named_obj_lock);
+    if (tls_no_gen == g_named_obj_gen && tls_no_hit &&
+        tls_no_type == type &&
+        strcasecmp(tls_no_name, name) == 0) {
+        HANDLE h = tls_no_hit;
+        pthread_mutex_unlock(&g_named_obj_lock);
+        return h;
+    }
     for (int i = 0; i < g_named_obj_count; i++) {
         if (g_named_objs[i].type == type &&
             strcasecmp(g_named_objs[i].name, name) == 0) {
             HANDLE h = g_named_objs[i].handle;
+            tls_no_gen = g_named_obj_gen;
+            strncpy(tls_no_name, name, sizeof(tls_no_name) - 1);
+            tls_no_name[sizeof(tls_no_name) - 1] = '\0';
+            tls_no_type = type;
+            tls_no_hit = h;
             pthread_mutex_unlock(&g_named_obj_lock);
             return h;
         }
@@ -106,6 +147,7 @@ static void named_obj_register(const char *name, HANDLE h, int type)
         e->name[sizeof(e->name) - 1] = '\0';
         e->handle = h;
         e->type = type;
+        g_named_obj_gen++;
     }
     pthread_mutex_unlock(&g_named_obj_lock);
 }
@@ -123,6 +165,7 @@ void named_obj_unregister(HANDLE h)
             if (i < g_named_obj_count)
                 g_named_objs[i] = g_named_objs[g_named_obj_count];
             memset(&g_named_objs[g_named_obj_count], 0, sizeof(named_obj_entry_t));
+            g_named_obj_gen++;
             break;
         }
     }
@@ -185,14 +228,25 @@ WINAPI_EXPORT HANDLE CreateEventA(
         evt->signaled = bInitialState ? 1 : 0;
         evt->manual_reset = bManualReset ? 1 : 0;
         HANDLE h = handle_alloc(HANDLE_TYPE_EVENT, -1, evt);
-        if (h && g_named_obj_count < NAMED_OBJ_MAX) {
+        /* handle_alloc returns INVALID_HANDLE_VALUE on failure, but CreateEvent
+         * contract returns NULL on failure. Treat both as failure. */
+        if (h && h != INVALID_HANDLE_VALUE && g_named_obj_count < NAMED_OBJ_MAX) {
             named_obj_entry_t *e = &g_named_objs[g_named_obj_count++];
             strncpy(e->name, lpName, sizeof(e->name) - 1);
             e->name[sizeof(e->name) - 1] = '\0';
             e->handle = h;
             e->type = HANDLE_TYPE_EVENT;
+            g_named_obj_gen++;
         }
         pthread_mutex_unlock(&g_named_obj_lock);
+        if (!h || h == INVALID_HANDLE_VALUE) {
+            /* handle_alloc failed: destroy pthread primitives and free */
+            pthread_mutex_destroy(&evt->mutex);
+            pthread_cond_destroy(&evt->cond);
+            free(evt);
+            set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+            return NULL;
+        }
         return h;
     }
 
@@ -207,13 +261,25 @@ WINAPI_EXPORT HANDLE CreateEventA(
     evt->signaled = bInitialState ? 1 : 0;
     evt->manual_reset = bManualReset ? 1 : 0;
 
-    return handle_alloc(HANDLE_TYPE_EVENT, -1, evt);
+    HANDLE h = handle_alloc(HANDLE_TYPE_EVENT, -1, evt);
+    /* handle_alloc returns INVALID_HANDLE_VALUE on failure, but CreateEvent
+     * contract returns NULL on failure. Normalize. */
+    if (!h || h == INVALID_HANDLE_VALUE) {
+        pthread_mutex_destroy(&evt->mutex);
+        pthread_cond_destroy(&evt->cond);
+        free(evt);
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    return h;
 }
 
-/* Simple UTF-16 to ASCII converter for named object names */
+/* Simple UTF-16 to ASCII converter for named object names.
+ * Safety: guard against buflen==0 (buflen-1 underflows to SIZE_MAX, which
+ * would otherwise allow an unbounded loop/write if the caller passes 0). */
 static const char *wide_to_narrow_name(LPCWSTR wide, char *buf, size_t buflen)
 {
-    if (!wide || !wide[0]) return NULL;
+    if (!wide || !wide[0] || !buf || buflen == 0) return NULL;
     size_t i;
     for (i = 0; i < buflen - 1 && wide[i]; i++)
         buf[i] = (char)(wide[i] & 0x7F);
@@ -304,16 +370,19 @@ WINAPI_EXPORT HANDLE CreateMutexA(
             if (shm_fd >= 0) {
                 HANDLE h = broker_mmap_handle(shm_fd, HANDLE_TYPE_MUTEX);
                 if (h) {
-                    /* If initial owner, lock it via futex CAS */
+                    /* If initial owner, lock it via futex CAS — only
+                     * stomp owner_tid/recursion if the CAS succeeded, otherwise
+                     * another process already holds the mutex. */
                     if (bInitialOwner) {
                         handle_entry_t *entry = handle_lookup(h);
                         if (entry) {
                             shm_mutex_t *m = (shm_mutex_t *)entry->data;
                             uint32_t expected = 0;
-                            atomic_compare_exchange_strong(&m->futex_word,
-                                &expected, (uint32_t)getpid());
-                            atomic_store(&m->owner_tid, (uint32_t)gettid());
-                            atomic_store(&m->recursion, 1);
+                            if (atomic_compare_exchange_strong(&m->futex_word,
+                                    &expected, (uint32_t)getpid())) {
+                                atomic_store(&m->owner_tid, (uint32_t)gettid());
+                                atomic_store(&m->recursion, 1);
+                            }
                         }
                     }
                     named_obj_register(lpName, h, HANDLE_TYPE_MUTEX);
@@ -353,14 +422,24 @@ WINAPI_EXPORT HANDLE CreateMutexA(
             mtx->owner = (DWORD)gettid();
         }
         HANDLE h = handle_alloc(HANDLE_TYPE_MUTEX, -1, mtx);
-        if (h && g_named_obj_count < NAMED_OBJ_MAX) {
+        /* handle_alloc returns INVALID_HANDLE_VALUE on failure, but CreateMutex
+         * contract returns NULL on failure. Treat both as failure. */
+        if (h && h != INVALID_HANDLE_VALUE && g_named_obj_count < NAMED_OBJ_MAX) {
             named_obj_entry_t *e = &g_named_objs[g_named_obj_count++];
             strncpy(e->name, lpName, sizeof(e->name) - 1);
             e->name[sizeof(e->name) - 1] = '\0';
             e->handle = h;
             e->type = HANDLE_TYPE_MUTEX;
+            g_named_obj_gen++;
         }
         pthread_mutex_unlock(&g_named_obj_lock);
+        if (!h || h == INVALID_HANDLE_VALUE) {
+            if (bInitialOwner) pthread_mutex_unlock(&mtx->mutex);
+            pthread_mutex_destroy(&mtx->mutex);
+            free(mtx);
+            set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+            return NULL;
+        }
         return h;
     }
 
@@ -382,7 +461,17 @@ WINAPI_EXPORT HANDLE CreateMutexA(
         mtx->owner = (DWORD)gettid();
     }
 
-    return handle_alloc(HANDLE_TYPE_MUTEX, -1, mtx);
+    HANDLE h = handle_alloc(HANDLE_TYPE_MUTEX, -1, mtx);
+    /* handle_alloc returns INVALID_HANDLE_VALUE on failure, but CreateMutex
+     * contract returns NULL on failure. Normalize. */
+    if (!h || h == INVALID_HANDLE_VALUE) {
+        if (bInitialOwner) pthread_mutex_unlock(&mtx->mutex);
+        pthread_mutex_destroy(&mtx->mutex);
+        free(mtx);
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    return h;
 }
 
 WINAPI_EXPORT HANDLE CreateMutexW(
@@ -481,14 +570,23 @@ WINAPI_EXPORT HANDLE CreateSemaphoreA(
         sem_init(&sem->sem, 0, (unsigned int)lInitialCount);
         sem->max_count = lMaximumCount;
         HANDLE h = handle_alloc(HANDLE_TYPE_SEMAPHORE, -1, sem);
-        if (h && g_named_obj_count < NAMED_OBJ_MAX) {
+        /* handle_alloc returns INVALID_HANDLE_VALUE on failure, but CreateSemaphore
+         * contract returns NULL on failure. Treat both as failure. */
+        if (h && h != INVALID_HANDLE_VALUE && g_named_obj_count < NAMED_OBJ_MAX) {
             named_obj_entry_t *e = &g_named_objs[g_named_obj_count++];
             strncpy(e->name, lpName, sizeof(e->name) - 1);
             e->name[sizeof(e->name) - 1] = '\0';
             e->handle = h;
             e->type = HANDLE_TYPE_SEMAPHORE;
+            g_named_obj_gen++;
         }
         pthread_mutex_unlock(&g_named_obj_lock);
+        if (!h || h == INVALID_HANDLE_VALUE) {
+            sem_destroy(&sem->sem);
+            free(sem);
+            set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+            return NULL;
+        }
         return h;
     }
 
@@ -502,7 +600,16 @@ WINAPI_EXPORT HANDLE CreateSemaphoreA(
     sem_init(&sem->sem, 0, (unsigned int)lInitialCount);
     sem->max_count = lMaximumCount;
 
-    return handle_alloc(HANDLE_TYPE_SEMAPHORE, -1, sem);
+    HANDLE h = handle_alloc(HANDLE_TYPE_SEMAPHORE, -1, sem);
+    /* handle_alloc returns INVALID_HANDLE_VALUE on failure, but CreateSemaphore
+     * contract returns NULL on failure. Normalize. */
+    if (!h || h == INVALID_HANDLE_VALUE) {
+        sem_destroy(&sem->sem);
+        free(sem);
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    return h;
 }
 
 WINAPI_EXPORT HANDLE CreateSemaphoreW(
@@ -1078,7 +1185,9 @@ WINAPI_EXPORT HANDLE CreateWaitableTimerA(
 
     /* Store the timerfd as the handle's fd so WaitForSingleObject can poll it */
     HANDLE h = handle_alloc(HANDLE_TYPE_TIMER, fd, data);
-    if (!h) {
+    /* handle_alloc returns INVALID_HANDLE_VALUE on failure, but CreateWaitableTimer
+     * contract returns NULL on failure. Normalize. */
+    if (!h || h == INVALID_HANDLE_VALUE) {
         close(fd);
         free(data);
         set_last_error(ERROR_NOT_ENOUGH_MEMORY);

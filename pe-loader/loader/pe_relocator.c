@@ -57,6 +57,10 @@ int pe_apply_relocations(pe_image_t *image)
         fprintf(stderr, LOG_PREFIX "Invalid relocation directory RVA\n");
         return -1;
     }
+    if ((uint64_t)reloc_dir->virtual_address + (uint64_t)reloc_dir->size > (uint64_t)image->mapped_size) {
+        fprintf(stderr, LOG_PREFIX "Relocation directory extends past mapped image\n");
+        return -1;
+    }
 
     uint32_t processed = 0;
     uint32_t total_entries = 0;
@@ -64,6 +68,9 @@ int pe_apply_relocations(pe_image_t *image)
     uint8_t *ptr = reloc_base;
 
     while (processed < reloc_dir->size) {
+        if (reloc_dir->size - processed < sizeof(pe_base_reloc_block_t))
+            break;
+
         pe_base_reloc_block_t *block = (pe_base_reloc_block_t *)ptr;
 
         if (block->block_size == 0)
@@ -72,8 +79,62 @@ int pe_apply_relocations(pe_image_t *image)
         if (block->block_size < sizeof(pe_base_reloc_block_t))
             break;
 
+        if (block->block_size > reloc_dir->size - processed)
+            break;
+
         uint32_t num_entries = (block->block_size - sizeof(pe_base_reloc_block_t)) / sizeof(uint16_t);
         uint16_t *entries = (uint16_t *)(ptr + sizeof(pe_base_reloc_block_t));
+
+        /*
+         * Hot-path fast case: block is PURELY PE_REL_BASED_DIR64 entries.
+         *
+         * Modern x64 PEs use DIR64 exclusively, with zero-padding ABSOLUTE
+         * entries at block tails to reach 4-byte alignment.  We scan the
+         * block once to verify it is a pure DIR64|ABSOLUTE block, then use
+         * a tight unrolled loop that skips per-entry bounds-check overhead.
+         *
+         * Preserves the exact semantics of the general loop when it fires:
+         *   - ABSOLUTE entries are no-ops (just padding)
+         *   - DIR64 patches full 64-bit int at (block_base + offset)
+         *
+         * This is the dominant branch for Windows 10+ 64-bit binaries.
+         */
+        int pure_dir64 = 1;
+        for (uint32_t i = 0; i < num_entries; i++) {
+            uint8_t t = PE_RELOC_TYPE(entries[i]);
+            if (t != PE_REL_BASED_DIR64 && t != PE_REL_BASED_ABSOLUTE) {
+                pure_dir64 = 0;
+                break;
+            }
+        }
+
+        if (__builtin_expect(pure_dir64, 1)) {
+            /* Pre-compute block base pointer once -- valid iff page_rva in-range. */
+            if (block->page_rva >= image->mapped_size) {
+                processed += block->block_size;
+                ptr += block->block_size;
+                continue;
+            }
+            uint8_t *block_base = image->mapped_base + block->page_rva;
+            uint64_t block_page_limit = (uint64_t)image->mapped_size - block->page_rva;
+            for (uint32_t i = 0; i < num_entries; i++) {
+                uint16_t entry = entries[i];
+                uint8_t type = PE_RELOC_TYPE(entry);
+                if (type == PE_REL_BASED_ABSOLUTE) continue;
+                /* DIR64: must have 8 bytes in-bounds at block_base+offset */
+                uint16_t offset = PE_RELOC_OFFSET(entry);
+                if (__builtin_expect((uint64_t)offset + 8u > block_page_limit, 0)) {
+                    skipped++;
+                    continue;
+                }
+                uint64_t *patch = (uint64_t *)(block_base + offset);
+                *patch = (uint64_t)((int64_t)*patch + delta);
+                total_entries++;
+            }
+            processed += block->block_size;
+            ptr += block->block_size;
+            continue;
+        }
 
         for (uint32_t i = 0; i < num_entries; i++) {
             uint16_t entry = entries[i];
@@ -117,7 +178,7 @@ int pe_apply_relocations(pe_image_t *image)
                 if (i + 1 < num_entries) {
                     uint16_t next_entry_val = entries[i + 1];
                     uint16_t *patch = (uint16_t *)target;
-                    int32_t adj = (int32_t)(*patch << 16) + (int32_t)next_entry_val + (int32_t)delta;
+                    int32_t adj = (int32_t)((uint32_t)*patch << 16) + (int32_t)next_entry_val + (int32_t)delta;
                     *patch = (uint16_t)((adj + 0x8000) >> 16);
                     i++; /* consume next entry */
                     total_entries++;

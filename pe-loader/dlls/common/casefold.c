@@ -28,6 +28,18 @@ typedef struct casefold_entry {
 
 static casefold_entry_t g_cache[CASEFOLD_CACHE_SIZE];
 static pthread_mutex_t g_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile unsigned int g_cache_gen = 0;
+
+/* TLS last-hit bypass: hot file-open paths repeatedly resolve the same
+ * (dir, component) pairs. Full hash+mutex+strcmp is expensive per call;
+ * a 1-entry per-thread cache makes the fast path nearly free.
+ *
+ * Invalidated when g_cache_gen bumps (from casefold_cache_flush). */
+static __thread unsigned int tls_cf_gen = (unsigned int)-1;
+static __thread char tls_cf_dir[PATH_MAX];
+static __thread char tls_cf_comp_lc[NAME_MAX];
+static __thread char tls_cf_real[NAME_MAX];
+static __thread int  tls_cf_valid = 0;
 
 /* djb2 hash */
 static unsigned int cache_hash(const char *dir, const char *component)
@@ -43,6 +55,15 @@ static unsigned int cache_hash(const char *dir, const char *component)
 
 static int cache_lookup(const char *dir, const char *component, char *out, size_t out_size)
 {
+    /* TLS last-hit fast path (no lock, no hash). */
+    if (tls_cf_valid && tls_cf_gen == g_cache_gen) {
+        if (strcmp(tls_cf_dir, dir) == 0 &&
+            strcasecmp(tls_cf_comp_lc, component) == 0) {
+            snprintf(out, out_size, "%s", tls_cf_real);
+            return 1;
+        }
+    }
+
     unsigned int idx = cache_hash(dir, component);
     pthread_mutex_lock(&g_cache_lock);
     casefold_entry_t *e = &g_cache[idx];
@@ -53,6 +74,19 @@ static int cache_lookup(const char *dir, const char *component, char *out, size_
             strcasecmp(e->key + dir_len + 1, component) == 0) {
             e->hits++;
             snprintf(out, out_size, "%s", e->real_name);
+            /* Populate TLS cache under the lock so we read a consistent
+             * real_name without racing a concurrent insert. */
+            if (strlen(dir) < sizeof(tls_cf_dir) &&
+                strlen(component) < sizeof(tls_cf_comp_lc)) {
+                strncpy(tls_cf_dir, dir, sizeof(tls_cf_dir) - 1);
+                tls_cf_dir[sizeof(tls_cf_dir) - 1] = '\0';
+                strncpy(tls_cf_comp_lc, component, sizeof(tls_cf_comp_lc) - 1);
+                tls_cf_comp_lc[sizeof(tls_cf_comp_lc) - 1] = '\0';
+                strncpy(tls_cf_real, e->real_name, sizeof(tls_cf_real) - 1);
+                tls_cf_real[sizeof(tls_cf_real) - 1] = '\0';
+                tls_cf_gen = g_cache_gen;
+                tls_cf_valid = 1;
+            }
             pthread_mutex_unlock(&g_cache_lock);
             return 1;
         }
@@ -75,6 +109,17 @@ static void cache_insert(const char *dir, const char *component, const char *rea
         snprintf(e->real_name, sizeof(e->real_name), "%s", real_name);
         e->hits = 1;
         e->valid = 1;
+    }
+    if (dir_len < sizeof(tls_cf_dir) && strlen(component) < sizeof(tls_cf_comp_lc) &&
+        strlen(real_name) < sizeof(tls_cf_real)) {
+        strncpy(tls_cf_dir, dir, sizeof(tls_cf_dir) - 1);
+        tls_cf_dir[sizeof(tls_cf_dir) - 1] = '\0';
+        strncpy(tls_cf_comp_lc, component, sizeof(tls_cf_comp_lc) - 1);
+        tls_cf_comp_lc[sizeof(tls_cf_comp_lc) - 1] = '\0';
+        strncpy(tls_cf_real, real_name, sizeof(tls_cf_real) - 1);
+        tls_cf_real[sizeof(tls_cf_real) - 1] = '\0';
+        tls_cf_gen = g_cache_gen;
+        tls_cf_valid = 1;
     }
     pthread_mutex_unlock(&g_cache_lock);
 }
@@ -182,8 +227,11 @@ int casefold_resolve(const char *path, char *resolved, size_t size)
         while ((ent = readdir(dir)) != NULL) {
             if (strcasecmp(ent->d_name, component) == 0) {
                 cache_insert(built, component, ent->d_name);
-                snprintf(built, sizeof(built), "%s/%s",
+                /* Avoid snprintf aliasing (built is both src and dst) */
+                char next_built[PATH_MAX];
+                snprintf(next_built, sizeof(next_built), "%s/%s",
                          (built[0] == '/' && built[1] == '\0') ? "" : built, ent->d_name);
+                snprintf(built, sizeof(built), "%s", next_built);
                 found = 1;
                 break;
             }
@@ -205,5 +253,6 @@ void casefold_cache_flush(void)
 {
     pthread_mutex_lock(&g_cache_lock);
     memset(g_cache, 0, sizeof(g_cache));
+    g_cache_gen++;
     pthread_mutex_unlock(&g_cache_lock);
 }

@@ -155,6 +155,25 @@ void             trust_tlb_flush(void);
 int              trust_tlb_init(void);
 void             trust_tlb_cleanup(void);
 
+/*
+ * Map a subject_id to its TLB set index. MUST be kept in sync with the
+ * internal tlb_hash() in trust_tlb.c, otherwise cross-set operations
+ * (token transfer, two-subject lookups) won't find entries that
+ * trust_tlb_insert() placed at the hashed set index.
+ */
+static inline u32 trust_tlb_set_of(u32 subject_id)
+{
+    u32 x = subject_id;
+    x = (x ^ (x >> 16)) * 0x85ebca6bU;
+    x = (x ^ (x >> 13)) * 0xc2b2ae35U;
+    x ^= (x >> 16);
+#if (TRUST_TLB_SETS & (TRUST_TLB_SETS - 1)) == 0
+    return x & (TRUST_TLB_SETS - 1);
+#else
+    return x % TRUST_TLB_SETS;
+#endif
+}
+
 /* Atomic modify: lookup + callback + writeback under set lock (prevents TOCTOU) */
 typedef int (*trust_tlb_modify_fn)(trust_subject_t *subj, void *data);
 int              trust_tlb_modify(u32 subject_id, trust_tlb_modify_fn fn, void *data);
@@ -229,6 +248,12 @@ int  trust_chromosome_verify(const trust_chromosome_t *chromo);
 void trust_chromosome_inherit(trust_chromosome_t *child,
                                const trust_chromosome_t *parent, u8 gen);
 u32  trust_chromosome_rolling_hash(u32 hash_state, u32 new_input);
+/* Deferred-update variants: skip the checksum recompute on each call.
+ * Caller MUST call trust_chromosome_finalize() before publishing the
+ * chromosome (e.g. before releasing the TLB set lock). */
+void trust_chromosome_update_a_deferred(trust_chromosome_t *chromo,
+                                         u32 segment_idx, u32 new_value);
+void trust_chromosome_finalize(trust_chromosome_t *chromo);
 
 /* --- Token Economy operations (trust_token.c) ---
  *

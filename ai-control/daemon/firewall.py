@@ -31,9 +31,23 @@ try:
     from backend.nft_manager import NftManager, FirewallRule, Direction, Action, Protocol
     from backend.rule_store import RuleStore
     from backend.connection_monitor import ConnectionMonitor
+    from backend import app_tracker as _app_tracker_mod
     _backend_available = True
 except ImportError:
     logger.warning("Firewall backend not available — using raw nft fallback")
+    _app_tracker_mod = None  # type: ignore
+
+# cgroup_manager is optional -- the daemon keeps working on systems without
+# cgroup v2 (the nft socket-cgroupv2 predicate just never matches).  We import
+# it defensively so an ImportError from a non-Linux build host doesn't take
+# the whole firewall offline.
+_cgroup_manager_mod = None
+if _backend_available:
+    try:
+        from backend import cgroup_manager as _cgroup_manager_mod  # type: ignore
+    except ImportError:
+        logger.debug("cgroup_manager module unavailable — app-scope enforcement disabled")
+        _cgroup_manager_mod = None
 
 
 class FirewallController:
@@ -44,6 +58,7 @@ class FirewallController:
         self._nft: Optional["NftManager"] = None
         self._store: Optional["RuleStore"] = None
         self._monitor: Optional["ConnectionMonitor"] = None
+        self._tracker = None  # AppTracker instance owning the app-rule listener
 
         if _backend_available:
             try:
@@ -51,12 +66,88 @@ class FirewallController:
                 self._store = RuleStore()
                 self._monitor = ConnectionMonitor()
                 self._monitor.start()
+                # ------------------------------------------------------------------
+                # Wire AppTracker -> NftManager so rule.application entries actually
+                # enforce.  Without this, nft emits "socket cgroupv2 level 2
+                # \"pe-compat.slice/<app>.scope\"" predicates but no PID ever
+                # lives in that cgroup path, so the rule never matches.  The
+                # tracker's on_rule_changed() callback plus its /proc polling
+                # place running PIDs into the right scope.
+                #
+                # Graceful fallback: if cgroup v2 isn't available or we lack
+                # permission (e.g. running non-root in a container), the
+                # cgroup_manager methods become no-ops and return False --
+                # the firewall still works, application predicates just don't
+                # match.  We log once so operators can diagnose.
+                # ------------------------------------------------------------------
+                cgroup_ok = False
+                if _cgroup_manager_mod is not None:
+                    try:
+                        cgroup_ok = bool(_cgroup_manager_mod.detect_cgroupv2())
+                    except Exception:
+                        cgroup_ok = False
+
+                if cgroup_ok:
+                    try:
+                        # Pre-create pe-compat.slice so the first rule add
+                        # doesn't race with cgroup directory creation.
+                        _cgroup_manager_mod.ensure_slice()
+                    except Exception:
+                        logger.exception("cgroup_manager.ensure_slice() failed")
+
+                    if _app_tracker_mod is not None:
+                        try:
+                            self._tracker = _app_tracker_mod.AppTracker()
+                            self._tracker.attach_to_nft_manager(self._nft)
+                            logger.info(
+                                "AppTracker attached to NftManager "
+                                "(cgroup v2 enforcement active)"
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to attach AppTracker; application-scoped "
+                                "firewall rules will not enforce"
+                            )
+                            self._tracker = None
+                else:
+                    logger.warning(
+                        "cgroup v2 not available or insufficient permissions — "
+                        "application-scoped firewall rules will be compiled "
+                        "but not enforced"
+                    )
+
                 logger.info("Firewall backend initialized (NftManager + RuleStore + ConnectionMonitor)")
             except Exception:
                 logger.exception("Failed to initialize firewall backend, falling back to raw nft")
                 self._nft = None
                 self._store = None
                 self._monitor = None
+                self._tracker = None
+
+    def prune_pid_cache(self) -> int:
+        """Prune stale (exited) PIDs from the AppTracker's memoisation set.
+
+        The tracker memoises successful cgroup placements as
+        ``(pid, app_name)`` tuples to avoid hammering ``cgroup.procs`` on
+        every 2-second poll.  Linux recycles PID numbers, so without
+        pruning, a stale entry for a long-dead process can cause a newly
+        spawned process with the same PID to skip scoping.  Call this
+        from the daemon's housekeeping timer (once per minute is plenty).
+
+        Returns the number of entries pruned, 0 when there's no tracker.
+        """
+        tracker = self._tracker
+        if tracker is None:
+            return 0
+        try:
+            from firewall import prune_exited_pids  # type: ignore
+        except ImportError:
+            return 0
+        try:
+            return prune_exited_pids(tracker)
+        except Exception:
+            logger.debug("prune_exited_pids failed", exc_info=True)
+            return 0
 
     # ------------------------------------------------------------------
     # Query
@@ -233,6 +324,7 @@ class FirewallController:
             return False
 
     async def _run_nft(self, args: str) -> str:
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 self._nft_bin, *args.split(),
@@ -246,6 +338,12 @@ class FirewallController:
             return stdout.decode(errors="replace")
         except asyncio.TimeoutError:
             logger.error("nft command timed out: %s %s", self._nft_bin, args)
+            if proc is not None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
             return ""
         except FileNotFoundError:
             logger.error("nft binary not found at %s", self._nft_bin)
@@ -253,6 +351,7 @@ class FirewallController:
 
     @staticmethod
     async def _systemctl(action: str, unit: str) -> dict:
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "systemctl", action, unit,
@@ -265,6 +364,14 @@ class FirewallController:
                 "stdout": stdout.decode(errors="replace").strip(),
                 "stderr": stderr.decode(errors="replace").strip(),
             }
+        except asyncio.TimeoutError:
+            if proc is not None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+            return {"success": False, "error": "timeout"}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 

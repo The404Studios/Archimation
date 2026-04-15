@@ -251,7 +251,7 @@ int objectd_connect(void)
         return 0;
     }
 
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) {
         atomic_store(&g_objectd_available, 0);
         pthread_mutex_unlock(&g_objectd_lock);

@@ -76,6 +76,12 @@ typedef struct {
     fake_cert_info_t cert;
 } module_entry_t;
 
+/* Module-name -> modules[] index hash for O(1) dedup in integrity_check_module.
+ * Anti-cheats often probe 30-100+ modules during startup; the original O(N)
+ * scan was the dominant cost on 1GB/1-core HW. */
+#define MOD_HASH_BUCKETS 512
+#define MOD_HASH_EMPTY   -1
+
 /* Process integrity state */
 typedef struct {
     int             initialized;
@@ -87,10 +93,56 @@ typedef struct {
     int             process_debug_object_handle_status;
     module_entry_t  modules[MAX_MODULES];
     int             num_modules;
+    int             mod_hash[MOD_HASH_BUCKETS];   /* -1 or modules[] index */
     fake_cert_info_t process_cert;      /* Certificate for the main process */
 } integrity_state_t;
 
 static integrity_state_t g_integrity = {0};
+
+static unsigned int mod_hash_name(const char *name)
+{
+    unsigned int h = 5381;
+    while (*name) {
+        unsigned char c = (unsigned char)*name++;
+        if (c >= 'A' && c <= 'Z') c += 32;
+        h = ((h << 5) + h) + c;
+    }
+    return h % MOD_HASH_BUCKETS;
+}
+
+static void mod_hash_reset(void)
+{
+    for (int i = 0; i < MOD_HASH_BUCKETS; i++)
+        g_integrity.mod_hash[i] = MOD_HASH_EMPTY;
+}
+
+static int mod_hash_lookup(const char *name)
+{
+    unsigned int bucket = mod_hash_name(name);
+    for (unsigned int step = 0; step < MOD_HASH_BUCKETS; step++) {
+        unsigned int probe = (bucket + step) % MOD_HASH_BUCKETS;
+        int idx = g_integrity.mod_hash[probe];
+        if (idx == MOD_HASH_EMPTY)
+            return -1;
+        if (idx >= 0 && idx < g_integrity.num_modules &&
+            strcasecmp(g_integrity.modules[idx].name, name) == 0) {
+            return idx;
+        }
+    }
+    return -1;
+}
+
+static void mod_hash_insert(const char *name, int idx)
+{
+    unsigned int bucket = mod_hash_name(name);
+    for (unsigned int step = 0; step < MOD_HASH_BUCKETS; step++) {
+        unsigned int probe = (bucket + step) % MOD_HASH_BUCKETS;
+        if (g_integrity.mod_hash[probe] == MOD_HASH_EMPTY) {
+            g_integrity.mod_hash[probe] = idx;
+            return;
+        }
+    }
+}
 
 /* Forward declarations */
 static void setup_default_certificate(fake_cert_info_t *cert, const char *subject);
@@ -103,18 +155,32 @@ static int  spoof_nt_query_information(int info_class, void *buffer, int buffer_
  * Set up a fake but plausible code-signing certificate.
  * Anti-cheats check that the game process and its modules are signed
  * by expected publishers.
+ *
+ * The constant fields (issuer/serial/thumbprint) live in rodata as a
+ * single template and are memcpy'd in.  Previously each of ~256 module
+ * registrations re-ran strncpy three times for the same constants.
  */
+static const char CERT_ISSUER_DIGICERT[] =
+    "DigiCert SHA2 Assured ID Code Signing CA";
+static const char CERT_SERIAL_DEFAULT[]  =
+    "0A:1B:2C:3D:4E:5F:6A:7B:8C:9D";
+static const char CERT_THUMBPRINT_DEFAULT[] =
+    "A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0";
+
 static void setup_default_certificate(fake_cert_info_t *cert, const char *subject)
 {
     memset(cert, 0, sizeof(*cert));
     strncpy(cert->subject, subject, sizeof(cert->subject) - 1);
-    strncpy(cert->issuer, "DigiCert SHA2 Assured ID Code Signing CA",
-            sizeof(cert->issuer) - 1);
-    strncpy(cert->serial, "0A:1B:2C:3D:4E:5F:6A:7B:8C:9D",
-            sizeof(cert->serial) - 1);
-    strncpy(cert->thumbprint,
-            "A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0",
-            sizeof(cert->thumbprint) - 1);
+    /* memcpy from rodata templates (sizeof includes NUL) */
+    memcpy(cert->issuer, CERT_ISSUER_DIGICERT,
+           sizeof(CERT_ISSUER_DIGICERT) < sizeof(cert->issuer)
+               ? sizeof(CERT_ISSUER_DIGICERT) : sizeof(cert->issuer) - 1);
+    memcpy(cert->serial, CERT_SERIAL_DEFAULT,
+           sizeof(CERT_SERIAL_DEFAULT) < sizeof(cert->serial)
+               ? sizeof(CERT_SERIAL_DEFAULT) : sizeof(cert->serial) - 1);
+    memcpy(cert->thumbprint, CERT_THUMBPRINT_DEFAULT,
+           sizeof(CERT_THUMBPRINT_DEFAULT) < sizeof(cert->thumbprint)
+               ? sizeof(CERT_THUMBPRINT_DEFAULT) : sizeof(cert->thumbprint) - 1);
     cert->valid = 1;
 
     fprintf(stderr, INTEGRITY_LOG_PREFIX "Set up certificate: subject=\"%s\", "
@@ -228,6 +294,7 @@ int integrity_init(void)
     fprintf(stderr, INTEGRITY_LOG_PREFIX "Initializing process integrity spoofing\n");
 
     memset(&g_integrity, 0, sizeof(g_integrity));
+    mod_hash_reset();
 
     /*
      * Set default values matching a clean Windows process:
@@ -311,14 +378,14 @@ int integrity_check_module(const char *module_name, const char *module_path)
 
     fprintf(stderr, INTEGRITY_LOG_PREFIX "Module integrity check: %s\n", module_name);
 
-    /* Check if module is already registered */
-    for (int i = 0; i < g_integrity.num_modules; i++) {
-        if (strcasecmp(g_integrity.modules[i].name, module_name) == 0) {
-            fprintf(stderr, INTEGRITY_LOG_PREFIX "  Module already registered, "
-                    "integrity=%s\n",
-                    g_integrity.modules[i].integrity_ok ? "OK" : "FAIL");
-            return g_integrity.modules[i].integrity_ok;
-        }
+    /* O(1) hash lookup instead of linear scan.  Modules are typically
+     * re-checked many times during anti-cheat lifecycle. */
+    int existing = mod_hash_lookup(module_name);
+    if (existing >= 0) {
+        fprintf(stderr, INTEGRITY_LOG_PREFIX "  Module already registered, "
+                "integrity=%s\n",
+                g_integrity.modules[existing].integrity_ok ? "OK" : "FAIL");
+        return g_integrity.modules[existing].integrity_ok;
     }
 
     /* Register new module */
@@ -328,7 +395,8 @@ int integrity_check_module(const char *module_name, const char *module_path)
         return 1;
     }
 
-    module_entry_t *mod = &g_integrity.modules[g_integrity.num_modules];
+    int new_idx = g_integrity.num_modules;
+    module_entry_t *mod = &g_integrity.modules[new_idx];
     memset(mod, 0, sizeof(*mod));
 
     strncpy(mod->name, module_name, sizeof(mod->name) - 1);
@@ -343,6 +411,7 @@ int integrity_check_module(const char *module_name, const char *module_path)
     setup_default_certificate(&mod->cert, "Microsoft Windows");
 
     g_integrity.num_modules++;
+    mod_hash_insert(mod->name, new_idx);
 
     fprintf(stderr, INTEGRITY_LOG_PREFIX "  Registered module #%d: %s -> VALID\n",
             g_integrity.num_modules, module_name);
@@ -379,21 +448,16 @@ int integrity_fake_signature(const char *module_name, char *subject,
         cert = &g_integrity.process_cert;
         fprintf(stderr, INTEGRITY_LOG_PREFIX "Signature query for main process\n");
     } else {
-        /* Find module certificate */
-        for (int i = 0; i < g_integrity.num_modules; i++) {
-            if (strcasecmp(g_integrity.modules[i].name, module_name) == 0) {
-                cert = &g_integrity.modules[i].cert;
-                break;
-            }
-        }
-
-        if (!cert) {
+        /* O(1) hash lookup instead of linear scan */
+        int idx = mod_hash_lookup(module_name);
+        if (idx >= 0) {
+            cert = &g_integrity.modules[idx].cert;
+            fprintf(stderr, INTEGRITY_LOG_PREFIX "Signature query for module: %s\n",
+                    module_name);
+        } else {
             fprintf(stderr, INTEGRITY_LOG_PREFIX "Signature query for unknown "
                     "module: %s, using default\n", module_name);
             cert = &g_integrity.process_cert;
-        } else {
-            fprintf(stderr, INTEGRITY_LOG_PREFIX "Signature query for module: %s\n",
-                    module_name);
         }
     }
 

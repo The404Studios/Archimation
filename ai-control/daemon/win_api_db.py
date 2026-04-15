@@ -1831,6 +1831,13 @@ class WinApiDatabase:
                 with open(self._db_path) as f:
                     data = json.load(f)
                 if data.get("version") == _DB_VERSION:
+                    # Clear existing state so repeated _load() calls don't
+                    # accumulate duplicate index entries (list buckets would
+                    # otherwise grow unboundedly on every reload).
+                    self._signatures.clear()
+                    self._by_dll.clear()
+                    self._by_category.clear()
+                    self._by_complexity.clear()
                     for entry in data.get("signatures", []):
                         sig = WinApiSignature(**entry)
                         key = self._key(sig.dll, sig.name)
@@ -1936,10 +1943,15 @@ class WinApiDatabase:
         key = self._key(sig.dll, sig.name)
         existing = self._signatures.get(key)
         if existing:
-            # Remove old index entries
-            dll = existing.dll.lower()
-            for idx in (self._by_dll, self._by_category, self._by_complexity):
-                for bucket in idx.values():
+            # Remove old index entries via the known old attribute values
+            # (O(bucket_size), not O(total_buckets * bucket_size)).
+            for idx, attr in (
+                (self._by_dll, existing.dll.lower()),
+                (self._by_category, existing.category),
+                (self._by_complexity, existing.complexity),
+            ):
+                bucket = idx.get(attr)
+                if bucket is not None:
                     try:
                         bucket.remove(key)
                     except ValueError:

@@ -55,6 +55,9 @@ _TCP_STATE_MAP = {
     "0B": ConnState.CLOSING,
 }
 
+# Precompiled once -- previously re-compiled on every /proc/*/fd entry
+_SOCKET_INODE_RE = re.compile(r"socket:\[(\d+)\]")
+
 
 @dataclass(frozen=True, eq=True)
 class ConnectionKey:
@@ -138,7 +141,39 @@ class ConnectionMonitor:
         monitor.stop()
     """
 
-    def __init__(self, poll_interval: float = 2.0) -> None:
+    # When idle (no connection churn for several ticks) back the poll off
+    # to the slow interval; spin back up the moment something changes.
+    _IDLE_POLL_MULTIPLIER: float = 2.0
+    _IDLE_THRESHOLD_TICKS: int = 5
+
+    @staticmethod
+    def _auto_poll_interval(default: float) -> float:
+        """Return a sensible poll interval based on host RAM size.
+
+        Old hardware with <2 GiB RAM can't afford to walk /proc/*/fd
+        every two seconds -- slow spinning disks and a single CPU make
+        the poll dominate load.  Double the interval for those hosts
+        while keeping new hardware snappy.  Parsing /proc/meminfo is a
+        one-time cost at construction.  If the file is unreadable
+        (non-Linux dev box, test harness) we keep the caller's default.
+        """
+        try:
+            with open("/proc/meminfo", "r") as fh:
+                for line in fh:
+                    if line.startswith("MemTotal:"):
+                        kb = int(line.split()[1])
+                        if kb < 2_200_000:   # <~2.1 GiB
+                            return max(default * 2.0, 4.0)
+                        return default
+        except (FileNotFoundError, PermissionError, ValueError, IndexError):
+            pass
+        return default
+
+    def __init__(self, poll_interval: Optional[float] = None) -> None:
+        # Allow explicit interval override but default to hardware-aware
+        # tuning.  None = auto; anything else wins.
+        if poll_interval is None:
+            poll_interval = self._auto_poll_interval(2.0)
         self._poll_interval = poll_interval
         self._active: dict[ConnectionKey, ConnectionInfo] = {}
         self._lock = threading.Lock()
@@ -156,6 +191,23 @@ class ConnectionMonitor:
         # Stats
         self._total_seen: int = 0
         self._total_closed: int = 0
+
+        # Idle back-off: if several consecutive polls see no change we
+        # extend the sleep interval -- reading /proc/net/* and walking
+        # /proc/*/fd every 2 s is wasted CPU on an idle old machine.
+        self._idle_ticks: int = 0
+        # Shared /proc-fd inode-map cache (walking /proc/*/fd is the
+        # expensive part of each poll).  Short TTL so a new connection
+        # is still attributed promptly.
+        self._inode_map_cache: Optional[dict[int, tuple[int, str, str]]] = None
+        self._inode_map_cache_time: float = 0.0
+        self._inode_map_ttl: float = 1.0
+        # get_connections() cache -- the GUI polls it at its own 2 s
+        # cadence, but the monitor may also provide it to CLI callers
+        # in-process.  Guard against a double-read within a tight window.
+        self._get_connections_cache: Optional[list[dict]] = None
+        self._get_connections_cache_time: float = 0.0
+        self._get_connections_ttl: float = 0.5
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -243,9 +295,23 @@ class ConnectionMonitor:
         This wrapper converts ``ConnectionInfo`` dataclass objects into
         plain dictionaries so that GUI and CLI code can use
         ``conn.get("protocol")`` style access.
+
+        Result is memoised for a short TTL to absorb bursty callers
+        (e.g. GUI filter changes firing refresh() multiple times in the
+        same tick).  Use monotonic() so an NTP step during the poll
+        window can't suddenly expire a valid cache or keep a stale one
+        alive for hours.
         """
+        now = time.monotonic()
+        if (self._get_connections_cache is not None
+                and now - self._get_connections_cache_time
+                < self._get_connections_ttl):
+            return self._get_connections_cache
         with self._lock:
-            return [c.to_dict() for c in self._active.values()]
+            snapshot = [c.to_dict() for c in self._active.values()]
+        self._get_connections_cache = snapshot
+        self._get_connections_cache_time = now
+        return snapshot
 
     def get_active_connections(self) -> list[ConnectionInfo]:
         """Return a snapshot of all currently active connections."""
@@ -290,13 +356,25 @@ class ConnectionMonitor:
         logger.debug("Poll loop starting")
         while not self._stop_event.is_set():
             try:
-                self._poll_once()
+                changed = self._poll_once()
             except Exception:
                 logger.exception("Error during connection poll")
-            self._stop_event.wait(timeout=self._poll_interval)
+                changed = False
+            # Adaptive sleep: back off when nothing has changed for a
+            # while; snap back immediately when activity resumes.
+            if changed:
+                self._idle_ticks = 0
+                interval = self._poll_interval
+            else:
+                self._idle_ticks += 1
+                if self._idle_ticks >= self._IDLE_THRESHOLD_TICKS:
+                    interval = self._poll_interval * self._IDLE_POLL_MULTIPLIER
+                else:
+                    interval = self._poll_interval
+            self._stop_event.wait(timeout=interval)
         logger.debug("Poll loop exiting")
 
-    def _poll_once(self) -> None:
+    def _poll_once(self) -> bool:
         """Perform a single poll cycle.
 
         State updates happen under the lock, but callback dispatch
@@ -345,9 +423,16 @@ class ConnectionMonitor:
         for conn in closed_conns:
             self._fire_closed_callbacks(conn)
 
+        # Invalidate the dict-snapshot cache whenever the set changes,
+        # so GUI callers see additions/removals on the very next poll.
+        if new_conns or closed_conns:
+            self._get_connections_cache = None
+
+        return bool(new_conns or closed_conns)
+
     def _read_current_connections(self) -> dict[ConnectionKey, ConnectionInfo]:
         """Read all connections from /proc/net/* and map to processes."""
-        inode_map = self._build_inode_map()
+        inode_map = self._get_cached_inode_map()
         connections: dict[ConnectionKey, ConnectionInfo] = {}
 
         for proto, path in [
@@ -367,55 +452,69 @@ class ConnectionMonitor:
         path: str,
         inode_map: dict[int, tuple[int, str, str]],
     ) -> list[ConnectionInfo]:
-        """Parse a /proc/net/* file and resolve process info."""
+        """Parse a /proc/net/* file and resolve process info.
+
+        Iterates the file line-by-line rather than pulling the whole
+        thing into memory via ``readlines()`` -- on a busy server the
+        TCP table can run into tens of megabytes and the list copy is
+        purely wasted RAM on old hardware.
+        """
         results: list[ConnectionInfo] = []
         try:
-            with open(path, "r") as fh:
-                lines = fh.readlines()
+            fh = open(path, "r")
         except (FileNotFoundError, PermissionError):
             return results
 
         is_v6 = "6" in protocol
-        for line in lines[1:]:
-            line = line.strip()
-            if not line:
-                continue
+        is_tcp = protocol.startswith("tcp")
+        try:
+            # Skip header line without buffering the rest
             try:
+                next(fh)
+            except StopIteration:
+                return results
+            for line in fh:
+                # Bare split() already collapses whitespace + strips
+                # trailing newline, no need for an explicit .strip()
                 parts = line.split()
-                local_hex = parts[1]
-                remote_hex = parts[2]
-                state_hex = parts[3]
-                inode = int(parts[9])
+                if len(parts) < 10:
+                    continue
+                try:
+                    local_hex = parts[1]
+                    remote_hex = parts[2]
+                    state_hex = parts[3]
+                    inode = int(parts[9])
 
-                local_addr, local_port = self._decode_address(local_hex, is_v6)
-                remote_addr, remote_port = self._decode_address(remote_hex, is_v6)
+                    local_addr, local_port = self._decode_address(local_hex, is_v6)
+                    remote_addr, remote_port = self._decode_address(remote_hex, is_v6)
 
-                if protocol.startswith("tcp"):
-                    state = _TCP_STATE_MAP.get(state_hex, ConnState.CLOSED).value
-                else:
-                    state = (
-                        ConnState.UNCONN.value
-                        if state_hex == "07"
-                        else ConnState.ESTABLISHED.value
-                    )
+                    if is_tcp:
+                        state = _TCP_STATE_MAP.get(state_hex, ConnState.CLOSED).value
+                    else:
+                        state = (
+                            ConnState.UNCONN.value
+                            if state_hex == "07"
+                            else ConnState.ESTABLISHED.value
+                        )
 
-                pid, proc_name, exe_path = inode_map.get(inode, (0, "", ""))
+                    pid, proc_name, exe_path = inode_map.get(inode, (0, "", ""))
 
-                conn = ConnectionInfo(
-                    protocol=protocol,
-                    local_addr=local_addr,
-                    local_port=local_port,
-                    remote_addr=remote_addr,
-                    remote_port=remote_port,
-                    state=state,
-                    pid=pid,
-                    process_name=proc_name,
-                    exe_path=exe_path,
-                    inode=inode,
-                )
-                results.append(conn)
-            except (IndexError, ValueError):
-                continue
+                    results.append(ConnectionInfo(
+                        protocol=protocol,
+                        local_addr=local_addr,
+                        local_port=local_port,
+                        remote_addr=remote_addr,
+                        remote_port=remote_port,
+                        state=state,
+                        pid=pid,
+                        process_name=proc_name,
+                        exe_path=exe_path,
+                        inode=inode,
+                    ))
+                except (IndexError, ValueError):
+                    continue
+        finally:
+            fh.close()
 
         return results
 
@@ -441,46 +540,93 @@ class ConnectionMonitor:
 
         return addr, port
 
+    def _get_cached_inode_map(self) -> dict[int, tuple[int, str, str]]:
+        """Return a /proc/[pid]/fd inode map, rebuilding at most once per TTL.
+
+        Walking every process's ``/proc/*/fd`` entries is by far the most
+        expensive part of a poll -- O(all fds on the system).  The map is
+        cheap to keep between ticks because connection identity (the key
+        we actually look up) rarely changes within a second.  Monotonic
+        clock so NTP steps can't corrupt TTL accounting.
+        """
+        now = time.monotonic()
+        if (self._inode_map_cache is not None
+                and now - self._inode_map_cache_time < self._inode_map_ttl):
+            return self._inode_map_cache
+        inode_map = self._build_inode_map()
+        self._inode_map_cache = inode_map
+        self._inode_map_cache_time = now
+        return inode_map
+
     @staticmethod
     def _build_inode_map() -> dict[int, tuple[int, str, str]]:
-        """Map socket inodes to (pid, name, exe) via /proc/[pid]/fd/."""
+        """Map socket inodes to (pid, name, exe) via /proc/[pid]/fd/.
+
+        Uses ``os.scandir()`` for the per-pid fd directory walk so the
+        kernel hands us dirents directly (no extra stat syscalls).  On
+        busy systems with 10k+ open fds this is the hot path; the naive
+        ``os.listdir`` + ``os.readlink`` version paid a dirent-and-stat
+        round-trip per fd.  We also defer reading ``comm`` and ``exe``
+        until after we know the PID has at least one socket fd -- most
+        processes (kernel workers, long-lived daemons) never do, so
+        skipping those two opens per uninteresting pid adds up.
+        """
         inode_map: dict[int, tuple[int, str, str]] = {}
 
         try:
-            entries = os.listdir("/proc")
+            proc_entries = os.listdir("/proc")
         except (FileNotFoundError, PermissionError):
             return inode_map
 
-        for entry in entries:
-            if not entry.isdigit():
+        for entry in proc_entries:
+            # Skip non-pid entries without str->int round-trip
+            if not entry[0:1].isdigit() or not entry.isdigit():
                 continue
-            pid = int(entry)
-            fd_dir = f"/proc/{pid}/fd"
+            pid_str = entry
+            fd_dir = f"/proc/{pid_str}/fd"
+
+            # First pass: collect socket inodes from this pid's fd dir.
+            # scandir is >2x faster than listdir+readlink here because
+            # readlink is unavoidable for every fd but we skip the
+            # listdir stat overhead.
+            sockets: list[int] = []
+            try:
+                with os.scandir(fd_dir) as it:
+                    for fd_entry in it:
+                        try:
+                            link = os.readlink(fd_entry.path)
+                        except (FileNotFoundError, PermissionError, OSError):
+                            continue
+                        # Most fds are regular files or pipes -- the
+                        # cheap prefix check filters those without
+                        # running the regex.
+                        if not link.startswith("socket:"):
+                            continue
+                        match = _SOCKET_INODE_RE.match(link)
+                        if match:
+                            sockets.append(int(match.group(1)))
+            except (FileNotFoundError, PermissionError):
+                continue
+
+            # Only pay the comm/exe cost when a socket was actually
+            # found.  Most PIDs never have network fds.
+            if not sockets:
+                continue
 
             try:
-                with open(f"/proc/{pid}/comm", "r") as f:
+                with open(f"/proc/{pid_str}/comm", "r") as f:
                     name = f.read().strip()
             except (FileNotFoundError, PermissionError):
                 name = ""
-
             try:
-                exe = os.readlink(f"/proc/{pid}/exe")
+                exe = os.readlink(f"/proc/{pid_str}/exe")
             except (FileNotFoundError, PermissionError, OSError):
                 exe = ""
 
-            try:
-                fds = os.listdir(fd_dir)
-            except (FileNotFoundError, PermissionError):
-                continue
-
-            for fd in fds:
-                try:
-                    link = os.readlink(os.path.join(fd_dir, fd))
-                except (FileNotFoundError, PermissionError, OSError):
-                    continue
-                match = re.match(r"socket:\[(\d+)\]", link)
-                if match:
-                    inode_map[int(match.group(1))] = (pid, name, exe)
+            pid = int(pid_str)
+            info = (pid, name, exe)
+            for inode in sockets:
+                inode_map[inode] = info
 
         return inode_map
 

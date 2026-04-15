@@ -510,8 +510,13 @@ class MainWindow(Gtk.ApplicationWindow):
             self._nav_list.select_row(first_row)
 
         # Periodically update status bar
-        GLib.timeout_add_seconds(3, self._update_statusbar)
+        self._statusbar_timer_id = GLib.timeout_add_seconds(3, self._update_statusbar)
         self._update_statusbar()
+
+        # Stop the background connection monitor thread and close the DB
+        # when the window closes, so we don't leak a polling thread if the
+        # app is left running in the background.
+        self.connect("close-request", self._on_close_request)
 
     # -- Navigation --------------------------------------------------------
 
@@ -576,7 +581,11 @@ class MainWindow(Gtk.ApplicationWindow):
             if gfile:
                 path = gfile.get_path()
                 self._store.import_rules(path)
-                self._nft.reload()
+                # Pull freshly-imported rules into the NftManager before
+                # applying so the rule set compiled into nft matches what
+                # the user just imported.
+                self._nft.load_rules(self._store.list_rules())
+                self._nft.apply_rules()
                 self._on_refresh(None)
                 logger.info("Rules imported from %s", path)
         except Exception as exc:
@@ -599,6 +608,33 @@ class MainWindow(Gtk.ApplicationWindow):
             logger.error("Export failed: %s", exc)
 
     # -- Status bar --------------------------------------------------------
+
+    def _on_close_request(self, _win: Gtk.ApplicationWindow) -> bool:
+        """Clean up background resources when the window closes."""
+        try:
+            if getattr(self, "_statusbar_timer_id", 0):
+                GLib.source_remove(self._statusbar_timer_id)
+                self._statusbar_timer_id = 0
+        except Exception:
+            pass
+        # Stop the monitor panel's own GLib.timeout_add timer before
+        # the backend goes away; otherwise the next tick fires and we
+        # access a closed ConnectionMonitor / dead filter widgets.
+        try:
+            stop_timer = getattr(self._monitor_panel, "_stop_timer", None)
+            if callable(stop_timer):
+                stop_timer()
+        except Exception:
+            logger.exception("Failed to stop monitor panel timer")
+        try:
+            self._monitor.stop()
+        except Exception:
+            logger.exception("Failed to stop connection monitor")
+        try:
+            self._store.close()
+        except Exception:
+            logger.exception("Failed to close rule store")
+        return False  # allow window to close
 
     def _update_statusbar(self) -> bool:
         """Refresh the status bar text. Returns True to keep the timer alive."""

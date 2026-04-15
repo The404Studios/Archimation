@@ -10,8 +10,116 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <pthread.h>
+
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <errno.h>
+#ifndef SYS_getrandom
+#define SYS_getrandom 318
+#endif
+#ifndef GRND_NONBLOCK
+#define GRND_NONBLOCK 0x0001
+#endif
+#endif
 
 #include "common/dll_common.h"
+
+/*
+ * Fast RNG path:
+ *  1. __builtin_cpu_supports("rdrnd") at runtime → use RDRAND (new HW: AES-NI + RDRAND)
+ *  2. Linux getrandom(2) syscall (kernel 3.17+), avoids fd open/close
+ *  3. Cached /dev/urandom fd fallback (FD_CLOEXEC, opened once, never closed)
+ *
+ * Old HW (Pentium 4, no RDRAND) goes path #2/#3. New HW (Ivy Bridge+) path #1
+ * eliminates a syscall entirely for small random requests.
+ */
+static int g_urandom_fd = -1;
+static pthread_once_t g_urandom_once = PTHREAD_ONCE_INIT;
+static int g_has_rdrand = -1;   /* -1 = unprobed; 0 = no; 1 = yes */
+
+static void urandom_open_once(void)
+{
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) g_urandom_fd = fd;
+}
+
+#if defined(__x86_64__) && defined(__RDRND__)
+/* Compiled-in RDRAND intrinsic; only used after runtime CPU check. */
+#include <immintrin.h>
+static inline int rdrand_u64(uint64_t *out)
+{
+    for (int i = 0; i < 10; i++) {
+        unsigned long long v;
+        if (_rdrand64_step(&v)) { *out = v; return 1; }
+    }
+    return 0;
+}
+#else
+static inline int rdrand_u64(uint64_t *out) { (void)out; return 0; }
+#endif
+
+static int fill_random(uint8_t *buf, size_t len)
+{
+    if (!buf || len == 0) return 1;
+
+    /* Runtime CPU probe (dual-HW rule: always scalar fallback for old HW).
+     * Only honour RDRAND when BOTH the CPU advertises it AND we were
+     * compiled with -mrdrnd so the intrinsic is available; otherwise stay
+     * on getrandom/urandom. */
+    if (g_has_rdrand < 0) {
+#if defined(__x86_64__) && defined(__RDRND__)
+        g_has_rdrand = __builtin_cpu_supports("rdrnd") ? 1 : 0;
+#else
+        g_has_rdrand = 0;
+#endif
+    }
+    if (g_has_rdrand == 1) {
+        size_t i = 0;
+        while (i + 8 <= len) {
+            uint64_t v;
+            if (!rdrand_u64(&v)) { g_has_rdrand = 0; break; }
+            memcpy(buf + i, &v, 8);
+            i += 8;
+        }
+        if (i < len && g_has_rdrand == 1) {
+            uint64_t v;
+            if (rdrand_u64(&v)) {
+                memcpy(buf + i, &v, len - i);
+                return 1;
+            }
+        } else if (i == len) {
+            return 1;
+        }
+        /* fall through on RDRAND failure */
+    }
+
+#if defined(__linux__)
+    /* getrandom(2): zero-fd, single syscall */
+    size_t done = 0;
+    while (done < len) {
+        long r = syscall(SYS_getrandom, buf + done, len - done, 0);
+        if (r > 0) { done += (size_t)r; continue; }
+        if (r < 0 && errno == EINTR) continue;
+        break; /* ENOSYS on kernel <3.17 — fall through */
+    }
+    if (done == len) return 1;
+#endif
+
+    /* Cached /dev/urandom fd path */
+    pthread_once(&g_urandom_once, urandom_open_once);
+    int fd = g_urandom_fd;
+    if (fd < 0) return 0;
+
+    size_t total = 0;
+    while (total < len) {
+        ssize_t r = read(fd, buf + total, len - total);
+        if (r > 0) { total += (size_t)r; continue; }
+        if (r < 0 && errno == EINTR) continue;
+        break;
+    }
+    return total == len;
+}
 
 /* NTSTATUS codes (supplement those in winnt.h) */
 #ifndef STATUS_NOT_SUPPORTED
@@ -130,23 +238,10 @@ WINAPI_EXPORT int32_t BCryptGenRandom(void *hAlgorithm, uint8_t *pbBuffer,
     (void)hAlgorithm; (void)dwFlags;
     if (!pbBuffer || cbBuffer == 0) return STATUS_INVALID_PARAMETER;
 
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "[bcrypt] CRITICAL: /dev/urandom unavailable\n");
+    if (!fill_random(pbBuffer, cbBuffer)) {
+        fprintf(stderr, "[bcrypt] CRITICAL: entropy source unavailable\n");
         return STATUS_NOT_SUPPORTED;
     }
-
-    size_t total = 0;
-    while (total < cbBuffer) {
-        ssize_t got = read(fd, pbBuffer + total, cbBuffer - total);
-        if (got <= 0) {
-            close(fd);
-            fprintf(stderr, "[bcrypt] CRITICAL: /dev/urandom read failed\n");
-            return STATUS_NOT_SUPPORTED;
-        }
-        total += got;
-    }
-    close(fd);
     return STATUS_SUCCESS;
 }
 
@@ -159,6 +254,7 @@ WINAPI_EXPORT int32_t BCryptCreateHash(void *hAlgorithm, void **phHash,
     if (!hAlgorithm || !phHash) return STATUS_INVALID_PARAMETER;
 
     bcrypt_alg_t *a = (bcrypt_alg_t *)hAlgorithm;
+    if (a->magic != BCRYPT_ALG_MAGIC) return STATUS_INVALID_HANDLE;
     bcrypt_hash_t *h = calloc(1, sizeof(bcrypt_hash_t));
     if (!h) return STATUS_NO_MEMORY;
 
@@ -180,13 +276,13 @@ WINAPI_EXPORT int32_t BCryptHashData(void *hHash, const uint8_t *pbInput,
     if (h->magic != BCRYPT_HASH_MAGIC) return STATUS_INVALID_HANDLE;
 
     /* Accumulate data (simplified - real impl would use actual hash algo) */
+    if (cbInput == 0) return STATUS_SUCCESS;
+    if (!pbInput) return STATUS_INVALID_PARAMETER;
     uint8_t *new_data = realloc(h->hash_data, h->hash_data_len + cbInput);
-    if (!new_data && cbInput > 0) return STATUS_NO_MEMORY;
-    if (cbInput > 0) {
-        memcpy(new_data + h->hash_data_len, pbInput, cbInput);
-        h->hash_data = new_data;
-        h->hash_data_len += cbInput;
-    }
+    if (!new_data) return STATUS_NO_MEMORY;
+    memcpy(new_data + h->hash_data_len, pbInput, cbInput);
+    h->hash_data = new_data;
+    h->hash_data_len += cbInput;
     return STATUS_SUCCESS;
 }
 
@@ -202,6 +298,7 @@ WINAPI_EXPORT int32_t BCryptFinishHash(void *hHash, uint8_t *pbOutput,
      * Simplified: XOR-fold accumulated data into output.
      * Real impl would use SHA/MD5 from OpenSSL/libgcrypt.
      */
+    if (cbOutput == 0) return STATUS_INVALID_PARAMETER;
     memset(pbOutput, 0, cbOutput);
     for (size_t i = 0; i < h->hash_data_len; i++)
         pbOutput[i % cbOutput] ^= h->hash_data[i];
@@ -227,6 +324,7 @@ WINAPI_EXPORT int32_t BCryptDuplicateHash(void *hHash, void **phNewHash,
     (void)pbHashObject; (void)cbHashObject; (void)dwFlags;
     if (!hHash || !phNewHash) return STATUS_INVALID_PARAMETER;
     bcrypt_hash_t *src = (bcrypt_hash_t *)hHash;
+    if (src->magic != BCRYPT_HASH_MAGIC) return STATUS_INVALID_HANDLE;
     bcrypt_hash_t *dst = calloc(1, sizeof(bcrypt_hash_t));
     if (!dst) return STATUS_NO_MEMORY;
     dst->magic = BCRYPT_HASH_MAGIC;

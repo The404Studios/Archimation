@@ -22,9 +22,12 @@ _srcdir="${startdir}/../../trust"
 build() {
     cd "$_srcdir"
 
-    # Build userspace library only (kernel module needs running kernel headers)
+    # Build userspace library only (kernel module needs running kernel headers).
+    # MAKEFLAGS propagated by build-packages.sh (-jN); `make -C lib clean` is a
+    # single target so -j doesn't help it, but `make -C lib all` builds multiple
+    # TUs in parallel. `make clean` is cheap (rm), no -j needed.
     make -C lib clean
-    make -C lib all
+    make -C lib all ${MAKEFLAGS:-}
 }
 
 package() {

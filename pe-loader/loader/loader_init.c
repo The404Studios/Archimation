@@ -76,32 +76,42 @@ static void try_resolve(void)
 {
     /* Allow re-resolution until ALL critical function pointers are found.
      * First call may happen before DLLs are loaded by pe_resolve_imports().
-     * Cap attempts to avoid repeated futile dlopen calls when DLLs are absent. */
+     * Cap attempts to avoid repeated futile dlopen calls when DLLs are absent.
+     *
+     * Skip dlopen for groups whose symbols are already resolved -- otherwise
+     * each retry bumps the refcount on libraries we never dlclose, leaking
+     * dlopen refcounts on repeat invocations. */
     if (initialized && fn_handle_table_init && fn_ntdll_exception_init
         && fn_pe_set_main_args) return;
     if (initialized && resolve_attempts >= MAX_RESOLVE_ATTEMPTS) return;
     initialized = 1;
     resolve_attempts++;
 
-    void *h = try_open_dll("libpe_kernel32.so");
-    if (h) {
-        fn_set_command_line = dlsym(h, "kernel32_set_command_line");
-        fn_set_module_filename = dlsym(h, "kernel32_set_module_filename");
-        /* handle_table_init lives in libpe_kernel32.so (dll_common.c is
-         * statically linked into each DLL .so). Use unique symbol name
-         * to avoid interposition with loader's own handle_table_init. */
-        fn_handle_table_init = dlsym(h, "handle_table_init");
+    if (!fn_handle_table_init || !fn_set_command_line || !fn_set_module_filename) {
+        void *h = try_open_dll("libpe_kernel32.so");
+        if (h) {
+            fn_set_command_line = dlsym(h, "kernel32_set_command_line");
+            fn_set_module_filename = dlsym(h, "kernel32_set_module_filename");
+            /* handle_table_init lives in libpe_kernel32.so (dll_common.c is
+             * statically linked into each DLL .so). Use unique symbol name
+             * to avoid interposition with loader's own handle_table_init. */
+            fn_handle_table_init = dlsym(h, "handle_table_init");
+        }
     }
 
-    void *hn = try_open_dll("libpe_ntdll.so");
-    if (hn) {
-        fn_ntdll_exception_init = dlsym(hn, "ntdll_exception_init");
-        fn_ntdll_exception_wire_pe = dlsym(hn, "ntdll_exception_wire_pe");
+    if (!fn_ntdll_exception_init || !fn_ntdll_exception_wire_pe) {
+        void *hn = try_open_dll("libpe_ntdll.so");
+        if (hn) {
+            fn_ntdll_exception_init = dlsym(hn, "ntdll_exception_init");
+            fn_ntdll_exception_wire_pe = dlsym(hn, "ntdll_exception_wire_pe");
+        }
     }
 
-    void *hm = try_open_dll("libpe_msvcrt.so");
-    if (hm) {
-        fn_pe_set_main_args = dlsym(hm, "__pe_set_main_args");
+    if (!fn_pe_set_main_args) {
+        void *hm = try_open_dll("libpe_msvcrt.so");
+        if (hm) {
+            fn_pe_set_main_args = dlsym(hm, "__pe_set_main_args");
+        }
     }
 }
 

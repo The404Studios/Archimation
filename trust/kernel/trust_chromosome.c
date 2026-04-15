@@ -57,7 +57,22 @@ void trust_chromosome_init(trust_chromosome_t *chromo, u32 subject_id,
 
 /*
  * Update a runtime behavioral (A) segment.
- * Increments mutation count and recomputes sex determination.
+ *
+ * Performance: the checksum here is a CRC32 over ~200 bytes of data.
+ * trust_risc_record_action calls update_a up to 4 times in a row,
+ * paying 4x CRC32 even though only the last snapshot matters for
+ * readers. We skip the checksum recompute when the new value equals
+ * the old (common idle-heartbeat case) and leave the rolling
+ * "deferred then flushed" semantics to the caller — the decay timer
+ * and immune tick walk live entries and will pick up the stale
+ * checksum on the NEXT verify call, which is acceptable for the data
+ * integrity check (not crypto).
+ *
+ * NOTE: we still recompute checksum on every change here because
+ * external callers (including the ioctl GET_CHROMOSOME path) rely on
+ * checksum being in sync with segments.  For a batch of updates,
+ * use trust_chromosome_update_a_deferred and flush with
+ * trust_chromosome_finalize.
  */
 void trust_chromosome_update_a(trust_chromosome_t *chromo, u32 segment_idx,
                                 u32 new_value)
@@ -97,6 +112,35 @@ void trust_chromosome_update_b(trust_chromosome_t *chromo, u32 segment_idx,
 
         chromo->checksum = trust_chromosome_checksum(chromo);
     }
+}
+
+/*
+ * Deferred update helpers: batch multiple segment writes and pay only
+ * ONE CRC32 at the end.  Used by the hot path trust_risc_record_action
+ * which mutates 4 A-segments per call.
+ *
+ * Performance: record_action on a subject now computes ~1 CRC32 per
+ * call instead of 4, reducing a sub-microsecond but highly repetitive
+ * cost across every fork, fopen, setsockopt, etc.  On old HW without
+ * a CRC32 instruction this matters more than on new HW with SSE4.2.
+ */
+void trust_chromosome_update_a_deferred(trust_chromosome_t *chromo,
+                                         u32 segment_idx, u32 new_value)
+{
+    if (segment_idx >= TRUST_CHROMOSOME_PAIRS)
+        return;
+    if (chromo->a_segments[segment_idx] != new_value) {
+        chromo->a_segments[segment_idx] = new_value;
+        chromo->mutation_count++;
+        if (segment_idx == CHROMO_A_SEX)
+            chromo->sex = trust_chromosome_determine_sex(chromo);
+        /* checksum left stale — caller MUST finalize before unlock */
+    }
+}
+
+void trust_chromosome_finalize(trust_chromosome_t *chromo)
+{
+    chromo->checksum = trust_chromosome_checksum(chromo);
 }
 
 /*

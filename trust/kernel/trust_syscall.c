@@ -125,13 +125,30 @@ static void tsc_record_event(struct tsc_pid_slot *slot, u16 syscall_nr,
     struct nlmsghdr *nlh;
     struct tsc_event_msg *msg;
     int msg_size;
-
-    /* Check category filter */
-    if (!(slot->category_mask & category))
-        return;
+    pid_t caller_pid = current->pid;
+    u64 ts_ns;              /* Local copy: ev is invalid after unlock. */
+    u32 slot_subject_id;
+    pid_t slot_pid;
 
     /* Record in ring buffer */
     spin_lock(&slot->lock);
+    /*
+     * Re-verify slot identity under the lock.  Between the caller's
+     * tsc_find_slot_by_pid() and this spin_lock(), tsc_stop_trace()
+     * followed by tsc_start_trace() can reuse the slot for a different
+     * PID — writing the event then would pollute another PID's ring.
+     */
+    if (!slot->active || slot->pid != caller_pid) {
+        spin_unlock(&slot->lock);
+        return;
+    }
+
+    /* Check category filter under lock (category_mask may be updated). */
+    if (!(slot->category_mask & category)) {
+        spin_unlock(&slot->lock);
+        return;
+    }
+
     ev = &slot->ring[slot->ring_head % TSC_RING_SIZE];
     ev->subject_id = slot->subject_id;
     ev->pid = slot->pid;
@@ -141,7 +158,8 @@ static void tsc_record_event(struct tsc_pid_slot *slot, u16 syscall_nr,
     ev->arg1 = arg1;
     ev->arg2 = arg2;
     ev->return_value = retval;
-    ev->timestamp_ns = ktime_get_ns();
+    ts_ns = ktime_get_ns();
+    ev->timestamp_ns = ts_ns;
     slot->ring_head = (slot->ring_head + 1) % TSC_RING_SIZE;
     if (slot->ring_count < TSC_RING_SIZE)
         slot->ring_count++;
@@ -149,6 +167,12 @@ static void tsc_record_event(struct tsc_pid_slot *slot, u16 syscall_nr,
     /* Update stats counter */
     if (syscall_nr < 512)
         slot->stats[syscall_nr]++;
+
+    /* Snapshot slot identity for the netlink message: after we drop
+     * slot->lock the slot can be racily reused by tsc_stop_trace/
+     * tsc_start_trace and overwritten. */
+    slot_subject_id = slot->subject_id;
+    slot_pid = slot->pid;
     spin_unlock(&slot->lock);
 
     /* Emit via netlink */
@@ -169,15 +193,15 @@ static void tsc_record_event(struct tsc_pid_slot *slot, u16 syscall_nr,
     msg = nlmsg_data(nlh);
     memset(msg, 0, sizeof(*msg));
     msg->seq = (u32)atomic_inc_return(&g_tsc.event_seq);
-    msg->subject_id = slot->subject_id;
-    msg->pid = slot->pid;
+    msg->subject_id = slot_subject_id;
+    msg->pid = slot_pid;
     msg->syscall_nr = syscall_nr;
     msg->category = category;
     msg->arg0 = arg0;
     msg->arg1 = arg1;
     msg->arg2 = arg2;
     msg->return_value = retval;
-    msg->timestamp_ns = ev->timestamp_ns;
+    msg->timestamp_ns = ts_ns;
 
     NETLINK_CB(skb).dst_group = TSC_NETLINK_GROUP;
     nlmsg_multicast(g_tsc.nl_sock, skb, 0, TSC_NETLINK_GROUP, GFP_ATOMIC);
@@ -788,6 +812,7 @@ static bool tsc_kretp_registered[TSC_NUM_KRETPROBES];
 int tsc_start_trace(u32 subject_id, pid_t pid, u8 category_mask)
 {
     struct tsc_pid_slot *slot;
+    u8 final_mask;
 
     if (!g_tsc.enabled)
         return -ENODEV;
@@ -802,10 +827,12 @@ int tsc_start_trace(u32 subject_id, pid_t pid, u8 category_mask)
     if (!slot)
         return -ENOSPC;
 
+    final_mask = category_mask ? category_mask : TSC_CAT_ALL;
+
     spin_lock(&slot->lock);
     slot->pid = pid;
     slot->subject_id = subject_id;
-    slot->category_mask = category_mask ? category_mask : TSC_CAT_ALL;
+    slot->category_mask = final_mask;
     slot->ring_head = 0;
     slot->ring_count = 0;
     memset(slot->stats, 0, sizeof(slot->stats));
@@ -818,7 +845,7 @@ int tsc_start_trace(u32 subject_id, pid_t pid, u8 category_mask)
         set_bit(pid, g_tsc.pid_bitmap);
 
     pr_info("trust: TSC started tracing pid %d (subject %u, categories 0x%02x)\n",
-            pid, subject_id, slot->category_mask);
+            pid, subject_id, final_mask);
     return 0;
 }
 

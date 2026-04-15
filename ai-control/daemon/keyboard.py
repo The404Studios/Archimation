@@ -64,6 +64,16 @@ SHIFT_CHARS = {
     "|": "backslash", "<": "comma", ">": "dot", "?": "slash",
 }
 
+# Reverse map from key code -> key name. Built once at import to avoid an
+# O(n) scan of KEY_MAP.items() per character in type_text() (was O(n*m)
+# worst case for a 26-letter string on slow CPUs).
+_CODE_TO_KEY_NAME = {code: name for name, code in KEY_MAP.items()}
+# Direct char -> key_name map (skips the code->name lookup entirely during typing).
+_CHAR_TO_KEY_NAME = {
+    char: _CODE_TO_KEY_NAME.get(code)
+    for char, code in CHAR_TO_KEY.items()
+}
+
 
 class KeyboardController:
     """Controls keyboard input via Linux uinput."""
@@ -82,6 +92,9 @@ class KeyboardController:
                 ecodes.EV_KEY: list(range(1, 256)),  # All key codes
             }
             self.device = UInput(capabilities, name="ai-control-keyboard")
+            # Cache the ecodes module to avoid repeated imports on every
+            # press/release call (type_text() fires this per character).
+            self._ev_key = ecodes.EV_KEY
             logger.info("Virtual keyboard device created")
         except ImportError:
             logger.warning("python-evdev not available, keyboard control disabled")
@@ -94,14 +107,13 @@ class KeyboardController:
         """Press a key down."""
         if not self.device:
             return False
-        import evdev.ecodes as ecodes
 
         code = KEY_MAP.get(key_name.lower())
         if code is None:
             logger.warning(f"Unknown key: {key_name}")
             return False
 
-        self.device.write(ecodes.EV_KEY, code, 1)  # Key down
+        self.device.write(self._ev_key, code, 1)  # Key down
         self.device.syn()
         return True
 
@@ -109,13 +121,12 @@ class KeyboardController:
         """Release a key."""
         if not self.device:
             return False
-        import evdev.ecodes as ecodes
 
         code = KEY_MAP.get(key_name.lower())
         if code is None:
             return False
 
-        self.device.write(ecodes.EV_KEY, code, 0)  # Key up
+        self.device.write(self._ev_key, code, 0)  # Key up
         self.device.syn()
         return True
 
@@ -149,12 +160,8 @@ class KeyboardController:
                 self.press_key("leftshift")
                 self.tap_key(SHIFT_CHARS[char], 0.02)
                 self.release_key("leftshift")
-            elif char in CHAR_TO_KEY:
-                key_name = None
-                for name, code in KEY_MAP.items():
-                    if code == CHAR_TO_KEY[char]:
-                        key_name = name
-                        break
+            else:
+                key_name = _CHAR_TO_KEY_NAME.get(char)
                 if key_name:
                     self.tap_key(key_name, 0.02)
             time.sleep(delay)

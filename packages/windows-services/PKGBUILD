@@ -23,8 +23,9 @@ _srcdir="${startdir}/../../services"
 
 build() {
     cd "$_srcdir"
+    # Parallel compile (MAKEFLAGS propagated from build-packages.sh).
     make clean
-    make all
+    make all ${MAKEFLAGS:-}
 }
 
 package() {

@@ -534,12 +534,21 @@ NTSTATUS ObRegisterCallbacks(POB_CALLBACK_REGISTRATION CallbackRegistration,
             (unsigned)CallbackRegistration->Version,
             (unsigned)CallbackRegistration->OperationRegistrationCount);
 
-    if (g_ob_callback_count < MAX_OB_CALLBACKS) {
-        /* Store a reference to the registration for later cleanup */
-        g_ob_callbacks[g_ob_callback_count] = CallbackRegistration;
-        *RegistrationHandle = (PVOID)(uintptr_t)(g_ob_callback_count + 1);
-        g_ob_callback_count++;
-        WDM_LOG("  Registered as handle %p", *RegistrationHandle);
+    /* Find a free slot (reuse NULLed entries from previous unregister) */
+    int slot = -1;
+    for (int i = 0; i < MAX_OB_CALLBACKS; i++) {
+        if (g_ob_callbacks[i] == NULL) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot >= 0) {
+        g_ob_callbacks[slot] = CallbackRegistration;
+        if (slot + 1 > g_ob_callback_count)
+            g_ob_callback_count = slot + 1;
+        *RegistrationHandle = (PVOID)(uintptr_t)(slot + 1);
+        WDM_LOG("  Registered as handle %p (slot %d)", *RegistrationHandle, slot);
     } else {
         WDM_LOG("  WARNING: Maximum OB callbacks reached");
         *RegistrationHandle = (PVOID)(uintptr_t)0xDEAD;

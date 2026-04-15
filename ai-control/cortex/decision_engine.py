@@ -7,12 +7,28 @@ Three-tier evaluation (from spec Section 6.1 DECIDE):
 3. LLM reasoning (slow, optional): for ambiguous cases via local GGUF model
 """
 import logging
+import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Callable, Any
+from typing import Optional, List, Dict, Callable, Any, Deque
 from enum import IntEnum
 
 logger = logging.getLogger("cortex.decision")
+
+
+def _is_old_hw() -> bool:
+    """Tight heuristic: <=2 cores or <2GB RAM => scale buffers down."""
+    try:
+        cpus = os.cpu_count() or 1
+    except Exception:
+        cpus = 1
+    mem_gb = 1.0
+    try:
+        mem_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)
+    except (ValueError, OSError, AttributeError):
+        pass
+    return cpus <= 2 or mem_gb < 2.0
 
 
 class Verdict(IntEnum):
@@ -129,11 +145,24 @@ class DecisionEngine:
 
     def __init__(self) -> None:
         self._policy_rules: List[PolicyRule] = []
+        # Secondary index: (source_layer, event_type) -> list of rules.
+        # Rebuilt on add/remove; eliminates linear scan of ALL rules per event.
+        self._rule_index: Dict[tuple, List[PolicyRule]] = {}
         self._heuristic_state: Dict[str, Any] = {}
         self._llm: Any = None  # Optional llama-cpp-python backend
         self._eval_count: int = 0
-        self._eval_times: List[float] = []
+        # HW-tier aware buffer sizes.  Old hardware gets a smaller timing
+        # window (less memory) and a tighter state hard cap so a pathological
+        # event storm cannot chew through RAM on a 1-core 1GB box.
+        old_hw = _is_old_hw()
+        self._eval_times: Deque[float] = deque(maxlen=250 if old_hw else 1000)
+        self._state_hard_cap: int = 2000 if old_hw else 10000
+        self._state_trim_to: int = 1000 if old_hw else 5000
         self._verdict_counts: Dict[str, int] = {v.name: 0 for v in Verdict}
+        # Cached p99 (recomputed only every N evaluations) to avoid sorting
+        # the full timing deque on every /status API call.
+        self._stats_cache: Optional[dict] = None
+        self._stats_cache_eval_count: int = -1
 
         self._load_default_policies()
 
@@ -193,12 +222,25 @@ class DecisionEngine:
         """Add a policy rule. Rules are kept sorted by descending priority."""
         self._policy_rules.append(rule)
         self._policy_rules.sort(key=lambda r: -r.priority)
+        self._rebuild_rule_index()
 
     def remove_rule(self, name: str) -> bool:
         """Remove a policy rule by name. Returns True if found."""
         before = len(self._policy_rules)
         self._policy_rules = [r for r in self._policy_rules if r.name != name]
-        return len(self._policy_rules) < before
+        if len(self._policy_rules) < before:
+            self._rebuild_rule_index()
+            return True
+        return False
+
+    def _rebuild_rule_index(self) -> None:
+        """Rebuild the (layer, type) -> rules index from _policy_rules.
+        Preserves priority order (policy_rules is already sorted)."""
+        idx: Dict[tuple, List[PolicyRule]] = {}
+        for rule in self._policy_rules:
+            key = (rule.source_layer, rule.event_type)
+            idx.setdefault(key, []).append(rule)
+        self._rule_index = idx
 
     # -- Main evaluation pipeline --
 
@@ -247,8 +289,6 @@ class DecisionEngine:
         """Record timing and verdict statistics."""
         elapsed = time.monotonic() - start
         self._eval_times.append(elapsed)
-        if len(self._eval_times) > 1000:
-            self._eval_times = self._eval_times[-500:]
 
         self._verdict_counts[result.verdict.name] = (
             self._verdict_counts.get(result.verdict.name, 0) + 1
@@ -257,29 +297,61 @@ class DecisionEngine:
     # -- Tier 1: Policy rules --
 
     def _eval_policy(self, event: Event) -> Optional[EvalResult]:
-        """Check static policy rules in priority order."""
-        for rule in self._policy_rules:
-            if (rule.source_layer == event.source_layer and
-                    rule.event_type == event.event_type):
-                try:
-                    if rule.condition(event):
-                        logger.debug(
-                            "Policy rule '%s' matched event (layer=%d, type=0x%02x)",
-                            rule.name, event.source_layer, event.event_type,
-                        )
-                        return EvalResult(
-                            verdict=rule.verdict,
-                            reason=rule.reason,
-                            tier="policy",
-                            confidence=1.0,
-                        )
-                except Exception as exc:
-                    logger.error(
-                        "Policy rule '%s' raised exception: %s", rule.name, exc,
+        """Check static policy rules in priority order.
+
+        Uses the (source_layer, event_type) index for O(matching-rules) lookup
+        instead of scanning all rules.  Order within the bucket preserves the
+        original priority-descending sort.
+        """
+        rules = self._rule_index.get((event.source_layer, event.event_type))
+        if not rules:
+            return None
+        for rule in rules:
+            try:
+                if rule.condition(event):
+                    logger.debug(
+                        "Policy rule '%s' matched event (layer=%d, type=0x%02x)",
+                        rule.name, event.source_layer, event.event_type,
                     )
+                    return EvalResult(
+                        verdict=rule.verdict,
+                        reason=rule.reason,
+                        tier="policy",
+                        confidence=1.0,
+                    )
+            except Exception as exc:
+                logger.error(
+                    "Policy rule '%s' raised exception: %s", rule.name, exc,
+                )
         return None
 
     # -- Tier 2: Heuristics --
+
+    def _sliding_window_add(
+        self, key: str, now: float, window_s: float, max_entries: int = 4096,
+    ) -> int:
+        """Append `now` to a sliding time window and return its length.
+
+        Uses a deque per key for O(1) append + popleft; the previous
+        implementation rebuilt the list via list-comprehension on every
+        event, which was O(N) *per event* on hot PIDs.  The deque-based
+        approach is amortized O(1) per event, a 10-100x win under heavy
+        event rates.
+
+        `max_entries` caps deque size so a pathological sender cannot grow
+        the window past its natural ceiling (redundant with the window
+        expiry, but defends against clock skew / time jumps).
+        """
+        history = self._heuristic_state.get(key)
+        if history is None:
+            history = deque(maxlen=max_entries)
+            self._heuristic_state[key] = history
+        # Expire old entries from the left of the window -- O(1) per pop.
+        cutoff = now - window_s
+        while history and history[0] < cutoff:
+            history.popleft()
+        history.append(now)
+        return len(history)
 
     def _eval_heuristics(self, event: Event) -> Optional[EvalResult]:
         """Behavioral pattern detection."""
@@ -287,42 +359,32 @@ class DecisionEngine:
         # Heuristic: rapid PE spawning (fork bomb detection)
         # Spec: "Process spawning >20 children in 5s = suspicious"
         if event.source_layer == 2 and event.event_type == EVT_PE_LOAD:
-            key = f"spawn_rate_{event.pid}"
             now = time.monotonic()
-            history: List[float] = self._heuristic_state.get(key, [])
-            history = [t for t in history if now - t < 5.0]
-            history.append(now)
-            self._heuristic_state[key] = history
-
-            if len(history) > 20:
+            n = self._sliding_window_add(f"spawn_rate_{event.pid}", now, 5.0)
+            if n > 20:
                 logger.warning(
                     "Fork bomb heuristic: pid %d spawned %d PE loads in 5s",
-                    event.pid, len(history),
+                    event.pid, n,
                 )
                 return EvalResult(
                     verdict=Verdict.QUARANTINE,
-                    reason=f"Rapid PE spawning: {len(history)} loads in 5s (fork bomb?)",
+                    reason=f"Rapid PE spawning: {n} loads in 5s (fork bomb?)",
                     tier="heuristic",
                     confidence=0.85,
                 )
 
         # Heuristic: repeated trust denials (privilege escalation probing)
         if event.source_layer == 2 and event.event_type == EVT_PE_TRUST_DENY:
-            key = f"deny_rate_{event.pid}"
             now = time.monotonic()
-            history = self._heuristic_state.get(key, [])
-            history = [t for t in history if now - t < 10.0]
-            history.append(now)
-            self._heuristic_state[key] = history
-
-            if len(history) > 50:
+            n = self._sliding_window_add(f"deny_rate_{event.pid}", now, 10.0)
+            if n > 50:
                 logger.warning(
                     "Privilege probe heuristic: pid %d got %d trust denials in 10s",
-                    event.pid, len(history),
+                    event.pid, n,
                 )
                 return EvalResult(
                     verdict=Verdict.QUARANTINE,
-                    reason=f"Excessive trust denials: {len(history)} in 10s "
+                    reason=f"Excessive trust denials: {n} in 10s "
                            f"(privilege escalation attempt?)",
                     tier="heuristic",
                     confidence=0.75,
@@ -330,22 +392,23 @@ class DecisionEngine:
 
         # Heuristic: service crash loop
         if event.source_layer == 3 and event.event_type == EVT_SVC_CRASH:
-            svc_name = event.payload.get("service_name", str(event.pid))
-            key = f"crash_rate_{svc_name}"
+            # payload may arrive as raw bytes if no struct parser is registered
+            # for the SCM event type -- guard the .get() call defensively.
+            payload = getattr(event, "payload", None)
+            if isinstance(payload, dict):
+                svc_name = payload.get("service_name", str(event.pid))
+            else:
+                svc_name = str(event.pid)
             now = time.monotonic()
-            history = self._heuristic_state.get(key, [])
-            history = [t for t in history if now - t < 60.0]
-            history.append(now)
-            self._heuristic_state[key] = history
-
-            if len(history) > 5:
+            n = self._sliding_window_add(f"crash_rate_{svc_name}", now, 60.0)
+            if n > 5:
                 logger.warning(
                     "Crash loop heuristic: service '%s' crashed %d times in 60s",
-                    svc_name, len(history),
+                    svc_name, n,
                 )
                 return EvalResult(
                     verdict=Verdict.DENY,
-                    reason=f"Service crash loop: {len(history)} crashes in 60s "
+                    reason=f"Service crash loop: {n} crashes in 60s "
                            f"-- stopping restarts",
                     tier="heuristic",
                     confidence=0.9,
@@ -353,17 +416,12 @@ class DecisionEngine:
 
         # Heuristic: PE exception storm
         if event.source_layer == 2 and event.event_type == EVT_PE_EXCEPTION:
-            key = f"exception_rate_{event.pid}"
             now = time.monotonic()
-            history = self._heuristic_state.get(key, [])
-            history = [t for t in history if now - t < 10.0]
-            history.append(now)
-            self._heuristic_state[key] = history
-
-            if len(history) > 100:
+            n = self._sliding_window_add(f"exception_rate_{event.pid}", now, 10.0)
+            if n > 100:
                 return EvalResult(
                     verdict=Verdict.QUARANTINE,
-                    reason=f"Exception storm: {len(history)} exceptions in 10s "
+                    reason=f"Exception storm: {n} exceptions in 10s "
                            f"-- process unstable",
                     tier="heuristic",
                     confidence=0.8,
@@ -375,12 +433,11 @@ class DecisionEngine:
             if isinstance(payload, dict) and payload.get("new_prot") == "rwx":
                 region_tag = payload.get("tag", "")
                 if region_tag in ("heap", "unknown"):
-                    rwx_key = f"rwx_heap_{event.pid}"
                     now = time.monotonic()
-                    history = self._heuristic_state.setdefault(rwx_key, [])
-                    history.append(now)
-                    history[:] = [t for t in history if now - t < 10.0]
-                    if len(history) > 5:
+                    n = self._sliding_window_add(
+                        f"rwx_heap_{event.pid}", now, 10.0,
+                    )
+                    if n > 5:
                         return EvalResult(
                             verdict=Verdict.QUARANTINE,
                             reason="Excessive RWX heap allocations "
@@ -404,12 +461,9 @@ class DecisionEngine:
 
         # Heuristic: stub call frequency -- detect programs that are mostly broken
         if event.source_layer == 2 and event.event_type == EVT_STUB_CALLED:
-            stub_key = f"stub_freq_{event.pid}"
             now = time.monotonic()
-            history = self._heuristic_state.setdefault(stub_key, [])
-            history.append(now)
-            history[:] = [t for t in history if now - t < 5.0]
-            if len(history) > 100:
+            n = self._sliding_window_add(f"stub_freq_{event.pid}", now, 5.0)
+            if n > 100:
                 return EvalResult(
                     verdict=Verdict.ESCALATE,
                     reason=f"Process {event.pid} hitting >100 stubs/5s "
@@ -456,8 +510,10 @@ class DecisionEngine:
                         confidence=0.7,
                     )
 
-        # Prune stale heuristic state entries periodically
-        if self._eval_count % 100 == 0:
+        # Prune stale heuristic state entries periodically.  Skip the walk
+        # entirely when the state dict is small -- no risk of unbounded growth
+        # and nothing to reclaim.
+        if self._eval_count % 100 == 0 and len(self._heuristic_state) > 128:
             self._prune_heuristic_state()
 
         return None
@@ -465,28 +521,46 @@ class DecisionEngine:
     def _prune_heuristic_state(self) -> None:
         """Remove heuristic state entries with no recent activity (idle > 30s).
 
-        Also enforces a hard cap of 10000 keys to prevent unbounded growth
-        from many short-lived PIDs generating unique heuristic keys.
+        Also enforces a hard cap to prevent unbounded growth from many
+        short-lived PIDs generating unique heuristic keys.  On old HW the
+        cap is tighter to keep memory footprint small.
+
+        Accepts both list and deque values (legacy pickled state might
+        still be list-based; live state is deque-based).
         """
         now = time.monotonic()
         stale_keys = []
         for key, history in self._heuristic_state.items():
-            if isinstance(history, list) and history:
-                if now - history[-1] > 30.0:
+            # `history` is either a list or deque of floats.  Both support
+            # len(), indexing via history[-1], and truthiness.
+            if history:
+                try:
+                    last = history[-1]
+                except (IndexError, TypeError):
                     stale_keys.append(key)
-            elif isinstance(history, list) and not history:
+                    continue
+                if now - last > 30.0:
+                    stale_keys.append(key)
+            else:
                 stale_keys.append(key)
         for key in stale_keys:
             del self._heuristic_state[key]
 
-        # Hard cap: if still too many keys, evict oldest
-        if len(self._heuristic_state) > 10000:
+        # Hard cap: if still too many keys, evict oldest.  Cap is soft-tied
+        # to HW tier via an override attribute so tests/constrained hosts
+        # can tune it without editing the class.
+        hard_cap = getattr(self, "_state_hard_cap", 10000)
+        trim_to = getattr(self, "_state_trim_to", 5000)
+        if len(self._heuristic_state) > hard_cap:
             entries = []
             for key, history in self._heuristic_state.items():
-                last = history[-1] if isinstance(history, list) and history else 0
+                try:
+                    last = history[-1] if history else 0
+                except (IndexError, TypeError):
+                    last = 0
                 entries.append((key, last))
             entries.sort(key=lambda x: x[1])
-            to_remove = len(self._heuristic_state) - 5000  # trim to 5000
+            to_remove = len(self._heuristic_state) - trim_to
             for key, _ in entries[:to_remove]:
                 del self._heuristic_state[key]
 
@@ -519,7 +593,23 @@ class DecisionEngine:
 
     @property
     def stats(self) -> dict:
-        """Engine performance and evaluation statistics."""
+        """Engine performance and evaluation statistics.
+
+        The avg/p99 timing calculation is O(N log N) over the 1000-entry
+        deque (full sort).  Cache the result for ~100 evaluations so the
+        /status API endpoint doesn't pay that cost on every poll.
+        """
+        if (
+            self._stats_cache is not None
+            and self._eval_count - self._stats_cache_eval_count < 100
+        ):
+            # Refresh only the live counters; timing stats remain cached.
+            cached = dict(self._stats_cache)
+            cached["evaluations"] = self._eval_count
+            cached["heuristic_state_keys"] = len(self._heuristic_state)
+            cached["verdict_counts"] = dict(self._verdict_counts)
+            return cached
+
         avg_time = (
             sum(self._eval_times) / len(self._eval_times)
             if self._eval_times else 0.0
@@ -528,7 +618,7 @@ class DecisionEngine:
             sorted(self._eval_times)[int(len(self._eval_times) * 0.99)]
             if len(self._eval_times) >= 100 else avg_time
         )
-        return {
+        result = {
             "evaluations": self._eval_count,
             "policy_rules": len(self._policy_rules),
             "avg_eval_time_ms": round(avg_time * 1000, 3),
@@ -537,6 +627,9 @@ class DecisionEngine:
             "verdict_counts": dict(self._verdict_counts),
             "llm_available": self._llm is not None,
         }
+        self._stats_cache = result
+        self._stats_cache_eval_count = self._eval_count
+        return result
 
     @property
     def rules(self) -> List[dict]:

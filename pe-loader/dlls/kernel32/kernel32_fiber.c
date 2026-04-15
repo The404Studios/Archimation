@@ -327,3 +327,19 @@ WINAPI_EXPORT BOOL ConvertFiberToThread(void)
     free(fiber);
     return TRUE;
 }
+
+/*
+ * fiber_thread_cleanup - Called on thread exit to free a thread-fiber
+ * that ConvertThreadToFiber created but ConvertFiberToThread never undid.
+ * Only frees if this thread converted itself to a fiber (is_thread_fiber).
+ * Real fibers created via CreateFiber need explicit DeleteFiber -- we
+ * cannot safely free their stack here because they may still be active.
+ */
+void fiber_thread_cleanup(void)
+{
+    fiber_data_t *fiber = g_current_fiber;
+    if (fiber && fiber->is_thread_fiber) {
+        g_current_fiber = NULL;
+        free(fiber);
+    }
+}

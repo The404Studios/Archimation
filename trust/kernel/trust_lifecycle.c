@@ -110,106 +110,142 @@ static int lineage_record(u32 parent_id, u32 child_id, u8 child_sex, u8 gen)
  *
  * Returns 0 on success, -EPERM if cancer detected, -ENOENT if parent unknown.
  */
+struct mitotic_parent_ctx {
+    u64             now;
+    int             outcome;      /* 0=ok, -EPERM cancer, -ENOSPC starved */
+    trust_subject_t parent_snap;  /* snapshot for child derivation */
+};
+
+static int _mitotic_parent_cb(trust_subject_t *parent, void *data)
+{
+    struct mitotic_parent_ctx *ctx = data;
+    int ret;
+
+    /* Check frozen/apoptotic */
+    if (parent->flags & (TRUST_FLAG_FROZEN | TRUST_FLAG_APOPTOTIC)) {
+        ctx->outcome = -EPERM;
+        ctx->parent_snap = *parent;
+        return 0;
+    }
+
+    /* --- Cancer Detection --- */
+    if (ctx->now - parent->lifecycle.spawn_window_start <
+        TRUST_CANCER_SPAWN_WINDOW) {
+        parent->lifecycle.spawn_count++;
+        if (parent->lifecycle.spawn_count > TRUST_CANCER_SPAWN_LIMIT) {
+            parent->flags |= TRUST_FLAG_CANCEROUS;
+            parent->immune.status = TRUST_IMMUNE_CANCEROUS;
+            parent->lifecycle.state = TRUST_LIFECYCLE_APOPTOTIC;
+            trust_trc_adjust(&parent->trc, TRUST_ACTION_CANCER_DETECTED);
+            ctx->outcome = -EPERM;
+            ctx->parent_snap = *parent; /* for audit after lock release */
+            return 0;
+        }
+    } else {
+        parent->lifecycle.spawn_window_start = ctx->now;
+        parent->lifecycle.spawn_count = 1;
+    }
+
+    /* Total spawn limit */
+    parent->lifecycle.total_spawns++;
+    if (parent->lifecycle.total_spawns > TRUST_CANCER_TOTAL_LIMIT) {
+        parent->flags |= TRUST_FLAG_CANCEROUS;
+        parent->immune.status = TRUST_IMMUNE_CANCEROUS;
+        ctx->outcome = -EPERM;
+        ctx->parent_snap = *parent;
+        return 0;
+    }
+
+    /* Burn tokens */
+    ret = trust_token_burn(&parent->tokens, TRUST_ACTION_MITOTIC_DIVIDE);
+    if (ret) {
+        ctx->outcome = -ENOSPC;
+        ctx->parent_snap = *parent;
+        return 0;
+    }
+
+    parent->lifecycle.last_division_ts = ctx->now;
+    parent->lifecycle.state = TRUST_LIFECYCLE_ACTIVE;
+    parent->chromosome.division_count++;
+
+    trust_chromosome_update_a(&parent->chromosome, CHROMO_A_SPAWN_RATE,
+        trust_chromosome_rolling_hash(
+            parent->chromosome.a_segments[CHROMO_A_SPAWN_RATE],
+            parent->lifecycle.spawn_count));
+
+    ctx->outcome = 0;
+    ctx->parent_snap = *parent;
+    return 0;
+}
+
 int trust_lifecycle_mitotic_divide(u32 parent_id, u32 child_id)
 {
-    trust_subject_t parent, child;
+    struct mitotic_parent_ctx ctx;
+    trust_subject_t child;
+    trust_subject_t *parent;
     u64 now;
     int ret;
 
-    /* Look up parent */
-    ret = trust_tlb_lookup(parent_id, &parent);
-    if (ret)
-        return -ENOENT;
-
-    /* Check frozen/apoptotic */
-    if (parent.flags & (TRUST_FLAG_FROZEN | TRUST_FLAG_APOPTOTIC))
-        return -EPERM;
-
     now = trust_get_timestamp();
+    ctx.now = now;
+    ctx.outcome = -EINVAL;
 
-    /* --- Cancer Detection --- */
-    /* Check spawn rate within window */
-    if (now - parent.lifecycle.spawn_window_start < TRUST_CANCER_SPAWN_WINDOW) {
-        parent.lifecycle.spawn_count++;
-        if (parent.lifecycle.spawn_count > TRUST_CANCER_SPAWN_LIMIT) {
-            /* CANCER DETECTED: runaway spawning */
-            parent.flags |= TRUST_FLAG_CANCEROUS;
-            parent.immune.status = TRUST_IMMUNE_CANCEROUS;
-            parent.lifecycle.state = TRUST_LIFECYCLE_APOPTOTIC;
-            /* TRC Integration: cancer → lockdown */
-            trust_trc_adjust(&parent.trc, TRUST_ACTION_CANCER_DETECTED);
-            trust_tlb_insert(&parent);
+    /*
+     * Atomic parent mutation: the spawn_count / total_spawns / token burn
+     * all happen under the TLB set spinlock, eliminating the lookup-
+     * modify-insert TOCTOU race on concurrent fork().
+     */
+    ret = trust_tlb_modify(parent_id, _mitotic_parent_cb, &ctx);
+    if (ret != 0)
+        return ret;  /* -ENOENT (no parent) or -ENOMEM (TLB not ready) */
+
+    if (ctx.outcome == -EPERM) {
+        /* Cancer or frozen — audit with post-state values */
+        if (ctx.parent_snap.flags & TRUST_FLAG_CANCEROUS) {
             trust_fbc_audit(parent_id, TRUST_ACTION_CANCER_DETECTED,
-                           parent.trust_score, parent.trust_score,
-                           parent.capabilities, 0);
+                            ctx.parent_snap.trust_score,
+                            ctx.parent_snap.trust_score,
+                            ctx.parent_snap.capabilities, 0);
             pr_warn("trust_lifecycle: CANCER detected for subject %u "
                     "(%u spawns in window)\n",
-                    parent_id, parent.lifecycle.spawn_count);
-            return -EPERM;
+                    parent_id, ctx.parent_snap.lifecycle.spawn_count);
         }
-    } else {
-        /* Reset spawn window */
-        parent.lifecycle.spawn_window_start = now;
-        parent.lifecycle.spawn_count = 1;
-    }
-
-    /* Check total spawn limit */
-    parent.lifecycle.total_spawns++;
-    if (parent.lifecycle.total_spawns > TRUST_CANCER_TOTAL_LIMIT) {
-        parent.flags |= TRUST_FLAG_CANCEROUS;
-        parent.immune.status = TRUST_IMMUNE_CANCEROUS;
-        trust_tlb_insert(&parent);
         return -EPERM;
     }
-
-    /* Burn parent's tokens for division */
-    ret = trust_token_burn(&parent.tokens, TRUST_ACTION_MITOTIC_DIVIDE);
-    if (ret) {
-        /* Parent starved — can't afford to spawn */
-        trust_tlb_insert(&parent);
+    if (ctx.outcome == -ENOSPC)
         return -ENOSPC;
-    }
+    if (ctx.outcome != 0)
+        return ctx.outcome;
 
-    /* Update parent state */
-    parent.lifecycle.last_division_ts = now;
-    parent.lifecycle.state = TRUST_LIFECYCLE_ACTIVE;
-    parent.chromosome.division_count++;
-
-    /* Update parent's spawn rate chromosome */
-    trust_chromosome_update_a(&parent.chromosome, CHROMO_A_SPAWN_RATE,
-        trust_chromosome_rolling_hash(
-            parent.chromosome.a_segments[CHROMO_A_SPAWN_RATE],
-            parent.lifecycle.spawn_count));
-
-    trust_tlb_insert(&parent);
+    parent = &ctx.parent_snap;
 
     /* --- Create Child --- */
     memset(&child, 0, sizeof(child));
     child.subject_id = child_id;
-    child.domain = parent.domain;
+    child.domain = parent->domain;
 
     /* Inherit chromosome with generational decay */
-    trust_chromosome_inherit(&child.chromosome, &parent.chromosome,
-                              parent.lifecycle.generation + 1);
+    trust_chromosome_inherit(&child.chromosome, &parent->chromosome,
+                              parent->lifecycle.generation + 1);
     child.chromosome.parent_id = parent_id;
 
     /* Compute max score from generational decay */
-    child.lifecycle.generation = parent.lifecycle.generation + 1;
+    child.lifecycle.generation = parent->lifecycle.generation + 1;
     child.lifecycle.max_score = trust_lifecycle_get_max_score(
-        child.lifecycle.generation, parent.authority_level);
+        child.lifecycle.generation, parent->authority_level);
 
     /* Child starts at reduced score (half of parent, capped by generation) */
-    child.trust_score = parent.trust_score / 2;
+    child.trust_score = parent->trust_score / 2;
     if (child.trust_score > child.lifecycle.max_score)
         child.trust_score = child.lifecycle.max_score;
 
     /* Child inherits parent's authority level (but with lower ceiling) */
-    child.authority_level = parent.authority_level;
-    child.capabilities = trust_default_caps(parent.authority_level);
-    child.threshold_low = parent.threshold_low;
-    child.threshold_high = parent.threshold_high;
+    child.authority_level = parent->authority_level;
+    child.capabilities = trust_default_caps(parent->authority_level);
+    child.threshold_low = parent->threshold_low;
+    child.threshold_high = parent->threshold_high;
     child.last_action_ts = now;
-    child.decay_rate = parent.decay_rate;
+    child.decay_rate = parent->decay_rate;
     child.flags = TRUST_FLAG_NEW;
 
     /* Initialize child lifecycle */
@@ -262,54 +298,72 @@ int trust_lifecycle_mitotic_divide(u32 parent_id, u32 child_id)
  *   - Creates a dependency between them
  *
  * Returns 0 on success.
+ *
+ * Uses trust_tlb_modify on each subject independently. Since A and B may
+ * live in different TLB sets, we cannot hold both set-locks simultaneously,
+ * so we apply each mutation atomically in its own critical section. If
+ * either pre-check fails the other is left untouched.
  */
+struct meiotic_combine_ctx {
+    u32     partner_id;
+    int     outcome;        /* 0=ok, -EPERM frozen/apoptotic/cancerous */
+    int32_t score;          /* snapshot score after mutation */
+    u32     caps;           /* snapshot caps after mutation */
+};
+
+static int _meiotic_combine_cb(trust_subject_t *subj, void *data)
+{
+    struct meiotic_combine_ctx *c = data;
+
+    if (subj->flags &
+        (TRUST_FLAG_FROZEN | TRUST_FLAG_APOPTOTIC | TRUST_FLAG_CANCEROUS)) {
+        c->outcome = -EPERM;
+        c->score = subj->trust_score;
+        c->caps  = subj->capabilities;
+        return 0;
+    }
+
+    subj->flags |= TRUST_FLAG_MEIOTIC;
+    subj->lifecycle.state = TRUST_LIFECYCLE_COMBINING;
+    subj->lifecycle.meiotic_partner = c->partner_id;
+    trust_token_burn(&subj->tokens, TRUST_ACTION_MEIOTIC_COMBINE);
+
+    c->outcome = 0;
+    c->score = subj->trust_score;
+    c->caps  = subj->capabilities;
+    return 0;
+}
+
 int trust_lifecycle_meiotic_combine(u32 subject_a, u32 subject_b)
 {
-    trust_subject_t sa, sb;
+    struct meiotic_combine_ctx ca = { .partner_id = subject_b, .outcome = -EINVAL };
+    struct meiotic_combine_ctx cb = { .partner_id = subject_a, .outcome = -EINVAL };
     int ret;
     int32_t combined_score;
 
-    ret = trust_tlb_lookup(subject_a, &sa);
-    if (ret)
+    ret = trust_tlb_modify(subject_a, _meiotic_combine_cb, &ca);
+    if (ret != 0)
         return -ENOENT;
+    if (ca.outcome == -EPERM)
+        return -EPERM;
 
-    ret = trust_tlb_lookup(subject_b, &sb);
-    if (ret)
+    ret = trust_tlb_modify(subject_b, _meiotic_combine_cb, &cb);
+    if (ret != 0)
         return -ENOENT;
-
-    /* Neither can be frozen or apoptotic */
-    if ((sa.flags | sb.flags) &
-        (TRUST_FLAG_FROZEN | TRUST_FLAG_APOPTOTIC | TRUST_FLAG_CANCEROUS))
+    if (cb.outcome == -EPERM)
         return -EPERM;
 
     /* Compute combined score: min(S(A), S(B)) */
-    combined_score = sa.trust_score < sb.trust_score ?
-                     sa.trust_score : sb.trust_score;
+    combined_score = ca.score < cb.score ? ca.score : cb.score;
 
-    /* Mark both as in meiotic combination */
-    sa.flags |= TRUST_FLAG_MEIOTIC;
-    sa.lifecycle.state = TRUST_LIFECYCLE_COMBINING;
-    sa.lifecycle.meiotic_partner = subject_b;
-
-    sb.flags |= TRUST_FLAG_MEIOTIC;
-    sb.lifecycle.state = TRUST_LIFECYCLE_COMBINING;
-    sb.lifecycle.meiotic_partner = subject_a;
-
-    /* Burn tokens for combination */
-    trust_token_burn(&sa.tokens, TRUST_ACTION_MEIOTIC_COMBINE);
-    trust_token_burn(&sb.tokens, TRUST_ACTION_MEIOTIC_COMBINE);
-
-    trust_tlb_insert(&sa);
-    trust_tlb_insert(&sb);
-
-    /* Create mutual dependency */
+    /* Create mutual dependency (has its own locking) */
     trust_dep_add(subject_a, subject_b);
     trust_dep_add(subject_b, subject_a);
 
     /* Audit */
     trust_fbc_audit(subject_a, TRUST_ACTION_MEIOTIC_COMBINE,
-                   sa.trust_score, combined_score,
-                   sa.capabilities, sa.capabilities & sb.capabilities);
+                   ca.score, combined_score,
+                   ca.caps, ca.caps & cb.caps);
 
     pr_info("trust_lifecycle: meiotic combination %u + %u (combined_score=%d)\n",
             subject_a, subject_b, combined_score);
@@ -320,23 +374,19 @@ int trust_lifecycle_meiotic_combine(u32 subject_a, u32 subject_b)
 /*
  * Release a meiotic combination.
  */
+static int _meiotic_release_cb(trust_subject_t *subj, void *data)
+{
+    (void)data;
+    subj->flags &= ~TRUST_FLAG_MEIOTIC;
+    subj->lifecycle.state = TRUST_LIFECYCLE_ACTIVE;
+    subj->lifecycle.meiotic_partner = 0;
+    return 0;
+}
+
 void trust_lifecycle_meiotic_release(u32 subject_a, u32 subject_b)
 {
-    trust_subject_t sa, sb;
-
-    if (trust_tlb_lookup(subject_a, &sa) == 0) {
-        sa.flags &= ~TRUST_FLAG_MEIOTIC;
-        sa.lifecycle.state = TRUST_LIFECYCLE_ACTIVE;
-        sa.lifecycle.meiotic_partner = 0;
-        trust_tlb_insert(&sa);
-    }
-
-    if (trust_tlb_lookup(subject_b, &sb) == 0) {
-        sb.flags &= ~TRUST_FLAG_MEIOTIC;
-        sb.lifecycle.state = TRUST_LIFECYCLE_ACTIVE;
-        sb.lifecycle.meiotic_partner = 0;
-        trust_tlb_insert(&sb);
-    }
+    (void)trust_tlb_modify(subject_a, _meiotic_release_cb, NULL);
+    (void)trust_tlb_modify(subject_b, _meiotic_release_cb, NULL);
 
     trust_dep_remove(subject_a, subject_b);
     trust_dep_remove(subject_b, subject_a);
@@ -345,47 +395,61 @@ void trust_lifecycle_meiotic_release(u32 subject_a, u32 subject_b)
 /*
  * Check for cancer (called periodically and during spawning).
  * Returns 1 if cancer detected, 0 if healthy.
+ *
+ * The detection + flag-set is performed atomically inside the callback
+ * so concurrent spawn/mutation events cannot lose an increment to
+ * suspicious_actions nor miss the CANCEROUS transition.
  */
+struct check_cancer_ctx { int verdict; };
+
+static int _check_cancer_cb(trust_subject_t *subj, void *data)
+{
+    struct check_cancer_ctx *c = data;
+
+    if (subj->flags & TRUST_FLAG_CANCEROUS) {
+        c->verdict = 1;
+        return 0;
+    }
+
+    if (subj->lifecycle.spawn_count > TRUST_CANCER_SPAWN_LIMIT) {
+        subj->flags |= TRUST_FLAG_CANCEROUS;
+        subj->immune.status = TRUST_IMMUNE_CANCEROUS;
+        c->verdict = 1;
+        return 0;
+    }
+
+    if (subj->lifecycle.total_spawns > TRUST_CANCER_TOTAL_LIMIT) {
+        subj->flags |= TRUST_FLAG_CANCEROUS;
+        subj->immune.status = TRUST_IMMUNE_CANCEROUS;
+        c->verdict = 1;
+        return 0;
+    }
+
+    if (subj->chromosome.mutation_count > 1000) {
+        subj->immune.status = TRUST_IMMUNE_SUSPICIOUS;
+        subj->immune.suspicious_actions++;
+        if (subj->immune.suspicious_actions > 100) {
+            subj->flags |= TRUST_FLAG_CANCEROUS;
+            subj->immune.status = TRUST_IMMUNE_CANCEROUS;
+            c->verdict = 1;
+        } else {
+            c->verdict = 0;
+        }
+        return 0;
+    }
+
+    c->verdict = 0;
+    return 0;
+}
+
 int trust_lifecycle_check_cancer(u32 subject_id)
 {
-    trust_subject_t subj;
+    struct check_cancer_ctx ctx = { .verdict = 0 };
 
-    if (trust_tlb_lookup(subject_id, &subj))
+    if (trust_tlb_modify(subject_id, _check_cancer_cb, &ctx) != 0)
         return 0;
 
-    /* Already flagged */
-    if (subj.flags & TRUST_FLAG_CANCEROUS)
-        return 1;
-
-    /* Check spawn rate in current window */
-    if (subj.lifecycle.spawn_count > TRUST_CANCER_SPAWN_LIMIT) {
-        subj.flags |= TRUST_FLAG_CANCEROUS;
-        subj.immune.status = TRUST_IMMUNE_CANCEROUS;
-        trust_tlb_insert(&subj);
-        return 1;
-    }
-
-    /* Check total spawns */
-    if (subj.lifecycle.total_spawns > TRUST_CANCER_TOTAL_LIMIT) {
-        subj.flags |= TRUST_FLAG_CANCEROUS;
-        subj.immune.status = TRUST_IMMUNE_CANCEROUS;
-        trust_tlb_insert(&subj);
-        return 1;
-    }
-
-    /* Check chromosome mutation rate (excessive = suspicious) */
-    if (subj.chromosome.mutation_count > 1000) {
-        subj.immune.status = TRUST_IMMUNE_SUSPICIOUS;
-        subj.immune.suspicious_actions++;
-        if (subj.immune.suspicious_actions > 100) {
-            subj.flags |= TRUST_FLAG_CANCEROUS;
-            subj.immune.status = TRUST_IMMUNE_CANCEROUS;
-        }
-        trust_tlb_insert(&subj);
-        return (subj.flags & TRUST_FLAG_CANCEROUS) ? 1 : 0;
-    }
-
-    return 0;
+    return ctx.verdict;
 }
 
 /*
@@ -403,32 +467,64 @@ int trust_lifecycle_apoptosis(u32 subject_id)
     return _trust_lifecycle_apoptosis(subject_id, 0);
 }
 
+struct apoptosis_ctx {
+    u64              deadline;
+    int              already_apoptotic;
+    int32_t          prev_score;
+    u32              prev_caps;
+};
+
+static int _apoptosis_cb(trust_subject_t *subj, void *data)
+{
+    struct apoptosis_ctx *c = data;
+
+    c->prev_score = subj->trust_score;
+    c->prev_caps  = subj->capabilities;
+
+    /* Idempotent: if already apoptotic, no-op (caller still returns 0 but
+     * skips the ape_destroy/audit/cascade work that was already done). */
+    if (subj->flags & TRUST_FLAG_APOPTOTIC) {
+        c->already_apoptotic = 1;
+        return 0;
+    }
+
+    subj->flags |= TRUST_FLAG_APOPTOTIC;
+    subj->lifecycle.state = TRUST_LIFECYCLE_APOPTOTIC;
+    subj->capabilities = 0;
+    subj->immune.status = TRUST_IMMUNE_APOPTOSIS;
+    subj->immune.apoptosis_deadline = c->deadline;
+    c->already_apoptotic = 0;
+    return 0;
+}
+
 static int _trust_lifecycle_apoptosis(u32 subject_id, int depth)
 {
-    trust_subject_t subj;
+    struct apoptosis_ctx ctx = { 0 };
+    int ret;
 
-    if (trust_tlb_lookup(subject_id, &subj))
+    ctx.deadline = trust_get_timestamp() + 5000000000ULL;  /* 5s */
+
+    ret = trust_tlb_modify(subject_id, _apoptosis_cb, &ctx);
+    if (ret != 0)
         return -ENOENT;
 
-    subj.flags |= TRUST_FLAG_APOPTOTIC;
-    subj.lifecycle.state = TRUST_LIFECYCLE_APOPTOTIC;
-    subj.capabilities = 0;  /* Strip all capabilities */
-    subj.immune.status = TRUST_IMMUNE_APOPTOSIS;
-    subj.immune.apoptosis_deadline = trust_get_timestamp() +
-                                     5000000000ULL; /* 5 second deadline */
+    if (ctx.already_apoptotic) {
+        /* Someone else already put this subject into apoptosis;
+         * do not re-destroy the proof chain or re-cascade. */
+        return 0;
+    }
 
-    trust_tlb_insert(&subj);
-
-    /* Destroy proof chain — authority is irrecoverably lost */
+    /* Destroy proof chain — authority is irrecoverably lost.
+     * Must be done outside the TLB set-lock: trust_ape has its own locks. */
     trust_ape_destroy_entity(subject_id);
 
     trust_fbc_audit(subject_id, TRUST_ACTION_APOPTOSIS,
-                   subj.trust_score, TRUST_SCORE_MIN,
-                   subj.capabilities, 0);
+                   ctx.prev_score, TRUST_SCORE_MIN,
+                   ctx.prev_caps, 0);
 
     pr_info("trust_lifecycle: apoptosis initiated for subject %u\n", subject_id);
 
-    /* Trigger cascade for children */
+    /* Trigger cascade for children (allocates/recurses — outside lock) */
     _trust_lifecycle_apoptotic_cascade(subject_id, depth);
 
     return 0;
@@ -533,35 +629,43 @@ static void _trust_lifecycle_apoptotic_cascade(u32 subject_id, int depth)
     spin_unlock(&g_trust_lineage.lock);
 
     /* Phase 2: process children without holding the lock */
-    for (i = 0; i < child_count; i++) {
-        u32 cid = children[i].child_id;
-        u8  sex = children[i].child_sex;
+    {
+        int needs_reroot = 0;
+        for (i = 0; i < child_count; i++) {
+            u32 cid = children[i].child_id;
+            u8  sex = children[i].child_sex;
 
-        switch (sex) {
-        case CHROMO_SEX_XX:
-        case CHROMO_SEX_YY:
-            /*
-             * XX (conformant) and YY (strongly divergent) children
-             * die with parent. XX children likely share the same
-             * compromise vector. YY children are too divergent to trust.
-             */
-            pr_info("trust_lifecycle: cascade apoptosis -> child %u (sex=%s)\n",
-                    cid, sex == CHROMO_SEX_XX ? "XX" : "YY");
-            _trust_lifecycle_apoptosis(cid, depth + 1);
-            break;
+            switch (sex) {
+            case CHROMO_SEX_XX:
+            case CHROMO_SEX_YY:
+                /*
+                 * XX (conformant) and YY (strongly divergent) children
+                 * die with parent. XX children likely share the same
+                 * compromise vector. YY children are too divergent to trust.
+                 */
+                pr_info("trust_lifecycle: cascade apoptosis -> child %u (sex=%s)\n",
+                        cid, sex == CHROMO_SEX_XX ? "XX" : "YY");
+                _trust_lifecycle_apoptosis(cid, depth + 1);
+                break;
 
-        case CHROMO_SEX_XY:
-        case CHROMO_SEX_YX:
-            /*
-             * XY/YX (divergent) children survive and are re-rooted
-             * to init. They demonstrated behavioral independence from
-             * the parent, so they are likely not compromised.
-             */
-            pr_info("trust_lifecycle: re-rooting child %u (sex=%s) to init\n",
-                    cid, sex == CHROMO_SEX_XY ? "XY" : "YX");
-            trust_lifecycle_handle_orphans(subject_id);
-            break;
+            case CHROMO_SEX_XY:
+            case CHROMO_SEX_YX:
+                /*
+                 * XY/YX (divergent) children survive and are re-rooted
+                 * to init. They demonstrated behavioral independence from
+                 * the parent, so they are likely not compromised.
+                 * Defer the re-root to a single call after the loop —
+                 * trust_lifecycle_handle_orphans re-roots ALL children
+                 * of this parent, so calling it per-child wastes work.
+                 */
+                pr_info("trust_lifecycle: re-rooting child %u (sex=%s) to init\n",
+                        cid, sex == CHROMO_SEX_XY ? "XY" : "YX");
+                needs_reroot = 1;
+                break;
+            }
         }
+        if (needs_reroot)
+            trust_lifecycle_handle_orphans(subject_id);
     }
 
     kfree(children);
@@ -634,87 +738,141 @@ void trust_immune_init(trust_immune_t *immune)
 
 /*
  * Evaluate a subject's immune status.
- * Called periodically to check for anomalies.
  *
- * Returns the new immune status.
+ * Previously this did multiple lookup/mutate/insert cycles under
+ * different locks, opening TOCTOU windows where a concurrent mutation
+ * (e.g. record_action bumping suspicious_actions) could be silently
+ * clobbered by a trust_tlb_insert() of stale state.  Collapse all
+ * reads and writes into a single trust_tlb_modify callback so every
+ * mutation is atomic against decay ticks and record-action bursts.
+ *
+ * The quarantine promotion path still runs outside the lock because
+ * trust_immune_quarantine takes the set lock itself and the
+ * verdict only needs to be acted on once.
  */
+struct immune_eval_ctx {
+    int verdict;                /* TRUST_IMMUNE_* */
+    int need_quarantine;        /* 1 => caller should quarantine */
+    int already_cascading;      /* snapshot before mutation */
+};
+
+static int _immune_eval_cb(trust_subject_t *subj, void *data)
+{
+    struct immune_eval_ctx *c = data;
+
+    c->need_quarantine = 0;
+
+    /* Already in cascade: don't touch */
+    if (subj->immune.status >= TRUST_IMMUNE_APOPTOSIS) {
+        c->already_cascading = 1;
+        c->verdict = subj->immune.status;
+        return 0;
+    }
+    c->already_cascading = 0;
+
+    /* Cancer detection (inline — avoids recursive TLB lock) */
+    if (subj->flags & TRUST_FLAG_CANCEROUS) {
+        subj->immune.status = TRUST_IMMUNE_CANCEROUS;
+        c->verdict = TRUST_IMMUNE_CANCEROUS;
+        return 0;
+    }
+    if (subj->lifecycle.spawn_count > TRUST_CANCER_SPAWN_LIMIT ||
+        subj->lifecycle.total_spawns > TRUST_CANCER_TOTAL_LIMIT) {
+        subj->flags |= TRUST_FLAG_CANCEROUS;
+        subj->immune.status = TRUST_IMMUNE_CANCEROUS;
+        c->verdict = TRUST_IMMUNE_CANCEROUS;
+        return 0;
+    }
+
+    /* Chromosome integrity */
+    if (trust_chromosome_verify(&subj->chromosome) != 0) {
+        subj->immune.status = TRUST_IMMUNE_SUSPICIOUS;
+        subj->immune.suspicious_actions += 10;
+        trust_trc_adjust(&subj->trc, TRUST_ACTION_IMMUNE_TRIGGER);
+
+        if (subj->immune.suspicious_actions > 50) {
+            c->need_quarantine = 1;
+            c->verdict = TRUST_IMMUNE_QUARANTINED;
+            return 0;
+        }
+        c->verdict = TRUST_IMMUNE_SUSPICIOUS;
+        return 0;
+    }
+
+    /* YY sex — always suspicious */
+    if (subj->chromosome.sex == CHROMO_SEX_YY) {
+        if (subj->immune.status < TRUST_IMMUNE_SUSPICIOUS)
+            subj->immune.status = TRUST_IMMUNE_SUSPICIOUS;
+        subj->immune.suspicious_actions++;
+    } else if (subj->immune.status == TRUST_IMMUNE_SUSPICIOUS &&
+               subj->immune.suspicious_actions > 0) {
+        /* Decay suspicious count when behaving well */
+        subj->immune.suspicious_actions--;
+        if (subj->immune.suspicious_actions == 0)
+            subj->immune.status = TRUST_IMMUNE_HEALTHY;
+    }
+
+    c->verdict = subj->immune.status;
+    return 0;
+}
+
 int trust_immune_evaluate(u32 subject_id)
 {
-    trust_subject_t subj;
+    struct immune_eval_ctx ctx = { .verdict = TRUST_IMMUNE_HEALTHY };
 
-    if (trust_tlb_lookup(subject_id, &subj))
+    if (trust_tlb_modify(subject_id, _immune_eval_cb, &ctx) != 0)
         return TRUST_IMMUNE_HEALTHY;
 
-    /* Already in cascade */
-    if (subj.immune.status >= TRUST_IMMUNE_APOPTOSIS)
-        return subj.immune.status;
-
-    /* Check for cancer */
-    if (trust_lifecycle_check_cancer(subject_id)) {
-        subj.immune.status = TRUST_IMMUNE_CANCEROUS;
-        trust_tlb_insert(&subj);
-        return TRUST_IMMUNE_CANCEROUS;
+    /* Escalate to quarantine outside the lock (it takes the set lock itself). */
+    if (ctx.need_quarantine) {
+        trust_immune_quarantine(subject_id, TRUST_ACTION_CHROMOSOME_MUTATE);
+        return TRUST_IMMUNE_QUARANTINED;
     }
 
-    /* Check chromosome integrity */
-    if (trust_chromosome_verify(&subj.chromosome) != 0) {
-        subj.immune.status = TRUST_IMMUNE_SUSPICIOUS;
-        subj.immune.suspicious_actions += 10;  /* Integrity failure is serious */
-        /* TRC Integration: integrity failure → elevated */
-        trust_trc_adjust(&subj.trc, TRUST_ACTION_IMMUNE_TRIGGER);
-        trust_tlb_insert(&subj);
-
-        if (subj.immune.suspicious_actions > 50) {
-            trust_immune_quarantine(subject_id, TRUST_ACTION_CHROMOSOME_MUTATE);
-            return TRUST_IMMUNE_QUARANTINED;
-        }
-        return TRUST_IMMUNE_SUSPICIOUS;
-    }
-
-    /* Check XY sex — YY subjects are always suspicious */
-    if (subj.chromosome.sex == CHROMO_SEX_YY) {
-        if (subj.immune.status < TRUST_IMMUNE_SUSPICIOUS)
-            subj.immune.status = TRUST_IMMUNE_SUSPICIOUS;
-        subj.immune.suspicious_actions++;
-        trust_tlb_insert(&subj);
-    }
-
-    /* Decay suspicious count over time if behaving well */
-    if (subj.immune.status == TRUST_IMMUNE_SUSPICIOUS &&
-        subj.immune.suspicious_actions > 0) {
-        subj.immune.suspicious_actions--;
-        if (subj.immune.suspicious_actions == 0) {
-            subj.immune.status = TRUST_IMMUNE_HEALTHY;
-        }
-        trust_tlb_insert(&subj);
-    }
-
-    return subj.immune.status;
+    return ctx.verdict;
 }
 
 /*
  * Quarantine a subject — isolate it from performing any actions.
  */
+struct quarantine_ctx {
+    u32     reason;
+    u64     ts;
+    int32_t score;
+};
+
+static int _quarantine_cb(trust_subject_t *subj, void *data)
+{
+    struct quarantine_ctx *c = data;
+
+    subj->immune.status = TRUST_IMMUNE_QUARANTINED;
+    subj->immune.quarantine_reason = c->reason;
+    subj->immune.quarantine_ts = c->ts;
+    subj->flags |= TRUST_FLAG_FROZEN;
+    subj->capabilities = 0;
+    /* TRC Integration: quarantine → elevated resistance */
+    trust_trc_adjust(&subj->trc, TRUST_ACTION_IMMUNE_TRIGGER);
+
+    c->score = subj->trust_score;
+    return 0;
+}
+
 int trust_immune_quarantine(u32 subject_id, u32 reason)
 {
-    trust_subject_t subj;
+    struct quarantine_ctx ctx = {
+        .reason = reason,
+        .ts     = trust_get_timestamp(),
+        .score  = 0,
+    };
+    int ret;
 
-    if (trust_tlb_lookup(subject_id, &subj))
+    ret = trust_tlb_modify(subject_id, _quarantine_cb, &ctx);
+    if (ret != 0)
         return -ENOENT;
 
-    subj.immune.status = TRUST_IMMUNE_QUARANTINED;
-    subj.immune.quarantine_reason = reason;
-    subj.immune.quarantine_ts = trust_get_timestamp();
-    subj.flags |= TRUST_FLAG_FROZEN;
-    subj.capabilities = 0;
-    /* TRC Integration: quarantine → elevated resistance */
-    trust_trc_adjust(&subj.trc, TRUST_ACTION_IMMUNE_TRIGGER);
-
-    trust_tlb_insert(&subj);
-
     trust_fbc_audit(subject_id, TRUST_ACTION_IMMUNE_TRIGGER,
-                   subj.trust_score, subj.trust_score,
-                   subj.capabilities, 0);
+                   ctx.score, ctx.score,
+                   0, 0);
 
     pr_warn("trust_lifecycle: subject %u QUARANTINED (reason=%u)\n",
             subject_id, reason);
@@ -724,25 +882,39 @@ int trust_immune_quarantine(u32 subject_id, u32 reason)
 /*
  * Release a subject from quarantine (requires AI observer approval).
  */
-int trust_immune_release_quarantine(u32 subject_id)
+struct release_quarantine_ctx { int outcome; };
+
+static int _release_quarantine_cb(trust_subject_t *subj, void *data)
 {
-    trust_subject_t subj;
+    struct release_quarantine_ctx *c = data;
 
-    if (trust_tlb_lookup(subject_id, &subj))
-        return -ENOENT;
+    if (subj->immune.status != TRUST_IMMUNE_QUARANTINED) {
+        c->outcome = -EINVAL;
+        return 0;
+    }
 
-    if (subj.immune.status != TRUST_IMMUNE_QUARANTINED)
-        return -EINVAL;
-
-    subj.immune.status = TRUST_IMMUNE_HEALTHY;
-    subj.immune.suspicious_actions = 0;
-    subj.flags &= ~TRUST_FLAG_FROZEN;
+    subj->immune.status = TRUST_IMMUNE_HEALTHY;
+    subj->immune.suspicious_actions = 0;
+    subj->flags &= ~TRUST_FLAG_FROZEN;
 
     /* Restore basic capabilities only — elevated ones must be re-earned */
-    subj.capabilities = trust_default_caps(TRUST_AUTH_USER);
-    subj.authority_level = TRUST_AUTH_USER;
+    subj->capabilities = trust_default_caps(TRUST_AUTH_USER);
+    subj->authority_level = TRUST_AUTH_USER;
 
-    trust_tlb_insert(&subj);
+    c->outcome = 0;
+    return 0;
+}
+
+int trust_immune_release_quarantine(u32 subject_id)
+{
+    struct release_quarantine_ctx ctx = { .outcome = -EINVAL };
+    int ret;
+
+    ret = trust_tlb_modify(subject_id, _release_quarantine_cb, &ctx);
+    if (ret != 0)
+        return -ENOENT;
+    if (ctx.outcome != 0)
+        return ctx.outcome;
 
     pr_info("trust_lifecycle: subject %u released from quarantine\n", subject_id);
     return 0;
@@ -755,15 +927,26 @@ int trust_immune_release_quarantine(u32 subject_id)
 void trust_immune_tick(void)
 {
     int set, way;
+    unsigned long flags;
     u64 now = trust_get_timestamp();
+
+    /*
+     * Called from trust_decay_timer_fn (softirq). TLB set locks are also
+     * taken in process context via ioctl handlers, so we must use
+     * irqsave to avoid softirq-vs-process deadlock on the same CPU.
+     */
+    if (!g_trust_tlb.sets)
+        return;
 
     for (set = 0; set < TRUST_TLB_SETS; set++) {
         trust_tlb_set_t *s = &g_trust_tlb.sets[set];
 
-        if (!s->valid_mask)
+        /* Use READ_ONCE for SMP safety — the mask can be concurrently
+         * mutated by insert/invalidate on another CPU. */
+        if (READ_ONCE(s->valid_mask) == 0)
             continue;
 
-        spin_lock(&s->lock);
+        spin_lock_irqsave(&s->lock, flags);
         for (way = 0; way < TRUST_TLB_WAYS; way++) {
             trust_subject_t *subj;
 
@@ -787,10 +970,23 @@ void trust_immune_tick(void)
             /* Regenerate tokens */
             trust_token_regenerate(&subj->tokens);
 
-            /* Update token balance chromosome */
-            subj->chromosome.a_segments[CHROMO_A_TOKEN_BALANCE] =
-                (u32)subj->tokens.balance;
+            /*
+             * Update token balance chromosome segment.  Only refresh
+             * the CRC32 checksum if the value actually changed — most
+             * ticks leave a subject at max_balance with zero change,
+             * so avoiding the CRC over ~200 bytes for every subject
+             * every second is a meaningful old-HW win.  Leaving the
+             * checksum stale here would cause trust_chromosome_verify
+             * to fail and trigger spurious immune escalation.
+             */
+            {
+                u32 new_bal = (u32)subj->tokens.balance;
+                if (subj->chromosome.a_segments[CHROMO_A_TOKEN_BALANCE] != new_bal) {
+                    subj->chromosome.a_segments[CHROMO_A_TOKEN_BALANCE] = new_bal;
+                    trust_chromosome_finalize(&subj->chromosome);
+                }
+            }
         }
-        spin_unlock(&s->lock);
+        spin_unlock_irqrestore(&s->lock, flags);
     }
 }

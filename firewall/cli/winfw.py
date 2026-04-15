@@ -19,24 +19,21 @@ Provides a Windows-style CLI for managing the nftables-backed firewall:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
-import signal
 import sys
-import time
 from pathlib import Path
 from typing import Any, NoReturn
 
-# Ensure we can import the backend package
+# Ensure we can import the backend package for deferred imports below.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from backend import (  # noqa: E402
-    NftManager,
-    FirewallRule,
-    RuleStore,
-    ConnectionMonitor,
-    ProfileManager,
-)
+
+# Backend modules (NftManager, RuleStore, ConnectionMonitor, ProfileManager,
+# FirewallRule) are imported lazily inside each sub-command.  Keeping the
+# top-level import path light keeps ``winfw --help`` and ``winfw status``
+# startup snappy on old hardware -- the full backend pulls in asyncio,
+# ipaddress, subprocess, sqlite3, and ~2000 lines of module code that
+# status-like invocations don't need to compile up-front.
 
 logger = logging.getLogger("pe-compat.firewall.cli")
 
@@ -63,12 +60,13 @@ def _colour(text: str, code: str) -> str:
 
 def cmd_status(_args: argparse.Namespace) -> None:
     """Show firewall status and active profile."""
+    from backend import NftManager, ProfileManager, RuleStore  # noqa: E402
     nft = NftManager()
     profiles = ProfileManager()
 
     enabled = nft.is_enabled()
     profile_name = profiles.get_active_profile_name()
-    store = RuleStore()
+    store = RuleStore()  # noqa: F811  (imported lazily above)
 
     status_str = _colour("ON", _GREEN) if enabled else _colour("OFF", _RED)
     print(f"{_colour('Firewall Status:', _BOLD)} {status_str}")
@@ -94,19 +92,34 @@ def cmd_status(_args: argparse.Namespace) -> None:
 
 
 def cmd_enable(_args: argparse.Namespace) -> None:
-    """Enable the firewall."""
+    """Enable the firewall.
+
+    We ensure the pe-compat.slice cgroup exists at enable time so that any
+    ``socket cgroupv2`` predicates emitted by subsequent rule loads can
+    match.  The slice is created lazily anyway, but doing it here produces
+    a single diagnostic on failure instead of N rule-evaluation failures.
+    """
+    from backend import NftManager  # noqa: E402
+    try:
+        from backend import cgroup_manager as _cgm  # noqa: E402
+        if _cgm.detect_cgroupv2():
+            _cgm.ensure_slice()
+    except ImportError:
+        pass  # cgroup_manager is optional
     NftManager().enable()
     print(_colour("Firewall enabled.", _GREEN))
 
 
 def cmd_disable(_args: argparse.Namespace) -> None:
     """Disable the firewall."""
+    from backend import NftManager  # noqa: E402
     NftManager().disable()
     print(_colour("Firewall disabled.", _YELLOW))
 
 
 def cmd_add(args: argparse.Namespace) -> None:
     """Add a new firewall rule."""
+    from backend import FirewallRule, NftManager, RuleStore  # noqa: E402
     rule = FirewallRule(
         name=args.name,
         direction=args.direction,
@@ -120,7 +133,12 @@ def cmd_add(args: argparse.Namespace) -> None:
 
     store = RuleStore()
     stored = store.add_rule(rule)
-    NftManager().reload()
+    # A fresh NftManager has an empty in-memory rule set, so reload()
+    # alone would apply an empty ruleset and wipe out whatever rules
+    # were already active.  Load from the persistent store first.
+    nft = NftManager()
+    nft.load_rules(store.list_rules())
+    nft.apply_rules()
     print(
         f"Rule added (id={stored.id}): "
         f"{_colour(args.action.upper(), _GREEN if args.action == 'allow' else _RED)} "
@@ -130,11 +148,17 @@ def cmd_add(args: argparse.Namespace) -> None:
 
 def cmd_remove(args: argparse.Namespace) -> None:
     """Remove a firewall rule by name or id."""
+    from backend import NftManager, RuleStore  # noqa: E402
     store = RuleStore()
+
+    def _reload_from_store() -> None:
+        nft = NftManager()
+        nft.load_rules(store.list_rules())
+        nft.apply_rules()
 
     if args.id is not None:
         store.delete_rule(args.id)
-        NftManager().reload()
+        _reload_from_store()
         print(f"Rule id={args.id} removed.")
     elif args.name:
         rules = store.get_rules()
@@ -144,7 +168,7 @@ def cmd_remove(args: argparse.Namespace) -> None:
             sys.exit(1)
         for r in matched:
             store.delete_rule(r["id"])
-        NftManager().reload()
+        _reload_from_store()
         print(f"Removed {len(matched)} rule(s) named '{args.name}'.")
     else:
         print(_colour("Specify --name or --id.", _RED))
@@ -153,6 +177,7 @@ def cmd_remove(args: argparse.Namespace) -> None:
 
 def cmd_list(args: argparse.Namespace) -> None:
     """List firewall rules."""
+    from backend import ProfileManager, RuleStore  # noqa: E402
     store = RuleStore()
     profiles_mgr = ProfileManager()
 
@@ -192,7 +217,28 @@ def cmd_list(args: argparse.Namespace) -> None:
 
 def cmd_monitor(_args: argparse.Namespace) -> None:
     """Live terminal connection monitor (refreshes every 2s)."""
-    monitor = ConnectionMonitor()
+    # Use AppTracker directly: ConnectionMonitor.get_connections() only
+    # reports entries that have been picked up by its background poll
+    # loop, which we never start here.  AppTracker.get_connections()
+    # reads /proc synchronously each call, which is what we want for
+    # a one-shot CLI refresh loop.
+    import signal
+    import time
+    from backend import AppTracker, NftManager
+    monitor = AppTracker()
+    # Wire tracker → NftManager so rules with application= fields actually
+    # cause PIDs to be scoped.  The monitor CLI is the most common path
+    # users take to watch rules work interactively, so hooking the tracker
+    # here lets "winfw monitor" double as a live enforcement surface.
+    try:
+        from backend import cgroup_manager as _cgm
+        if _cgm.detect_cgroupv2():
+            _cgm.ensure_slice()
+            monitor.attach_to_nft_manager(NftManager())
+    except ImportError:
+        pass
+    except Exception:
+        logger.debug("attach_to_nft_manager failed", exc_info=True)
     running = True
 
     def _handle_signal(_sig: int, _frame: object) -> None:
@@ -214,16 +260,27 @@ def cmd_monitor(_args: argparse.Namespace) -> None:
     print(_colour("Live Connection Monitor  (Ctrl+C to exit)", _BOLD))
     print()
 
+    from dataclasses import asdict
+    # ANSI escape: move cursor home + clear below.  os.system("clear")
+    # forks /bin/sh on every tick which on old hardware is ~20 ms of
+    # pure overhead; the escape is zero-cost on any ANSI terminal.
+    _CLEAR_SCREEN = "\033[H\033[2J"
     while running:
         try:
-            connections = monitor.get_connections()
+            raw = monitor.get_connections()
+            connections = [asdict(c) for c in raw]
         except Exception as exc:
             print(_colour(f"Error: {exc}", _RED))
             time.sleep(2)
             continue
 
-        # Clear screen
-        os.system("clear" if os.name != "nt" else "cls")
+        # Clear screen via ANSI (fast) with fallback for non-TTY or
+        # Windows terminals without VT processing enabled.
+        if sys.stdout.isatty() and os.name != "nt":
+            sys.stdout.write(_CLEAR_SCREEN)
+            sys.stdout.flush()
+        else:
+            os.system("clear" if os.name != "nt" else "cls")
         print(_colour("Live Connection Monitor  (Ctrl+C to exit)", _BOLD))
         print(f"Connections: {len(connections)}")
         print()
@@ -256,6 +313,7 @@ def cmd_monitor(_args: argparse.Namespace) -> None:
 
 def cmd_profile(args: argparse.Namespace) -> None:
     """View or change the active network profile."""
+    from backend import NftManager, ProfileManager  # noqa: E402
     profiles = ProfileManager()
 
     if args.set:
@@ -265,7 +323,13 @@ def cmd_profile(args: argparse.Namespace) -> None:
             print(_colour(f"Invalid profile '{name}'. Choose: {', '.join(valid)}", _RED))
             sys.exit(1)
         profiles.set_active_profile(name)
-        NftManager().reload()
+        # Load rules from the store and apply with the new profile
+        # filter so the profile change actually takes effect.
+        from backend import RuleStore as _RS  # noqa: E402
+        nft = NftManager()
+        with _RS() as _store:
+            nft.load_rules(_store.list_rules())
+        nft.apply_rules(profile=name)
         print(f"Active profile set to {_colour(name.capitalize(), _CYAN)}.")
     else:
         current = profiles.get_active_profile_name()
@@ -274,6 +338,7 @@ def cmd_profile(args: argparse.Namespace) -> None:
 
 def cmd_import(args: argparse.Namespace) -> None:
     """Import rules from a JSON file."""
+    from backend import NftManager, RuleStore  # noqa: E402
     path = Path(args.file)
     if not path.exists():
         print(_colour(f"File not found: {path}", _RED))
@@ -281,12 +346,16 @@ def cmd_import(args: argparse.Namespace) -> None:
 
     store = RuleStore()
     store.import_rules(str(path))
-    NftManager().reload()
+    # Ensure the freshly-imported rules actually reach nftables.
+    nft = NftManager()
+    nft.load_rules(store.list_rules())
+    nft.apply_rules()
     print(f"Rules imported from {_colour(str(path), _CYAN)}.")
 
 
 def cmd_export(args: argparse.Namespace) -> None:
     """Export rules to a JSON file."""
+    from backend import RuleStore  # noqa: E402
     path = Path(args.file)
     store = RuleStore()
     store.export_rules(str(path))

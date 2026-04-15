@@ -19,6 +19,21 @@
 
 #include "common/dll_common.h"
 
+/* Session 30: gate per-call fprintf behind PE_CRYPT32_TRACE. Anti-cheat
+ * startup enumerates the cert store aggressively (CertFindCertificateInStore
+ * in a loop) and the unconditional logging slowed init on old HW. */
+static int crypt32_trace_on(void)
+{
+    static int probed = -1;
+    if (probed == -1) {
+        const char *e = getenv("PE_CRYPT32_TRACE");
+        probed = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return probed;
+}
+#define CRYPT32_TRACE(...) do { if (__builtin_expect(crypt32_trace_on(), 0)) \
+    fprintf(stderr, __VA_ARGS__); } while (0)
+
 /*
  * Fake handle value for certificate stores and crypto providers.
  * We use a recognizable sentinel that is not NULL and not
@@ -43,7 +58,7 @@ WINAPI_EXPORT HANDLE CertOpenStore(
     (void)dwFlags;
     (void)pvPara;
 
-    fprintf(stderr, "[crypt32] CertOpenStore(...)\n");
+    CRYPT32_TRACE("[crypt32] CertOpenStore(...)\n");
 
     /* Return a fake, non-NULL handle so callers proceed normally */
     return FAKE_CERT_STORE;
@@ -54,7 +69,7 @@ WINAPI_EXPORT BOOL CertCloseStore(HANDLE hCertStore, DWORD dwFlags)
     (void)hCertStore;
     (void)dwFlags;
 
-    fprintf(stderr, "[crypt32] CertCloseStore(...)\n");
+    CRYPT32_TRACE("[crypt32] CertCloseStore(...)\n");
 
     return TRUE;
 }
@@ -74,7 +89,7 @@ WINAPI_EXPORT void *CertFindCertificateInStore(
     (void)pvFindPara;
     (void)pPrevCertContext;
 
-    fprintf(stderr, "[crypt32] CertFindCertificateInStore(...)\n");
+    CRYPT32_TRACE("[crypt32] CertFindCertificateInStore(...)\n");
 
     /* No certificates in our store */
     return NULL;
@@ -98,7 +113,7 @@ WINAPI_EXPORT BOOL CertGetCertificateChain(
     (void)dwFlags;
     (void)pvReserved;
 
-    fprintf(stderr, "[crypt32] CertGetCertificateChain(...)\n");
+    CRYPT32_TRACE("[crypt32] CertGetCertificateChain(...)\n");
 
     if (ppChainContext)
         *ppChainContext = NULL;
@@ -110,14 +125,14 @@ WINAPI_EXPORT void CertFreeCertificateChain(void *pChainContext)
 {
     (void)pChainContext;
 
-    fprintf(stderr, "[crypt32] CertFreeCertificateChain(...)\n");
+    CRYPT32_TRACE("[crypt32] CertFreeCertificateChain(...)\n");
 }
 
 WINAPI_EXPORT BOOL CertFreeCertificateContext(void *pCertContext)
 {
     (void)pCertContext;
 
-    fprintf(stderr, "[crypt32] CertFreeCertificateContext(...)\n");
+    CRYPT32_TRACE("[crypt32] CertFreeCertificateContext(...)\n");
 
     return TRUE;
 }
@@ -135,7 +150,7 @@ WINAPI_EXPORT DWORD CertGetNameStringA(
     (void)dwFlags;
     (void)pvTypePara;
 
-    fprintf(stderr, "[crypt32] CertGetNameStringA(...)\n");
+    CRYPT32_TRACE("[crypt32] CertGetNameStringA(...)\n");
 
     /* Write an empty string if the caller provided a buffer */
     if (pszNameString && cchNameString > 0)
@@ -210,7 +225,7 @@ WINAPI_EXPORT BOOL CryptStringToBinaryA(
     (void)pdwSkip;
     (void)pdwFlags;
 
-    fprintf(stderr, "[crypt32] CryptStringToBinaryA(...)\n");
+    CRYPT32_TRACE("[crypt32] CryptStringToBinaryA(...)\n");
 
     return FALSE;
 }
@@ -228,7 +243,7 @@ WINAPI_EXPORT BOOL CryptBinaryToStringA(
     (void)pszString;
     (void)pcchString;
 
-    fprintf(stderr, "[crypt32] CryptBinaryToStringA(...)\n");
+    CRYPT32_TRACE("[crypt32] CryptBinaryToStringA(...)\n");
 
     return FALSE;
 }
@@ -277,7 +292,7 @@ WINAPI_EXPORT BOOL CryptProtectData(
         return FALSE;
     }
 
-    fprintf(stderr, "[crypt32] CryptProtectData(%u bytes)\n", pDataIn->cbData);
+    CRYPT32_TRACE("[crypt32] CryptProtectData(%u bytes)\n", pDataIn->cbData);
 
     /* Output = header + plaintext */
     size_t out_len = sizeof(dpapi_header_t) + pDataIn->cbData;
@@ -315,7 +330,7 @@ WINAPI_EXPORT BOOL CryptUnprotectData(
         return FALSE;
     }
 
-    fprintf(stderr, "[crypt32] CryptUnprotectData(%u bytes)\n", pDataIn->cbData);
+    CRYPT32_TRACE("[crypt32] CryptUnprotectData(%u bytes)\n", pDataIn->cbData);
 
     if (ppszDataDescr)
         *ppszDataDescr = NULL;
@@ -360,7 +375,7 @@ WINAPI_EXPORT HANDLE PFXImportCertStore(
     (void)szPassword;
     (void)dwFlags;
 
-    fprintf(stderr, "[crypt32] PFXImportCertStore(...)\n");
+    CRYPT32_TRACE("[crypt32] PFXImportCertStore(...)\n");
 
     return NULL;
 }

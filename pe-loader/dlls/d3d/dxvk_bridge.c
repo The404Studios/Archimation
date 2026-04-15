@@ -187,16 +187,17 @@ unsigned long dxvk_get_x11_window(void *hwnd)
     /* Last resort: create a temporary X11 window */
     Display *dpy = get_display();
     if (!dpy) return 0;
+    if (!p_XDefaultRootWindow || !p_XCreateSimpleWindow) return 0;
 
     Window root = p_XDefaultRootWindow(dpy);
     Window win = p_XCreateSimpleWindow(dpy, root, 0, 0, 800, 600, 0, 0, 0);
-    if (win) {
-        p_XMapWindow(dpy, win);
-        p_XFlush(dpy);
-        dxvk_register_window(hwnd, (unsigned long)win, 800, 600);
-        fprintf(stderr, "[dxvk_bridge] Created fallback X11 window %lu for HWND %p\n",
-                (unsigned long)win, hwnd);
-    }
+    if (!win) return 0;
+
+    if (p_XMapWindow) p_XMapWindow(dpy, win);
+    if (p_XFlush) p_XFlush(dpy);
+    dxvk_register_window(hwnd, (unsigned long)win, 800, 600);
+    fprintf(stderr, "[dxvk_bridge] Created fallback X11 window %lu for HWND %p\n",
+            (unsigned long)win, hwnd);
     return (unsigned long)win;
 }
 
@@ -246,9 +247,6 @@ void dxvk_bridge_shutdown(void)
         g_display = NULL;
     }
 
-    if (g_x11_lib) {
-        dlclose(g_x11_lib);
-        g_x11_lib = NULL;
-        g_x11_tried = 0;
-    }
+    /* Intentionally do NOT dlclose libX11: DXVK/Mesa destructors may still
+     * use X11 atoms/functions after us. OS reclaims at process exit. */
 }

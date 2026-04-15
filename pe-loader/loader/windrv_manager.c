@@ -51,10 +51,12 @@ static PIRP build_irp(UCHAR major_function,
     irp->StackCount = 1;
     irp->CurrentLocation = 0;
 
-    /* Set up the system buffer for METHOD_BUFFERED */
+    /* Set up the system buffer for METHOD_BUFFERED.
+     * Use calloc so the output region (beyond input_len) is zeroed —
+     * drivers that read uninitialized bytes would otherwise leak heap memory. */
     if (input_len > 0 && input_buf) {
-        irp->AssociatedIrp_SystemBuffer = malloc(
-            input_len > output_len ? input_len : output_len);
+        uint32_t sys_len = input_len > output_len ? input_len : output_len;
+        irp->AssociatedIrp_SystemBuffer = calloc(1, sys_len);
         if (irp->AssociatedIrp_SystemBuffer)
             memcpy(irp->AssociatedIrp_SystemBuffer, input_buf, input_len);
     } else if (output_len > 0) {
@@ -230,7 +232,7 @@ static int windrv_serve(PDRIVER_OBJECT driver, const char *name)
     snprintf(sock_path, sizeof(sock_path), "/tmp/windrv_%s.sock", name);
     unlink(sock_path);
 
-    int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int server_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (server_fd < 0) {
         fprintf(stderr, LOG_PREFIX "Failed to create socket: %s\n",
                 strerror(errno));
@@ -377,6 +379,12 @@ int windrv_run_driver(pe_image_t *image, void *entry, const char *driver_name)
 
     if (drv_obj->DriverUnload)
         printf(LOG_PREFIX "DriverUnload: %p\n", (void *)drv_obj->DriverUnload);
+
+    /* RegistryPath is transient -- drivers that need it must copy. Free now
+     * before the (potentially long-running) dispatch loop to avoid a leak
+     * over the driver's lifetime. */
+    free(reg_path_buf);
+    free(reg_path);
 
     /* Enter IRP dispatch loop (drv_obj stays heap-allocated for driver lifetime) */
     return windrv_serve(drv_obj, driver_name);

@@ -8,6 +8,7 @@ Gracefully degrades to stub responses when no model is loaded.
 
 import gc
 import os
+import time
 import asyncio
 import logging
 from typing import Optional, AsyncGenerator
@@ -19,6 +20,13 @@ _model = None
 _model_path = None
 _model_lock: asyncio.Lock | None = None
 _model_lock_init = False  # guards one-time initialization
+# Cache llama_cpp import probe: (available, version). Avoids a failed
+# import being retried on every /ai/status call (import machinery is slow).
+_llama_probe_cache: tuple[bool, Optional[str]] | None = None
+# list_models() cache: scanning the models dir on each /ai/status request is
+# wasteful on slow disks. GGUF files rarely appear/disappear at runtime.
+_list_models_cache: tuple[list, float] | None = None
+_LIST_MODELS_TTL = 10.0
 
 
 def _get_lock():
@@ -38,8 +46,13 @@ def get_model_dir() -> str:
 
 def list_models() -> list:
     """List available GGUF models."""
+    global _list_models_cache
+    now = time.monotonic()
+    if _list_models_cache is not None and (now - _list_models_cache[1]) < _LIST_MODELS_TTL:
+        return _list_models_cache[0]
     model_dir = get_model_dir()
     if not os.path.isdir(model_dir):
+        _list_models_cache = ([], now)
         return []
     models = []
     for f in os.listdir(model_dir):
@@ -47,6 +60,7 @@ def list_models() -> list:
             path = os.path.join(model_dir, f)
             size_mb = os.path.getsize(path) / (1024 * 1024)
             models.append({"name": f, "path": path, "size_mb": round(size_mb, 1)})
+    _list_models_cache = (models, now)
     return models
 
 
@@ -94,13 +108,14 @@ async def unload_model() -> dict:
 
 def get_status() -> dict:
     """Get LLM subsystem status."""
-    try:
-        import llama_cpp
-        llama_available = True
-        llama_version = getattr(llama_cpp, "__version__", "unknown")
-    except ImportError:
-        llama_available = False
-        llama_version = None
+    global _llama_probe_cache
+    if _llama_probe_cache is None:
+        try:
+            import llama_cpp
+            _llama_probe_cache = (True, getattr(llama_cpp, "__version__", "unknown"))
+        except ImportError:
+            _llama_probe_cache = (False, None)
+    llama_available, llama_version = _llama_probe_cache
 
     return {
         "llama_cpp_available": llama_available,

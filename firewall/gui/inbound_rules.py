@@ -407,10 +407,21 @@ class InboundRulesPanel(Gtk.Box):
             widget.set_text(obj.name)
         elif prop == "action":
             widget.set_text(obj.action)
-            if obj.action.lower() == "block":
-                widget.add_css_class("error")
+            # Toggle exactly one of error/success -- previously bind()
+            # just add-only, so a cell that was ever "block" kept the
+            # error class forever even when its rule switched to "allow".
+            is_block = obj.action.lower() == "block"
+            want = "error" if is_block else "success"
+            drop = "success" if is_block else "error"
+            prev = getattr(widget, "_fw_action_css", None)
+            if prev == want:
+                pass
             else:
-                widget.add_css_class("success")
+                if prev:
+                    widget.remove_css_class(prev)
+                widget.remove_css_class(drop)
+                widget.add_css_class(want)
+                widget._fw_action_css = want
         elif prop == "protocol":
             widget.set_text(obj.protocol)
         elif prop == "port":
@@ -419,16 +430,32 @@ class InboundRulesPanel(Gtk.Box):
     # -- Data loading ------------------------------------------------------
 
     def refresh(self) -> None:
-        """Reload rules from the rule store."""
-        self._model.remove_all()
+        """Reload rules from the rule store.
+
+        Diff-updates the list model rather than remove-all + re-add so
+        that toggle / edit operations don't force GTK to rebuild every
+        row widget.  With 50+ rules on old hardware this is the
+        difference between an imperceptible refresh and a visible stall.
+        """
         try:
             rules = self._store.get_rules(direction=self.DIRECTION)
         except Exception as exc:
             logger.error("Failed to load %s rules: %s", self.DIRECTION, exc)
             rules = []
 
-        for rule in rules:
-            self._model.append(RuleObject(rule))
+        n_existing = self._model.get_n_items()
+        for i, rule in enumerate(rules):
+            if i < n_existing:
+                existing = self._model.get_item(i)
+                if existing.data != rule:
+                    self._model.splice(i, 1, [RuleObject(rule)])
+            else:
+                self._model.append(RuleObject(rule))
+
+        target_len = len(rules)
+        current_len = self._model.get_n_items()
+        if current_len > target_len:
+            self._model.splice(target_len, current_len - target_len, [])
 
         count = self._model.get_n_items()
         self._info_label.set_text(f"{count} {self.DIRECTION} rule(s)")
@@ -456,7 +483,14 @@ class InboundRulesPanel(Gtk.Box):
                 try:
                     rule = FirewallRule.from_dict(data)
                     self._store.add_rule(rule)
-                    self._nft.reload()
+                    # Sync the NftManager's in-memory rule set from the
+                    # persistent store before re-applying.  Previously only
+                    # ``reload()`` was called, which re-applies the current
+                    # in-memory dict -- but newly-added rules in the store
+                    # were never loaded into the manager, so the rule
+                    # appeared in the GUI and DB but never hit nftables.
+                    self._nft.load_rules(self._store.list_rules())
+                    self._nft.apply_rules()
                     self.refresh()
                     logger.info("Added %s rule: %s", self.DIRECTION, data["name"])
                 except Exception as exc:
@@ -481,7 +515,8 @@ class InboundRulesPanel(Gtk.Box):
             try:
                 fw_rule = FirewallRule.from_dict(data)
                 self._store.update_rule(fw_rule)
-                self._nft.reload()
+                self._nft.load_rules(self._store.list_rules())
+                self._nft.apply_rules()
                 self.refresh()
                 logger.info("Updated rule id=%s", rule.rule_id)
             except Exception as exc:
@@ -515,7 +550,8 @@ class InboundRulesPanel(Gtk.Box):
         if choice == 1:  # "Delete"
             try:
                 self._store.delete_rule(rule.rule_id)
-                self._nft.reload()
+                self._nft.load_rules(self._store.list_rules())
+                self._nft.apply_rules()
                 self.refresh()
                 logger.info("Deleted rule id=%s (%s)", rule.rule_id, rule.name)
             except Exception as exc:
@@ -528,7 +564,8 @@ class InboundRulesPanel(Gtk.Box):
         try:
             new_state = not rule.enabled
             self._store.set_rule_enabled(rule.rule_id, new_state)
-            self._nft.reload()
+            self._nft.load_rules(self._store.list_rules())
+            self._nft.apply_rules()
             self.refresh()
             state_str = "enabled" if new_state else "disabled"
             logger.info("Rule '%s' %s", rule.name, state_str)

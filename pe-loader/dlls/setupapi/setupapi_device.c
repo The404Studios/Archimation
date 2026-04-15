@@ -105,10 +105,11 @@ WINAPI_EXPORT BOOL SetupDiGetDeviceRegistryPropertyA(
     (void)regDataType;
     (void)buffer;
     (void)bufSize;
-    (void)requiredSize;
 
     fprintf(stderr, "[setupapi] SetupDiGetDeviceRegistryPropertyA(property=%u)\n", property);
 
+    if (requiredSize) *requiredSize = 0;
+    set_last_error(ERROR_NO_MORE_ITEMS);
     return FALSE;
 }
 
@@ -127,10 +128,11 @@ WINAPI_EXPORT BOOL SetupDiGetDeviceRegistryPropertyW(
     (void)regDataType;
     (void)buffer;
     (void)bufSize;
-    (void)requiredSize;
 
     fprintf(stderr, "[setupapi] SetupDiGetDeviceRegistryPropertyW(property=%u)\n", property);
 
+    if (requiredSize) *requiredSize = 0;
+    set_last_error(ERROR_NO_MORE_ITEMS);
     return FALSE;
 }
 

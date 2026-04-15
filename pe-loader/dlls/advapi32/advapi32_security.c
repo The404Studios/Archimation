@@ -9,8 +9,32 @@
 #include <string.h>
 #include <unistd.h>
 #include <pwd.h>
+#include <pthread.h>
 
 #include "common/dll_common.h"
+
+/* Cached username (NSS lookups via getpwuid are expensive when called per
+ * security API invocation -- some apps call LookupAccountSid thousands of
+ * times). Populated on first use, immutable thereafter for the process
+ * lifetime. */
+static char g_cached_username[64] = {0};
+static pthread_once_t g_username_once = PTHREAD_ONCE_INIT;
+
+static void init_cached_username(void)
+{
+    const char *user = "user";
+    struct passwd *pw = getpwuid(getuid());
+    if (pw && pw->pw_name && pw->pw_name[0])
+        user = pw->pw_name;
+    strncpy(g_cached_username, user, sizeof(g_cached_username) - 1);
+    g_cached_username[sizeof(g_cached_username) - 1] = '\0';
+}
+
+static const char *cached_username(void)
+{
+    pthread_once(&g_username_once, init_cached_username);
+    return g_cached_username;
+}
 
 /* Simplified SID structure */
 typedef struct {
@@ -57,8 +81,13 @@ WINAPI_EXPORT BOOL OpenProcessToken(HANDLE ProcessHandle, DWORD DesiredAccess,
         set_last_error(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    /* Return a pseudo-handle */
-    *TokenHandle = handle_alloc(HANDLE_TYPE_FILE, -1, NULL);
+    HANDLE h = handle_alloc(HANDLE_TYPE_FILE, -1, NULL);
+    if (!h || h == (HANDLE)-1) {
+        *TokenHandle = NULL;
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+    *TokenHandle = h;
     return TRUE;
 }
 
@@ -66,8 +95,17 @@ WINAPI_EXPORT BOOL OpenThreadToken(HANDLE ThreadHandle, DWORD DesiredAccess,
                                     BOOL OpenAsSelf, HANDLE *TokenHandle)
 {
     (void)ThreadHandle; (void)DesiredAccess; (void)OpenAsSelf;
-    if (!TokenHandle) return FALSE;
-    *TokenHandle = handle_alloc(HANDLE_TYPE_FILE, -1, NULL);
+    if (!TokenHandle) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    HANDLE h = handle_alloc(HANDLE_TYPE_FILE, -1, NULL);
+    if (!h || h == (HANDLE)-1) {
+        *TokenHandle = NULL;
+        set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+    *TokenHandle = h;
     return TRUE;
 }
 
@@ -154,22 +192,93 @@ WINAPI_EXPORT BOOL AdjustTokenPrivileges(HANDLE TokenHandle, BOOL DisableAllPriv
     return TRUE;
 }
 
+/* Well-known privilege name -> LUID table. Real Windows uses LUIDs 2..35.
+ * Callers roundtrip via LookupPrivilegeValue then AdjustTokenPrivileges, and
+ * later use the same LUID to compare against what they stored -- so each
+ * distinct name must map to a distinct LUID, and the same name must always
+ * map to the same LUID. */
+static DWORD luid_for_privilege_name(const char *name)
+{
+    static const struct { const char *name; DWORD luid; } privs[] = {
+        {"SeCreateTokenPrivilege", 2},
+        {"SeAssignPrimaryTokenPrivilege", 3},
+        {"SeLockMemoryPrivilege", 4},
+        {"SeIncreaseQuotaPrivilege", 5},
+        {"SeMachineAccountPrivilege", 6},
+        {"SeTcbPrivilege", 7},
+        {"SeSecurityPrivilege", 8},
+        {"SeTakeOwnershipPrivilege", 9},
+        {"SeLoadDriverPrivilege", 10},
+        {"SeSystemProfilePrivilege", 11},
+        {"SeSystemtimePrivilege", 12},
+        {"SeProfileSingleProcessPrivilege", 13},
+        {"SeIncreaseBasePriorityPrivilege", 14},
+        {"SeCreatePagefilePrivilege", 15},
+        {"SeCreatePermanentPrivilege", 16},
+        {"SeBackupPrivilege", 17},
+        {"SeRestorePrivilege", 18},
+        {"SeShutdownPrivilege", 19},
+        {"SeDebugPrivilege", 20},
+        {"SeAuditPrivilege", 21},
+        {"SeSystemEnvironmentPrivilege", 22},
+        {"SeChangeNotifyPrivilege", 23},
+        {"SeRemoteShutdownPrivilege", 24},
+        {"SeUndockPrivilege", 25},
+        {"SeSyncAgentPrivilege", 26},
+        {"SeEnableDelegationPrivilege", 27},
+        {"SeManageVolumePrivilege", 28},
+        {"SeImpersonatePrivilege", 29},
+        {"SeCreateGlobalPrivilege", 30},
+        {"SeTrustedCredManAccessPrivilege", 31},
+        {"SeRelabelPrivilege", 32},
+        {"SeIncreaseWorkingSetPrivilege", 33},
+        {"SeTimeZonePrivilege", 34},
+        {"SeCreateSymbolicLinkPrivilege", 35},
+    };
+    for (size_t i = 0; i < sizeof(privs)/sizeof(privs[0]); i++) {
+        if (strcmp(privs[i].name, name) == 0)
+            return privs[i].luid;
+    }
+    /* Unknown name -- return a stable hash-derived LUID so repeated lookups
+     * match, but none collide with the well-known set. */
+    DWORD h = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        h ^= *p;
+        h *= 16777619u;
+    }
+    if (h < 100) h += 100; /* keep out of well-known range */
+    return h;
+}
+
 WINAPI_EXPORT BOOL LookupPrivilegeValueA(LPCSTR lpSystemName, LPCSTR lpName, void *lpLuid)
 {
     (void)lpSystemName;
-    if (!lpName || !lpLuid) return FALSE;
-    /* Return a fake LUID */
-    memset(lpLuid, 0, sizeof(DWORD) * 2);
-    *(DWORD *)lpLuid = 1;
+    if (!lpName || !lpLuid) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    DWORD *parts = (DWORD *)lpLuid;
+    parts[0] = luid_for_privilege_name(lpName);
+    parts[1] = 0;
     return TRUE;
 }
 
 WINAPI_EXPORT BOOL LookupPrivilegeValueW(LPCWSTR lpSystemName, LPCWSTR lpName, void *lpLuid)
 {
-    (void)lpSystemName; (void)lpName;
-    if (!lpLuid) return FALSE;
-    memset(lpLuid, 0, sizeof(DWORD) * 2);
-    *(DWORD *)lpLuid = 1;
+    (void)lpSystemName;
+    if (!lpName || !lpLuid) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    /* Narrow the name for the lookup table (privilege names are ASCII). */
+    char narrow[128];
+    size_t i;
+    for (i = 0; lpName[i] && i < sizeof(narrow) - 1; i++)
+        narrow[i] = (char)(lpName[i] & 0xFF);
+    narrow[i] = '\0';
+    DWORD *parts = (DWORD *)lpLuid;
+    parts[0] = luid_for_privilege_name(narrow);
+    parts[1] = 0;
     return TRUE;
 }
 
@@ -182,8 +291,12 @@ WINAPI_EXPORT BOOL AllocateAndInitializeSid(
     DWORD sa4, DWORD sa5, DWORD sa6, DWORD sa7,
     PSID *pSid)
 {
+    if (!pSid) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     SID *sid = (SID *)calloc(1, sizeof(SID));
-    if (!sid) return FALSE;
+    if (!sid) { *pSid = NULL; return FALSE; }
     sid->Revision = 1;
     sid->SubAuthorityCount = nSubAuthorityCount > 8 ? 8 : nSubAuthorityCount;
     if (pIdentifierAuthority)
@@ -250,9 +363,18 @@ WINAPI_EXPORT BOOL ConvertSidToStringSidA(void *Sid, LPSTR *StringSid)
     for (int i = 0; i < 6; i++)
         auth = (auth << 8) | sid->IdentifierAuthority[i];
 
-    int pos = snprintf(buf, sizeof(buf), "S-%u-%lu", sid->Revision, (unsigned long)auth);
-    for (int i = 0; i < sid->SubAuthorityCount; i++)
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "-%u", sid->SubAuthority[i]);
+    int pos = snprintf(buf, sizeof(buf), "S-%u-%llu",
+                       (unsigned int)sid->Revision, (unsigned long long)auth);
+    if (pos < 0) pos = 0;
+    if ((size_t)pos >= sizeof(buf)) pos = (int)sizeof(buf) - 1;
+    for (int i = 0; i < sid->SubAuthorityCount; i++) {
+        if ((size_t)pos + 1 >= sizeof(buf)) break;
+        int w = snprintf(buf + pos, sizeof(buf) - pos, "-%u",
+                         (unsigned int)sid->SubAuthority[i]);
+        if (w < 0) break;
+        if ((size_t)(pos + w) >= sizeof(buf)) { pos = (int)sizeof(buf) - 1; break; }
+        pos += w;
+    }
 
     *StringSid = strdup(buf);
     return *StringSid != NULL;
@@ -279,26 +401,77 @@ WINAPI_EXPORT BOOL LookupAccountSidA(LPCSTR lpSystemName, void *Sid,
                                       LPSTR ReferencedDomainName, DWORD *cchReferencedDomainName,
                                       int *peUse)
 {
-    (void)lpSystemName; (void)Sid;
-    const char *user = "user";
-    const char *domain = "ARCHLINUX";
-
-    struct passwd *pw = getpwuid(getuid());
-    if (pw) user = pw->pw_name;
-
-    if (Name && cchName && *cchName > strlen(user)) {
-        strncpy(Name, user, *cchName - 1);
-        Name[*cchName - 1] = '\0';
+    (void)lpSystemName;
+    if (!Sid) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
     }
-    if (cchName) *cchName = (DWORD)strlen(user);
 
-    if (ReferencedDomainName && cchReferencedDomainName && *cchReferencedDomainName > strlen(domain)) {
-        strncpy(ReferencedDomainName, domain, *cchReferencedDomainName - 1);
-        ReferencedDomainName[*cchReferencedDomainName - 1] = '\0';
+    /* Map well-known SIDs to their canonical names. Previously this ignored
+     * the input SID entirely and always returned the current user -- code
+     * that probes the Admin/Everyone SIDs would mis-identify them. */
+    const char *user = cached_username();
+    const char *name;
+    const char *domain;
+    int use;
+    SID *sid_in = (SID *)Sid;
+
+    if (sid_in->Revision == 1 &&
+        sid_in->IdentifierAuthority[5] == 1 &&
+        sid_in->SubAuthorityCount == 1 &&
+        sid_in->SubAuthority[0] == 0) {
+        name = "Everyone";
+        domain = "";
+        use = 5; /* SidTypeWellKnownGroup */
+    } else if (sid_in->Revision == 1 &&
+               sid_in->IdentifierAuthority[5] == 5 &&
+               sid_in->SubAuthorityCount == 2 &&
+               sid_in->SubAuthority[0] == 32 &&
+               sid_in->SubAuthority[1] == 544) {
+        name = "Administrators";
+        domain = "BUILTIN";
+        use = 4; /* SidTypeAlias */
+    } else if (sid_in->Revision == 1 &&
+               sid_in->IdentifierAuthority[5] == 16) {
+        name = "Mandatory Label";
+        domain = "";
+        use = 10; /* SidTypeLabel */
+    } else {
+        name = user;
+        domain = "ARCHLINUX";
+        use = 1; /* SidTypeUser */
     }
-    if (cchReferencedDomainName) *cchReferencedDomainName = (DWORD)strlen(domain);
 
-    if (peUse) *peUse = 1; /* SidTypeUser */
+    DWORD name_len = (DWORD)strlen(name);
+    DWORD domain_len = (DWORD)strlen(domain);
+
+    /* Windows-documented buffer-too-small semantic: set *cchName to required
+     * size INCLUDING terminator, set last error, return FALSE. */
+    BOOL name_fits = (Name && cchName && *cchName > name_len);
+    BOOL domain_fits = (ReferencedDomainName && cchReferencedDomainName &&
+                        *cchReferencedDomainName > domain_len);
+
+    if ((cchName && !name_fits) || (cchReferencedDomainName && !domain_fits)) {
+        if (cchName) *cchName = name_len + 1;
+        if (cchReferencedDomainName) *cchReferencedDomainName = domain_len + 1;
+        if (peUse) *peUse = use;
+        set_last_error(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+
+    if (name_fits) {
+        memcpy(Name, name, name_len);
+        Name[name_len] = '\0';
+    }
+    if (cchName) *cchName = name_len;
+
+    if (domain_fits) {
+        memcpy(ReferencedDomainName, domain, domain_len);
+        ReferencedDomainName[domain_len] = '\0';
+    }
+    if (cchReferencedDomainName) *cchReferencedDomainName = domain_len;
+
+    if (peUse) *peUse = use;
     return TRUE;
 }
 
@@ -311,9 +484,7 @@ WINAPI_EXPORT BOOL GetUserNameA(LPSTR lpBuffer, LPDWORD pcbBuffer)
         return FALSE;
     }
 
-    const char *user = "user";
-    struct passwd *pw = getpwuid(getuid());
-    if (pw) user = pw->pw_name;
+    const char *user = cached_username();
 
     DWORD len = (DWORD)strlen(user) + 1;
     if (*pcbBuffer < len) {
@@ -525,28 +696,49 @@ WINAPI_EXPORT BOOL CreateWellKnownSid(int WellKnownSidType, void *DomainSid,
                                        void *pSid, DWORD *cbSid)
 {
     (void)DomainSid;
-    DWORD needed = sizeof(SID);
-    if (!pSid || !cbSid || *cbSid < needed) {
-        if (cbSid) *cbSid = needed;
+    if (!cbSid) {
+        set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    /* Build the SID in a temp, then report its actual length. Prior code
+     * always reported sizeof(SID)==40, confusing callers that call
+     * GetLengthSid() on the returned SID and get a smaller value. */
+    SID tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    switch (WellKnownSidType) {
+    case 0: /* WinNullSid: S-1-0-0 */
+        tmp.Revision = 1;
+        tmp.SubAuthorityCount = 1;
+        tmp.IdentifierAuthority[5] = 0;
+        tmp.SubAuthority[0] = 0;
+        break;
+    case 1: /* WinWorldSid (Everyone): S-1-1-0 */
+        tmp = g_everyone_sid;
+        break;
+    case 26: /* WinBuiltinAdministratorsSid: S-1-5-32-544 */
+        tmp = g_admin_sid;
+        break;
+    case 27: /* WinBuiltinUsersSid: S-1-5-32-545 */
+        tmp.Revision = 1;
+        tmp.SubAuthorityCount = 2;
+        tmp.IdentifierAuthority[5] = 5;
+        tmp.SubAuthority[0] = 32;
+        tmp.SubAuthority[1] = 545;
+        break;
+    default:
+        tmp = g_user_sid;
+        break;
+    }
+
+    DWORD needed = 8 + tmp.SubAuthorityCount * 4;
+    if (!pSid || *cbSid < needed) {
+        *cbSid = needed;
         set_last_error(ERROR_INSUFFICIENT_BUFFER);
         return FALSE;
     }
 
-    SID *sid = (SID *)pSid;
-    switch (WellKnownSidType) {
-    case 0: /* WinNullSid */
-        *sid = (SID){1, 1, {0,0,0,0,0,0}, {0}};
-        break;
-    case 1: /* WinWorldSid (Everyone) */
-        memcpy(sid, &g_everyone_sid, sizeof(SID));
-        break;
-    case 26: /* WinBuiltinAdministratorsSid */
-        memcpy(sid, &g_admin_sid, sizeof(SID));
-        break;
-    default:
-        memcpy(sid, &g_user_sid, sizeof(SID));
-        break;
-    }
+    memcpy(pSid, &tmp, needed);
     *cbSid = needed;
     return TRUE;
 }

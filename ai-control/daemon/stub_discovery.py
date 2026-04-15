@@ -329,6 +329,10 @@ for _dll, _so in _DLL_TO_SO.items():
         _SO_TO_DLL[_so] = _dll
 
 
+# Compiled once at import time; used by _parse_stub_log on every call.
+_STUB_LOG_RE = re.compile(r'STUB:\s+(\S+?)!(\S+)')
+
+
 def _categorize_api(func_name: str) -> str:
     """Categorize a Windows API function by its base name (strip A/W suffix)."""
     base = func_name.rstrip("AW") if len(func_name) > 2 else func_name
@@ -654,14 +658,23 @@ class StubDiscoveryEngine:
           3. journalctl for the PID's stderr
         """
         stub_calls: dict[str, int] = {}
-        _stub_re = re.compile(r'STUB:\s+(\S+?)!(\S+)')
 
-        # Source 1: structured JSONL stub call log (written by PE loader)
-        jsonl_path = "/tmp/pe-stub-calls.jsonl"
-        try:
-            if os.path.exists(jsonl_path):
+        # Source 1: structured JSONL stub call log (written by PE loader).
+        # PE loader writes per-PID files (/tmp/pe-stub-calls-<pid>.jsonl)
+        # with a legacy fallback to the shared /tmp/pe-stub-calls.jsonl.
+        pid_needle = f'"pid": {pid}'
+        pid_needle_compact = f'"pid":{pid}'
+        jsonl_paths = [f"/tmp/pe-stub-calls-{pid}.jsonl", "/tmp/pe-stub-calls.jsonl"]
+        for jsonl_path in jsonl_paths:
+            try:
+                if not os.path.exists(jsonl_path):
+                    continue
+                per_pid_file = jsonl_path.endswith(f"-{pid}.jsonl")
                 with open(jsonl_path) as f:
                     for line in f:
+                        if not per_pid_file:
+                            if pid_needle not in line and pid_needle_compact not in line:
+                                continue
                         line = line.strip()
                         if not line:
                             continue
@@ -678,8 +691,8 @@ class StubDiscoveryEngine:
                             key = f"{dll}!{func}"
                             count = entry.get("count", 1)
                             stub_calls[key] = stub_calls.get(key, 0) + count
-        except (OSError, PermissionError):
-            pass
+            except (OSError, PermissionError):
+                continue
 
         # Source 2: direct log file
         log_path = f"/tmp/pe-loader-{pid}.log"
@@ -687,7 +700,7 @@ class StubDiscoveryEngine:
             if os.path.exists(log_path):
                 with open(log_path) as f:
                     for line in f:
-                        m = _stub_re.search(line)
+                        m = _STUB_LOG_RE.search(line)
                         if m:
                             key = f"{m.group(1).lower()}!{m.group(2)}"
                             stub_calls[key] = stub_calls.get(key, 0) + 1
@@ -695,6 +708,7 @@ class StubDiscoveryEngine:
             pass
 
         # Source 3: journalctl for this PID (async subprocess)
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "journalctl", f"_PID={pid}", "--no-pager", "-o", "cat",
@@ -703,11 +717,20 @@ class StubDiscoveryEngine:
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
             for line in stdout.decode(errors="replace").splitlines():
-                m = _stub_re.search(line)
+                m = _STUB_LOG_RE.search(line)
                 if m:
                     key = f"{m.group(1).lower()}!{m.group(2)}"
                     stub_calls[key] = stub_calls.get(key, 0) + 1
-        except (FileNotFoundError, asyncio.TimeoutError, OSError):
+        except asyncio.TimeoutError:
+            # wait_for cancels communicate() but does NOT kill the child;
+            # reap it so we don't leak zombie journalctl processes over uptime.
+            if proc is not None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except (ProcessLookupError, OSError):
+                    pass
+        except (FileNotFoundError, OSError):
             pass
 
         return stub_calls

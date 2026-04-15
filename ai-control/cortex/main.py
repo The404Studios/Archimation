@@ -19,6 +19,7 @@ import signal
 import struct
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +34,41 @@ from .orchestrator import Orchestrator
 from .trust_history import TrustHistoryStore
 
 logger = logging.getLogger("cortex")
+
+
+# ---------------------------------------------------------------------------
+# Hardware capability detection: scales buffers/limits up on beefy machines,
+# down on constrained ones.  Old HW (1 core or <=1GB RAM) gets tight buffers,
+# new HW (4+ cores with plenty of RAM) gets richer history windows.
+# ---------------------------------------------------------------------------
+
+def _detect_hw_tier() -> str:
+    """Return 'old' for constrained hosts, 'new' for richer ones.
+
+    Heuristic only -- we never fail on detection errors, we just default to
+    'old' (safer, tighter buffers) when probes fail.
+    """
+    try:
+        cpu_count = os.cpu_count() or 1
+    except Exception:
+        cpu_count = 1
+    mem_gb = 1.0
+    try:
+        # sysconf is POSIX; Windows/WSL tooling may not expose it.
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        phys_pages = os.sysconf("SC_PHYS_PAGES")
+        mem_gb = (page_size * phys_pages) / (1024 ** 3)
+    except (ValueError, OSError, AttributeError):
+        pass
+    if cpu_count >= 4 and mem_gb >= 4.0:
+        return "new"
+    return "old"
+
+
+_HW_TIER = _detect_hw_tier()
+# Recent-event buffer size -- on old hardware we keep less history to cap
+# memory growth; on new hardware we keep more for richer /events/recent output.
+_RECENT_EVENTS_MAX = 500 if _HW_TIER == "new" else 150
 
 # ---------------------------------------------------------------------------
 # Version
@@ -88,8 +124,20 @@ class CortexHandlers:
         self._decision_engine = decision_engine
         self._events_processed: int = 0
         self._start_time: float = time.time()
-        self._recent_events: list[dict] = []
+        # deque(maxlen) gives O(1) bounded append; the previous list-and-slice
+        # copied the tail every 200 events, and burned CPU on busy systems.
+        self._recent_events: "deque[dict]" = deque(maxlen=_RECENT_EVENTS_MAX)
         self._pending_tasks: set[asyncio.Task] = set()
+        # Running counters over recorded action tags -- /status API previously
+        # walked the recent_events list four times per request to tally
+        # memory_events / anomalies / patterns / stubs / maps, which is O(N)
+        # per poll.  Now we tally at record-time for O(1) reads.
+        self._action_counts: dict[str, int] = {
+            "memory_anomaly": 0,
+            "memory_pattern": 0,
+            "memory_stub": 0,
+            "memory_map": 0,
+        }
 
     # -- Helpers --------------------------------------------------------------
 
@@ -112,12 +160,34 @@ class CortexHandlers:
             "action": action_taken,
         }
         self._recent_events.append(entry)
-        if len(self._recent_events) > 200:
-            self._recent_events = self._recent_events[-100:]
+        # Fast-path: tally categories at record time so /status doesn't have
+        # to rescan the whole ring buffer and run substring checks on every
+        # poll.  Uses startswith because record-tag format is stable.
+        if action_taken:
+            if "memory anomaly" in action_taken:
+                self._action_counts["memory_anomaly"] += 1
+            elif action_taken.startswith("pattern:"):
+                self._action_counts["memory_pattern"] += 1
+            elif action_taken.startswith("stub:"):
+                self._action_counts["memory_stub"] += 1
+            elif action_taken.startswith("map:"):
+                self._action_counts["memory_map"] += 1
 
     @property
     def recent_events(self) -> list[dict]:
-        return list(self._recent_events[-100:])
+        # deque supports slicing via list()+indexing; return at most 100 for
+        # the API without copying the whole buffer.
+        n = len(self._recent_events)
+        if n <= 100:
+            return list(self._recent_events)
+        # Skip to the 100-from-end point.  Deque supports negative indexing
+        # but not slicing, so we use islice from collections-like logic.
+        return list(self._recent_events)[-100:]
+
+    @property
+    def action_counts(self) -> dict[str, int]:
+        """O(1) snapshot of running action-category counters."""
+        return dict(self._action_counts)
 
     @property
     def events_processed(self) -> int:
@@ -208,9 +278,25 @@ class CortexHandlers:
         if engine_result is not None and self._apply_engine_verdict(event, engine_result):
             return  # Engine already handled (deny/quarantine)
 
+        # Session 25 follow-through: capture pid so the gated decision can
+        # fire resume/reject callbacks when the human approves or denies.
+        # Binding pid into closures here (not into orchestrator refs) means
+        # api.py can call the callback without any cortex-side reference.
+        gated_pid = event.pid
+        orchestrator = self._orchestrator
+
+        def _resume_cb() -> None:
+            orchestrator.resume_after_approval(gated_pid)
+
+        def _reject_cb() -> None:
+            orchestrator.kill_after_rejection(gated_pid)
+
         decision = self._autonomy.create_decision(
             Domain.PE_EXECUTION, "pe_load",
-            f"PE load: pid={event.pid} subject={event.subject_id}",
+            f"PE load: pid={gated_pid} subject={event.subject_id}",
+            pid=gated_pid,
+            resume_action=_resume_cb,
+            reject_action=_reject_cb,
         )
 
         payload = self._get_payload_dict(event)
@@ -248,7 +334,10 @@ class CortexHandlers:
                 action = "approved"
                 logger.info("PE load pid=%d: approved", event.pid)
         elif decision.approved is None:
-            # Pending human approval -- freeze the process while waiting
+            # Pending human approval -- freeze the process while waiting.
+            # The resume/reject callbacks attached to `decision` above will
+            # fire when the human calls /decisions/{index}/approve or /deny,
+            # or when the decision auto-expires (default 300s).
             self._orchestrator.freeze_process(event.pid)
             self._track_task(
                 self._orchestrator.notify_decision(decision)
@@ -282,6 +371,13 @@ class CortexHandlers:
                 "PE exit pid=%d: recorded in trust history (exit_code=%d, runtime=%dms)",
                 event.pid, exit_code, runtime_ms,
             )
+
+        # Free the score-cache slot for this now-dead pid so the cache
+        # doesn't accumulate stale entries across process churn.
+        try:
+            self._orchestrator.invalidate_score_cache(event.pid)
+        except Exception:
+            logger.debug("invalidate_score_cache failed", exc_info=True)
 
         self._record_event(event, "recorded")
         logger.debug("PE exit: pid=%d", event.pid)
@@ -330,9 +426,36 @@ class CortexHandlers:
         if engine_result is not None and self._apply_engine_verdict(event, engine_result):
             return  # Engine already handled (quarantine)
 
+        # Session 25 follow-through: wire pid + resume/reject callbacks so
+        # a human approval/denial on the pending decision unfreezes or
+        # kills the alert subject instead of leaving it SIGSTOP'd forever.
+        #
+        # Semantics differ from pe_load: an APPROVED immune alert means
+        # "yes, quarantine it" -- which we've ALREADY done at freeze time.
+        # So "approve" here keeps the process frozen+quarantined (no-op
+        # callback) while "reject" releases and resumes it (false alert).
+        gated_pid = event.pid
+        orchestrator = self._orchestrator
+
+        def _resume_cb() -> None:
+            # Approved: the human confirms the immune alert was legitimate.
+            # Process stays frozen+quarantined; nothing to do here.  The
+            # quarantine_release pathway is a separate admin action.
+            return
+
+        def _reject_cb() -> None:
+            # Rejected: the human says this was a false alarm.  Release
+            # the quarantine (if it was applied) AND resume the process,
+            # otherwise it leaks as a SIGSTOP'd ghost.
+            orchestrator.trust_release(gated_pid)
+            orchestrator.resume_after_approval(gated_pid)
+
         decision = self._autonomy.create_decision(
             Domain.SECURITY, "trust_alert",
-            f"Trust immune alert: pid={event.pid} subject={event.subject_id}",
+            f"Trust immune alert: pid={gated_pid} subject={event.subject_id}",
+            pid=gated_pid,
+            resume_action=_resume_cb,
+            reject_action=_reject_cb,
         )
 
         action = "observed"
@@ -366,6 +489,11 @@ class CortexHandlers:
 
     def handle_trust_quarantine(self, event: Event) -> None:
         """Trust system quarantined a subject (kernel-initiated)."""
+        # Quarantine usually clamps trust score -- invalidate cached reading.
+        try:
+            self._orchestrator.invalidate_score_cache(event.pid)
+        except Exception:
+            logger.debug("invalidate_score_cache failed", exc_info=True)
         self._record_event(event, "kernel quarantine")
         self._track_task(
             self._orchestrator.notify(
@@ -387,6 +515,13 @@ class CortexHandlers:
 
     def handle_trust_score_change(self, event: Event) -> None:
         """Trust score changed for a subject."""
+        # Drop any cached trust-score reading for this pid -- the decision
+        # engine + policy evaluator will re-query through the ioctl next
+        # time, ensuring we don't act on stale score data.
+        try:
+            self._orchestrator.invalidate_score_cache(event.pid)
+        except Exception:
+            logger.debug("invalidate_score_cache failed", exc_info=True)
         self._record_event(event, "score change")
 
     # -- Service fabric handlers ----------------------------------------------
@@ -997,19 +1132,58 @@ async def main(argv: Optional[list[str]] = None) -> None:
 
     # -- Dead-man switch periodic check ----------------------------------------
 
+    async def _interruptible_sleep(seconds: float) -> bool:
+        """Sleep that wakes immediately on shutdown.  Returns True if the
+        sleep completed (no shutdown), False if shutdown was signalled."""
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return True
+        return False
+
     async def _dead_man_check_loop() -> None:
         """Periodically check dead-man switch and prune heuristic state."""
+        # Old HW polls less often (cheaper) than new HW.
+        interval = 300 if _HW_TIER == "new" else 600
         while not shutdown_event.is_set():
             try:
-                await asyncio.sleep(300)  # Check every 5 minutes
+                # Interruptible sleep -- exits fast on shutdown instead of
+                # hanging the tasks.cancel() path for up to 300s.
+                if not await _interruptible_sleep(interval):
+                    return
                 autonomy.check_dead_man_switch()
                 # Prune stale heuristic state in the decision engine so it
                 # doesn't accumulate entries for long-gone processes.
                 decision_engine._prune_heuristic_state()
+            except asyncio.CancelledError:
+                return
             except Exception:
                 logger.exception("Dead-man check failed")
 
+    async def _pending_expiry_loop() -> None:
+        """Session 25 follow-through: auto-expire pending decisions that
+        have passed their TTL.  Runs every 30s so a 300s TTL results in
+        at most ~330s of actual lag before SIGKILL lands on a rejected
+        frozen PE process.  Without this, SIGSTOP'd processes would leak
+        forever when a human never clicks approve/deny.
+        """
+        while not shutdown_event.is_set():
+            try:
+                if not await _interruptible_sleep(30):
+                    return
+                expired = autonomy.expire_overdue_pending()
+                if expired:
+                    logger.warning(
+                        "Expired %d overdue pending decision(s); reject "
+                        "callbacks fired", expired,
+                    )
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("Pending expiry sweep failed")
+
     dead_man_task = asyncio.create_task(_dead_man_check_loop())
+    expiry_task = asyncio.create_task(_pending_expiry_loop())
 
     # -- Run until shutdown ---------------------------------------------------
 
@@ -1021,6 +1195,12 @@ async def main(argv: Optional[list[str]] = None) -> None:
     dead_man_task.cancel()
     try:
         await dead_man_task
+    except asyncio.CancelledError:
+        pass
+
+    expiry_task.cancel()
+    try:
+        await expiry_task
     except asyncio.CancelledError:
         pass
 
@@ -1055,12 +1235,22 @@ async def main(argv: Optional[list[str]] = None) -> None:
         except asyncio.CancelledError:
             pass
 
-    # Drain pending handler tasks so nothing is lost on shutdown
+    # Drain pending handler tasks so nothing is lost on shutdown.
+    # Snapshot the set BEFORE awaiting so new tasks arriving during the drain
+    # don't race the wait() call (done_callback_discard also mutates the set).
     if handlers._pending_tasks:
-        logger.info("Waiting for %d pending tasks...", len(handlers._pending_tasks))
-        done, _ = await asyncio.wait(handlers._pending_tasks, timeout=5.0)
-        for t in handlers._pending_tasks - done:
+        pending_snapshot = set(handlers._pending_tasks)
+        logger.info("Waiting for %d pending tasks...", len(pending_snapshot))
+        done, still_pending = await asyncio.wait(pending_snapshot, timeout=5.0)
+        for t in still_pending:
             t.cancel()
+        # Give cancelled tasks one tick to process cancellation cleanly so
+        # they don't log CancelledError traceback at interpreter exit.
+        if still_pending:
+            try:
+                await asyncio.wait(still_pending, timeout=1.0)
+            except Exception:
+                logger.debug("Cleanup wait for cancelled tasks failed", exc_info=True)
 
     # Release trust device
     orchestrator.close()

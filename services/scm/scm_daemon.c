@@ -94,6 +94,15 @@ static void handle_service_crash(service_entry_t *svc, int exit_code,
     svc->state = SERVICE_STOPPED;
     svc->pid = 0;
 
+    /* Clear the on-disk status file so `sc query` reflects reality
+     * instead of stale RUNNING with a defunct pid. */
+    {
+        char status_path[4096];
+        snprintf(status_path, sizeof(status_path),
+                 "%s/%s.status", SCM_RUN_PATH, svc->name);
+        unlink(status_path);
+    }
+
     /* Check restart policy */
     int should_restart = 0;
     if (svc->manually_stopped) {
@@ -547,27 +556,66 @@ static int process_command(const char *cmd, char *resp_buf, size_t resp_sz)
         }
 
     } else if (strcmp(action, "install") == 0 && n >= 3) {
-        int ret = scm_db_install(name, name, extra,
-                                 SERVICE_WIN32_OWN_PROCESS,
-                                 SERVICE_DEMAND_START, NULL);
-        if (ret == 0) {
-            scm_event_emit(SVC_EVT_INSTALL, 0, name, 0, 0);
-            len = format_response(resp_buf, resp_sz, "ok", "service installed");
-        } else if (ret == -1) {
-            len = format_response(resp_buf, resp_sz, "error", "service already exists");
+        /* extra = "<binary_path> [type] [start_type]"  -- sc.c packs optional
+         * type/start_type at the end.  Default to WIN32_OWN_PROCESS /
+         * DEMAND_START when not supplied. */
+        char bin_path[2048] = {0};
+        int inst_type = SERVICE_WIN32_OWN_PROCESS;
+        int inst_start = SERVICE_DEMAND_START;
+        int parsed = sscanf(extra, "%2047s %d %d",
+                            bin_path, &inst_type, &inst_start);
+        if (parsed < 1 || !bin_path[0]) {
+            len = format_response(resp_buf, resp_sz, "error",
+                                  "missing binary path");
         } else {
-            len = format_response(resp_buf, resp_sz, "error", "install failed");
+            int ret = scm_db_install(name, name, bin_path,
+                                     inst_type, inst_start, NULL);
+            if (ret == 0) {
+                scm_event_emit(SVC_EVT_INSTALL, 0, name, 0, 0);
+                len = format_response(resp_buf, resp_sz, "ok",
+                                      "service installed");
+            } else if (ret == -1) {
+                len = format_response(resp_buf, resp_sz, "error",
+                                      "service already exists");
+            } else if (ret == -3) {
+                len = format_response(resp_buf, resp_sz, "error",
+                                      "invalid service name");
+            } else {
+                len = format_response(resp_buf, resp_sz, "error",
+                                      "install failed");
+            }
         }
 
     } else if (strcmp(action, "delete") == 0 && n >= 2) {
-        scm_db_delete_service(name);
-        len = format_response(resp_buf, resp_sz, "ok", "service deleted");
+        /* Stop-delete race: if another thread is in scm_stop_service for the
+         * same name, it temporarily drops g_lock while waiting on the child.
+         * The delete path already handles a running service (see
+         * scm_db_delete_service which signals and waits).  The re-lookup in
+         * scm_stop_service after re-lock guards against use-after-free. */
+        if (!scm_db_find(name)) {
+            len = format_response(resp_buf, resp_sz, "error",
+                                  "service not found");
+        } else {
+            int dr = scm_db_delete_service(name);
+            if (dr == 0) {
+                scm_event_emit(SVC_EVT_STOP, 0, name, 0, 0);
+                len = format_response(resp_buf, resp_sz, "ok",
+                                      "service deleted");
+            } else {
+                len = format_response(resp_buf, resp_sz, "error",
+                                      "delete failed");
+            }
+        }
 
     } else if (strcmp(action, "list") == 0) {
-        /* Build a JSON array of services */
+        /* Build a JSON array of services.  Guard against undersized
+         * resp_sz to prevent size_t underflow in headroom calculations. */
+        const size_t headroom = 200;
         int count = scm_db_count();
         len = snprintf(resp_buf, resp_sz, "{\"status\":\"ok\",\"services\":[");
-        for (int i = 0; i < count && (size_t)len < resp_sz - 200; i++) {
+        if (len < 0 || (size_t)len >= resp_sz) len = (int)resp_sz - 1;
+        for (int i = 0; i < count && resp_sz > headroom &&
+                        (size_t)len < resp_sz - headroom; i++) {
             service_entry_t *svc = scm_db_get(i);
             if (!svc) continue;
             const char *state_str = "STOPPED";
@@ -577,16 +625,33 @@ static int process_command(const char *cmd, char *resp_buf, size_t resp_sz)
             char esc_svc_name[512];
             json_escape(svc->name, esc_svc_name, sizeof(esc_svc_name));
 
-            if (i > 0 && (size_t)len < resp_sz - 200) {
+            if (i > 0 && resp_sz > headroom &&
+                (size_t)len < resp_sz - headroom) {
                 resp_buf[len++] = ',';
             }
-            len += snprintf(resp_buf + len, resp_sz - len,
-                            "{\"name\":\"%s\",\"state\":\"%s\",\"type\":%d,"
-                            "\"start_type\":%d,\"pid\":%d}",
-                            esc_svc_name, state_str, svc->type,
-                            svc->start_type, svc->pid);
+            int w = snprintf(resp_buf + len, resp_sz - len,
+                             "{\"name\":\"%s\",\"state\":\"%s\",\"type\":%d,"
+                             "\"start_type\":%d,\"pid\":%d}",
+                             esc_svc_name, state_str, svc->type,
+                             svc->start_type, svc->pid);
+            /* Clamp: snprintf returns "would have written" on truncation.
+             * Do not let len advance past the buffer. */
+            if (w < 0) break;
+            if ((size_t)w >= resp_sz - len) {
+                len = (int)resp_sz - 1;
+                break;
+            }
+            len += w;
         }
-        len += snprintf(resp_buf + len, resp_sz - len, "]}\n");
+        if ((size_t)len < resp_sz) {
+            int w = snprintf(resp_buf + len, resp_sz - len, "]}\n");
+            if (w > 0) {
+                if ((size_t)w >= resp_sz - len)
+                    len = (int)resp_sz - 1;
+                else
+                    len += w;
+            }
+        }
 
     } else if (strcmp(action, "ping") == 0) {
         len = format_response(resp_buf, resp_sz, "ok", "pong");
@@ -645,6 +710,20 @@ static int create_listen_socket(void)
 
 static void handle_client(int client_fd)
 {
+    /* Prevent leaking the client socket into service children forked by
+     * process_command() -> scm_start_with_deps() -> scm_start_service(). */
+    fcntl(client_fd, F_SETFD, FD_CLOEXEC);
+
+    /*
+     * Install 2-second send/recv timeouts on the client socket so a
+     * slow/hung client cannot stall the SCM main loop indefinitely
+     * (the main loop also drives SIGCHLD-triggered restart policy).
+     * SO_RCVTIMEO/SO_SNDTIMEO apply to blocking read()/write() syscalls.
+     */
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    (void)setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
     char buf[CMD_BUFSIZE];
     ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
     if (n <= 0) {
@@ -663,9 +742,18 @@ static void handle_client(int client_fd)
     if (resp_len > 0) {
         ssize_t total = 0;
         while (total < resp_len) {
-            ssize_t n = write(client_fd, resp + total, resp_len - total);
-            if (n <= 0) break;
-            total += n;
+            ssize_t wn = write(client_fd, resp + total, resp_len - total);
+            if (wn < 0) {
+                /* EAGAIN after SO_SNDTIMEO = hung client; abandon */
+                if (errno == EAGAIN || errno == EWOULDBLOCK ||
+                    errno == EPIPE || errno == ECONNRESET)
+                    break;
+                if (errno == EINTR)
+                    continue;
+                break;
+            }
+            if (wn == 0) break;
+            total += (size_t)wn;
         }
     }
 

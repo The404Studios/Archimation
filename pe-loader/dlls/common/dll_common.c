@@ -27,6 +27,15 @@ static int g_handle_initialized = 0;
 static int g_freelist[MAX_HANDLES]; /* Stack of free indices */
 static int g_freelist_top = 0;     /* Top of stack (next free slot) */
 
+/*
+ * Per-type destructor table.  DLLs owning a handle type register a dtor
+ * via handle_register_dtor(); handle_close() consults this table before
+ * defaulting to generic free(data).  Sized to cover all HANDLE_TYPE_*
+ * values (enum range + #define range, max currently HANDLE_TYPE_IOCP=25).
+ */
+#define HANDLE_DTOR_SLOTS 64
+static handle_dtor_t g_dtors[HANDLE_DTOR_SLOTS];
+
 /* Fallback per-thread error for early init before TEB is ready */
 static __thread DWORD tls_last_error_fallback = 0;
 
@@ -38,11 +47,10 @@ static char g_pe_compat_prefix[PATH_MAX] = {0};
  * ELF PLT calls from within this .so would resolve to the loader's version
  * instead of this one.  Using a static function ensures we always call
  * our own copy. */
-static void handle_table_init_internal(void)
-{
-    if (g_handle_initialized)
-        return;
+static pthread_once_t g_handle_init_once = PTHREAD_ONCE_INIT;
 
+static void handle_table_do_init(void)
+{
     memset(g_handles, 0, sizeof(g_handles));
 
     /* Build freelist: push slots 3..MAX_HANDLES-1 (reverse order so 3 is popped first) */
@@ -64,7 +72,19 @@ static void handle_table_init_internal(void)
     g_handles[2].fd = STDERR_FILENO;
     g_handles[2].ref_count = 1;
 
-    g_handle_initialized = 1;
+    /* Release-store so other threads that see g_handle_initialized=1 also
+     * see the freelist + std-handle writes above. */
+    __atomic_store_n(&g_handle_initialized, 1, __ATOMIC_RELEASE);
+}
+
+static void handle_table_init_internal(void)
+{
+    /* Fast path: already initialized.  Acquire-load pairs with the
+     * release-store inside handle_table_do_init() so callers who see 1
+     * also see all the slot/freelist writes. */
+    if (__atomic_load_n(&g_handle_initialized, __ATOMIC_ACQUIRE))
+        return;
+    pthread_once(&g_handle_init_once, handle_table_do_init);
 }
 
 /* Public entry point - exported for dlsym() from loader_init.c */
@@ -115,6 +135,43 @@ int handle_is_overlapped(HANDLE h)
                   (g_handles[idx].flags & HANDLE_FLAG_OVERLAPPED)) ? 1 : 0;
     pthread_rwlock_unlock(&g_handle_rwlock);
     return result;
+}
+
+int handle_is_dup(HANDLE h)
+{
+    int idx = handle_to_index(h);
+    if (idx < 0)
+        return 0;
+    pthread_rwlock_rdlock(&g_handle_rwlock);
+    int result = (g_handles[idx].type != HANDLE_TYPE_INVALID &&
+                  (g_handles[idx].flags & HANDLE_FLAG_DUP)) ? 1 : 0;
+    pthread_rwlock_unlock(&g_handle_rwlock);
+    return result;
+}
+
+/*
+ * handle_register_dtor - register a per-type destructor.
+ *
+ * Called by owning DLLs (e.g. kernel32) at library-load time via a
+ * constructor.  The destructor is invoked by handle_close() on the last
+ * reference, with locks released and the slot already reclaimed, for
+ * non-HANDLE_FLAG_DUP handles of the given type.  The destructor is
+ * responsible for destroying embedded pthread primitives and free()ing
+ * entry->data.  Registration is last-writer-wins; in practice each type
+ * is registered exactly once.
+ */
+void handle_register_dtor(handle_type_t type, handle_dtor_t fn)
+{
+    if ((int)type < 0 || (int)type >= HANDLE_DTOR_SLOTS)
+        return;
+    __atomic_store_n(&g_dtors[type], fn, __ATOMIC_RELEASE);
+}
+
+static handle_dtor_t handle_get_dtor(handle_type_t type)
+{
+    if ((int)type < 0 || (int)type >= HANDLE_DTOR_SLOTS)
+        return NULL;
+    return __atomic_load_n(&g_dtors[type], __ATOMIC_ACQUIRE);
 }
 
 static int handle_to_index(HANDLE h)
@@ -191,25 +248,73 @@ int handle_close(HANDLE h)
         return -1;
     }
 
+    /* Snapshot for post-lock cleanup (dtor or generic free) so we can run
+     * potentially-blocking destructors (pthread_mutex_destroy, close()) with
+     * the handle table locks released.  The slot is cleared under the lock
+     * either way, so no other thread can observe the entry mid-destroy. */
+    handle_entry_t snapshot = {0};
+    int do_cleanup = 0;
+
     g_handles[idx].ref_count--;
     if (g_handles[idx].ref_count <= 0) {
-        if (g_handles[idx].fd >= 0 && idx >= 3) {
-            close(g_handles[idx].fd);
-        }
-        if (g_handles[idx].fd == -42 && g_handles[idx].data) {
-            munmap(g_handles[idx].data, 4096);  /* Broker-backed shm page */
-        } else if (g_handles[idx].data) {
-            free(g_handles[idx].data);
-        }
-        memset(&g_handles[idx], 0, sizeof(handle_entry_t));
-        /* Return slot to freelist for O(1) reuse */
-        if (g_freelist_top < MAX_HANDLES) {
-            g_freelist[g_freelist_top++] = idx;
+        /* CloseHandle on a std handle (stdin/stdout/stderr = slots 0/1/2)
+         * must be a no-op on Windows -- standard handles persist for the
+         * lifetime of the process and other kernel32 code paths still use
+         * GetStdHandle() to obtain them.  Clamp ref_count at 1, skip the
+         * memset/freelist push, and skip cleanup so the fd stays alive
+         * and the slot never gets reallocated to something else. */
+        if (idx < 3) {
+            g_handles[idx].ref_count = 1;
+        } else {
+            snapshot = g_handles[idx];
+            do_cleanup = 1;
+            memset(&g_handles[idx], 0, sizeof(handle_entry_t));
+            /* Return slot to freelist for O(1) reuse */
+            if (g_freelist_top < MAX_HANDLES) {
+                g_freelist[g_freelist_top++] = idx;
+            }
         }
     }
 
     pthread_mutex_unlock(&g_handle_lock);
     pthread_rwlock_unlock(&g_handle_rwlock);
+
+    if (do_cleanup) {
+        /*
+         * HANDLE_FLAG_DUP: this slot was a duplicate (e.g. NtDuplicateObject)
+         * that borrowed its fd/data from another slot.  The original owner
+         * will close the fd, destroy pthread primitives, and free the data.
+         * Doing any of that here would cause double-free / UAF / premature
+         * fd close on the original.  Just reclaim the slot and return.
+         */
+        if (snapshot.flags & HANDLE_FLAG_DUP)
+            return 0;
+
+        /* Owning close path: run fd/data cleanup.  Order: fd close first so
+         * destructors that also stash an fd see a consistent view. */
+        if (snapshot.fd >= 0 && idx >= 3) {
+            close(snapshot.fd);
+        }
+
+        /* Broker-backed shared-memory page uses munmap instead of free. */
+        if (snapshot.fd == -42 && snapshot.data) {
+            munmap(snapshot.data, 4096);
+            return 0;
+        }
+
+        if (snapshot.data) {
+            /* Type-specific destructor takes priority over generic free() so
+             * pthread/sem primitives inside type-specific structs are torn
+             * down properly.  The destructor OWNS the free() of snapshot.data.
+             * If no destructor is registered, fall back to generic free(). */
+            handle_dtor_t dtor = handle_get_dtor(snapshot.type);
+            if (dtor)
+                dtor(&snapshot);
+            else
+                free(snapshot.data);
+        }
+    }
+
     return 0;
 }
 

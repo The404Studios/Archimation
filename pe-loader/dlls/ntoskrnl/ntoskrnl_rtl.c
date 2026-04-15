@@ -53,6 +53,10 @@ WINAPI_EXPORT LONG RtlCompareUnicodeString(
         ? String1->Length : String2->Length;
     USHORT chars = len / sizeof(WCHAR);
 
+    /* Guard against NULL Buffer with non-zero Length (malformed UNICODE_STRING) */
+    if (chars > 0 && (!String1->Buffer || !String2->Buffer))
+        return (LONG)String1->Length - (LONG)String2->Length;
+
     for (USHORT i = 0; i < chars; i++) {
         WCHAR c1 = String1->Buffer[i];
         WCHAR c2 = String2->Buffer[i];
@@ -87,8 +91,15 @@ WINAPI_EXPORT NTSTATUS RtlUpcaseUnicodeString(
         Dest->MaximumLength = Src->Length + sizeof(WCHAR);
     }
 
-    Dest->Length = Src->Length;
-    USHORT chars = Src->Length / sizeof(WCHAR);
+    if (!Dest->Buffer || !Src->Buffer)
+        return STATUS_INVALID_PARAMETER;
+
+    /* Clamp against caller-provided MaximumLength when not allocating */
+    USHORT copy_len = Src->Length;
+    if (copy_len > Dest->MaximumLength)
+        copy_len = Dest->MaximumLength;
+    Dest->Length = copy_len;
+    USHORT chars = copy_len / sizeof(WCHAR);
     for (USHORT i = 0; i < chars; i++) {
         WCHAR c = Src->Buffer[i];
         Dest->Buffer[i] = (c >= 'a' && c <= 'z') ? c - 32 : c;
@@ -110,7 +121,11 @@ WINAPI_EXPORT NTSTATUS RtlAnsiStringToUnicodeString(
     if (!Dest || !Src)
         return STATUS_INVALID_PARAMETER;
 
-    USHORT wlen = Src->Length * sizeof(WCHAR);
+    /* Use ULONG to avoid USHORT overflow when Src->Length > 32767 */
+    ULONG wlen32 = (ULONG)Src->Length * sizeof(WCHAR);
+    if (wlen32 > 0xFFFD)
+        wlen32 = 0xFFFD; /* clamp to max USHORT minus NUL */
+    USHORT wlen = (USHORT)wlen32;
 
     if (AllocateDestinationString) {
         Dest->Buffer = (PWSTR)malloc(wlen + sizeof(WCHAR));
@@ -119,15 +134,21 @@ WINAPI_EXPORT NTSTATUS RtlAnsiStringToUnicodeString(
         Dest->MaximumLength = wlen + sizeof(WCHAR);
     }
 
+    if (Dest->MaximumLength < sizeof(WCHAR)) {
+        Dest->Length = 0;
+        return STATUS_BUFFER_TOO_SMALL;
+    }
     if (wlen > Dest->MaximumLength - sizeof(WCHAR))
         wlen = Dest->MaximumLength - sizeof(WCHAR);
 
     Dest->Length = wlen;
-    for (USHORT i = 0; i < Src->Length && i < wlen / sizeof(WCHAR); i++)
-        Dest->Buffer[i] = (WCHAR)(unsigned char)Src->Buffer[i];
+    if (Dest->Buffer && Src->Buffer) {
+        for (USHORT i = 0; i < Src->Length && i < wlen / sizeof(WCHAR); i++)
+            Dest->Buffer[i] = (WCHAR)(unsigned char)Src->Buffer[i];
 
-    if (wlen < Dest->MaximumLength)
-        Dest->Buffer[wlen / sizeof(WCHAR)] = 0;
+        if (wlen < Dest->MaximumLength)
+            Dest->Buffer[wlen / sizeof(WCHAR)] = 0;
+    }
 
     return STATUS_SUCCESS;
 }
@@ -147,13 +168,19 @@ WINAPI_EXPORT NTSTATUS RtlUnicodeStringToAnsiString(
         Dest->MaximumLength = alen + 1;
     }
 
+    if (Dest->MaximumLength == 0) {
+        Dest->Length = 0;
+        return STATUS_BUFFER_TOO_SMALL;
+    }
     if (alen > Dest->MaximumLength - 1)
         alen = Dest->MaximumLength - 1;
 
     Dest->Length = alen;
-    for (USHORT i = 0; i < alen; i++)
-        Dest->Buffer[i] = (CHAR)(Src->Buffer[i] & 0xFF);
-    Dest->Buffer[alen] = 0;
+    if (Dest->Buffer && Src->Buffer) {
+        for (USHORT i = 0; i < alen; i++)
+            Dest->Buffer[i] = (CHAR)(Src->Buffer[i] & 0xFF);
+        Dest->Buffer[alen] = 0;
+    }
 
     return STATUS_SUCCESS;
 }

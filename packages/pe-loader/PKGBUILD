@@ -32,8 +32,11 @@ _srcdir="${startdir}/../../pe-loader"
 
 build() {
     cd "$_srcdir"
+    # Parallel: MAKEFLAGS from build-packages.sh (-jN). Defaults to -j1 if unset.
+    # The PE loader has 200+ C sources — parallelising this is the biggest single
+    # build-time win. `make clean` is sequential (rm-only); no benefit from -j.
     make clean
-    make all
+    make all ${MAKEFLAGS:-}
 }
 
 package() {

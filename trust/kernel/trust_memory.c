@@ -443,23 +443,27 @@ int tms_register_section(u32 subject_id, u64 va_start, u64 size,
         break;
     }
 
-    if (map->region_count >= TMS_MAX_REGIONS_PER_SUBJECT)
-        return -ENOSPC;
-
     region = tms_alloc_region(va_start, va_start + size, prot, tag, label);
     if (!region)
         return -ENOMEM;
 
+    pid_t snap_pid;
     spin_lock(&map->lock);
+    if (map->region_count >= TMS_MAX_REGIONS_PER_SUBJECT) {
+        spin_unlock(&map->lock);
+        kfree(region);
+        return -ENOSPC;
+    }
     ret = tms_rbtree_insert(map, region);
     if (ret == -EEXIST) {
         /* Overlapping region was updated in-place; free the new node */
         kfree(region);
         ret = 0;  /* Not an error: region was updated */
     }
+    snap_pid = map->pid;
     spin_unlock(&map->lock);
 
-    tms_emit_event(TMS_EVENT_SECTION, subject_id, map->pid,
+    tms_emit_event(TMS_EVENT_SECTION, subject_id, snap_pid,
                    va_start, size, prot, 0, tag, label);
 
     pr_debug("trust: TMS section registered: subject=%u va=%llx-%llx tag=%d label=%s\n",
@@ -482,16 +486,17 @@ void tms_on_mmap(pid_t pid, u64 addr, u64 len, u32 prot)
     struct tms_subject_map *map;
     struct tms_region *region;
     struct tms_region *existing;
+    u32 snap_subject_id;
     int ret;
+
+    bool exec_heap_alert = false;
+    char alert_label[32] = {0};
 
     if (!g_tms.enabled || !addr || !len)
         return;
 
     map = tms_find_map_by_pid(pid);
     if (!map)
-        return;
-
-    if (map->region_count >= TMS_MAX_REGIONS_PER_SUBJECT)
         return;
 
     region = tms_alloc_region(addr, addr + len, prot,
@@ -501,19 +506,32 @@ void tms_on_mmap(pid_t pid, u64 addr, u64 len, u32 prot)
 
     spin_lock(&map->lock);
 
+    if (map->region_count >= TMS_MAX_REGIONS_PER_SUBJECT) {
+        spin_unlock(&map->lock);
+        kfree(region);
+        return;
+    }
+
+    /* Snapshot subject_id under lock; after unlock the slot may be reused. */
+    snap_subject_id = map->subject_id;
+
     /* Check if this mapping overlaps a known section */
     existing = tms_rbtree_find(map, addr);
     if (existing) {
         /* Update the existing region's protection */
         existing->prot = prot;
+        /* Snapshot fields needed for emit before releasing the lock. */
+        if (existing->tag == TMS_TAG_HEAP && (prot & PROT_EXEC)) {
+            exec_heap_alert = true;
+            strscpy(alert_label, existing->label, sizeof(alert_label));
+        }
         spin_unlock(&map->lock);
         kfree(region);
 
-        /* Alert if heap region is now executable */
-        if (existing->tag == TMS_TAG_HEAP && (prot & PROT_EXEC)) {
-            tms_emit_event(TMS_EVENT_EXEC_HEAP, map->subject_id, pid,
+        if (exec_heap_alert) {
+            tms_emit_event(TMS_EVENT_EXEC_HEAP, snap_subject_id, pid,
                            addr, len, prot, 0, TMS_TAG_HEAP,
-                           existing->label);
+                           alert_label);
         }
         return;
     }
@@ -524,7 +542,7 @@ void tms_on_mmap(pid_t pid, u64 addr, u64 len, u32 prot)
     if (ret == -EEXIST)
         kfree(region);
 
-    tms_emit_event(TMS_EVENT_MAP, map->subject_id, pid,
+    tms_emit_event(TMS_EVENT_MAP, snap_subject_id, pid,
                    addr, len, prot, 0, TMS_TAG_UNKNOWN, NULL);
 }
 
@@ -537,6 +555,7 @@ void tms_on_munmap(pid_t pid, u64 addr, u64 len)
 {
     struct tms_subject_map *map;
     struct tms_region *region;
+    u32 snap_subject_id;
     u64 end = addr + len;
 
     if (!g_tms.enabled || !addr || !len)
@@ -547,12 +566,13 @@ void tms_on_munmap(pid_t pid, u64 addr, u64 len)
         return;
 
     spin_lock(&map->lock);
+    snap_subject_id = map->subject_id;
     while ((region = tms_rbtree_find_overlap(map, addr, end)) != NULL) {
         tms_rbtree_remove(map, region);
     }
     spin_unlock(&map->lock);
 
-    tms_emit_event(TMS_EVENT_UNMAP, map->subject_id, pid,
+    tms_emit_event(TMS_EVENT_UNMAP, snap_subject_id, pid,
                    addr, len, 0, 0, TMS_TAG_UNKNOWN, NULL);
 }
 
@@ -569,6 +589,7 @@ void tms_on_mprotect(pid_t pid, u64 addr, u64 len, u32 prot)
     struct tms_subject_map *map;
     struct tms_region *region;
     struct rb_node *n;
+    u32 snap_subject_id;
     u64 end = addr + len;
 
     if (!g_tms.enabled || !addr || !len)
@@ -578,7 +599,18 @@ void tms_on_mprotect(pid_t pid, u64 addr, u64 len, u32 prot)
     if (!map)
         return;
 
+    /*
+     * Capture fields we need for post-unlock emit_event into locals before
+     * dropping map->lock — the region pointer itself is not stable once the
+     * lock is released (another thread's munmap handler can free it).
+     */
+    u32 alert_event = 0;
+    enum tms_region_tag alert_tag = TMS_TAG_UNKNOWN;
+    u64 alert_va = 0, alert_size = 0;
+    char alert_label[32] = {0};
+
     spin_lock(&map->lock);
+    snap_subject_id = map->subject_id;
 
     /* Walk the tree and update all overlapping regions */
     for (n = rb_first(&map->regions); n; n = rb_next(n)) {
@@ -595,34 +627,37 @@ void tms_on_mprotect(pid_t pid, u64 addr, u64 len, u32 prot)
         u32 old_prot = region->prot;
         region->prot = prot;
 
-        /* Detect suspicious protection changes */
+        /* Detect suspicious protection changes — snapshot fields, emit
+         * after releasing the lock to avoid blocking the mprotect fast path
+         * and to keep region dereferences strictly under the lock. */
         if (region->tag == TMS_TAG_TEXT && (prot & PROT_WRITE) &&
             !(old_prot & PROT_WRITE)) {
-            spin_unlock(&map->lock);
-            tms_emit_event(TMS_EVENT_W_TEXT, map->subject_id, pid,
-                           region->va_start,
-                           region->va_end - region->va_start,
-                           prot, 0, TMS_TAG_TEXT, region->label);
-            spin_lock(&map->lock);
-            /* Re-find our position since we dropped the lock */
+            alert_event = TMS_EVENT_W_TEXT;
+            alert_tag = TMS_TAG_TEXT;
+            alert_va = region->va_start;
+            alert_size = region->va_end - region->va_start;
+            strscpy(alert_label, region->label, sizeof(alert_label));
             break;
         }
 
         if (region->tag == TMS_TAG_HEAP && (prot & PROT_EXEC) &&
             !(old_prot & PROT_EXEC)) {
-            spin_unlock(&map->lock);
-            tms_emit_event(TMS_EVENT_EXEC_HEAP, map->subject_id, pid,
-                           region->va_start,
-                           region->va_end - region->va_start,
-                           prot, 0, TMS_TAG_HEAP, region->label);
-            spin_lock(&map->lock);
+            alert_event = TMS_EVENT_EXEC_HEAP;
+            alert_tag = TMS_TAG_HEAP;
+            alert_va = region->va_start;
+            alert_size = region->va_end - region->va_start;
+            strscpy(alert_label, region->label, sizeof(alert_label));
             break;
         }
     }
 
     spin_unlock(&map->lock);
 
-    tms_emit_event(TMS_EVENT_PROTECT, map->subject_id, pid,
+    if (alert_event)
+        tms_emit_event(alert_event, snap_subject_id, pid,
+                       alert_va, alert_size, prot, 0, alert_tag, alert_label);
+
+    tms_emit_event(TMS_EVENT_PROTECT, snap_subject_id, pid,
                    addr, len, prot, 0, TMS_TAG_UNKNOWN, NULL);
 }
 
@@ -714,17 +749,51 @@ int tms_scan_region(u32 subject_id, u64 va_start, u64 va_end)
     u64 addr;
     int hits = 0;
     u32 i;
+    /*
+     * Snapshot of the region found at va_start so we can filter patterns
+     * and emit events without holding map->lock across the scan.  The
+     * rbtree node itself must NOT be dereferenced after releasing the
+     * lock — a concurrent munmap handler can free it.
+     */
+    bool region_present = false;
+    enum tms_region_tag region_tag = TMS_TAG_UNKNOWN;
+    u64 region_va_start = 0;
 
     if (!g_tms.enabled)
         return -ENODEV;
+
+    /* Validate range: must be non-empty and cap scan size at 256 MiB so
+     * a malicious/broken caller can't pin a CPU for arbitrary time
+     * inside the page-by-page scan. */
+    if (va_start >= va_end)
+        return -EINVAL;
+    if (va_end - va_start > (256ULL << 20))
+        return -EINVAL;
 
     map = tms_find_map_by_subject(subject_id);
     if (!map)
         return -ENOENT;
 
+    /* Snapshot region metadata for pattern filtering, plus map->pid which
+     * can be zeroed by a concurrent tms_unregister_subject(). */
+    pid_t snap_pid;
+    spin_lock(&map->lock);
+    region = tms_rbtree_find(map, va_start);
+    if (region) {
+        region_present = true;
+        region_tag = region->tag;
+        region_va_start = region->va_start;
+    }
+    snap_pid = map->pid;
+    spin_unlock(&map->lock);
+    region = NULL;  /* do not dereference outside the lock */
+
+    if (snap_pid == 0)
+        return -ESRCH;
+
     /* Find the target task */
     rcu_read_lock();
-    task = find_task_by_vpid(map->pid);
+    task = find_task_by_vpid(snap_pid);
     if (task)
         get_task_struct(task);
     rcu_read_unlock();
@@ -736,11 +805,6 @@ int tms_scan_region(u32 subject_id, u64 va_start, u64 va_end)
     put_task_struct(task);
     if (!mm)
         return -ESRCH;
-
-    /* Find the region tag for pattern filtering */
-    spin_lock(&map->lock);
-    region = tms_rbtree_find(map, va_start);
-    spin_unlock(&map->lock);
 
     /* Scan page by page */
     for (addr = va_start & PAGE_MASK; addr < va_end; addr += PAGE_SIZE) {
@@ -774,24 +838,30 @@ int tms_scan_region(u32 subject_id, u64 va_start, u64 va_end)
             struct tms_pattern *pat = &g_tms.patterns[i];
 
             /* Filter by tag if the pattern requests it */
-            if (pat->scan_in != TMS_TAG_UNKNOWN && region &&
-                pat->scan_in != region->tag)
+            if (pat->scan_in != TMS_TAG_UNKNOWN && region_present &&
+                pat->scan_in != region_tag)
                 continue;
 
             if (tms_pattern_match(pat, kaddr + scan_offset, scan_len)) {
                 hits++;
                 spin_unlock(&g_tms.pattern_lock);
 
-                /* Update the region's hit counter */
-                if (region) {
+                /* Update the region's hit counter — re-lookup under the
+                 * lock since the original pointer is not stable across
+                 * the unlocked scan. */
+                if (region_present) {
+                    struct tms_region *r;
                     spin_lock(&map->lock);
-                    region->pattern_hits++;
+                    r = tms_rbtree_find(map, region_va_start);
+                    if (r)
+                        r->pattern_hits++;
                     spin_unlock(&map->lock);
                 }
 
-                tms_emit_event(TMS_EVENT_PATTERN, subject_id, map->pid,
+                tms_emit_event(TMS_EVENT_PATTERN, subject_id, snap_pid,
                                addr + scan_offset, scan_len, 0,
-                               pat->id, region ? region->tag : TMS_TAG_UNKNOWN,
+                               pat->id,
+                               region_present ? region_tag : TMS_TAG_UNKNOWN,
                                pat->name);
 
                 spin_lock(&g_tms.pattern_lock);
@@ -919,9 +989,9 @@ long tms_ioctl(unsigned int cmd, unsigned long arg)
     case TRUST_IOC_TMS_QUERY_MAP: {
         tms_ioc_query_map_t req;
         struct tms_subject_map *map;
-        tms_ioc_region_info_t info;
+        tms_ioc_region_info_t *snap;
         struct rb_node *n;
-        u32 count;
+        u32 count, max, i;
         u64 __user *ubuf;
 
         if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
@@ -931,35 +1001,49 @@ long tms_ioctl(unsigned int cmd, unsigned long arg)
         if (!map)
             return -ENOENT;
 
-        ubuf = (u64 __user *)req.buf;
-        count = 0;
+        max = req.max_regions;
+        if (max == 0 || max > TMS_MAX_REGIONS_PER_SUBJECT)
+            max = TMS_MAX_REGIONS_PER_SUBJECT;
 
+        /*
+         * Snapshot region metadata into a kernel buffer under map->lock,
+         * then copy_to_user outside the lock.  Iterating the rbtree while
+         * periodically releasing the lock lets a concurrent munmap free
+         * the node pointed to by `n`, causing rb_next(freed) UAF.
+         */
+        snap = kvmalloc_array(max, sizeof(*snap), GFP_KERNEL | __GFP_ZERO);
+        if (!snap)
+            return -ENOMEM;
+
+        count = 0;
         spin_lock(&map->lock);
         req.total = map->region_count;
 
-        for (n = rb_first(&map->regions); n && count < req.max_regions;
-             n = rb_next(n)) {
+        for (n = rb_first(&map->regions); n && count < max; n = rb_next(n)) {
             struct tms_region *r = rb_entry(n, struct tms_region, node);
+            tms_ioc_region_info_t *info = &snap[count];
 
-            memset(&info, 0, sizeof(info));
-            info.va_start = r->va_start;
-            info.va_end = r->va_end;
-            info.prot = r->prot;
-            info.tag = r->tag;
-            strscpy(info.label, r->label, sizeof(info.label));
-            info.load_time_ns = r->load_time_ns;
-            info.pattern_hits = r->pattern_hits;
-
-            spin_unlock(&map->lock);
-            if (copy_to_user((void __user *)ubuf +
-                             count * sizeof(tms_ioc_region_info_t),
-                             &info, sizeof(info))) {
-                return -EFAULT;
-            }
-            spin_lock(&map->lock);
+            info->va_start = r->va_start;
+            info->va_end = r->va_end;
+            info->prot = r->prot;
+            info->tag = r->tag;
+            strscpy(info->label, r->label, sizeof(info->label));
+            info->load_time_ns = r->load_time_ns;
+            info->pattern_hits = r->pattern_hits;
             count++;
         }
         spin_unlock(&map->lock);
+
+        ubuf = (u64 __user *)req.buf;
+        for (i = 0; i < count; i++) {
+            if (copy_to_user((void __user *)ubuf +
+                             i * sizeof(tms_ioc_region_info_t),
+                             &snap[i], sizeof(snap[i]))) {
+                kvfree(snap);
+                return -EFAULT;
+            }
+        }
+        kvfree(snap);
 
         req.returned = count;
         if (copy_to_user((void __user *)arg, &req, sizeof(req)))

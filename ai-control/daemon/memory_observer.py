@@ -11,6 +11,7 @@ known PE DLL stub paths.
 """
 
 import asyncio
+import collections
 import logging
 import os
 import re
@@ -266,23 +267,53 @@ def _find_pe_processes() -> list[int]:
 
     Heuristic: processes whose memory maps include PE-compat DLL stubs
     or whose exe path suggests they were loaded by the PE loader.
+
+    Fast-path via readlink(/proc/PID/exe): pe-loader processes link
+    directly to /usr/bin/peloader or similar, which avoids reading
+    /proc/PID/maps for every single PID on the system (hundreds of
+    opens and short reads on a busy box). Falls back to maps scanning
+    for non-loader PE processes (e.g. launched via binfmt_misc).
     """
     pe_pids = []
     try:
-        for entry in os.listdir("/proc"):
-            if not entry.isdigit():
-                continue
-            pid = int(entry)
+        proc_entries = os.listdir("/proc")
+    except (OSError, PermissionError):
+        return []
+
+    # First pass: cheap readlink() filter. Most idle PIDs fail here fast
+    # (no need to open /proc/PID/maps, which can be 1000+ lines).
+    maps_candidates = []
+    for entry in proc_entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            exe = os.readlink(f"/proc/{pid}/exe")
+        except (OSError, PermissionError):
+            continue
+        if "peloader" in exe or "pe-loader" in exe:
+            pe_pids.append(pid)
+            continue
+        # Only scan maps for PIDs whose exe is suspicious (e.g. .exe
+        # binfmt trampolines or unusual locations).
+        if exe.endswith(".exe") or "pe-compat" in exe:
+            pe_pids.append(pid)
+            continue
+        maps_candidates.append(pid)
+
+    # Second pass: maps content scan for remaining candidates. Skip this
+    # entirely if we've already found enough PE processes — saves a lot
+    # of I/O on systems with many idle non-PE processes.
+    if len(pe_pids) < 256:
+        for pid in maps_candidates:
             maps_path = f"/proc/{pid}/maps"
             try:
                 with open(maps_path, "r") as f:
-                    content = f.read(8192)  # Read first 8K to check quickly
-                if "pe-compat" in content or "pe_" in content or "libpe_" in content:
+                    content = f.read(8192)  # Read first 8K only
+                if "pe-compat" in content or "libpe_" in content:
                     pe_pids.append(pid)
             except (OSError, PermissionError):
                 continue
-    except (OSError, PermissionError):
-        pass
     return pe_pids
 
 
@@ -316,9 +347,10 @@ class MemoryObserver:
         # Per-process memory maps
         self._processes: dict[int, ProcessMemoryMap] = {}
 
-        # Anomaly log (ring buffer)
-        self._anomalies: list[MemoryAnomaly] = []
+        # Anomaly log (bounded ring buffer -- deque gives O(1) eviction
+        # instead of the O(n) list-slice previously used in the hot path)
         self._max_anomalies = 1000
+        self._anomalies: collections.deque = collections.deque(maxlen=self._max_anomalies)
 
         # Lifecycle
         self._running = False
@@ -387,6 +419,7 @@ class MemoryObserver:
 
         Returns True if the connection succeeded, False otherwise.
         """
+        sock = None
         try:
             import socket
             sock = socket.socket(
@@ -398,6 +431,13 @@ class MemoryObserver:
             logger.info("Connected to TMS via netlink (family=%d)", NETLINK_TMS)
             return True
         except (OSError, AttributeError, ImportError) as e:
+            # Close the socket if it was created but bind/setblocking failed,
+            # otherwise we leak an FD on every retry.
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
             logger.debug("TMS netlink unavailable: %s", e)
             return False
 
@@ -760,8 +800,6 @@ class MemoryObserver:
     def _record_anomaly(self, anomaly: MemoryAnomaly):
         """Record an anomaly, maintaining the ring buffer."""
         self._anomalies.append(anomaly)
-        if len(self._anomalies) > self._max_anomalies:
-            self._anomalies = self._anomalies[-self._max_anomalies:]
         self._stats["anomalies_detected"] += 1
         logger.warning(
             "[MEMORY ANOMALY] pid=%d severity=%s kind=%s: %s",
@@ -917,10 +955,9 @@ class MemoryObserver:
 
     async def get_memory_anomalies(self, pid: Optional[int] = None) -> list[dict]:
         """Get detected memory anomalies, optionally filtered by PID."""
-        anomalies = self._anomalies
-        if pid is not None:
-            anomalies = [a for a in anomalies if a.pid == pid]
-
+        # Single-pass filter+transform: avoid materializing an intermediate
+        # filtered list before building the output (relevant once the ring
+        # buffer grows toward _max_anomalies on long-running daemons).
         return [
             {
                 "pid": a.pid,
@@ -932,20 +969,25 @@ class MemoryObserver:
                 "va_end": f"0x{a.va_end:x}",
                 "details": a.details,
             }
-            for a in anomalies
+            for a in self._anomalies
+            if pid is None or a.pid == pid
         ]
 
     async def get_all_tracked(self) -> list[dict]:
         """Get a summary of all tracked processes."""
+        # Build per-PID anomaly counts in one pass to avoid O(N_procs * N_anoms)
+        # scans when both the process table and anomaly ring buffer are full.
+        anomalies_by_pid: dict[int, int] = {}
+        for a in self._anomalies:
+            anomalies_by_pid[a.pid] = anomalies_by_pid.get(a.pid, 0) + 1
+
         summaries = []
         for pid, pmap in sorted(self._processes.items()):
             pe_dll_count = sum(
                 1 for d in pmap.dlls_loaded
                 if d.endswith(".dll")
             )
-            anomaly_count = sum(
-                1 for a in self._anomalies if a.pid == pid
-            )
+            anomaly_count = anomalies_by_pid.get(pid, 0)
             total_mapped = sum(r.size for r in pmap.regions.values())
 
             summaries.append({

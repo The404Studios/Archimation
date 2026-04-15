@@ -247,7 +247,9 @@ typedef struct {
     PVOID context;
 } quwi_data_t;
 
-static void quwi_callback(void *Instance, void *Context, void *Work)
+/* Invoked via abi_call_win64_3 from tp_worker_thread, which requires
+ * ms_abi calling convention (args in RCX/RDX/R8, not RDI/RSI/RDX). */
+static void __attribute__((ms_abi)) quwi_callback(void *Instance, void *Context, void *Work)
 {
     (void)Instance; (void)Work;
     quwi_data_t *data = (quwi_data_t *)Context;
@@ -273,7 +275,7 @@ WINAPI_EXPORT BOOL QueueUserWorkItem(
     tp_work_item_t *item = calloc(1, sizeof(tp_work_item_t));
     if (!item) { free(data); return FALSE; }
 
-    item->callback = quwi_callback;
+    item->callback = (PTP_WORK_CALLBACK)(void *)quwi_callback;
     item->context = data;
     item->work_object = NULL;
     item->next = NULL;

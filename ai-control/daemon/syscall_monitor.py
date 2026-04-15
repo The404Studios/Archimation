@@ -161,29 +161,34 @@ class SyscallEvent:
         }
 
 
+_CATEGORY_LOG_CAP = 1024
+
+
 @dataclass
 class ProcessSyscallProfile:
     """Per-process syscall behavioral profile."""
     pid: int
     subject_id: int = 0
-    events: list = field(default_factory=list)
+    events: collections.deque = field(
+        default_factory=lambda: collections.deque(maxlen=MAX_TRACE_ENTRIES))
     stats: dict = field(default_factory=lambda: collections.defaultdict(int))
-    ioctl_log: list = field(default_factory=list)
-    file_access_log: list = field(default_factory=list)
-    network_log: list = field(default_factory=list)
+    ioctl_log: collections.deque = field(
+        default_factory=lambda: collections.deque(maxlen=_CATEGORY_LOG_CAP))
+    file_access_log: collections.deque = field(
+        default_factory=lambda: collections.deque(maxlen=_CATEGORY_LOG_CAP))
+    network_log: collections.deque = field(
+        default_factory=lambda: collections.deque(maxlen=_CATEGORY_LOG_CAP))
     last_event_time: float = 0.0
     start_time: float = field(default_factory=time.time)
 
     def add_event(self, event: SyscallEvent) -> None:
         """Add a syscall event to this profile."""
         self.events.append(event)
-        if len(self.events) > MAX_TRACE_ENTRIES:
-            self.events = self.events[-MAX_TRACE_ENTRIES:]
 
         self.stats[event.syscall_nr] += 1
         self.last_event_time = event.timestamp
 
-        # Categorize into specialized logs
+        # Categorize into specialized logs (bounded deques auto-evict)
         if event.syscall_nr == 16:  # ioctl
             self.ioctl_log.append({
                 "timestamp": event.timestamp,
@@ -193,8 +198,6 @@ class ProcessSyscallProfile:
                 "arg": event.arg2,
                 "return_value": event.return_value,
             })
-            if len(self.ioctl_log) > 1024:
-                self.ioctl_log = self.ioctl_log[-1024:]
 
         elif event.category == "file_io":
             entry = {
@@ -211,8 +214,6 @@ class ProcessSyscallProfile:
                 entry["size"] = event.arg2
 
             self.file_access_log.append(entry)
-            if len(self.file_access_log) > 1024:
-                self.file_access_log = self.file_access_log[-1024:]
 
         elif event.category == "network":
             entry = {
@@ -237,8 +238,6 @@ class ProcessSyscallProfile:
                 entry["size"] = event.arg2
 
             self.network_log.append(entry)
-            if len(self.network_log) > 1024:
-                self.network_log = self.network_log[-1024:]
 
     def get_behavioral_summary(self) -> dict:
         """Produce a behavioral summary for the cortex decision engine."""
@@ -386,6 +385,7 @@ class SyscallMonitor:
 
     def _try_kernel_mode(self) -> bool:
         """Try to open a netlink socket to the TSC kernel module."""
+        sock = None
         try:
             sock = socket.socket(
                 socket.AF_NETLINK, socket.SOCK_DGRAM, NETLINK_TSC
@@ -395,6 +395,13 @@ class SyscallMonitor:
             self._nl_sock = sock
             return True
         except (OSError, PermissionError) as e:
+            # Close the socket if bind/setblocking failed so we don't leak
+            # an FD on every retry over the daemon's uptime.
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
             logger.debug("Kernel netlink unavailable: %s (falling back to simulation)", e)
             return False
 
@@ -403,6 +410,8 @@ class SyscallMonitor:
     async def _kernel_event_loop(self) -> None:
         """Read syscall events from kernel via netlink."""
         loop = asyncio.get_event_loop()
+        last_evict = time.monotonic()
+        evict_interval = max(self._poll_interval, 5.0)
 
         while self._running:
             try:
@@ -419,8 +428,11 @@ class SyscallMonitor:
                 logger.error("Netlink receive error: %s", e)
                 await asyncio.sleep(1.0)
 
-            # Periodic cleanup
-            self._evict_stale_processes()
+            # Throttled cleanup (avoid O(N) walk on every packet)
+            now = time.monotonic()
+            if now - last_evict >= evict_interval:
+                self._evict_stale_processes()
+                last_evict = now
 
     def _parse_netlink_events(self, data: bytes) -> None:
         """Parse raw netlink messages containing TSC events."""
@@ -498,10 +510,14 @@ class SyscallMonitor:
 
     async def _poll_pe_processes(self) -> None:
         """Find PE processes and poll their current syscall state."""
-        # Look for processes running PE binaries (pe-loader as parent or
-        # /proc/PID/exe pointing to a PE binary)
+        # Offload the blocking /proc walk to an executor to avoid stalling
+        # the event loop for the (potentially hundreds of) filesystem calls.
+        loop = asyncio.get_event_loop()
         try:
-            pids = [int(d) for d in os.listdir("/proc") if d.isdigit()]
+            pids = await loop.run_in_executor(
+                None,
+                lambda: [int(d) for d in os.listdir("/proc") if d.isdigit()],
+            )
         except OSError:
             return
 
@@ -576,15 +592,19 @@ class SyscallMonitor:
     # --- Profile management ---
 
     def _get_or_create_profile(self, pid: int, subject_id: int) -> ProcessSyscallProfile:
-        """Get or create a profile for a PID."""
+        """Get or create a profile for a PID.
+
+        Uses dict-insertion-order as an LRU proxy for O(1) eviction
+        (previously min() scanned every profile — O(n) per create, which
+        matters under syscall-heavy workloads where new PIDs appear often).
+        """
         if pid not in self._profiles:
             if len(self._profiles) >= self._max_processes:
-                # Evict oldest
-                oldest_pid = min(
-                    self._profiles,
-                    key=lambda p: self._profiles[p].last_event_time
-                )
-                del self._profiles[oldest_pid]
+                try:
+                    oldest_pid = next(iter(self._profiles))
+                    del self._profiles[oldest_pid]
+                except StopIteration:
+                    pass
 
             self._profiles[pid] = ProcessSyscallProfile(
                 pid=pid,
@@ -597,13 +617,20 @@ class SyscallMonitor:
         return profile
 
     def _evict_stale_processes(self) -> None:
-        """Remove profiles for processes that haven't had events recently."""
+        """Remove profiles for processes that haven't had events recently.
+
+        Uses start_time as a fallback when last_event_time is still 0 so that
+        profiles created via start_tracking() but which never receive events
+        don't accumulate forever for dead PIDs.
+        """
         now = time.time()
-        stale = [
-            pid for pid, profile in self._profiles.items()
-            if now - profile.last_event_time > self._process_ttl
-            and profile.last_event_time > 0
-        ]
+        stale = []
+        for pid, profile in self._profiles.items():
+            ref_time = profile.last_event_time or profile.start_time
+            if now - ref_time > self._process_ttl:
+                stale.append(pid)
+            elif not os.path.exists(f"/proc/{pid}"):
+                stale.append(pid)
         for pid in stale:
             del self._profiles[pid]
 
@@ -614,7 +641,12 @@ class SyscallMonitor:
         profile = self._profiles.get(pid)
         if profile is None:
             return None
-        events = profile.events[-limit:]
+        # deque doesn't support slice; get last `limit` via list+islice
+        total = len(profile.events)
+        if limit >= total:
+            return [ev.to_dict() for ev in profile.events]
+        import itertools
+        events = itertools.islice(profile.events, total - limit, total)
         return [ev.to_dict() for ev in events]
 
     async def get_stats(self, pid: int) -> Optional[dict]:
@@ -648,21 +680,21 @@ class SyscallMonitor:
         profile = self._profiles.get(pid)
         if profile is None:
             return None
-        return profile.ioctl_log
+        return list(profile.ioctl_log)
 
     async def get_file_access(self, pid: int) -> Optional[list[dict]]:
         """Get file access log for a PID."""
         profile = self._profiles.get(pid)
         if profile is None:
             return None
-        return profile.file_access_log
+        return list(profile.file_access_log)
 
     async def get_network_activity(self, pid: int) -> Optional[list[dict]]:
         """Get network activity log for a PID."""
         profile = self._profiles.get(pid)
         if profile is None:
             return None
-        return profile.network_log
+        return list(profile.network_log)
 
     async def get_behavioral_summary(self, pid: int) -> Optional[dict]:
         """Get behavioral classification for the cortex decision engine."""

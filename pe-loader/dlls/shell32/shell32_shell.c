@@ -9,9 +9,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #include "common/dll_common.h"
+#include "compat/trust_gate.h"
 
 /* CSIDL folder IDs */
 #define CSIDL_DESKTOP           0x0000
@@ -155,14 +158,19 @@ WINAPI_EXPORT HRESULT SHGetFolderPathW(
     HWND hwnd, int csidl, HANDLE hToken,
     DWORD dwFlags, LPWSTR pszPath)
 {
+    if (!pszPath) return E_INVALIDARG;
     char narrow[MAX_PATH];
     HRESULT hr = SHGetFolderPathA(hwnd, csidl, hToken, dwFlags, narrow);
     if (hr != S_OK) return hr;
 
-    /* Convert narrow to wide */
-    for (int i = 0; narrow[i] && i < MAX_PATH - 1; i++)
+    /* Convert narrow to wide. Session 30: old code wrote the terminator at
+     * strlen(narrow) even when the narrow string was longer than MAX_PATH-1
+     * (impossible today, but defensive), potentially walking past the caller's
+     * MAX_PATH-sized buffer. Cap at i and write NUL there. */
+    int i;
+    for (i = 0; i < MAX_PATH - 1 && narrow[i]; i++)
         pszPath[i] = (WCHAR)(unsigned char)narrow[i];
-    pszPath[strlen(narrow)] = 0;
+    pszPath[i] = 0;
     return S_OK;
 }
 
@@ -190,12 +198,14 @@ WINAPI_EXPORT HRESULT SHGetKnownFolderPath(
     (void)dwFlags;
     (void)hToken;
 
+    if (!ppszPath) return E_INVALIDARG;
+
     /* Default to user profile */
     const char *home = get_home();
     size_t len = strlen(home);
 
     WCHAR *path = malloc((len + 1) * sizeof(WCHAR));
-    if (!path) return E_FAIL;
+    if (!path) { *ppszPath = NULL; return E_FAIL; }
 
     for (size_t i = 0; i < len; i++)
         path[i] = (WCHAR)(unsigned char)home[i];
@@ -220,21 +230,41 @@ WINAPI_EXPORT HINSTANCE ShellExecuteA(
     if (!lpFile)
         return (HINSTANCE)(intptr_t)SE_ERR_FNF;
 
-    /* Try to open with xdg-open (files/URLs) or execute directly */
+    /* Session 30: ShellExecute forks a child and execs arbitrary binaries —
+     * this is a process-create gate on Windows (LUA elevation prompt, etc.).
+     * Trust kernel must approve, otherwise an untrusted PE could escape
+     * through ShellExecute("cmd.exe", ...) or rundll32 to spawn arbitrary
+     * processes. SE_ERR_ACCESSDENIED is the canonical Windows error value
+     * for blocked execution. */
+    TRUST_CHECK_RET(TRUST_GATE_PROCESS_CREATE, "ShellExecuteA",
+                    (HINSTANCE)(intptr_t)5 /* SE_ERR_ACCESSDENIED */);
+
+    /* Try to open with xdg-open (files/URLs) or execute directly.
+     * Use double-fork so the grandchild is reparented to init and
+     * automatically reaped; avoids zombie leak since we never waitpid. */
     pid_t pid = fork();
     if (pid == 0) {
-        if (lpDirectory)
-            if (chdir(lpDirectory) < 0) { /* ignore */ }
+        pid_t pid2 = fork();
+        if (pid2 == 0) {
+            if (lpDirectory)
+                if (chdir(lpDirectory) < 0) { /* ignore */ }
 
-        if (lpParameters && lpParameters[0]) {
-            /* Execute directly without shell to prevent command injection.
-             * lpParameters is passed as a single argument; callers that need
-             * word-splitting should tokenize before calling ShellExecuteA. */
-            execlp(lpFile, lpFile, lpParameters, NULL);
-        } else {
-            execlp("xdg-open", "xdg-open", lpFile, NULL);
+            if (lpParameters && lpParameters[0]) {
+                /* Execute directly without shell to prevent command injection.
+                 * lpParameters is passed as a single argument; callers that need
+                 * word-splitting should tokenize before calling ShellExecuteA. */
+                execlp(lpFile, lpFile, lpParameters, NULL);
+            } else {
+                execlp("xdg-open", "xdg-open", lpFile, NULL);
+            }
+            _exit(1);
         }
-        _exit(1);
+        _exit(0);
+    }
+    if (pid > 0) {
+        int status;
+        (void)waitpid(pid, &status, 0); /* Reap intermediate child */
+        (void)status;
     }
 
     return (HINSTANCE)(intptr_t)42; /* > 32 = success */
@@ -493,4 +523,232 @@ WINAPI_EXPORT int SHFileOperationW(SHFILEOPSTRUCTW *lpFileOp)
     if (!lpFileOp) return 1;
     lpFileOp->fAnyOperationsAborted = FALSE;
     return 0;
+}
+
+/* ==========================================================================
+ * IShellItem / SH* / IL* family — simple stubs
+ *
+ * Most of these return E_NOTIMPL; apps handle that by falling back to
+ * legacy APIs (CSIDL, ShellExecute, plain paths). A few (SHGetStockIconInfo,
+ * SHCreateDirectoryExW, SHAddToRecentDocs) give a "success with defaults"
+ * answer since apps often ignore icons/recent-docs without ever branching.
+ * ==========================================================================
+ */
+
+/* HRESULT constants local to shell32 */
+#ifndef E_NOTIMPL
+#define E_NOTIMPL   ((HRESULT)0x80004001)
+#endif
+
+/* Win32 error codes used by SHCreateDirectoryEx* */
+#ifndef ERROR_SUCCESS
+#define ERROR_SUCCESS                0
+#endif
+#ifndef ERROR_PATH_NOT_FOUND
+#define ERROR_PATH_NOT_FOUND         3
+#endif
+#ifndef ERROR_ALREADY_EXISTS
+#define ERROR_ALREADY_EXISTS         183
+#endif
+#ifndef ERROR_BAD_PATHNAME
+#define ERROR_BAD_PATHNAME           161
+#endif
+
+/* Opaque types */
+typedef void IBindCtx;
+typedef void IShellFolder;
+typedef void IShellItem;
+typedef void IMalloc;
+typedef void IUnknown;
+typedef GUID *REFIID;
+typedef struct _ITEMIDLIST ITEMIDLIST;
+typedef ITEMIDLIST *PIDLIST_ABSOLUTE;
+typedef ITEMIDLIST *PIDLIST_RELATIVE;
+typedef const ITEMIDLIST *PCIDLIST_ABSOLUTE;
+typedef const ITEMIDLIST *PCUIDLIST_RELATIVE;
+typedef const ITEMIDLIST *PCUITEMID_CHILD;
+typedef ULONG SFGAOF;
+
+/* SHSTOCKICONINFO: exact 0x10C byte layout */
+typedef int SHSTOCKICONID;
+typedef struct _SHSTOCKICONINFO {
+    DWORD  cbSize;
+    HICON  hIcon;
+    int    iSysImageIndex;
+    int    iIcon;
+    WCHAR  szPath[MAX_PATH];
+} SHSTOCKICONINFO;
+
+/* ---- SH* family ---- */
+
+WINAPI_EXPORT HRESULT SHCreateItemFromParsingName(
+    const uint16_t *path, IBindCtx *ctx, REFIID iid, void **item)
+{
+    (void)path; (void)ctx; (void)iid;
+    if (item) *item = NULL;
+    return E_NOTIMPL;
+}
+
+WINAPI_EXPORT HRESULT SHParseDisplayName(
+    const uint16_t *name, IBindCtx *ctx,
+    PIDLIST_ABSOLUTE *pidl, SFGAOF attrs, SFGAOF *out_attrs)
+{
+    (void)name; (void)ctx; (void)attrs;
+    if (pidl) *pidl = NULL;
+    if (out_attrs) *out_attrs = 0;
+    return E_FAIL;
+}
+
+WINAPI_EXPORT HRESULT SHGetDesktopFolder(IShellFolder **ppshf)
+{
+    if (ppshf) *ppshf = NULL;
+    return E_NOTIMPL;
+}
+
+WINAPI_EXPORT HRESULT SHGetStockIconInfo(
+    SHSTOCKICONID id, UINT flags, SHSTOCKICONINFO *info)
+{
+    (void)id; (void)flags;
+    /* Zero-fill so callers reading hIcon/szPath see a benign default.
+     * Preserve cbSize so size-validating callers don't reject the struct. */
+    if (!info) return E_INVALIDARG;
+    DWORD saved_size = info->cbSize;
+    memset(info, 0, sizeof(*info));
+    info->cbSize = saved_size ? saved_size : (DWORD)sizeof(*info);
+    return S_OK;
+}
+
+WINAPI_EXPORT HRESULT SHGetImageList(int id, REFIID iid, void **pp)
+{
+    (void)id; (void)iid;
+    if (pp) *pp = NULL;
+    return E_NOTIMPL;
+}
+
+WINAPI_EXPORT void SHAddToRecentDocs(UINT flags, LPCVOID data)
+{
+    (void)flags; (void)data;
+    /* No-op: we don't track a Recent Documents list. */
+}
+
+WINAPI_EXPORT HRESULT SHCreateShellItem(
+    PCIDLIST_ABSOLUTE parent, IShellFolder *sf,
+    PCUITEMID_CHILD child, IShellItem **ppsi)
+{
+    (void)parent; (void)sf; (void)child;
+    if (ppsi) *ppsi = NULL;
+    return E_NOTIMPL;
+}
+
+WINAPI_EXPORT HRESULT SHGetMalloc(IMalloc **ppm)
+{
+    if (ppm) *ppm = NULL;
+    return E_NOTIMPL;
+}
+
+WINAPI_EXPORT HRESULT SHGetIDListFromObject(IUnknown *punk, PIDLIST_ABSOLUTE *ppidl)
+{
+    (void)punk;
+    if (ppidl) *ppidl = NULL;
+    return E_NOTIMPL;
+}
+
+WINAPI_EXPORT HRESULT SHGetInstanceExplorer(IUnknown **ppunk)
+{
+    if (ppunk) *ppunk = NULL;
+    return E_NOTIMPL;
+}
+
+/* SHCreateDirectoryExW:
+ *  mkdir -p on the wide path. Maps Linux errno to Win32 error codes
+ *  returned as HRESULT-ish int values (matches native behavior —
+ *  SHCreateDirectoryEx returns Win32 error codes, not HRESULTs).
+ *  A narrow SHCreateDirectoryExA already exists above; leave it alone.
+ */
+WINAPI_EXPORT HRESULT SHCreateDirectoryExW(HWND hwnd, const uint16_t *pszPath, void *psa)
+{
+    (void)hwnd; (void)psa;
+
+    if (!pszPath) return (HRESULT)ERROR_BAD_PATHNAME;
+
+    char narrow[4096];
+    wide_to_narrow_safe(pszPath, narrow, (int)sizeof(narrow));
+    if (!narrow[0]) return (HRESULT)ERROR_BAD_PATHNAME;
+
+    char linux_path[4096];
+    win_path_to_linux(narrow, linux_path, sizeof(linux_path));
+
+    /* Create recursively. Track whether any stage existed already. */
+    char tmp[4096];
+    strncpy(tmp, linux_path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    int any_existed = 0;
+    int any_failed = 0;
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, 0755) < 0) {
+                if (errno == EEXIST) any_existed = 1;
+                else if (errno == ENOENT) any_failed = 1;
+            }
+            *p = '/';
+        }
+    }
+    int rc = mkdir(tmp, 0755);
+    if (rc < 0 && errno == EEXIST)  return (HRESULT)ERROR_ALREADY_EXISTS;
+    if (rc < 0 && errno == ENOENT)  return (HRESULT)ERROR_PATH_NOT_FOUND;
+    if (rc < 0 && any_failed)       return (HRESULT)ERROR_PATH_NOT_FOUND;
+    (void)any_existed;
+    return (HRESULT)ERROR_SUCCESS;
+}
+
+/* ---- IL* PIDL family ----
+ *
+ * We don't actually synthesize PIDLs (they're opaque shell-side tokens with
+ * no Linux analogue). Creators return NULL so callers fall back to path-based
+ * APIs. ILFree frees what ILClone allocated; ILClone uses the ITEMIDLIST
+ * self-describing length (first 2 bytes of each SHITEMID is cb; list ends
+ * with a 2-byte zero cb) to memdup a caller-provided PIDL safely.
+ */
+
+WINAPI_EXPORT PIDLIST_ABSOLUTE ILCreateFromPathA(LPCSTR path)
+{
+    (void)path;
+    return NULL;
+}
+
+WINAPI_EXPORT PIDLIST_ABSOLUTE ILCreateFromPathW(const uint16_t *path)
+{
+    (void)path;
+    return NULL;
+}
+
+WINAPI_EXPORT void ILFree(PIDLIST_RELATIVE pidl)
+{
+    if (pidl) free(pidl);
+}
+
+WINAPI_EXPORT PIDLIST_RELATIVE ILClone(PCUIDLIST_RELATIVE pidl)
+{
+    if (!pidl) return NULL;
+
+    /* Walk the ITEMIDLIST: each SHITEMID starts with a 2-byte cb (total
+     * size of that element including the cb field). A terminator has cb=0.
+     * Total length = sum(cb) + 2 for the terminator. Cap at 64KB to bound
+     * pathological inputs. */
+    const unsigned char *p = (const unsigned char *)pidl;
+    size_t total = 0;
+    while (total < 65534) {
+        unsigned short cb = (unsigned short)(p[total] | (p[total + 1] << 8));
+        if (cb == 0) { total += 2; break; }
+        if (cb < 2) return NULL; /* malformed */
+        total += cb;
+    }
+    if (total == 0 || total > 65536) return NULL;
+
+    void *copy = malloc(total);
+    if (!copy) return NULL;
+    memcpy(copy, pidl, total);
+    return (PIDLIST_RELATIVE)copy;
 }

@@ -25,42 +25,52 @@
 #include "../include/trust_types.h"
 #include "trust_internal.h"
 
-/* Metabolic cost table — base cost per action type */
-static const trust_metabolic_cost_t g_cost_table[] = {
-	{ TRUST_ACTION_FILE_OPEN,        TRUST_COST_FILE_READ },
-	{ TRUST_ACTION_FILE_WRITE,       TRUST_COST_FILE_WRITE },
-	{ TRUST_ACTION_NET_CONNECT,      TRUST_COST_NET_CONNECT },
-	{ TRUST_ACTION_NET_LISTEN,       TRUST_COST_NET_LISTEN },
-	{ TRUST_ACTION_PROCESS_CREATE,   TRUST_COST_PROCESS_CREATE },
-	{ TRUST_ACTION_PROCESS_SIGNAL,   TRUST_COST_PROCESS_SIGNAL },
-	{ TRUST_ACTION_REGISTRY_READ,    1 },
-	{ TRUST_ACTION_REGISTRY_WRITE,   2 },
-	{ TRUST_ACTION_DEVICE_OPEN,      TRUST_COST_DEVICE_ACCESS },
-	{ TRUST_ACTION_SERVICE_START,    TRUST_COST_PROCESS_CREATE },
-	{ TRUST_ACTION_SERVICE_STOP,     TRUST_COST_PROCESS_SIGNAL },
-	{ TRUST_ACTION_FIREWALL_CHANGE,  TRUST_COST_FIREWALL_MODIFY },
-	{ TRUST_ACTION_TRUST_CHANGE,     TRUST_COST_TRUST_MODIFY },
-	{ TRUST_ACTION_ESCALATE,         TRUST_COST_ESCALATE },
-	{ TRUST_ACTION_DOMAIN_TRANSFER,  TRUST_COST_DOMAIN_TRANSFER },
-	{ TRUST_ACTION_MITOTIC_DIVIDE,   TRUST_COST_PROCESS_CREATE * 2 },
-	{ TRUST_ACTION_MEIOTIC_COMBINE,  TRUST_COST_PROCESS_CREATE },
+/*
+ * Metabolic cost table, indexed directly by TRUST_ACTION_* (densely
+ * numbered 1..TRUST_ACTION_MAX-1).  Replaces the previous linear scan
+ * of a {action, cost} pair array.  This turns a 17-iteration loop on
+ * the hot path (every trust_risc_record_action call) into a one-load
+ * bounds check + one-load cost fetch — O(1) with a predictable cache
+ * footprint on both old and new hardware.
+ *
+ * Zero entries indicate "use default 1 token" for actions without a
+ * dedicated cost constant.  __read_mostly hint lets the linker park
+ * the table in the read-mostly cacheline cluster — important on old
+ * HW with tiny L1 where write traffic would otherwise evict it.
+ */
+static const u32 g_action_cost[TRUST_ACTION_MAX] __read_mostly = {
+	[TRUST_ACTION_FILE_OPEN]         = TRUST_COST_FILE_READ,
+	[TRUST_ACTION_FILE_WRITE]        = TRUST_COST_FILE_WRITE,
+	[TRUST_ACTION_NET_CONNECT]       = TRUST_COST_NET_CONNECT,
+	[TRUST_ACTION_NET_LISTEN]        = TRUST_COST_NET_LISTEN,
+	[TRUST_ACTION_PROCESS_CREATE]    = TRUST_COST_PROCESS_CREATE,
+	[TRUST_ACTION_PROCESS_SIGNAL]    = TRUST_COST_PROCESS_SIGNAL,
+	[TRUST_ACTION_REGISTRY_READ]     = 1,
+	[TRUST_ACTION_REGISTRY_WRITE]    = 2,
+	[TRUST_ACTION_DEVICE_OPEN]       = TRUST_COST_DEVICE_ACCESS,
+	[TRUST_ACTION_SERVICE_START]     = TRUST_COST_PROCESS_CREATE,
+	[TRUST_ACTION_SERVICE_STOP]      = TRUST_COST_PROCESS_SIGNAL,
+	[TRUST_ACTION_FIREWALL_CHANGE]   = TRUST_COST_FIREWALL_MODIFY,
+	[TRUST_ACTION_TRUST_CHANGE]      = TRUST_COST_TRUST_MODIFY,
+	[TRUST_ACTION_ESCALATE]          = TRUST_COST_ESCALATE,
+	[TRUST_ACTION_DOMAIN_TRANSFER]   = TRUST_COST_DOMAIN_TRANSFER,
+	[TRUST_ACTION_MITOTIC_DIVIDE]    = TRUST_COST_PROCESS_CREATE * 2,
+	[TRUST_ACTION_MEIOTIC_COMBINE]   = TRUST_COST_PROCESS_CREATE,
 };
-
-#define COST_TABLE_SIZE (sizeof(g_cost_table) / sizeof(g_cost_table[0]))
 
 /*
  * Get the metabolic cost for an action type.
+ * O(1) direct-indexed lookup with bounds check.
  */
 u32 trust_token_cost_for_action(u32 action_type)
 {
-	int i;
+	u32 cost;
 
-	for (i = 0; i < (int)COST_TABLE_SIZE; i++) {
-		if (g_cost_table[i].action_type == action_type)
-			return g_cost_table[i].base_cost;
-	}
+	if (unlikely(action_type >= TRUST_ACTION_MAX))
+		return 1;
 
-	return 1; /* Default: 1 token for unknown actions */
+	cost = g_action_cost[action_type];
+	return cost ? cost : 1; /* Default: 1 token for unseeded entries */
 }
 
 /*
@@ -151,11 +161,14 @@ void trust_token_regenerate(trust_token_state_t *tokens)
 		return;
 
 	if (tokens->balance < tokens->max_balance) {
+		int32_t prev = tokens->balance;
 		int32_t regen = (int32_t)tokens->regen_rate;
 		tokens->balance += regen;
 		if (tokens->balance > tokens->max_balance)
 			tokens->balance = tokens->max_balance;
-		tokens->total_regenerated += (u32)regen;
+		/* Credit only what was actually added (post-clamp), not unclamped rate */
+		if (tokens->balance > prev)
+			tokens->total_regenerated += (u32)(tokens->balance - prev);
 	}
 
 	if (tokens->balance > 0)

@@ -192,10 +192,17 @@ WINAPI_EXPORT int _wcsicmp(const uint16_t *s1, const uint16_t *s2)
 
 WINAPI_EXPORT int _wcsnicmp(const uint16_t *s1, const uint16_t *s2, size_t count)
 {
-    for (size_t i = 0; i < count && *s1 && *s2; i++, s1++, s2++) {
-        uint16_t c1 = (*s1 >= 'A' && *s1 <= 'Z') ? *s1 + 32 : *s1;
-        uint16_t c2 = (*s2 >= 'A' && *s2 <= 'Z') ? *s2 + 32 : *s2;
+    /* Correctness fix: the original loop terminated as soon as EITHER string
+     * hit a NUL, but then returned 0. That meant _wcsnicmp("ab", "abcd", 4)
+     * wrongly returned 0 instead of the expected negative diff. Real Windows
+     * compares all `count` chars and returns the signed char difference at
+     * the first mismatch; a NUL in one string is just a char with value 0. */
+    for (size_t i = 0; i < count; i++) {
+        uint16_t a = s1[i], b = s2[i];
+        uint16_t c1 = (a >= 'A' && a <= 'Z') ? a + 32 : a;
+        uint16_t c2 = (b >= 'A' && b <= 'Z') ? b + 32 : b;
         if (c1 != c2) return (int)c1 - (int)c2;
+        if (a == 0) return 0; /* both equal AND both NUL → same string */
     }
     return 0;
 }
@@ -389,9 +396,14 @@ WINAPI_EXPORT int64_t _wtoi64(const uint16_t *str)
     return strtoll(buf, NULL, 10);
 }
 
-/* Helper: convert uint16_t string to narrow char */
+/* Helper: convert uint16_t string to narrow char.
+ * Safety: guard against bufsz==0 (the prior "bufsz - 1" underflowed to
+ * SIZE_MAX, allowing an unbounded write when callers passed 0) and
+ * NULL input (prior version would deref ws[0] and crash). */
 static size_t wcs_to_narrow(const uint16_t *ws, char *buf, size_t bufsz)
 {
+    if (!buf || bufsz == 0) return 0;
+    if (!ws) { buf[0] = '\0'; return 0; }
     size_t i = 0;
     while (ws[i] && i < bufsz - 1) { buf[i] = (char)ws[i]; i++; }
     buf[i] = '\0';
@@ -477,8 +489,17 @@ WINAPI_EXPORT int _snprintf_s(char *buffer, size_t sizeOfBuffer, size_t count,
 {
     __builtin_ms_va_list args;
     __builtin_ms_va_start(args, format);
+    /* Treat sizeOfBuffer==0 or buffer==NULL as "measure only" by passing
+     * NULL buffer to ms_abi_vformat; otherwise the engine would underflow
+     * bufsz-1 when writing.  MS returns -1 in this mode on real truncation
+     * but _snprintf_s (unlike _snprintf) writes nothing when buffer is 0. */
     size_t max = count < sizeOfBuffer ? count : sizeOfBuffer;
-    int ret = ms_abi_vformat(NULL, buffer, max, format, args);
+    int ret;
+    if (!buffer || max == 0) {
+        ret = ms_abi_vformat(NULL, NULL, 0, format, args);
+    } else {
+        ret = ms_abi_vformat(NULL, buffer, max, format, args);
+    }
     __builtin_ms_va_end(args);
     return ret;
 }
@@ -523,13 +544,17 @@ WINAPI_EXPORT int _snwprintf_s(uint16_t *buffer, size_t sizeOfBuffer, size_t cou
 WINAPI_EXPORT int _vsnwprintf(uint16_t *buffer, size_t count, const uint16_t *format, __builtin_ms_va_list argptr)
 {
     /* Convert wide format to narrow, format, then convert result back to wide */
+    if (!format) return -1;
     char narrow_fmt[2048] = {0};
-    for (int i = 0; format && format[i] && i < 2047; i++)
+    for (int i = 0; format[i] && i < 2047; i++)
         narrow_fmt[i] = (char)(format[i] < 128 ? format[i] : '?');
     char narrow_out[4096] = {0};
     int len = ms_abi_vformat(NULL, narrow_out, sizeof(narrow_out), narrow_fmt, argptr);
+    if (len < 0) return -1;
     if (buffer && count > 0) {
-        size_t copy = ((size_t)len < count - 1) ? (size_t)len : count - 1;
+        /* count==1 means only space for the NUL; copy zero chars. */
+        size_t max_out = count - 1;
+        size_t copy = ((size_t)len < max_out) ? (size_t)len : max_out;
         for (size_t i = 0; i < copy; i++)
             buffer[i] = (uint16_t)(unsigned char)narrow_out[i];
         buffer[copy] = 0;
@@ -540,13 +565,15 @@ WINAPI_EXPORT int _vsnwprintf(uint16_t *buffer, size_t count, const uint16_t *fo
 WINAPI_EXPORT int _vsnwprintf_s(uint16_t *buffer, size_t sizeOfBuffer, size_t count,
                                  const uint16_t *format, __builtin_ms_va_list argptr)
 {
-    (void)count;
-    return _vsnwprintf(buffer, sizeOfBuffer, format, argptr);
+    /* MS docs: buffer limited to min(sizeOfBuffer, count) wide chars. */
+    size_t max = count < sizeOfBuffer ? count : sizeOfBuffer;
+    return _vsnwprintf(buffer, max, format, argptr);
 }
 
 WINAPI_EXPORT int _vscwprintf(const uint16_t *format, __builtin_ms_va_list argptr)
 {
     /* Convert wide format to narrow, compute length via ms_abi_vformat */
+    if (!format) return -1;
     char narrow_fmt[2048] = {0};
     for (int i = 0; format[i] && i < 2047; i++)
         narrow_fmt[i] = (char)(format[i] < 128 ? format[i] : '?');
@@ -557,13 +584,20 @@ WINAPI_EXPORT int sprintf_s(char *buffer, size_t sizeOfBuffer, const char *forma
 {
     __builtin_ms_va_list args;
     __builtin_ms_va_start(args, format);
-    int ret = ms_abi_vformat(NULL, buffer, sizeOfBuffer, format, args);
+    int ret;
+    /* Guard against bufsz==0 underflow in the ms_abi_vformat engine. */
+    if (!buffer || sizeOfBuffer == 0)
+        ret = ms_abi_vformat(NULL, NULL, 0, format, args);
+    else
+        ret = ms_abi_vformat(NULL, buffer, sizeOfBuffer, format, args);
     __builtin_ms_va_end(args);
     return ret;
 }
 
 WINAPI_EXPORT int vsprintf_s(char *buffer, size_t sizeOfBuffer, const char *format, __builtin_ms_va_list argptr)
 {
+    if (!buffer || sizeOfBuffer == 0)
+        return ms_abi_vformat(NULL, NULL, 0, format, argptr);
     return ms_abi_vformat(NULL, buffer, sizeOfBuffer, format, argptr);
 }
 
@@ -587,7 +621,12 @@ WINAPI_EXPORT int _scprintf(const char *format, ...)
 
 /* ========== Wide File I/O ========== */
 
-/* Helper: convert UTF-16 to UTF-8 */
+/* Helper: convert UTF-16 to UTF-8.
+ * Correctness: handles surrogate pairs (non-BMP codepoints), which the
+ * prior version silently truncated to 3-byte encodings of the high
+ * surrogate — producing malformed UTF-8 rejected by glibc opendir()
+ * and most games' save-path logic when users have emoji/rare-script
+ * characters in their profile path. */
 static char *wchar_to_utf8(const uint16_t *wstr)
 {
     if (!wstr) return NULL;
@@ -598,14 +637,35 @@ static char *wchar_to_utf8(const uint16_t *wstr)
     size_t pos = 0;
     for (size_t i = 0; i < len; i++) {
         uint32_t c = wstr[i];
-        if (c < 0x80) buf[pos++] = (char)c;
-        else if (c < 0x800) {
-            buf[pos++] = 0xC0 | (c >> 6);
-            buf[pos++] = 0x80 | (c & 0x3F);
+
+        /* Surrogate pair decoding */
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < len) {
+            uint32_t lo = wstr[i + 1];
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                c = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00);
+                i++;
+            } else {
+                c = 0xFFFD; /* lone high surrogate */
+            }
+        } else if (c >= 0xDC00 && c <= 0xDFFF) {
+            c = 0xFFFD; /* stray low surrogate */
+        }
+
+        if (c < 0x80) {
+            buf[pos++] = (char)c;
+        } else if (c < 0x800) {
+            buf[pos++] = (char)(0xC0 | (c >> 6));
+            buf[pos++] = (char)(0x80 | (c & 0x3F));
+        } else if (c < 0x10000) {
+            buf[pos++] = (char)(0xE0 | (c >> 12));
+            buf[pos++] = (char)(0x80 | ((c >> 6) & 0x3F));
+            buf[pos++] = (char)(0x80 | (c & 0x3F));
         } else {
-            buf[pos++] = 0xE0 | (c >> 12);
-            buf[pos++] = 0x80 | ((c >> 6) & 0x3F);
-            buf[pos++] = 0x80 | (c & 0x3F);
+            /* 4-byte UTF-8 for U+10000..U+10FFFF */
+            buf[pos++] = (char)(0xF0 | (c >> 18));
+            buf[pos++] = (char)(0x80 | ((c >> 12) & 0x3F));
+            buf[pos++] = (char)(0x80 | ((c >> 6) & 0x3F));
+            buf[pos++] = (char)(0x80 | (c & 0x3F));
         }
     }
     buf[pos] = '\0';
@@ -712,11 +772,16 @@ WINAPI_EXPORT int _wunlink(const uint16_t *filename)
 WINAPI_EXPORT char *_fullpath(char *absPath, const char *relPath, size_t maxLength)
 {
     if (!relPath) return NULL;
+    /* If caller provided a buffer with 0 size, MS returns NULL (EINVAL).
+     * Without this guard, "maxLength - 1" underflows to SIZE_MAX. */
+    if (absPath && maxLength == 0) return NULL;
     char resolved[PATH_MAX];
     if (realpath(relPath, resolved)) {
         if (absPath) {
-            strncpy(absPath, resolved, maxLength - 1);
-            absPath[maxLength - 1] = '\0';
+            size_t len = strlen(resolved);
+            if (len >= maxLength) len = maxLength - 1;
+            memcpy(absPath, resolved, len);
+            absPath[len] = '\0';
             return absPath;
         } else {
             return strdup(resolved);
@@ -724,8 +789,10 @@ WINAPI_EXPORT char *_fullpath(char *absPath, const char *relPath, size_t maxLeng
     }
     /* If realpath fails (file doesn't exist), just return the path as-is */
     if (absPath) {
-        strncpy(absPath, relPath, maxLength - 1);
-        absPath[maxLength - 1] = '\0';
+        size_t len = strlen(relPath);
+        if (len >= maxLength) len = maxLength - 1;
+        memcpy(absPath, relPath, len);
+        absPath[len] = '\0';
         return absPath;
     }
     return strdup(relPath);
@@ -850,14 +917,29 @@ WINAPI_EXPORT int _makepath_s(char *path, size_t sizeInCharacters,
                                const char *fname, const char *ext)
 {
     if (!path || sizeInCharacters == 0) return 22;
+    /* Build up path with explicit bounds; do NOT use "sizeInCharacters -
+     * strlen(path) - 1" as that underflows to SIZE_MAX on overflow. */
+    size_t pos = 0;
     path[0] = '\0';
-    if (drive && drive[0]) strncat(path, drive, sizeInCharacters - strlen(path) - 1);
-    if (dir && dir[0]) strncat(path, dir, sizeInCharacters - strlen(path) - 1);
-    if (fname && fname[0]) strncat(path, fname, sizeInCharacters - strlen(path) - 1);
+    #define _APPEND_PART(s) do {                                    \
+        const char *_p = (s);                                       \
+        while (_p && *_p && pos + 1 < sizeInCharacters) {           \
+            path[pos++] = *_p++;                                    \
+        }                                                           \
+        if (_p && *_p) { path[0] = '\0'; return 34; /* ERANGE */ }  \
+    } while (0)
+    if (drive) _APPEND_PART(drive);
+    if (dir)   _APPEND_PART(dir);
+    if (fname) _APPEND_PART(fname);
     if (ext && ext[0]) {
-        if (ext[0] != '.') strncat(path, ".", sizeInCharacters - strlen(path) - 1);
-        strncat(path, ext, sizeInCharacters - strlen(path) - 1);
+        if (ext[0] != '.') {
+            if (pos + 1 < sizeInCharacters) path[pos++] = '.';
+            else { path[0] = '\0'; return 34; }
+        }
+        _APPEND_PART(ext);
     }
+    #undef _APPEND_PART
+    path[pos] = '\0';
     return 0;
 }
 
@@ -981,36 +1063,83 @@ WINAPI_EXPORT uint16_t *wcstok_s(uint16_t *str, const uint16_t *delimit, uint16_
     return start;
 }
 
-/* _errno */
+/* ---------- _errno family ----------
+ * Defined as a real thread-local translation helper in msvcrt_stdio.c.
+ * _errno_func() is an alias used when PE imports come through the
+ * *_func() indirection (older MSVCRT symbol naming).
+ */
+extern int *_errno(void);
+extern int pe_map_errno_linux_to_win(int e);
+
 WINAPI_EXPORT int *_errno_func(void)
 {
-    return &errno;
+    return _errno();
 }
 
-/* _strerror */
+/* _strerror — MS-specific: returns pointer to static buffer with message
+ * for CURRENT errno (ignores strErrMsg prefix in MSVC too when NULL).
+ * Since libc strerror() takes Linux errno space, use real errno directly. */
 WINAPI_EXPORT char *_strerror(const char *strErrMsg)
 {
     (void)strErrMsg;
     return strerror(errno);
 }
 
+/* strerror_s — errnum is in Windows errno space (apps pass values from
+ * MSVC errno.h).  Translate back to Linux space before calling libc
+ * strerror() so the message matches the code the app expects. */
 WINAPI_EXPORT int strerror_s(char *buffer, size_t sizeInBytes, int errnum)
 {
     if (!buffer || sizeInBytes == 0) return 22;
-    const char *msg = strerror(errnum);
-    strncpy(buffer, msg, sizeInBytes - 1);
-    buffer[sizeInBytes - 1] = '\0';
+    extern int pe_map_errno_win_to_linux(int e);
+    int linux_errnum = pe_map_errno_win_to_linux(errnum);
+    const char *msg = strerror(linux_errnum);
+    if (!msg) msg = "Unknown error";
+    size_t len = strlen(msg);
+    if (len >= sizeInBytes) len = sizeInBytes - 1;
+    memcpy(buffer, msg, len);
+    buffer[len] = '\0';
     return 0;
 }
 
-WINAPI_EXPORT int _wcstoui64(const uint16_t *nptr, uint16_t **endptr, int base)
+/* _wcserror_s — wide-char error message lookup.  Same Windows-space
+ * translation as strerror_s; converts ASCII message to UTF-16. */
+WINAPI_EXPORT int _wcserror_s(uint16_t *buffer, size_t sizeInWords, int errnum)
 {
-    (void)endptr;
-    char buf[64];
+    if (!buffer || sizeInWords == 0) return 22;
+    extern int pe_map_errno_win_to_linux(int e);
+    int linux_errnum = pe_map_errno_win_to_linux(errnum);
+    const char *msg = strerror(linux_errnum);
+    if (!msg) msg = "Unknown error";
+    size_t i = 0;
+    for (; msg[i] && i + 1 < sizeInWords; i++)
+        buffer[i] = (uint16_t)(unsigned char)msg[i];
+    buffer[i] = 0;
+    return 0;
+}
+
+/* _wcserror — non-secure form, returns pointer to thread-local buffer. */
+WINAPI_EXPORT uint16_t *_wcserror(int errnum)
+{
+    static __thread uint16_t wbuf[128];
+    _wcserror_s(wbuf, 128, errnum);
+    return wbuf;
+}
+
+WINAPI_EXPORT uint64_t _wcstoui64(const uint16_t *nptr, uint16_t **endptr, int base)
+{
+    /* MS declares this returning unsigned __int64.  The previous
+     * "int" return truncated values > 2^31 and ignored endptr entirely,
+     * breaking any caller that parses large hex or chains tokens. */
+    if (!nptr) { if (endptr) *endptr = NULL; return 0; }
+    char buf[128];
     int i = 0;
-    while (nptr[i] && i < 63) { buf[i] = (char)nptr[i]; i++; }
+    while (nptr[i] && i < 127) { buf[i] = (char)nptr[i]; i++; }
     buf[i] = '\0';
-    return (int)strtoull(buf, NULL, base);
+    char *ep = NULL;
+    uint64_t r = (uint64_t)strtoull(buf, &ep, base);
+    if (endptr) *endptr = (uint16_t *)(nptr + (ep - buf));
+    return r;
 }
 
 /* ================================================================
@@ -1086,6 +1215,9 @@ WINAPI_EXPORT uint16_t *_o_wcstok_s(uint16_t *s, const uint16_t *d, uint16_t **c
 
 /* Error string */
 WINAPI_EXPORT int _o_strerror_s(char *b, size_t n, int e) { return strerror_s(b, n, e); }
+WINAPI_EXPORT int _o__wcserror_s(uint16_t *b, size_t n, int e) { return _wcserror_s(b, n, e); }
+WINAPI_EXPORT uint16_t *_o__wcserror(int e) { return _wcserror(e); }
+WINAPI_EXPORT char *_o__strerror(const char *m) { return _strerror(m); }
 
 WINAPI_EXPORT long _o_wcstol(const uint16_t *s, uint16_t **e, int b) { return pe_wcstol(s, e, b); }
 WINAPI_EXPORT unsigned long _o_wcstoul(const uint16_t *s, uint16_t **e, int b) { return pe_wcstoul(s, e, b); }

@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>  /* strcasecmp, strncasecmp */
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
@@ -26,21 +27,41 @@
 
 #include "registry.h"
 
-/* Reject path components that could escape the registry root */
+/* Reject path components that could escape the registry root.
+ *
+ * Windows registry allows ".." as a substring within names (e.g. value
+ * names like "config..backup" are legal).  We only reject ".." when it
+ * appears as an entire path component -- i.e. bracketed by path separators
+ * or at the start/end of the string.  Path separators in the registry
+ * API are backslashes; forward slashes are treated as literal chars by
+ * Windows but we also treat them as separators because we translate them
+ * to filesystem slashes later. */
 static int registry_validate_name(const char *name)
 {
     if (!name || !*name)
         return 0;  /* empty is OK (root key) */
-    /* Reject path traversal sequences */
-    if (strstr(name, ".."))
-        return -1;
+
     /* Reject absolute paths */
     if (name[0] == '/' || name[0] == '\\')
         return -1;
-    /* Reject embedded null-like characters */
-    for (const char *p = name; *p; p++) {
-        if (*p == '\0')
-            break;
+
+    /* Walk components separated by '\\' or '/' and reject any that are
+     * exactly "..".  Also reject any single component equal to "." which
+     * would be a no-op traversal. */
+    const char *p = name;
+    const char *comp = name;
+    while (1) {
+        char c = *p;
+        if (c == '\\' || c == '/' || c == '\0') {
+            size_t len = (size_t)(p - comp);
+            if (len == 2 && comp[0] == '.' && comp[1] == '.')
+                return -1;
+            if (len == 1 && comp[0] == '.')
+                return -1;
+            if (c == '\0') break;
+            comp = p + 1;
+        }
+        p++;
     }
     return 0;
 }
@@ -129,6 +150,80 @@ static int is_predefined_hkey(HKEY hKey)
 }
 
 /*
+ * HKCR merge view helpers.
+ *
+ * Windows semantics: HKEY_CLASSES_ROOT is a virtual merged view of
+ *   HKCU\SOFTWARE\Classes  (per-user overrides, wins on collision)
+ * overlaid on
+ *   HKLM\SOFTWARE\Classes  (system-wide defaults)
+ *
+ * We implement this by resolving HKCR subkeys against both HKCU\SOFTWARE\Classes
+ * and HKLM\SOFTWARE\Classes, preferring HKCU when the key/value exists there.
+ * The legacy ~/.pe-compat/registry/HKCR/ directory is kept as a fallback (some
+ * callers historically write to it directly) but is checked last.
+ */
+static void build_hkcr_candidate(const char *base, const char *subkey,
+                                 char *out, size_t size)
+{
+    if (subkey && subkey[0])
+        snprintf(out, size, "%s/SOFTWARE/Classes/%s", base, subkey);
+    else
+        snprintf(out, size, "%s/SOFTWARE/Classes", base);
+    for (char *p = out; *p; p++) {
+        if (*p == '\\') *p = '/';
+    }
+}
+
+static int path_is_dir(const char *path)
+{
+    struct stat st;
+    return (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
+}
+
+/* Resolve an HKCR-relative path to the best concrete filesystem path.
+ * Priority: HKCU\SOFTWARE\Classes -> HKLM\SOFTWARE\Classes -> legacy HKCR dir.
+ * If none exist yet and for_write is set, return the HKLM path so writes
+ * land in a Windows-compatible location. Caller converts slashes. */
+static void resolve_hkcr_path(const char *subkey, char *out, size_t size,
+                              int for_write)
+{
+    char hkcu_path[4096], hklm_path[4096], legacy_path[4096];
+    char hkcu_base[4096], hklm_base[4096];
+
+    snprintf(hkcu_base, sizeof(hkcu_base), "%s/HKCU", g_registry_root);
+    snprintf(hklm_base, sizeof(hklm_base), "%s/HKLM", g_registry_root);
+
+    build_hkcr_candidate(hkcu_base, subkey, hkcu_path, sizeof(hkcu_path));
+    build_hkcr_candidate(hklm_base, subkey, hklm_path, sizeof(hklm_path));
+    if (subkey && subkey[0])
+        snprintf(legacy_path, sizeof(legacy_path), "%s/HKCR/%s",
+                 g_registry_root, subkey);
+    else
+        snprintf(legacy_path, sizeof(legacy_path), "%s/HKCR", g_registry_root);
+    for (char *p = legacy_path; *p; p++) {
+        if (*p == '\\') *p = '/';
+    }
+
+    /* Read: HKCU first (user wins), then HKLM, then legacy. */
+    if (!for_write) {
+        if (path_is_dir(hkcu_path))   { snprintf(out, size, "%s", hkcu_path); return; }
+        if (path_is_dir(hklm_path))   { snprintf(out, size, "%s", hklm_path); return; }
+        if (path_is_dir(legacy_path)) { snprintf(out, size, "%s", legacy_path); return; }
+        /* None exist -- return HKLM path so open-then-auto-create lands
+         * in the Windows-canonical location. */
+        snprintf(out, size, "%s", hklm_path);
+        return;
+    }
+
+    /* Write: prefer existing HKCU, else existing HKLM, else legacy if it
+     * already exists (don't regress callers who wrote there); default HKLM. */
+    if (path_is_dir(hkcu_path))   { snprintf(out, size, "%s", hkcu_path); return; }
+    if (path_is_dir(hklm_path))   { snprintf(out, size, "%s", hklm_path); return; }
+    if (path_is_dir(legacy_path)) { snprintf(out, size, "%s", legacy_path); return; }
+    snprintf(out, size, "%s", hklm_path);
+}
+
+/*
  * Build the filesystem path for a registry key.
  *
  * NOTE: Multi-level subkey paths (e.g. "SOFTWARE\Microsoft\Windows") are
@@ -140,19 +235,31 @@ static int is_predefined_hkey(HKEY hKey)
  * We auto-create intermediate directories when opening well-known paths
  * (Windows apps assume parent keys exist for paths like
  * HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion).
+ *
+ * HKCR paths are virtualised: reads prefer HKCU\SOFTWARE\Classes then
+ * HKLM\SOFTWARE\Classes (see resolve_hkcr_path).  for_write=1 biases the
+ * path towards a location suitable for writes (existing user override if
+ * present, else HKLM system-wide).
  */
-static int build_key_path(HKEY hKey, const char *subkey, char *path, size_t size)
+static int build_key_path_ex(HKEY hKey, const char *subkey,
+                             char *path, size_t size, int for_write)
 {
     ensure_registry_root();
 
     if (is_predefined_hkey(hKey)) {
-        const char *prefix = hkey_to_prefix(hKey);
-        if (!prefix) return -1;
-
-        if (subkey && subkey[0]) {
-            snprintf(path, size, "%s/%s/%s", g_registry_root, prefix, subkey);
+        uintptr_t val = (uintptr_t)hKey;
+        if (val == 0x80000000) {
+            /* HKCR: resolve through merge view */
+            resolve_hkcr_path(subkey, path, size, for_write);
         } else {
-            snprintf(path, size, "%s/%s", g_registry_root, prefix);
+            const char *prefix = hkey_to_prefix(hKey);
+            if (!prefix) return -1;
+
+            if (subkey && subkey[0]) {
+                snprintf(path, size, "%s/%s/%s", g_registry_root, prefix, subkey);
+            } else {
+                snprintf(path, size, "%s/%s", g_registry_root, prefix);
+            }
         }
     } else {
         /* hKey is an opened key handle - look up its path */
@@ -175,6 +282,11 @@ static int build_key_path(HKEY hKey, const char *subkey, char *path, size_t size
     }
 
     return 0;
+}
+
+static int build_key_path(HKEY hKey, const char *subkey, char *path, size_t size)
+{
+    return build_key_path_ex(hKey, subkey, path, size, 0);
 }
 
 /* Create directories recursively (creates all intermediate components) */
@@ -218,6 +330,44 @@ static void ensure_key_parents(const char *path)
      * that is the caller's responsibility. */
 }
 
+/*
+ * Whitelist of subkey prefixes for which RegOpenKeyEx is allowed to
+ * auto-create missing intermediate directories. Many Windows apps call
+ * RegOpenKeyEx on well-known hierarchies and expect the keys to already
+ * exist; without auto-create they would see ERROR_FILE_NOT_FOUND and fail
+ * to launch. But auto-creating on any arbitrary subkey pollutes the
+ * registry tree with empty dirs (Session 25 Agent 9 concern). Only the
+ * canonical system hives are whitelisted here.
+ */
+static int is_whitelisted_auto_create(const char *subkey)
+{
+    if (!subkey || !*subkey)
+        return 1;  /* opening a predefined root itself */
+    /* Match case-insensitive prefix - Windows registry paths are CI */
+    static const char *prefixes[] = {
+        "SOFTWARE",
+        "SOFTWARE\\Microsoft",
+        "SOFTWARE\\Classes",
+        "SOFTWARE\\Wow6432Node",
+        "SOFTWARE\\WOW6432Node",
+        "SYSTEM\\CurrentControlSet",
+        "SYSTEM",
+        "HARDWARE",
+        "SECURITY",
+        "SAM",
+        NULL
+    };
+    for (int i = 0; prefixes[i]; i++) {
+        size_t len = strlen(prefixes[i]);
+        if (strncasecmp(subkey, prefixes[i], len) == 0) {
+            char next = subkey[len];
+            if (next == '\0' || next == '\\' || next == '/')
+                return 1;
+        }
+    }
+    return 0;
+}
+
 /* --- Public API --- */
 
 LONG registry_open_key(HKEY hKey, const char *subkey, HKEY *result)
@@ -233,17 +383,16 @@ LONG registry_open_key(HKEY hKey, const char *subkey, HKEY *result)
         return ERROR_INVALID_HANDLE;
 
     /*
-     * Auto-create intermediate directories.  Many Windows applications
-     * call RegOpenKeyEx on well-known paths like
-     *   HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion
-     * and expect every component to already exist.  On our filesystem-
-     * backed registry the parent directories may not yet be present, so
-     * we materialise them here.  The final leaf is also created as an
-     * empty directory (equivalent to an empty registry key) so the open
-     * succeeds.
+     * Auto-create intermediate directories -- but ONLY for whitelisted
+     * system paths.  Many Windows applications call RegOpenKeyEx on
+     * well-known paths like HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion
+     * and expect every component to already exist.  But auto-creating on
+     * arbitrary subkeys pollutes the registry tree with empty dirs.
      */
-    ensure_key_parents(path);
-    mkdir(path, 0755);  /* create leaf key if not present */
+    if (is_whitelisted_auto_create(subkey)) {
+        ensure_key_parents(path);
+        mkdir(path, 0755);  /* create leaf key if not present */
+    }
 
     struct stat st;
     if (stat(path, &st) < 0 || !S_ISDIR(st.st_mode))
@@ -274,7 +423,8 @@ LONG registry_create_key(HKEY hKey, const char *subkey, HKEY *result)
         return ERROR_INVALID_PARAMETER;
 
     char path[4096];
-    if (build_key_path(hKey, subkey, path, sizeof(path)) < 0)
+    /* Writes to HKCR should land in an appropriate HKLM/HKCU mirror. */
+    if (build_key_path_ex(hKey, subkey, path, sizeof(path), 1) < 0)
         return ERROR_INVALID_HANDLE;
 
     ensure_key_parents(path);
@@ -315,7 +465,8 @@ LONG registry_set_value(HKEY hKey, const char *name, DWORD type,
 
     char key_path[4096];
     if (is_predefined_hkey(hKey)) {
-        if (build_key_path(hKey, NULL, key_path, sizeof(key_path)) < 0)
+        /* Writes to HKCR root-level default values route via merge-view write path */
+        if (build_key_path_ex(hKey, NULL, key_path, sizeof(key_path), 1) < 0)
             return ERROR_INVALID_HANDLE;
     } else {
         handle_entry_t *entry = handle_lookup(hKey);
@@ -379,6 +530,23 @@ LONG registry_get_value(HKEY hKey, const char *subkey, const char *name,
     snprintf(val_path, sizeof(val_path), "%s/.values/%s", key_path, val_name);
 
     FILE *f = fopen(val_path, "rb");
+    /* HKCR merge-view fallback: if the HKCU resolution missed the value,
+     * fall back to HKLM\SOFTWARE\Classes. build_key_path() already picks
+     * HKCU if its directory exists, but the value file might only live on
+     * the HKLM side. */
+    if (!f && is_predefined_hkey(hKey) && (uintptr_t)hKey == 0x80000000) {
+        char hklm_base[4096];
+        char hklm_path[4096];
+        snprintf(hklm_base, sizeof(hklm_base), "%s/HKLM", g_registry_root);
+        build_hkcr_candidate(hklm_base, subkey, hklm_path, sizeof(hklm_path));
+        char fallback_val[4096];
+        snprintf(fallback_val, sizeof(fallback_val), "%s/.values/%s",
+                 hklm_path, val_name);
+        for (char *p = fallback_val; *p; p++) {
+            if (*p == '\\') *p = '/';
+        }
+        f = fopen(fallback_val, "rb");
+    }
     if (!f)
         return ERROR_FILE_NOT_FOUND;
 
@@ -469,8 +637,94 @@ LONG registry_delete_key(HKEY hKey, const char *subkey)
     return ERROR_SUCCESS;
 }
 
+/* Collect subkey names from a directory into out[]. Returns count appended.
+ * Skips "." "..", ".values" and any entries already present in out[]
+ * (dedup for HKCR merge).  out_cap is max entries; each is up to 256 chars. */
+static DWORD collect_subkeys(const char *dir_path,
+                             char (*out)[256], DWORD out_count,
+                             DWORD out_cap)
+{
+    DIR *d = opendir(dir_path);
+    if (!d)
+        return out_count;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL && out_count < out_cap) {
+        if (ent->d_name[0] == '.') {
+            if (ent->d_name[1] == '\0') continue;
+            if (ent->d_name[1] == '.' && ent->d_name[2] == '\0') continue;
+            if (strcmp(ent->d_name, ".values") == 0) continue;
+        }
+
+        char full[4096];
+        snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name);
+        struct stat st;
+        if (stat(full, &st) < 0 || !S_ISDIR(st.st_mode))
+            continue;
+
+        /* Dedup: case-insensitive match against existing entries
+         * (Windows registry is case-preserving but case-insensitive). */
+        int dup = 0;
+        for (DWORD i = 0; i < out_count; i++) {
+            if (strcasecmp(out[i], ent->d_name) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+
+        size_t nlen = strlen(ent->d_name);
+        if (nlen >= 256) nlen = 255;
+        memcpy(out[out_count], ent->d_name, nlen);
+        out[out_count][nlen] = '\0';
+        out_count++;
+    }
+    closedir(d);
+    return out_count;
+}
+
 LONG registry_enum_key(HKEY hKey, DWORD index, char *name, DWORD *name_size)
 {
+    /* HKCR merge: enumerate union of HKCU\SOFTWARE\Classes,
+     * HKLM\SOFTWARE\Classes, and the legacy HKCR directory (HKCU wins).
+     * This mirrors Windows HKCR semantics. */
+    if (is_predefined_hkey(hKey) && (uintptr_t)hKey == 0x80000000) {
+        ensure_registry_root();
+
+        /* Cap at 4096 unique class names; more than enough for stubs. */
+        enum { MAX_HKCR_ENTRIES = 4096 };
+        static char names[MAX_HKCR_ENTRIES][256];
+        DWORD count = 0;
+
+        char hkcu_base[4096], hklm_base[4096], legacy[4096];
+        snprintf(hkcu_base, sizeof(hkcu_base),
+                 "%s/HKCU/SOFTWARE/Classes", g_registry_root);
+        snprintf(hklm_base, sizeof(hklm_base),
+                 "%s/HKLM/SOFTWARE/Classes", g_registry_root);
+        snprintf(legacy, sizeof(legacy),
+                 "%s/HKCR", g_registry_root);
+
+        /* HKCU first: its entries take precedence (dedup keeps first seen). */
+        count = collect_subkeys(hkcu_base, names, count, MAX_HKCR_ENTRIES);
+        count = collect_subkeys(hklm_base, names, count, MAX_HKCR_ENTRIES);
+        count = collect_subkeys(legacy,    names, count, MAX_HKCR_ENTRIES);
+
+        if (index >= count)
+            return ERROR_NO_MORE_ITEMS;
+
+        DWORD len = (DWORD)strlen(names[index]);
+        if (!name || !name_size || *name_size <= len) {
+            if (name_size)
+                *name_size = len + 1;
+            return ERROR_MORE_DATA;
+        }
+        memcpy(name, names[index], len);
+        name[len] = '\0';
+        *name_size = len;
+        return ERROR_SUCCESS;
+    }
+
     char key_path[4096];
     if (is_predefined_hkey(hKey)) {
         if (build_key_path(hKey, NULL, key_path, sizeof(key_path)) < 0)
@@ -492,9 +746,13 @@ LONG registry_enum_key(HKEY hKey, DWORD index, char *name, DWORD *name_size)
     DWORD current = 0;
 
     while ((ent = readdir(d)) != NULL) {
-        /* Skip . and .. and .values */
-        if (ent->d_name[0] == '.')
-            continue;
+        /* Skip "." and ".." only - Windows registry keys CAN start with "."
+         * (e.g. HKCR\.txt, HKCR\.exe).  Also skip our ".values" sidecar dir. */
+        if (ent->d_name[0] == '.') {
+            if (ent->d_name[1] == '\0') continue;                          /* "."  */
+            if (ent->d_name[1] == '.' && ent->d_name[2] == '\0') continue; /* ".." */
+            if (strcmp(ent->d_name, ".values") == 0) continue;
+        }
 
         /* Only list directories (subkeys) */
         char full[4096];
@@ -505,17 +763,18 @@ LONG registry_enum_key(HKEY hKey, DWORD index, char *name, DWORD *name_size)
 
         if (current == index) {
             DWORD len = (DWORD)strlen(ent->d_name);
-            if (name_size && *name_size <= len) {
-                *name_size = len + 1;
+            /* Windows semantics: lpcchName on input = buffer size in chars
+             * (INCLUDING room for NUL). On success, lpcchName = length
+             * WITHOUT the NUL. Need strictly greater than len. */
+            if (!name || !name_size || *name_size <= len) {
+                if (name_size)
+                    *name_size = len + 1;
                 closedir(d);
                 return ERROR_MORE_DATA;
             }
-            if (name) {
-                strncpy(name, ent->d_name, *name_size);
-                name[*name_size - 1] = '\0';
-            }
-            if (name_size)
-                *name_size = len;
+            memcpy(name, ent->d_name, len);
+            name[len] = '\0';
+            *name_size = len;
             closedir(d);
             return ERROR_SUCCESS;
         }
@@ -553,7 +812,11 @@ LONG registry_enum_value(HKEY hKey, DWORD index, char *name, DWORD *name_size,
     DWORD current = 0;
 
     while ((ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] == '.')
+        /* Skip "." and ".." only.  (Value files may not legally start with ".",
+         * but we still explicitly filter the two special entries.) */
+        if (ent->d_name[0] == '.' &&
+            (ent->d_name[1] == '\0' ||
+             (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
             continue;
 
         if (current == index) {
@@ -561,24 +824,24 @@ LONG registry_enum_value(HKEY hKey, DWORD index, char *name, DWORD *name_size,
             const char *val_name = strcmp(ent->d_name, "@") == 0 ? "" : ent->d_name;
             DWORD len = (DWORD)strlen(val_name);
 
-            if (name_size && *name_size <= len) {
-                *name_size = len + 1;
+            /* Check name buffer FIRST - on ERROR_MORE_DATA we must not
+             * touch data output, but we should still report required size. */
+            if (!name || !name_size || *name_size <= len) {
+                if (name_size)
+                    *name_size = len + 1;
                 closedir(d);
                 return ERROR_MORE_DATA;
             }
-            if (name) {
-                strncpy(name, val_name, name_size ? *name_size : len + 1);
-                if (name_size && *name_size > 0) name[*name_size - 1] = '\0';
-            }
-            if (name_size)
-                *name_size = len;
+            memcpy(name, val_name, len);
+            name[len] = '\0';
+            *name_size = len;
 
             /* Read value data */
             char val_path[4096];
             snprintf(val_path, sizeof(val_path), "%s/%s", values_dir, ent->d_name);
             FILE *f = fopen(val_path, "rb");
             if (f) {
-                DWORD val_type;
+                DWORD val_type = 0;
                 if (fread(&val_type, sizeof(DWORD), 1, f) < 1) val_type = 0;
                 if (type)
                     *type = val_type;
@@ -589,11 +852,24 @@ LONG registry_enum_value(HKEY hKey, DWORD index, char *name, DWORD *name_size,
                 fseek(f, pos, SEEK_SET);
                 DWORD val_size = (DWORD)(file_size - pos);
 
-                if (data && data_size && *data_size >= val_size) {
-                    if (fread(data, 1, val_size, f) < val_size) { /* partial */ }
-                    *data_size = val_size;
-                } else if (data_size) {
-                    *data_size = val_size;
+                if (data_size) {
+                    if (data && *data_size >= val_size) {
+                        if (val_size > 0 &&
+                            fread(data, 1, val_size, f) < val_size) {
+                            /* partial read tolerated */
+                        }
+                        *data_size = val_size;
+                    } else {
+                        DWORD needed = val_size;
+                        *data_size = needed;
+                        if (data) {
+                            /* Caller provided buffer but too small */
+                            fclose(f);
+                            closedir(d);
+                            return ERROR_MORE_DATA;
+                        }
+                        /* data==NULL: query-only, SUCCESS with size filled */
+                    }
                 }
                 fclose(f);
             }

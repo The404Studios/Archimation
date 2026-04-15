@@ -167,7 +167,13 @@ static int cmd_auth_chain_len(const trust_cmd_entry_t *cmd,
 	return ret;
 }
 
-/* AUTH_ROTATE: Rotate hash algorithm.  Op0 = subject_id, imm = new hash_cfg */
+/* AUTH_ROTATE: Rotate hash algorithm.  Op0 = subject_id, imm = new hash_cfg
+ *
+ * Actual hash rotation must go through APE (it requires invalidating
+ * the existing proof chain and re-minting). The per-subject hash config
+ * is not mutable via TLB alone. Until APE exposes a rotate entry point,
+ * return -ENOSYS instead of a success no-op: a program that expects the
+ * rotation to have taken effect must not get a false success. */
 static int cmd_auth_rotate(const trust_cmd_entry_t *cmd,
 			   trust_cmd_result_t *result)
 {
@@ -176,7 +182,7 @@ static int cmd_auth_rotate(const trust_cmd_entry_t *cmd,
 	trust_subject_t subj;
 	int ret;
 
-	/* Validate hash config */
+	/* Validate hash config so a malformed program fails loudly. */
 	if (new_cfg >= TRUST_HASH_CFG_COUNT) {
 		result->status = -EINVAL;
 		result->value = 0;
@@ -190,10 +196,9 @@ static int cmd_auth_rotate(const trust_cmd_entry_t *cmd,
 		return -ENOENT;
 	}
 
-	/* Rotation recorded; actual hash config update happens through APE */
-	result->status = 0;
-	result->value = new_cfg;
-	return 0;
+	result->status = -ENOSYS;
+	result->value = 0;
+	return -ENOSYS;
 }
 
 /* ========================================================================
@@ -303,8 +308,11 @@ static int cmd_trust_demote(const trust_cmd_entry_t *cmd,
 	u32 sid = cmd_get_subject(cmd, 0);
 	int32_t delta = cmd_get_s32(cmd, 1);
 
-	/* Ensure delta is negative for demotion */
-	if (delta > 0)
+	/* Ensure delta is negative for demotion.
+	 * Guard against the most-negative int32: negating it is UB. */
+	if (delta == (int32_t)(-2147483647 - 1))
+		delta = -2147483647;  /* saturate to most-negative representable */
+	else if (delta > 0)
 		delta = -delta;
 
 	trust_fbc_propagate(sid, delta);
@@ -434,12 +442,18 @@ static int cmd_gate_translate(const trust_cmd_entry_t *cmd,
 }
 
 /* GATE_DOMAIN_ENTER: Enter domain.  Op0 = sid, Op1 = domain */
+struct gate_domain_ctx { u16 domain; };
+static int _gate_domain_enter_cb(trust_subject_t *subj, void *data) {
+	struct gate_domain_ctx *c = data;
+	subj->domain = c->domain;
+	return 0;
+}
 static int cmd_gate_domain_enter(const trust_cmd_entry_t *cmd,
 				 trust_cmd_result_t *result)
 {
 	u32 sid = cmd_get_subject(cmd, 0);
 	u16 domain = cmd_get_u16(cmd, 1);
-	trust_subject_t subj;
+	struct gate_domain_ctx ctx = { .domain = domain };
 	int ret;
 
 	if (domain >= TRUST_DOMAIN_MAX) {
@@ -447,14 +461,14 @@ static int cmd_gate_domain_enter(const trust_cmd_entry_t *cmd,
 		return -EINVAL;
 	}
 
-	ret = trust_tlb_lookup(sid, &subj);
+	/* Use trust_tlb_modify to avoid TOCTOU: between lookup and insert
+	 * another dispatch could mutate the subject (score, tokens, caps)
+	 * and our stale insert would silently overwrite those updates. */
+	ret = trust_tlb_modify(sid, _gate_domain_enter_cb, &ctx);
 	if (ret) {
 		result->status = -ENOENT;
 		return -ENOENT;
 	}
-
-	subj.domain = domain;
-	trust_tlb_insert(&subj);
 
 	result->status = 0;
 	result->value = domain;
@@ -462,21 +476,24 @@ static int cmd_gate_domain_enter(const trust_cmd_entry_t *cmd,
 }
 
 /* GATE_DOMAIN_LEAVE: Leave domain, return to LINUX.  Op0 = sid */
+static int _gate_domain_leave_cb(trust_subject_t *subj, void *data) {
+	(void)data;
+	subj->domain = TRUST_DOMAIN_LINUX;
+	return 0;
+}
 static int cmd_gate_domain_leave(const trust_cmd_entry_t *cmd,
 				 trust_cmd_result_t *result)
 {
 	u32 sid = cmd_get_subject(cmd, 0);
-	trust_subject_t subj;
 	int ret;
 
-	ret = trust_tlb_lookup(sid, &subj);
+	/* Same TOCTOU concern as enter: use modify to keep concurrent
+	 * mutations to this subject consistent. */
+	ret = trust_tlb_modify(sid, _gate_domain_leave_cb, NULL);
 	if (ret) {
 		result->status = -ENOENT;
 		return -ENOENT;
 	}
-
-	subj.domain = TRUST_DOMAIN_LINUX;
-	trust_tlb_insert(&subj);
 
 	result->status = 0;
 	result->value = TRUST_DOMAIN_LINUX;
@@ -557,9 +574,16 @@ static int cmd_res_burn(const trust_cmd_entry_t *cmd,
 struct res_mint_ctx { int32_t amount; int32_t balance; };
 static int _res_mint_cb(trust_subject_t *subj, void *data) {
 	struct res_mint_ctx *c = data;
-	subj->tokens.balance += c->amount;
-	if (subj->tokens.balance > subj->tokens.max_balance)
+	/* Clamp-before-add to prevent signed int32 overflow when
+	 * balance + amount exceeds INT32_MAX. Overflow is UB and on
+	 * some ABIs would wrap negative, producing a burst of "free"
+	 * starvation clears. */
+	if (c->amount < 0)
+		c->amount = 0;  /* imm is u16 so this can't happen, but be defensive */
+	if (subj->tokens.balance > subj->tokens.max_balance - c->amount)
 		subj->tokens.balance = subj->tokens.max_balance;
+	else
+		subj->tokens.balance += c->amount;
 	/* Cap total_regenerated at UINT32_MAX to prevent overflow */
 	if (subj->tokens.total_regenerated > UINT32_MAX - (u32)c->amount)
 		subj->tokens.total_regenerated = UINT32_MAX;
@@ -588,7 +612,12 @@ static int cmd_res_mint(const trust_cmd_entry_t *cmd,
 	return 0;
 }
 
-/* RES_XFER: Transfer tokens.  Op0 = from_sid, Op1 = to_sid, imm = amount */
+/* RES_XFER: Transfer tokens.  Op0 = from_sid, Op1 = to_sid, imm = amount
+ *
+ * Must use spin_lock_irqsave on TLB set locks — those locks are also
+ * acquired from softirq context by trust_decay_timer_fn -> decay/immune
+ * ticks. Plain spin_lock() here would softirq-deadlock on the same CPU.
+ */
 static int cmd_res_xfer(const trust_cmd_entry_t *cmd,
 			trust_cmd_result_t *result)
 {
@@ -598,6 +627,7 @@ static int cmd_res_xfer(const trust_cmd_entry_t *cmd,
 	u32 from_set_idx, to_set_idx;
 	trust_tlb_set_t *set_a, *set_b;
 	trust_subject_t *from_p = NULL, *to_p = NULL;
+	unsigned long flags_a, flags_b = 0;
 	int i;
 
 	if (amount <= 0 || !g_trust_tlb.sets) {
@@ -605,21 +635,31 @@ static int cmd_res_xfer(const trust_cmd_entry_t *cmd,
 		return -EINVAL;
 	}
 
-	from_set_idx = from_sid % TRUST_TLB_SETS;
-	to_set_idx = to_sid % TRUST_TLB_SETS;
+	/* Reject self-transfer: would double-count total_burned AND
+	 * total_regenerated on the same subject, corrupting lifetime
+	 * accounting (and the aliased from_p/to_p pointer arithmetic
+	 * below is only safe by coincidence, not design). */
+	if (from_sid == to_sid) {
+		result->status = -EINVAL;
+		return -EINVAL;
+	}
+
+	/* Must match tlb_hash() in trust_tlb.c */
+	from_set_idx = trust_tlb_set_of(from_sid);
+	to_set_idx = trust_tlb_set_of(to_sid);
 
 	/* Lock in consistent order to prevent deadlock */
 	if (from_set_idx <= to_set_idx) {
 		set_a = &g_trust_tlb.sets[from_set_idx];
 		set_b = &g_trust_tlb.sets[to_set_idx];
-		spin_lock(&set_a->lock);
+		spin_lock_irqsave(&set_a->lock, flags_a);
 		if (from_set_idx != to_set_idx)
-			spin_lock(&set_b->lock);
+			spin_lock_irqsave(&set_b->lock, flags_b);
 	} else {
 		set_a = &g_trust_tlb.sets[to_set_idx];
 		set_b = &g_trust_tlb.sets[from_set_idx];
-		spin_lock(&set_a->lock);
-		spin_lock(&set_b->lock);
+		spin_lock_irqsave(&set_a->lock, flags_a);
+		spin_lock_irqsave(&set_b->lock, flags_b);
 	}
 
 	for (i = 0; i < TRUST_TLB_WAYS; i++) {
@@ -641,32 +681,44 @@ static int cmd_res_xfer(const trust_cmd_entry_t *cmd,
 
 	if (!from_p || !to_p) {
 		if (from_set_idx != to_set_idx)
-			spin_unlock(&set_b->lock);
-		spin_unlock(&set_a->lock);
+			spin_unlock_irqrestore(&set_b->lock, flags_b);
+		spin_unlock_irqrestore(&set_a->lock, flags_a);
 		result->status = -ENOENT;
 		return -ENOENT;
 	}
 
 	if (from_p->tokens.balance < amount) {
 		if (from_set_idx != to_set_idx)
-			spin_unlock(&set_b->lock);
-		spin_unlock(&set_a->lock);
+			spin_unlock_irqrestore(&set_b->lock, flags_b);
+		spin_unlock_irqrestore(&set_a->lock, flags_a);
 		result->status = -ENOSPC;
 		return -ENOSPC;
 	}
 
 	from_p->tokens.balance -= amount;
-	from_p->tokens.total_burned += amount;
-	to_p->tokens.balance += amount;
-	if (to_p->tokens.balance > to_p->tokens.max_balance)
+	/* Cap lifetime counters at UINT32_MAX to prevent silent overflow. */
+	if (from_p->tokens.total_burned > UINT32_MAX - (u32)amount)
+		from_p->tokens.total_burned = UINT32_MAX;
+	else
+		from_p->tokens.total_burned += (u32)amount;
+	/* Clamp-before-add to avoid signed int32 overflow on huge amounts. */
+	if (to_p->tokens.balance > to_p->tokens.max_balance - amount)
 		to_p->tokens.balance = to_p->tokens.max_balance;
-	to_p->tokens.total_regenerated += amount;
+	else
+		to_p->tokens.balance += amount;
+	if (to_p->tokens.total_regenerated > UINT32_MAX - (u32)amount)
+		to_p->tokens.total_regenerated = UINT32_MAX;
+	else
+		to_p->tokens.total_regenerated += (u32)amount;
+	/* Clear starvation on recipient if balance becomes positive */
+	if (to_p->tokens.starved && to_p->tokens.balance > 0)
+		to_p->tokens.starved = 0;
 
 	result->value = (u64)(u32)from_p->tokens.balance;
 
 	if (from_set_idx != to_set_idx)
-		spin_unlock(&set_b->lock);
-	spin_unlock(&set_a->lock);
+		spin_unlock_irqrestore(&set_b->lock, flags_b);
+	spin_unlock_irqrestore(&set_a->lock, flags_a);
 
 	result->status = 0;
 	return 0;
@@ -697,7 +749,7 @@ static int cmd_res_regen(const trust_cmd_entry_t *cmd,
 			 trust_cmd_result_t *result)
 {
 	u32 sid = cmd_get_subject(cmd, 0);
-	struct res_regen_ctx ctx;
+	struct res_regen_ctx ctx = { 0 };
 	int ret;
 
 	ret = trust_tlb_modify(sid, _res_regen_cb, &ctx);

@@ -33,6 +33,8 @@ int shm_alloc(const char *shm_name, int *out_fd, void **out_ptr)
 {
     int fd;
     void *ptr;
+    int we_created = 0;  /* Track whether we created this shm, so we only
+                          * unlink it on failure if we own it. */
 
     if (!shm_name || !out_fd || !out_ptr) {
         fprintf(stderr, "[objectd] shm_alloc: invalid arguments\n");
@@ -61,6 +63,7 @@ int shm_alloc(const char *shm_name, int *out_fd, void **out_ptr)
             return -1;
         }
     }
+    we_created = 1;
 
     /* Set size to one page (only for newly created regions) */
     if (ftruncate(fd, SHM_PAGE_SIZE) < 0) {
@@ -78,7 +81,10 @@ do_mmap:
         fprintf(stderr, "[objectd] mmap(%s) failed: %s\n",
                 shm_name, strerror(errno));
         close(fd);
-        shm_unlink(shm_name);
+        /* Only unlink if we created this segment; otherwise we'd be
+         * destroying shared state owned by another process. */
+        if (we_created)
+            shm_unlink(shm_name);
         return -1;
     }
 

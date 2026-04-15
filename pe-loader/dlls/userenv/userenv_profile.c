@@ -238,7 +238,7 @@ WINAPI_EXPORT BOOL ExpandEnvironmentStringsForUserA(void *hToken, const char *lp
                                                       char *lpDest, uint32_t dwSize)
 {
     (void)hToken;
-    if (!lpSrc || !lpDest) return FALSE;
+    if (!lpSrc || !lpDest || dwSize == 0) return FALSE;
     /* Simple: just copy, expanding %USERPROFILE% etc. */
     const char *home = get_home_dir();
 

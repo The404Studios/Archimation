@@ -78,6 +78,10 @@ _HASH_PREFIX_LEN = 16
 class MemoryDiffEngine:
     """Captures and compares process memory snapshots over time."""
 
+    # Cap total tracked PIDs to prevent unbounded dict growth when
+    # snapshots are captured for many short-lived processes.
+    MAX_TRACKED_PIDS = 256
+
     def __init__(self, max_snapshots_per_pid: int = 20):
         self._snapshots: dict[int, list[MemorySnapshot]] = {}  # pid -> snapshots
         self._max_snapshots_per_pid = max(1, max_snapshots_per_pid)
@@ -165,6 +169,21 @@ class MemoryDiffEngine:
             dll_list=sorted(dll_list),
             region_hashes=region_hashes,
         )
+
+        # Evict dead-PID entries if we're about to add a new tracked PID
+        # and we're at the cap. Keeps the dict bounded over long uptimes.
+        if pid not in self._snapshots and len(self._snapshots) >= self.MAX_TRACKED_PIDS:
+            dead = [p for p in self._snapshots if not os.path.exists(f"/proc/{p}")]
+            for p in dead:
+                del self._snapshots[p]
+            # If still over cap, drop oldest (by oldest snapshot timestamp)
+            if len(self._snapshots) >= self.MAX_TRACKED_PIDS:
+                oldest_pid = min(
+                    self._snapshots,
+                    key=lambda p: (self._snapshots[p][0].timestamp
+                                   if self._snapshots[p] else 0.0),
+                )
+                del self._snapshots[oldest_pid]
 
         # Store (with eviction of oldest)
         self._snapshots.setdefault(pid, []).append(snapshot)

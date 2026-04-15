@@ -56,6 +56,14 @@ static pe_dll_entry_t g_pe_dlls[MAX_PE_DLLS];
 static int g_pe_dll_count = 0;
 static pthread_mutex_t g_pe_dll_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* PE DLL table is append-only (entries stay once loaded=1), so a TLS
+ * last-hit cache is always valid once populated. Gen counter future-proofs
+ * any later path that clears or rewrites entries. */
+static volatile unsigned int g_pe_dll_gen = 0;
+static __thread unsigned int tls_pe_gen = (unsigned int)-1;
+static __thread char         tls_pe_name[260];
+static __thread pe_dll_entry_t *tls_pe_hit = NULL;
+
 /* Forward declarations */
 static int pe_dll_resolve_imports(void *base, uint32_t size_of_image);
 void *pe_dll_get_proc(void *base, const char *proc_name);
@@ -100,7 +108,8 @@ static int find_dll_file(const char *name, char *result, size_t result_size)
     if (env_path) {
         char *paths = strdup(env_path);
         if (!paths) return -1;
-        char *tok = strtok(paths, ":");
+        char *save = NULL;
+        char *tok = strtok_r(paths, ":", &save);
         while (tok) {
             snprintf(path, sizeof(path), "%s/%s", tok, name);
             if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
@@ -108,7 +117,7 @@ static int find_dll_file(const char *name, char *result, size_t result_size)
                 free(paths);
                 return 0;
             }
-            tok = strtok(NULL, ":");
+            tok = strtok_r(NULL, ":", &save);
         }
         free(paths);
     }
@@ -142,7 +151,7 @@ static int find_dll_file(const char *name, char *result, size_t result_size)
     return -1;
 }
 
-/* Check if already loaded */
+/* Check if already loaded. Caller MUST hold g_pe_dll_lock. */
 static pe_dll_entry_t *find_loaded_pe_dll(const char *name)
 {
     char lower[260];
@@ -151,9 +160,19 @@ static pe_dll_entry_t *find_loaded_pe_dll(const char *name)
         lower[i] = (name[i] >= 'A' && name[i] <= 'Z') ? name[i] + 32 : name[i];
     lower[i] = '\0';
 
+    if (tls_pe_gen == g_pe_dll_gen && tls_pe_hit &&
+        tls_pe_hit->loaded && strcmp(tls_pe_name, lower) == 0) {
+        return tls_pe_hit;
+    }
+
     for (int j = 0; j < g_pe_dll_count; j++) {
-        if (strcmp(g_pe_dlls[j].name, lower) == 0 && g_pe_dlls[j].loaded)
+        if (strcmp(g_pe_dlls[j].name, lower) == 0 && g_pe_dlls[j].loaded) {
+            tls_pe_gen = g_pe_dll_gen;
+            strncpy(tls_pe_name, lower, sizeof(tls_pe_name) - 1);
+            tls_pe_name[sizeof(tls_pe_name) - 1] = '\0';
+            tls_pe_hit = &g_pe_dlls[j];
             return &g_pe_dlls[j];
+        }
     }
     return NULL;
 }
@@ -393,6 +412,7 @@ void *pe_dll_load(const char *dll_name)
     entry->export_size = export_size;
     entry->loaded = 1;
     g_pe_dll_count++;
+    g_pe_dll_gen++;
 
     /* Register in PEB LDR module list */
     env_register_module(base, size_of_image, entry->entry_point,
@@ -654,8 +674,11 @@ void *pe_dll_get_proc(void *base, const char *proc_name)
 /* Check if a PE DLL is loaded, return base address */
 void *pe_dll_find(const char *name)
 {
+    pthread_mutex_lock(&g_pe_dll_lock);
     pe_dll_entry_t *e = find_loaded_pe_dll(name);
-    return e ? e->base : NULL;
+    void *base = e ? e->base : NULL;
+    pthread_mutex_unlock(&g_pe_dll_lock);
+    return base;
 }
 
 /*

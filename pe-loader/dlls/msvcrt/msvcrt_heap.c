@@ -185,8 +185,15 @@ WINAPI_EXPORT size_t _msize_dbg(void *memblock, int blockType)
 /* _recalloc - realloc + zero-fill new bytes */
 WINAPI_EXPORT void *_recalloc(void *memblock, size_t count, size_t size)
 {
+    /* MSVC _recalloc(p, 0, 0) frees p and returns NULL (matches MS
+     * realloc(p,0) semantics).  Without this the glibc realloc(p,0)
+     * behavior is implementation-defined and may leak or alias. */
     size_t total = count * size;
     if (count && total / count != size) return NULL; /* overflow */
+    if (total == 0) {
+        if (memblock) free(memblock);
+        return NULL;
+    }
     if (!memblock) return calloc(count, size);
     size_t old_size = malloc_usable_size(memblock);
     void *ptr = realloc(memblock, total);
@@ -279,6 +286,10 @@ WINAPI_EXPORT void *_aligned_recalloc(void *memblock, size_t count, size_t size,
 {
     size_t total = count * size;
     if (count && total / count != size) return NULL;
+    if (total == 0) {
+        if (memblock) _aligned_free(memblock);
+        return NULL;
+    }
     size_t old_size = memblock ? malloc_usable_size(memblock) : 0;
     void *ptr = _aligned_realloc(memblock, total, alignment);
     if (ptr && total > old_size)

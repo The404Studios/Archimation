@@ -25,6 +25,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 #include "common/dll_common.h"
 
@@ -226,25 +228,32 @@ typedef struct {
 } font_entry_t;
 
 static font_entry_t g_font_table[MAX_FONT_HANDLES];
-static int g_font_table_initialized = 0;
-static uintptr_t g_next_font_handle = 0xF1000000;
+/* Session 30: make font-handle allocation thread-safe. Same rationale as
+ * the dc_map lock — Unity/UE can touch font state from the render thread
+ * while the worker thread is still loading assets via SelectObject. */
+static _Atomic(uintptr_t) g_next_font_handle = 0xF1000000;
+static pthread_mutex_t g_font_table_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t  g_font_table_once = PTHREAD_ONCE_INIT;
+
+static void font_table_init_cb(void)
+{
+    memset(g_font_table, 0, sizeof(g_font_table));
+}
 
 static void ensure_font_table_init(void)
 {
-    if (!g_font_table_initialized) {
-        memset(g_font_table, 0, sizeof(g_font_table));
-        g_font_table_initialized = 1;
-    }
+    pthread_once(&g_font_table_once, font_table_init_cb);
 }
 
 static font_entry_t *font_alloc(const LOGFONTA *lf)
 {
     ensure_font_table_init();
+    pthread_mutex_lock(&g_font_table_lock);
     for (int i = 0; i < MAX_FONT_HANDLES; i++) {
         if (!g_font_table[i].used) {
             memset(&g_font_table[i], 0, sizeof(font_entry_t));
             g_font_table[i].used = 1;
-            g_font_table[i].handle = (HFONT)(g_next_font_handle++);
+            g_font_table[i].handle = (HFONT)atomic_fetch_add(&g_next_font_handle, 1);
 
             if (lf) {
                 g_font_table[i].logfont = *lf;
@@ -267,9 +276,11 @@ static font_entry_t *font_alloc(const LOGFONTA *lf)
                 g_font_table[i].logfont.lfPitchAndFamily = DEFAULT_PITCH | FF_SWISS;
             }
 
+            pthread_mutex_unlock(&g_font_table_lock);
             return &g_font_table[i];
         }
     }
+    pthread_mutex_unlock(&g_font_table_lock);
     return NULL;
 }
 
@@ -277,12 +288,40 @@ static font_entry_t *font_lookup(HFONT hf)
 {
     ensure_font_table_init();
     if (!hf) return NULL;
+    pthread_mutex_lock(&g_font_table_lock);
     for (int i = 0; i < MAX_FONT_HANDLES; i++) {
-        if (g_font_table[i].used && g_font_table[i].handle == hf)
+        if (g_font_table[i].used && g_font_table[i].handle == hf) {
+            pthread_mutex_unlock(&g_font_table_lock);
             return &g_font_table[i];
+        }
     }
+    pthread_mutex_unlock(&g_font_table_lock);
     return NULL;
 }
+
+/*
+ * Free a font entry by handle.  Called from DeleteObject in gdi32_dc.c
+ * when the handle falls in our font range, and from any direct
+ * DeleteFont callers.  Returns TRUE on success, FALSE if handle
+ * wasn't found.  Not exported (internal helper).
+ */
+int gdi32_font_delete(HFONT hf)
+{
+    ensure_font_table_init();
+    if (!hf) return 0;
+    pthread_mutex_lock(&g_font_table_lock);
+    for (int i = 0; i < MAX_FONT_HANDLES; i++) {
+        if (g_font_table[i].used && g_font_table[i].handle == hf) {
+            memset(&g_font_table[i], 0, sizeof(g_font_table[i]));
+            pthread_mutex_unlock(&g_font_table_lock);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&g_font_table_lock);
+    return 0;
+}
+
+/* gdi32_font_dc_release() defined below after g_font_dc is declared. */
 
 /* --------------------------------------------------------------------------
  * Per-DC state tracking
@@ -356,6 +395,189 @@ static font_dc_state_t *font_dc_get_or_create(HDC hdc)
         }
     }
     return NULL;
+}
+
+/*
+ * Release per-DC font state.  Called from DeleteDC/ReleaseDC in
+ * gdi32_dc.c so the 64-slot g_font_dc table doesn't leak entries on
+ * every GetDC.  Once all 64 slots fill, font_dc_get_or_create() returns
+ * NULL and SetTextColor_Font / SelectObject_Font / etc fail silently.
+ */
+void gdi32_font_dc_release(HDC hdc)
+{
+    if (!hdc) return;
+    ensure_font_dc_init();
+    for (int i = 0; i < MAX_FONT_DCS; i++) {
+        if (g_font_dc[i].used && g_font_dc[i].hdc == hdc) {
+            memset(&g_font_dc[i], 0, sizeof(g_font_dc[i]));
+            return;
+        }
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Stock-font support (Session 26 Agent 7 follow-up)
+ *
+ * Stock fonts come from GetStockObject(SYSTEM_FONT / DEFAULT_GUI_FONT / ...).
+ * They are allocated as gdi_object_t in gdi32_dc.c (handle range
+ * 0x80000000-0x800003FF) -- NOT as font_entry_t in our font pool -- so
+ * font_lookup() used to return NULL for them.  Effect: TextOut/GetTextMetrics
+ * fell back to Arial-16 regardless of which stock font the app selected,
+ * and GetObjectA on a stock font handle returned 0.
+ *
+ * Fix: when SelectObject (in gdi32_dc.c) or GetObjectA dispatches a stock-font
+ * handle here, we materialise a font_entry_t on demand keyed by the stock
+ * HGDIOBJ itself, backed by a per-stock-id LOGFONTA template.
+ *
+ * The stock-id constants must match the GetStockObject(n) indices used in
+ * gdi32_dc.c so the two files stay in sync.
+ * -------------------------------------------------------------------------- */
+
+#define GDI_STOCK_OEM_FIXED_FONT      10
+#define GDI_STOCK_ANSI_FIXED_FONT     11
+#define GDI_STOCK_ANSI_VAR_FONT       12
+#define GDI_STOCK_SYSTEM_FONT         13
+#define GDI_STOCK_DEVICE_DEFAULT_FONT 14
+#define GDI_STOCK_SYSTEM_FIXED_FONT   16
+#define GDI_STOCK_DEFAULT_GUI_FONT    17
+
+/* Fill LOGFONTA with sensible defaults for each stock-font id.
+ * Heights are negative (= cell height in pixels, Windows convention). */
+static void fill_stock_logfont_defaults(int stock_id, LOGFONTA *lf)
+{
+    memset(lf, 0, sizeof(*lf));
+    lf->lfCharSet        = DEFAULT_CHARSET;
+    lf->lfOutPrecision   = OUT_DEFAULT_PRECIS;
+    lf->lfClipPrecision  = CLIP_DEFAULT_PRECIS;
+    lf->lfQuality        = DEFAULT_QUALITY;
+
+    switch (stock_id) {
+    case GDI_STOCK_OEM_FIXED_FONT:
+        lf->lfHeight         = -12;
+        lf->lfWeight         = FW_NORMAL;
+        lf->lfCharSet        = OEM_CHARSET;
+        lf->lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
+        strncpy(lf->lfFaceName, "Terminal", LF_FACESIZE - 1);
+        break;
+    case GDI_STOCK_ANSI_FIXED_FONT:
+    case GDI_STOCK_SYSTEM_FIXED_FONT:
+        lf->lfHeight         = -12;
+        lf->lfWeight         = FW_NORMAL;
+        lf->lfCharSet        = ANSI_CHARSET;
+        lf->lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
+        strncpy(lf->lfFaceName, "Courier", LF_FACESIZE - 1);
+        break;
+    case GDI_STOCK_ANSI_VAR_FONT:
+        lf->lfHeight         = -12;
+        lf->lfWeight         = FW_NORMAL;
+        lf->lfCharSet        = ANSI_CHARSET;
+        lf->lfPitchAndFamily = VARIABLE_PITCH | FF_SWISS;
+        strncpy(lf->lfFaceName, "MS Sans Serif", LF_FACESIZE - 1);
+        break;
+    case GDI_STOCK_SYSTEM_FONT:
+        lf->lfHeight         = -16;
+        lf->lfWeight         = FW_BOLD;
+        lf->lfCharSet        = ANSI_CHARSET;
+        lf->lfPitchAndFamily = VARIABLE_PITCH | FF_SWISS;
+        strncpy(lf->lfFaceName, "System", LF_FACESIZE - 1);
+        break;
+    case GDI_STOCK_DEVICE_DEFAULT_FONT:
+        lf->lfHeight         = -16;
+        lf->lfWeight         = FW_NORMAL;
+        lf->lfCharSet        = ANSI_CHARSET;
+        lf->lfPitchAndFamily = VARIABLE_PITCH | FF_SWISS;
+        strncpy(lf->lfFaceName, "System", LF_FACESIZE - 1);
+        break;
+    case GDI_STOCK_DEFAULT_GUI_FONT:
+    default:
+        lf->lfHeight         = -11;
+        lf->lfWeight         = FW_NORMAL;
+        lf->lfCharSet        = DEFAULT_CHARSET;
+        lf->lfPitchAndFamily = VARIABLE_PITCH | FF_SWISS;
+        strncpy(lf->lfFaceName, "MS Shell Dlg", LF_FACESIZE - 1);
+        break;
+    }
+    lf->lfFaceName[LF_FACESIZE - 1] = '\0';
+}
+
+/*
+ * Ensure a font_entry_t exists in g_font_table with handle == stock_handle.
+ * Idempotent: if an entry for that handle is already present, returns it.
+ * Called from SelectObject's stock-font dispatch so font_lookup() finds
+ * metrics for the stock handle and TextOut / GetTextMetrics pick up the
+ * stock font's LOGFONTA instead of the Arial-16 fallback.
+ */
+static font_entry_t *stock_font_entry_ensure(HGDIOBJ stock_handle, int stock_id)
+{
+    ensure_font_table_init();
+    if (!stock_handle) return NULL;
+
+    /* Reuse existing entry for this handle if already materialised. */
+    for (int i = 0; i < MAX_FONT_HANDLES; i++) {
+        if (g_font_table[i].used &&
+            g_font_table[i].handle == (HFONT)stock_handle) {
+            return &g_font_table[i];
+        }
+    }
+
+    /* Allocate a slot and install the stock-font LOGFONTA template. */
+    for (int i = 0; i < MAX_FONT_HANDLES; i++) {
+        if (!g_font_table[i].used) {
+            memset(&g_font_table[i], 0, sizeof(font_entry_t));
+            g_font_table[i].used = 1;
+            g_font_table[i].handle = (HFONT)stock_handle;
+            fill_stock_logfont_defaults(stock_id, &g_font_table[i].logfont);
+
+            int h = g_font_table[i].logfont.lfHeight;
+            if (h < 0) h = -h;
+            if (h == 0) h = 16;
+            g_font_table[i].pixel_height = h;
+            g_font_table[i].avg_width = (h > 2) ? (h * 2) / 3 : 8;
+            if (g_font_table[i].avg_width < 1)
+                g_font_table[i].avg_width = 8;
+            return &g_font_table[i];
+        }
+    }
+    return NULL;  /* Table full */
+}
+
+/*
+ * Called from gdi32_dc.c:SelectObject when a stock-font gdi_object_t is
+ * selected.  Side effects:
+ *   1. Materialise a font_entry_t for the stock handle (so font_lookup works).
+ *   2. Point the font_dc_state_t's selected_font at the stock handle.
+ *
+ * No return value -- gdi32_dc.c handles the "previous selection" reporting
+ * through its own dc_entry_t state.
+ */
+void gdi32_font_sync_stock_on_dc(HDC hdc, HGDIOBJ stock_handle, int stock_id)
+{
+    if (!hdc || !stock_handle) return;
+
+    font_entry_t *fe = stock_font_entry_ensure(stock_handle, stock_id);
+    if (!fe) return;
+
+    font_dc_state_t *dc = font_dc_get_or_create(hdc);
+    if (!dc) return;
+
+    dc->prev_font = dc->selected_font;
+    dc->selected_font = (HFONT)stock_handle;
+}
+
+/*
+ * Called from gdi32_dc.c:gdi32_dc_get_object_info when GetObjectA is invoked
+ * on a stock-font handle.  Fills the caller's LOGFONTA (or reports the
+ * required buffer size when pv==NULL).  Returns bytes written, matching
+ * the Win32 GetObjectA contract.
+ */
+int gdi32_font_fill_stock_logfonta(int stock_id, int cb, void *pv)
+{
+    if (!pv) return (int)sizeof(LOGFONTA);
+    if (cb < (int)sizeof(LOGFONTA)) return 0;
+
+    LOGFONTA *out = (LOGFONTA *)pv;
+    fill_stock_logfont_defaults(stock_id, out);
+    return (int)sizeof(LOGFONTA);
 }
 
 /* --------------------------------------------------------------------------
@@ -528,6 +750,46 @@ WINAPI_EXPORT HGDIOBJ SelectObject_Font(HDC hdc, HGDIOBJ h)
     fprintf(stderr, "gdi32_font: SelectObject_Font(hdc=%p, font=%p) -> prev=%p\n",
             hdc, h, old);
     return old;
+}
+
+/* ==========================================================================
+ * gdi32_font_select_on_dc - dispatcher entry point from gdi32_dc.c
+ *
+ * Called by SelectObject in gdi32_dc.c when the handle is in the font range
+ * (0xF1000000-0xF1FFFFFF).  Validates the handle, updates both the
+ * canonical dc_entry_t.selected_font (via gdi32_dc_set_selected) AND the
+ * local g_font_dc state table so text metrics / TextOut lookups stay in
+ * sync.  Returns the previously-selected font handle.
+ *
+ * Note: two sources of truth for selected_font exist today (dc_entry_t in
+ * gdi32_dc.c and font_dc_state_t here).  We update both.  Cleaning up the
+ * duplication is deferred (cross-file coordination required).
+ * ========================================================================== */
+
+extern __attribute__((ms_abi)) HGDIOBJ gdi32_dc_set_selected(HDC hdc, int obj_type, HGDIOBJ new_h);
+
+#ifndef OBJ_FONT
+#define OBJ_FONT 6
+#endif
+
+__attribute__((ms_abi)) HFONT gdi32_font_select_on_dc(HDC hdc, HFONT new_hf)
+{
+    if (!hdc || !new_hf)
+        return NULL;
+
+    /* Validate this is one of our font handles */
+    if (!font_lookup(new_hf))
+        return NULL;
+
+    /* Update local font_dc state table (for TextOut/metrics) */
+    font_dc_state_t *dc = font_dc_get_or_create(hdc);
+    if (dc) {
+        dc->prev_font = dc->selected_font;
+        dc->selected_font = new_hf;
+    }
+
+    /* Update canonical dc_entry_t in gdi32_dc.c and get the old handle */
+    return (HFONT)gdi32_dc_set_selected(hdc, OBJ_FONT, (HGDIOBJ)new_hf);
 }
 
 /* ==========================================================================

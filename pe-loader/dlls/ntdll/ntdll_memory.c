@@ -49,6 +49,21 @@ static int win32_prot_to_mmap(DWORD protect)
     }
 }
 
+/* Cached page size — sysconf(_SC_PAGESIZE) reads auxv every call; cache once.
+ * Page size is immutable for process lifetime on all Linux configs, including
+ * hugepage machines (mmap of regular anonymous memory still uses the base
+ * page size; explicit MAP_HUGETLB is a separate opt-in). */
+static long get_cached_page_size(void)
+{
+    static long cached = 0;
+    long v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (v > 0) return v;
+    v = sysconf(_SC_PAGESIZE);
+    if (v <= 0) v = 4096;
+    __atomic_store_n(&cached, v, __ATOMIC_RELEASE);
+    return v;
+}
+
 WINAPI_EXPORT NTSTATUS NtAllocateVirtualMemory(
     HANDLE ProcessHandle,
     PVOID *BaseAddress,
@@ -64,8 +79,10 @@ WINAPI_EXPORT NTSTATUS NtAllocateVirtualMemory(
         return STATUS_INVALID_PARAMETER;
 
     size_t size = *RegionSize;
-    long page_size = sysconf(_SC_PAGESIZE);
-    size = (size + page_size - 1) & ~(page_size - 1);
+    long page_size = get_cached_page_size();
+    size = (size + (size_t)page_size - 1) & ~((size_t)page_size - 1);
+    if (size == 0)
+        return STATUS_INVALID_PARAMETER;
 
     int prot = win32_prot_to_mmap(Protect);
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
@@ -84,12 +101,16 @@ WINAPI_EXPORT NTSTATUS NtAllocateVirtualMemory(
 
         if (AllocationType & MEM_COMMIT) {
             /* Reserve + Commit: apply requested protection */
-            mprotect(addr, size, prot);
+            if (mprotect(addr, size, prot) < 0) {
+                munmap(addr, size);
+                return STATUS_UNSUCCESSFUL;
+            }
         }
     } else if (AllocationType & MEM_COMMIT) {
         /* Commit only: apply protection to already-reserved region */
         if (addr) {
-            mprotect(addr, size, prot);
+            if (mprotect(addr, size, prot) < 0)
+                return STATUS_UNSUCCESSFUL;
         } else {
             addr = mmap(NULL, size, prot, flags, -1, 0);
             if (addr == MAP_FAILED)
@@ -110,16 +131,18 @@ WINAPI_EXPORT NTSTATUS NtFreeVirtualMemory(
 {
     (void)ProcessHandle;
 
-    if (!BaseAddress || !*BaseAddress)
+    if (!BaseAddress || !*BaseAddress || !RegionSize)
         return STATUS_INVALID_PARAMETER;
 
     if (FreeType & MEM_RELEASE) {
         size_t size = *RegionSize;
         if (size == 0) {
-            /* Query /proc/self/maps to find the actual mapping size */
+            /* Query /proc/self/maps to find the actual mapping size.
+             * Use a buffer large enough for long mapping paths so the
+             * "start-end" prefix is never split across fgets calls. */
             FILE *maps = fopen("/proc/self/maps", "r");
             if (maps) {
-                char line[256];
+                char line[4096];
                 uintptr_t target = (uintptr_t)*BaseAddress;
                 while (fgets(line, sizeof(line), maps)) {
                     uintptr_t start, end;
@@ -205,7 +228,8 @@ WINAPI_EXPORT NTSTATUS NtQueryVirtualMemory(
     }
 
     uintptr_t target = (uintptr_t)BaseAddress;
-    char line[512];
+    /* Big enough for long mapping paths so the "start-end" prefix isn't split */
+    char line[4096];
     int found = 0;
 
     while (fgets(line, sizeof(line), f)) {
@@ -321,4 +345,66 @@ WINAPI_EXPORT NTSTATUS RtlDestroyHeap(PVOID HeapHandle)
 {
     (void)HeapHandle;
     return STATUS_SUCCESS;
+}
+
+/* ===== Rtl memory helpers (ntdll namespace) =====
+ *
+ * These mirror the ntoskrnl.exe implementations so PE binaries importing
+ * them via ntdll.dll resolve against ntdll.so's own symbol table. Each .so
+ * has an independent symbol namespace (PIC, no cross-DLL linkage), so the
+ * duplicate definitions in ntoskrnl.so do not conflict at link time.
+ */
+
+/* No NULL/zero-length guards: real Windows Rtl* macros are bare memcpy/memmove/
+ * memset. These are called billions of times by the PE CRT; adding guards burns
+ * cycles and apps that pass NULL with len>0 crash on Windows too (matches ABI).
+ * C11 defines memcpy/memmove/memset(NULL, ..., 0) as no-ops, so the len==0 case
+ * is already safe in the underlying libc call. */
+
+WINAPI_EXPORT void RtlCopyMemory(void *Destination, const void *Source, SIZE_T Length)
+{
+    memcpy(Destination, Source, Length);
+}
+
+WINAPI_EXPORT void RtlMoveMemory(void *Destination, const void *Source, SIZE_T Length)
+{
+    memmove(Destination, Source, Length);
+}
+
+WINAPI_EXPORT void RtlZeroMemory(void *Destination, SIZE_T Length)
+{
+    memset(Destination, 0, Length);
+}
+
+WINAPI_EXPORT void RtlFillMemory(void *Destination, SIZE_T Length, UCHAR Fill)
+{
+    memset(Destination, Fill, Length);
+}
+
+/* RtlSecureZeroMemory - a zeroing op the compiler must NOT optimize away
+ * (used by callers wiping secrets). Touch each byte through a volatile
+ * pointer so the store is observable. */
+WINAPI_EXPORT void RtlSecureZeroMemory(void *Destination, SIZE_T Length)
+{
+    if (!Destination || !Length)
+        return;
+    volatile unsigned char *p = (volatile unsigned char *)Destination;
+    SIZE_T i;
+    for (i = 0; i < Length; i++)
+        p[i] = 0;
+}
+
+/* RtlCompareMemory returns the count of matching leading bytes (NOT 0/1 like
+ * memcmp). Length==0 naturally returns 0 via the loop guard; NULL args with
+ * Length>0 crash (matches Windows behavior — caller's fault). */
+WINAPI_EXPORT SIZE_T RtlCompareMemory(const void *Source1, const void *Source2, SIZE_T Length)
+{
+    const UCHAR *s1 = (const UCHAR *)Source1;
+    const UCHAR *s2 = (const UCHAR *)Source2;
+    SIZE_T i;
+    for (i = 0; i < Length; i++) {
+        if (s1[i] != s2[i])
+            break;
+    }
+    return i;
 }

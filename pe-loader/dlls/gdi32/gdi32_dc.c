@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 #include "common/dll_common.h"
 #include "../../graphics/gfx_backend.h"
@@ -124,16 +126,24 @@ typedef struct {
 #define MAX_GDI_OBJECTS 1024
 
 static gdi_object_t g_gdi_objects[MAX_GDI_OBJECTS];
-static int g_gdi_initialized = 0;
+/* Session 30: ensure_gdi_init was racy — multiple threads calling
+ * GetStockObject concurrently at startup could double-init the object pool
+ * (stock handles allocated twice, leaking slots). Use pthread_once so
+ * initialization is idempotent + deterministic, and guard the pool itself
+ * with g_gdi_pool_lock. */
+static pthread_once_t g_gdi_init_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t g_gdi_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Stock objects (pre-allocated) */
 static HGDIOBJ g_stock_objects[32];
 
 static void ensure_gdi_init(void);
 
-static gdi_object_t *gdi_alloc(gdi_obj_type_t type)
+/* Internal: allocate a slot without running ensure_gdi_init() — used by
+ * the init-once callback to populate stock objects. Callers outside init
+ * MUST go through gdi_alloc() which runs init first. */
+static gdi_object_t *gdi_alloc_nolock_internal(gdi_obj_type_t type)
 {
-    ensure_gdi_init();
     for (int i = 0; i < MAX_GDI_OBJECTS; i++) {
         if (!g_gdi_objects[i].used) {
             memset(&g_gdi_objects[i], 0, sizeof(gdi_object_t));
@@ -143,6 +153,15 @@ static gdi_object_t *gdi_alloc(gdi_obj_type_t type)
         }
     }
     return NULL;
+}
+
+static gdi_object_t *gdi_alloc(gdi_obj_type_t type)
+{
+    ensure_gdi_init();
+    pthread_mutex_lock(&g_gdi_pool_lock);
+    gdi_object_t *r = gdi_alloc_nolock_internal(type);
+    pthread_mutex_unlock(&g_gdi_pool_lock);
+    return r;
 }
 
 static HGDIOBJ gdi_to_handle(gdi_object_t *obj)
@@ -165,12 +184,14 @@ static gdi_object_t *handle_to_gdi(HGDIOBJ h)
     return &g_gdi_objects[idx];
 }
 
+static void gdi_init_once_cb(void);
 static void ensure_gdi_init(void)
 {
-    if (g_gdi_initialized)
-        return;
-    g_gdi_initialized = 1;
+    pthread_once(&g_gdi_init_once, gdi_init_once_cb);
+}
 
+static void gdi_init_once_cb(void)
+{
     memset(g_gdi_objects, 0, sizeof(g_gdi_objects));
     memset(g_stock_objects, 0, sizeof(g_stock_objects));
 
@@ -183,7 +204,7 @@ static void ensure_gdi_init(void)
         { BLACK_BRUSH,  RGB(0, 0, 0) },
     };
     for (int i = 0; i < 5; i++) {
-        gdi_object_t *obj = gdi_alloc(GDI_OBJ_BRUSH);
+        gdi_object_t *obj = gdi_alloc_nolock_internal(GDI_OBJ_BRUSH);
         if (obj) {
             obj->stock = 1;
             obj->color = stock_brushes[i].color;
@@ -193,7 +214,7 @@ static void ensure_gdi_init(void)
 
     /* NULL_BRUSH */
     {
-        gdi_object_t *obj = gdi_alloc(GDI_OBJ_BRUSH);
+        gdi_object_t *obj = gdi_alloc_nolock_internal(GDI_OBJ_BRUSH);
         if (obj) {
             obj->stock = 1;
             obj->color = CLR_INVALID;  /* No fill */
@@ -207,7 +228,7 @@ static void ensure_gdi_init(void)
         { BLACK_PEN, RGB(0, 0, 0) },
     };
     for (int i = 0; i < 2; i++) {
-        gdi_object_t *obj = gdi_alloc(GDI_OBJ_PEN);
+        gdi_object_t *obj = gdi_alloc_nolock_internal(GDI_OBJ_PEN);
         if (obj) {
             obj->stock = 1;
             obj->color = stock_pens[i].color;
@@ -218,7 +239,7 @@ static void ensure_gdi_init(void)
 
     /* NULL_PEN */
     {
-        gdi_object_t *obj = gdi_alloc(GDI_OBJ_PEN);
+        gdi_object_t *obj = gdi_alloc_nolock_internal(GDI_OBJ_PEN);
         if (obj) {
             obj->stock = 1;
             obj->color = CLR_INVALID;
@@ -227,14 +248,22 @@ static void ensure_gdi_init(void)
         }
     }
 
-    /* Stock fonts */
+    /* Stock fonts.
+     *
+     * Record the stock-font identity in obj->style so SelectObject and
+     * GetObjectA can reconstruct a sensible LOGFONTA (Session 26 Agent 7:
+     * stock fonts selected via SelectObject didn't update font_dc_state_t,
+     * so TextOut always used default metrics; GetObjectA also returned 0).
+     * obj->style is unused for fonts (pens-only field), so we repurpose it.
+     * +1 offset so zero never collides with "stock_id not set". */
     int font_indices[] = { OEM_FIXED_FONT, ANSI_FIXED_FONT, ANSI_VAR_FONT,
                            SYSTEM_FONT, DEVICE_DEFAULT_FONT, SYSTEM_FIXED_FONT,
                            DEFAULT_GUI_FONT };
     for (int i = 0; i < 7; i++) {
-        gdi_object_t *obj = gdi_alloc(GDI_OBJ_FONT);
+        gdi_object_t *obj = gdi_alloc_nolock_internal(GDI_OBJ_FONT);
         if (obj) {
             obj->stock = 1;
+            obj->style = font_indices[i] + 1;  /* stock-id tag, +1 so 0 = unset */
             g_stock_objects[font_indices[i]] = gdi_to_handle(obj);
         }
     }
@@ -265,25 +294,34 @@ typedef struct {
 } dc_entry_t;
 
 static dc_entry_t g_dc_map[MAX_DC_MAP];
-static int g_dc_map_initialized = 0;
-static uintptr_t g_next_hdc = 0x20000;
+/* Session 30: g_next_hdc was plain uintptr_t with no synchronization,
+ * concurrent GetDC/CreateCompatibleDC from the UI thread + background
+ * preload threads could hand out the SAME hdc to two DCs. Use atomic. */
+static _Atomic(uintptr_t) g_next_hdc = 0x20000;
+static pthread_mutex_t g_dc_map_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t g_dc_map_init_once = PTHREAD_ONCE_INIT;
+
+static void dc_map_init_cb(void)
+{
+    memset(g_dc_map, 0, sizeof(g_dc_map));
+}
 
 static void ensure_dc_map_init(void)
 {
-    if (!g_dc_map_initialized) {
-        memset(g_dc_map, 0, sizeof(g_dc_map));
-        g_dc_map_initialized = 1;
-    }
+    pthread_once(&g_dc_map_init_once, dc_map_init_cb);
 }
 
 static dc_entry_t *dc_alloc(gfx_dc_t *gfx_dc, HWND hwnd)
 {
     ensure_dc_map_init();
+    pthread_mutex_lock(&g_dc_map_lock);
     for (int i = 0; i < MAX_DC_MAP; i++) {
         if (!g_dc_map[i].used) {
             memset(&g_dc_map[i], 0, sizeof(dc_entry_t));
             g_dc_map[i].used = 1;
-            g_dc_map[i].hdc = (HDC)(g_next_hdc++);
+            /* atomic post-increment so concurrent dc_alloc calls each get a
+             * unique hdc value. */
+            g_dc_map[i].hdc = (HDC)atomic_fetch_add(&g_next_hdc, 1);
             g_dc_map[i].gfx_dc = gfx_dc;
             g_dc_map[i].hwnd = hwnd;
             g_dc_map[i].text_color = RGB(0, 0, 0);
@@ -293,31 +331,45 @@ static dc_entry_t *dc_alloc(gfx_dc_t *gfx_dc, HWND hwnd)
             g_dc_map[i].map_mode = MM_TEXT;
             g_dc_map[i].rop2 = R2_COPYPEN;
             g_dc_map[i].stretch_mode = COLORONCOLOR;
+            pthread_mutex_unlock(&g_dc_map_lock);
             return &g_dc_map[i];
         }
     }
+    pthread_mutex_unlock(&g_dc_map_lock);
     return NULL;
 }
 
 static dc_entry_t *dc_lookup(HDC hdc)
 {
     ensure_dc_map_init();
+    /* Caller relies on returned pointer surviving briefly — dc_free only
+     * clears ->used, the slot itself is static. No concurrent mutation of
+     * per-entry fields is safe across dc_free; callers observing a just-
+     * freed entry see used==0 on the next lookup. Snapshot under the lock
+     * to avoid torn reads of the hdc field during dc_alloc. */
+    pthread_mutex_lock(&g_dc_map_lock);
     for (int i = 0; i < MAX_DC_MAP; i++) {
-        if (g_dc_map[i].used && g_dc_map[i].hdc == hdc)
+        if (g_dc_map[i].used && g_dc_map[i].hdc == hdc) {
+            pthread_mutex_unlock(&g_dc_map_lock);
             return &g_dc_map[i];
+        }
     }
+    pthread_mutex_unlock(&g_dc_map_lock);
     return NULL;
 }
 
 static void dc_free(HDC hdc)
 {
     ensure_dc_map_init();
+    pthread_mutex_lock(&g_dc_map_lock);
     for (int i = 0; i < MAX_DC_MAP; i++) {
         if (g_dc_map[i].used && g_dc_map[i].hdc == hdc) {
             g_dc_map[i].used = 0;
+            pthread_mutex_unlock(&g_dc_map_lock);
             return;
         }
     }
+    pthread_mutex_unlock(&g_dc_map_lock);
 }
 
 /* --------------------------------------------------------------------------
@@ -358,6 +410,10 @@ HDC gdi32_GetDC(HWND hWnd)
     return entry->hdc;
 }
 
+/* Defined in gdi32_font.c -- releases per-DC font state slot so the
+ * 64-slot font DC state table doesn't leak entries on every GetDC. */
+extern void gdi32_font_dc_release(HDC hdc);
+
 int gdi32_ReleaseDC(HWND hWnd, HDC hDC)
 {
     dc_entry_t *entry = dc_lookup(hDC);
@@ -370,6 +426,7 @@ int gdi32_ReleaseDC(HWND hWnd, HDC hDC)
         backend->release_dc(backend, win, entry->gfx_dc);
     }
 
+    gdi32_font_dc_release(hDC);
     dc_free(hDC);
     return 1;
 }
@@ -420,6 +477,7 @@ WINAPI_EXPORT BOOL DeleteDC(HDC hdc)
         gfx_free_dc(entry->gfx_dc);
     }
 
+    gdi32_font_dc_release(hdc);
     dc_free(hdc);
     return TRUE;
 }
@@ -465,14 +523,88 @@ BOOL gdi32_EndPaint(HWND hWnd, const PAINTSTRUCT *lpPaint)
 
 /* --------------------------------------------------------------------------
  * SelectObject
+ *
+ * Dispatches by handle range (Session 23 DeleteObject pattern):
+ *   0x80000000-0x800003FF : gdi_object_t pool (pens/brushes/regions)
+ *   0xB0000000-0xBFFFFFFF : bitmap pool (gdi32_bitmap.c)
+ *   0xF1000000-0xF1FFFFFF : font pool   (gdi32_font.c)
+ *
+ * Session 23 bug: old code called handle_to_gdi(h) which only validated the
+ * gdi_object_t range, so bitmap/font handles returned NULL --
+ * entry->selected_bitmap was never set, breaking StretchBlt/BitBlt on
+ * off-screen memory DCs.
  * -------------------------------------------------------------------------- */
+
+/* Defined in gdi32_bitmap.c and gdi32_font.c (same .so). Each validates
+ * the handle, updates the DC's selected_bitmap/selected_font slot, and
+ * returns the previously-selected handle. */
+extern __attribute__((ms_abi)) HBITMAP gdi32_bitmap_select_on_dc(HDC hdc, HBITMAP new_hbm);
+extern __attribute__((ms_abi)) HFONT   gdi32_font_select_on_dc(HDC hdc, HFONT new_hf);
+
+/* Defined in gdi32_font.c.  Called from SelectObject's GDI_OBJ_FONT case when
+ * the app selects a stock font.  `stock_id` is the GetStockObject index
+ * (SYSTEM_FONT, DEFAULT_GUI_FONT, ...).  The helper ensures a font_entry_t
+ * exists for `stock_handle` (so font_lookup finds it) and points the
+ * font_dc_state_t at it so TextOut / GetTextMetrics pick up the right
+ * defaults instead of Arial-16. */
+extern void gdi32_font_sync_stock_on_dc(HDC hdc, HGDIOBJ stock_handle, int stock_id);
+
+/* OBJ_* constants (wingdi.h) -- defined once here, re-defined later
+ * for the GetCurrentObject helper section. */
+#ifndef OBJ_PEN
+#define OBJ_PEN     1
+#define OBJ_BRUSH   2
+#define OBJ_FONT    6
+#define OBJ_BITMAP  7
+#endif
+
+/* Called by the bitmap/font helpers to swap the DC's slot and return old. */
+__attribute__((ms_abi)) HGDIOBJ gdi32_dc_set_selected(HDC hdc, int obj_type, HGDIOBJ new_h)
+{
+    dc_entry_t *entry = dc_lookup(hdc);
+    if (!entry) return NULL;
+
+    HGDIOBJ old = NULL;
+    switch (obj_type) {
+    case OBJ_BITMAP:
+        old = entry->selected_bitmap;
+        entry->selected_bitmap = new_h;
+        if (entry->gfx_dc)
+            entry->gfx_dc->current_bitmap = NULL;  /* bitmap ptr tracked elsewhere */
+        break;
+    case OBJ_FONT:
+        old = entry->selected_font;
+        entry->selected_font = new_h;
+        if (entry->gfx_dc)
+            entry->gfx_dc->current_font = NULL;  /* font ptr not valid here */
+        break;
+    default:
+        break;
+    }
+    return old;
+}
 
 WINAPI_EXPORT HGDIOBJ SelectObject(HDC hdc, HGDIOBJ h)
 {
     dc_entry_t *entry = dc_lookup(hdc);
     if (!entry)
         return NULL;
+    if (!h)
+        return NULL;
 
+    uintptr_t hv = (uintptr_t)h;
+
+    /* Bitmap range -- dispatch to gdi32_bitmap.c */
+    if (hv >= 0xB0000000UL && hv < 0xC0000000UL) {
+        return (HGDIOBJ)gdi32_bitmap_select_on_dc(hdc, (HBITMAP)h);
+    }
+
+    /* Font range -- dispatch to gdi32_font.c */
+    if (hv >= 0xF1000000UL && hv < 0xF2000000UL) {
+        return (HGDIOBJ)gdi32_font_select_on_dc(hdc, (HFONT)h);
+    }
+
+    /* gdi_object_t range (pens/brushes/stock) */
     gdi_object_t *obj = handle_to_gdi(h);
     if (!obj)
         return NULL;
@@ -493,12 +625,20 @@ WINAPI_EXPORT HGDIOBJ SelectObject(HDC hdc, HGDIOBJ h)
             entry->gfx_dc->current_pen = obj;
         break;
     case GDI_OBJ_FONT:
+        /* Stock fonts live in gdi_object_t pool. Update dc_entry AND push
+         * the stock-font identity into gdi32_font.c's font_dc_state_t so
+         * TextOut / GetTextMetrics use the right LOGFONTA instead of the
+         * default Arial-16 (Session 26 Agent 7 fix). obj->style carries
+         * the stock-font id + 1 (0 means no tag). */
         old = entry->selected_font;
         entry->selected_font = h;
         if (entry->gfx_dc)
             entry->gfx_dc->current_font = obj;
+        if (obj->stock && obj->style > 0)
+            gdi32_font_sync_stock_on_dc(hdc, h, obj->style - 1);
         break;
     case GDI_OBJ_BITMAP:
+        /* Bitmap in gdi_object_t pool (unusual; normally in 0xB... range) */
         old = entry->selected_bitmap;
         entry->selected_bitmap = h;
         if (entry->gfx_dc)
@@ -509,6 +649,73 @@ WINAPI_EXPORT HGDIOBJ SelectObject(HDC hdc, HGDIOBJ h)
     }
 
     return old;
+}
+
+/* --------------------------------------------------------------------------
+ * GetObject dispatch for gdi_object_t pool (pens/brushes)
+ *
+ * gdi32_bitmap.c owns the WINAPI_EXPORT GetObjectA/W. It dispatches by
+ * handle range and calls this helper for gdi_object_t (pen/brush) handles.
+ * -------------------------------------------------------------------------- */
+
+/* LOGPEN: { UINT lopnStyle; POINT lopnWidth; COLORREF lopnColor; } = 16 bytes */
+typedef struct tagLOGPEN {
+    UINT     lopnStyle;
+    POINT    lopnWidth;   /* only .x is used; .y is ignored */
+    COLORREF lopnColor;
+} LOGPEN;
+
+/* LOGBRUSH: { UINT lbStyle; COLORREF lbColor; ULONG_PTR lbHatch; } */
+typedef struct tagLOGBRUSH {
+    UINT      lbStyle;
+    COLORREF  lbColor;
+    uintptr_t lbHatch;
+} LOGBRUSH;
+
+__attribute__((ms_abi)) int gdi32_dc_get_object_info(HGDIOBJ h, int cb, void *pv)
+{
+    gdi_object_t *obj = handle_to_gdi(h);
+    if (!obj)
+        return 0;
+
+    switch (obj->type) {
+    case GDI_OBJ_PEN: {
+        if (!pv) return (int)sizeof(LOGPEN);
+        if (cb < (int)sizeof(LOGPEN)) return 0;
+        LOGPEN *lp = (LOGPEN *)pv;
+        lp->lopnStyle = (UINT)obj->style;
+        lp->lopnWidth.x = obj->width;
+        lp->lopnWidth.y = 0;
+        lp->lopnColor = obj->color;
+        return (int)sizeof(LOGPEN);
+    }
+    case GDI_OBJ_BRUSH: {
+        if (!pv) return (int)sizeof(LOGBRUSH);
+        if (cb < (int)sizeof(LOGBRUSH)) return 0;
+        LOGBRUSH *lb = (LOGBRUSH *)pv;
+        lb->lbStyle = (obj->color == CLR_INVALID) ? 1 /* BS_NULL/HOLLOW */ : 0 /* BS_SOLID */;
+        lb->lbColor = obj->color;
+        lb->lbHatch = 0;
+        return (int)sizeof(LOGBRUSH);
+    }
+    case GDI_OBJ_FONT:
+        /* Stock font: fill LOGFONTA from defaults keyed by stock-id.
+         * Session 26 Agent 7: GetObjectA used to return 0 here, so apps
+         * calling GetObjectA(GetStockObject(DEFAULT_GUI_FONT), ...) got
+         * nothing.  We now hand back a sensible default.  The per-stock-id
+         * template lives in gdi32_font.c (one source of truth). */
+        if (obj->stock && obj->style > 0) {
+            /* Declared extern; defined in gdi32_font.c */
+            extern int gdi32_font_fill_stock_logfonta(int stock_id, int cb, void *pv);
+            return gdi32_font_fill_stock_logfonta(obj->style - 1, cb, pv);
+        }
+        return 0;
+    case GDI_OBJ_REGION:
+    case GDI_OBJ_DC:
+    case GDI_OBJ_PALETTE:
+    default:
+        return 0;
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -527,10 +734,7 @@ WINAPI_EXPORT HGDIOBJ GetStockObject(int i)
  * GetCurrentObject helper (called from gdi32_bitmap.c)
  * -------------------------------------------------------------------------- */
 
-#define OBJ_PEN     1
-#define OBJ_BRUSH   2
-#define OBJ_FONT    6
-#define OBJ_BITMAP  7
+/* OBJ_* defined earlier (guarded by #ifndef OBJ_PEN) before SelectObject. */
 
 HGDIOBJ gdi32_dc_get_selected(HDC hdc, int obj_type)
 {
@@ -584,10 +788,37 @@ UINT gdi32_dc_set_text_align(HDC hdc, UINT align)
 
 /* --------------------------------------------------------------------------
  * DeleteObject
+ *
+ * Handles all GDI object ranges:
+ *   0x80000000-0x800003FF : gdi_object_t pool (pens/brushes/stock items)
+ *   0xB0000000-0xBFFFFFFF : bitmap pool (gdi32_bitmap.c)
+ *   0xF1000000-0xF1FFFFFF : font pool   (gdi32_font.c)
+ *
+ * Without the range dispatch, DeleteObject would silently return FALSE
+ * for every bitmap and font -- leaking pixel buffers and LOGFONT data.
  * -------------------------------------------------------------------------- */
+
+/* Defined in gdi32_bitmap.c and gdi32_font.c (same .so) */
+extern __attribute__((ms_abi)) BOOL DeleteBitmap(HBITMAP hbm);
+extern int gdi32_font_delete(HFONT hf);
 
 WINAPI_EXPORT BOOL DeleteObject(HGDIOBJ ho)
 {
+    if (!ho)
+        return FALSE;
+
+    uintptr_t h = (uintptr_t)ho;
+
+    /* Bitmap range -- dispatch to gdi32_bitmap.c */
+    if (h >= 0xB0000000UL && h < 0xC0000000UL) {
+        return DeleteBitmap((HBITMAP)ho);
+    }
+
+    /* Font range -- dispatch to gdi32_font.c */
+    if (h >= 0xF1000000UL && h < 0xF2000000UL) {
+        return gdi32_font_delete((HFONT)ho) ? TRUE : FALSE;
+    }
+
     gdi_object_t *obj = handle_to_gdi(ho);
     if (!obj)
         return FALSE;

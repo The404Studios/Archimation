@@ -301,10 +301,33 @@ static void apply_context_to_ucontext(const CONTEXT *ctx, ucontext_t *uc)
  * Returns EXCEPTION_CONTINUE_EXECUTION if a handler fixed the problem,
  * EXCEPTION_CONTINUE_SEARCH if no handler claimed it.
  */
+/*
+ * Resume iteration after a handler ran unlocked. The previous entry's
+ * next-pointer may have been free()d by a concurrent Remove call, so we
+ * re-locate the entry by id. If the previous entry still exists, return
+ * its next-pointer. If it was removed, restart from head. Called with
+ * g_veh_lock held.
+ */
+static veh_entry_t *veh_find_next_after_id(veh_entry_t *head, DWORD last_id)
+{
+    if (last_id == 0)
+        return head;
+    for (veh_entry_t *cur = head; cur; cur = cur->next) {
+        if (cur->id == last_id)
+            return cur->next;
+    }
+    /* Previous entry was removed while unlocked: restart from head.
+     * Track a visited set via id to avoid re-invoking same handlers twice
+     * is a larger fix; the short-circuit CONTINUE_EXECUTION below mitigates
+     * duplicate dispatch risk. */
+    return head;
+}
+
 static LONG dispatch_exception(EXCEPTION_POINTERS *ep)
 {
     LONG result;
     veh_entry_t *entry;
+    DWORD last_id;
 
     /*
      * Phase 1: Vectored Exception Handlers (first chance).
@@ -315,10 +338,11 @@ static LONG dispatch_exception(EXCEPTION_POINTERS *ep)
      * if we can't acquire the lock, skip VEH dispatch (better than deadlock).
      */
     if (pthread_mutex_trylock(&g_veh_lock) == 0) {
+        last_id = 0;
         entry = g_veh_first_head;
         while (entry) {
             PVECTORED_EXCEPTION_HANDLER handler = entry->handler;
-            veh_entry_t *next_entry = entry->next;  /* Save BEFORE unlock */
+            DWORD entry_id = entry->id;
             pthread_mutex_unlock(&g_veh_lock);
 
             result = handler(ep);
@@ -330,7 +354,10 @@ static LONG dispatch_exception(EXCEPTION_POINTERS *ep)
                  * We already released above, so nothing to unlock. */
                 goto veh_done;
             }
-            entry = next_entry;  /* Use saved pointer instead of re-traversal */
+            /* Re-locate next entry by id: previously-saved entry->next may
+             * have been free()d by a concurrent RemoveVectoredExceptionHandler. */
+            last_id = entry_id;
+            entry = veh_find_next_after_id(g_veh_first_head, last_id);
         }
         /* Loop ended normally: we still hold the lock from trylock */
         pthread_mutex_unlock(&g_veh_lock);
@@ -350,10 +377,11 @@ veh_done:
 
     /* Phase 3: Vectored Continue Handlers */
     if (pthread_mutex_trylock(&g_veh_lock) == 0) {
+        last_id = 0;
         entry = g_vch_head;
         while (entry) {
             PVECTORED_EXCEPTION_HANDLER handler = entry->handler;
-            veh_entry_t *next_entry = entry->next;  /* Save BEFORE unlock */
+            DWORD entry_id = entry->id;
             pthread_mutex_unlock(&g_veh_lock);
 
             result = handler(ep);
@@ -362,7 +390,8 @@ veh_done:
 
             if (pthread_mutex_trylock(&g_veh_lock) != 0)
                 goto vch_done;
-            entry = next_entry;  /* Use saved pointer instead of re-traversal */
+            last_id = entry_id;
+            entry = veh_find_next_after_id(g_vch_head, last_id);
         }
         pthread_mutex_unlock(&g_veh_lock);
     }
@@ -506,10 +535,22 @@ static void exception_signal_handler(int sig, siginfo_t *info, void *ucontext_ra
  * Install/uninstall signal handlers
  * ---------------------------------------------------------------- */
 
+static pthread_mutex_t g_signals_install_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static void install_signal_handlers(void)
 {
-    if (g_signals_installed)
+    /* Double-checked lock: concurrent callers must not both install, because
+     * the second install would overwrite g_old_sig* with our own handler,
+     * losing the real chained handler and turning re-raise into infinite
+     * recursion. */
+    if (__atomic_load_n(&g_signals_installed, __ATOMIC_ACQUIRE))
         return;
+
+    pthread_mutex_lock(&g_signals_install_lock);
+    if (g_signals_installed) {
+        pthread_mutex_unlock(&g_signals_install_lock);
+        return;
+    }
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -535,7 +576,9 @@ static void install_signal_handlers(void)
     sigaction(SIGILL,  &sa, &g_old_sigill);
     sigaction(SIGTRAP, &sa, &g_old_sigtrap);
 
-    g_signals_installed = 1;
+    __atomic_store_n(&g_signals_installed, 1, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_signals_install_lock);
+    return;
 }
 
 /* ----------------------------------------------------------------
@@ -550,12 +593,15 @@ static veh_entry_t *add_handler(veh_entry_t **head, veh_entry_t **tail,
         return NULL;
 
     entry->handler = handler;
-    entry->id = g_veh_next_id++;
 
     /* Install signal handlers on first registration */
     install_signal_handlers();
 
     pthread_mutex_lock(&g_veh_lock);
+    /* Assign id under the lock so two concurrent adds don't share an id.
+     * Also guarantees ids are monotonically increasing in list order, which
+     * the safe iterator in dispatch_exception relies on. */
+    entry->id = g_veh_next_id++;
 
     if (first) {
         /* Insert at head */

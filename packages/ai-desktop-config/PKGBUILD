@@ -3,7 +3,7 @@
 
 pkgname=ai-desktop-config
 pkgver=0.2.0
-pkgrel=26
+pkgrel=27
 pkgdesc="AI Arch Linux desktop configuration: Windows-like XFCE desktop, .exe integration, gaming support, AI control panel, Contusion automation engine, WiFi manager, driver viewer, disk installer"
 arch=('any')
 url="https://github.com/ai-arch-linux/ai-desktop-config"
@@ -7605,17 +7605,6 @@ class ContusionApp(Adw.Application):
         self._update_status_bar()
         self._show_toast("Refreshed")
 
-
-            name = entry.get_text().strip()
-            if not name:
-                name = f"Macro {len(load_macros())+1}"
-            macros = load_macros()
-            macros.append({"name": name, "actions": [],
-                           "last_run": "never"})
-            save_macros(macros)
-            self._reload_macros()
-            self._show_toast(f"Macro '{name}' created")
-
     def _on_play_macro(self, _b, idx):
         macros = load_macros()
         if idx < len(macros):
@@ -8304,9 +8293,27 @@ class ContusionApp(Adw.Application):
         scroll.set_child(page)
         return scroll
 
-    def _check_connection(self):
-        def do():
-            health = api_call("GET", "/health")
+    def _auto_refresh(self):
+        self._check_connection()
+        return True
+
+    def _monitor_tick(self):
+        """Auto-refresh monitor page every 3 seconds."""
+        if (self.stack.get_visible_child_name()
+                == "Monitor"):
+            self._refresh_monitor()
+        return True
+
+
+def main():
+    app = ContusionApp()
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
+CONTUSION_APP
+
     # ==========================================================================
     # AI SCREENSHOT HELPER (multi-mode: full/region/window/delay)
     # ==========================================================================
@@ -8390,30 +8397,6 @@ if [ -f "$FPATH" ]; then
     curl -s -X POST --connect-timeout 1         -H "Content-Type: application/json"         -d "{\"action\": \"screenshot\", \"path\": \"$FPATH\", \"mode\": \"$MODE\"}"         http://127.0.0.1:8420/automate/notify 2>/dev/null &
 fi
 AISCREENSHOT
-        self._show_toast("Refreshed")
-
-    def _auto_refresh(self):
-        self._check_connection()
-        return True
-
-    def _monitor_tick(self):
-        """Auto-refresh monitor page every 3 seconds."""
-        if (self.stack.get_visible_child_name()
-                == "Monitor"):
-            self._refresh_monitor()
-        return True
-
-
-def main():
-    app = ContusionApp()
-    app.run()
-
-
-if __name__ == "__main__":
-    main()
-CONTUSION_APP
-
-    # (ai-screenshot is already installed above with multi-mode support)
 
     # ==========================================================================
     # SYSTEM UPDATE CHECKER (notifies user of available Arch package updates)

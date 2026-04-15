@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <pthread.h>
+#include <errno.h>
 
 #include "common/dll_common.h"
 
@@ -72,7 +73,7 @@ static __attribute__((ms_abi)) HRESULT dsfile_QueryInterface(IDStorageFile *self
     *ppv = NULL;
     if (!riid || memcmp(riid, IID_IUnknown_bytes, 16) == 0) {
         *ppv = self;
-        self->ref_count++;
+        __sync_add_and_fetch(&self->ref_count, 1);
         return S_OK;
     }
     return E_NOINTERFACE;
@@ -80,12 +81,12 @@ static __attribute__((ms_abi)) HRESULT dsfile_QueryInterface(IDStorageFile *self
 
 static __attribute__((ms_abi)) ULONG dsfile_AddRef(IDStorageFile *self)
 {
-    return ++self->ref_count;
+    return __sync_add_and_fetch(&self->ref_count, 1);
 }
 
 static __attribute__((ms_abi)) ULONG dsfile_Release(IDStorageFile *self)
 {
-    uint32_t ref = --self->ref_count;
+    uint32_t ref = __sync_sub_and_fetch(&self->ref_count, 1);
     if (ref == 0) {
         if (self->fd >= 0) close(self->fd);
         free(self->lpVtbl);
@@ -167,7 +168,7 @@ static __attribute__((ms_abi)) HRESULT dsstat_QueryInterface(IDStorageStatusArra
     *ppv = NULL;
     if (!riid || memcmp(riid, IID_IUnknown_bytes, 16) == 0) {
         *ppv = self;
-        self->ref_count++;
+        __sync_add_and_fetch(&self->ref_count, 1);
         return S_OK;
     }
     return E_NOINTERFACE;
@@ -175,12 +176,12 @@ static __attribute__((ms_abi)) HRESULT dsstat_QueryInterface(IDStorageStatusArra
 
 static __attribute__((ms_abi)) ULONG dsstat_AddRef(IDStorageStatusArray *self)
 {
-    return ++self->ref_count;
+    return __sync_add_and_fetch(&self->ref_count, 1);
 }
 
 static __attribute__((ms_abi)) ULONG dsstat_Release(IDStorageStatusArray *self)
 {
-    uint32_t ref = --self->ref_count;
+    uint32_t ref = __sync_sub_and_fetch(&self->ref_count, 1);
     if (ref == 0) {
         free(self->lpVtbl);
         free(self);
@@ -266,7 +267,7 @@ static __attribute__((ms_abi)) HRESULT dsqueue_QueryInterface(IDStorageQueue *se
     *ppv = NULL;
     if (!riid || memcmp(riid, IID_IUnknown_bytes, 16) == 0) {
         *ppv = self;
-        self->ref_count++;
+        __sync_add_and_fetch(&self->ref_count, 1);
         return S_OK;
     }
     return E_NOINTERFACE;
@@ -274,12 +275,12 @@ static __attribute__((ms_abi)) HRESULT dsqueue_QueryInterface(IDStorageQueue *se
 
 static __attribute__((ms_abi)) ULONG dsqueue_AddRef(IDStorageQueue *self)
 {
-    return ++self->ref_count;
+    return __sync_add_and_fetch(&self->ref_count, 1);
 }
 
 static __attribute__((ms_abi)) ULONG dsqueue_Release(IDStorageQueue *self)
 {
-    uint32_t ref = --self->ref_count;
+    uint32_t ref = __sync_sub_and_fetch(&self->ref_count, 1);
     if (ref == 0) {
         free(self->requests);
         pthread_mutex_destroy(&self->lock);
@@ -348,13 +349,35 @@ static __attribute__((ms_abi)) void dsqueue_Submit(IDStorageQueue *self)
         ds_request_t *r = &self->requests[i];
         if (r->fd < 0 || !r->dest || r->size == 0) continue;
 
-        ssize_t bytes = pread(r->fd, r->dest, r->size, (off_t)r->offset);
-        if (bytes < 0) {
-            fprintf(stderr, DS_LOG "Submit: pread failed for fd=%d offset=%lu size=%u\n",
-                    r->fd, (unsigned long)r->offset, r->size);
-        } else if ((uint32_t)bytes < r->size) {
-            /* Short read — zero-fill the rest */
-            memset((char *)r->dest + bytes, 0, r->size - (uint32_t)bytes);
+        /* Loop pread until the full range is satisfied. Short reads from
+         * network filesystems or interrupted syscalls were previously
+         * padded with zeros, silently corrupting UE5 assets (Session 30
+         * bug: Fortnite texture streaming mis-rendered bricks when NFS
+         * returned EINTR mid-request). */
+        uint32_t remaining = r->size;
+        char    *dst       = (char *)r->dest;
+        uint64_t offset    = r->offset;
+        int      hard_fail = 0;
+        while (remaining > 0) {
+            ssize_t bytes = pread(r->fd, dst, remaining, (off_t)offset);
+            if (bytes < 0) {
+                if (errno == EINTR) continue;
+                fprintf(stderr, DS_LOG "Submit: pread failed for fd=%d offset=%lu rem=%u: %s\n",
+                        r->fd, (unsigned long)offset, remaining, strerror(errno));
+                hard_fail = 1;
+                break;
+            }
+            if (bytes == 0) {
+                /* EOF before full read: zero-fill the remainder. */
+                memset(dst, 0, remaining);
+                break;
+            }
+            dst       += bytes;
+            offset    += (uint64_t)bytes;
+            remaining -= (uint32_t)bytes;
+        }
+        if (hard_fail && remaining > 0) {
+            memset(dst, 0, remaining);
         }
     }
 
@@ -427,13 +450,18 @@ struct IDStorageFactory {
     uint32_t ref_count;
 };
 
+/* Forward decl — g_factory singleton lock is defined below; Release() needs it
+ * to atomically clear g_factory when the last reference goes away, preventing
+ * a Release-after-free race (Session 25 Agent 12 flagged). */
+static pthread_mutex_t g_factory_lock;
+
 static __attribute__((ms_abi)) HRESULT dsfactory_QueryInterface(IDStorageFactory *self, const GUID *riid, void **ppv)
 {
     if (!ppv) return (HRESULT)0x80004003; /* E_POINTER */
     *ppv = NULL;
     if (!riid || memcmp(riid, IID_IUnknown_bytes, 16) == 0) {
         *ppv = self;
-        self->ref_count++;
+        __sync_add_and_fetch(&self->ref_count, 1);
         return S_OK;
     }
     return E_NOINTERFACE;
@@ -441,13 +469,23 @@ static __attribute__((ms_abi)) HRESULT dsfactory_QueryInterface(IDStorageFactory
 
 static __attribute__((ms_abi)) ULONG dsfactory_AddRef(IDStorageFactory *self)
 {
-    return ++self->ref_count;
+    return __sync_add_and_fetch(&self->ref_count, 1);
 }
+
+/* Forward decl of the singleton so Release can NULL it */
+static IDStorageFactory *g_factory;
 
 static __attribute__((ms_abi)) ULONG dsfactory_Release(IDStorageFactory *self)
 {
-    uint32_t ref = --self->ref_count;
+    uint32_t ref = __sync_sub_and_fetch(&self->ref_count, 1);
     if (ref == 0) {
+        /* Guard the singleton-NULL + free so that a concurrent
+         * get_or_create_factory() cannot observe a dangling g_factory. */
+        pthread_mutex_lock(&g_factory_lock);
+        if (g_factory == self)
+            g_factory = NULL;
+        pthread_mutex_unlock(&g_factory_lock);
+
         free(self->lpVtbl);
         free(self);
     }
@@ -467,6 +505,11 @@ static __attribute__((ms_abi)) HRESULT dsfactory_CreateQueue(IDStorageFactory *s
 
     queue->ref_count = 1;
     queue->requests = calloc(256, sizeof(ds_request_t));
+    if (!queue->requests) {
+        free(queue->lpVtbl);
+        free(queue);
+        return E_OUTOFMEMORY;
+    }
     queue->request_capacity = 256;
     queue->request_count = 0;
     pthread_mutex_init(&queue->lock, NULL);
@@ -481,14 +524,24 @@ static __attribute__((ms_abi)) HRESULT dsfactory_OpenFile(IDStorageFactory *self
     (void)self; (void)riid;
     if (!ppv) return E_INVALIDARG;
 
-    /* Convert UTF-16LE path to narrow string */
-    char narrow_path[512];
-    int i = 0;
+    /* Convert UTF-16LE path to UTF-8 via the canonical helper so paths with
+     * non-ASCII characters (user names, localized drives, etc.) resolve
+     * correctly instead of being replaced by '_'. Session 30 fix. */
+    char narrow_path[sizeof(((IDStorageFile*)0)->path)];
     if (path) {
-        for (i = 0; i < 511 && path[i]; i++)
-            narrow_path[i] = (path[i] < 128) ? (char)path[i] : '_';
+        int r = utf16_to_utf8((const WCHAR *)path, -1, narrow_path, (int)sizeof(narrow_path));
+        if (r <= 0) {
+            /* Fall back to ASCII low-byte copy for badly encoded paths. */
+            int i = 0;
+            for (i = 0; i < (int)sizeof(narrow_path) - 1 && path[i]; i++)
+                narrow_path[i] = (path[i] < 128) ? (char)path[i] : '_';
+            narrow_path[i] = '\0';
+        }
+    } else {
+        narrow_path[0] = '\0';
     }
-    narrow_path[i] = '\0';
+    /* Guarantee NUL-termination regardless of helper behaviour. */
+    narrow_path[sizeof(narrow_path) - 1] = '\0';
 
     /* Translate Windows path separators */
     for (int j = 0; narrow_path[j]; j++) {
@@ -496,18 +549,18 @@ static __attribute__((ms_abi)) HRESULT dsfactory_OpenFile(IDStorageFactory *self
     }
 
     /* Use win_path_to_linux for proper path resolution */
-    char linux_path[512];
-    if (win_path_to_linux(narrow_path, linux_path, sizeof(linux_path)) == 0) {
-        /* Try translated path first */
-    } else {
+    char linux_path[sizeof(narrow_path)];
+    if (win_path_to_linux(narrow_path, linux_path, sizeof(linux_path)) != 0) {
         strncpy(linux_path, narrow_path, sizeof(linux_path) - 1);
         linux_path[sizeof(linux_path) - 1] = '\0';
     }
 
-    int fd = open(linux_path, O_RDONLY);
+    /* O_CLOEXEC: don't leak the fd into child processes. DirectStorage
+     * files are streaming data, we never want sub-processes to inherit. */
+    int fd = open(linux_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         /* Try the original narrow path as fallback */
-        fd = open(narrow_path, O_RDONLY);
+        fd = open(narrow_path, O_RDONLY | O_CLOEXEC);
     }
 
     if (fd < 0) {
@@ -524,7 +577,9 @@ static __attribute__((ms_abi)) HRESULT dsfactory_OpenFile(IDStorageFactory *self
 
     file->ref_count = 1;
     file->fd = fd;
+    /* sizeof(file->path) - 1 = 511; guaranteed-NUL. */
     strncpy(file->path, narrow_path, sizeof(file->path) - 1);
+    file->path[sizeof(file->path) - 1] = '\0';
 
     fprintf(stderr, DS_LOG "OpenFile: opened '%s' (fd=%d)\n", narrow_path, fd);
     *ppv = file;
@@ -580,24 +635,36 @@ static IDStorageFactoryVtbl *create_dsfactory_vtbl(void)
 static IDStorageFactory *g_factory = NULL;
 static pthread_mutex_t g_factory_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Returns the singleton with an extra reference already added (caller owns).
+ * The lock/bump happens atomically so an over-releasing caller can't free
+ * the factory between us handing it back and the caller's own AddRef. */
 static IDStorageFactory *get_or_create_factory(void)
 {
     pthread_mutex_lock(&g_factory_lock);
     if (!g_factory) {
-        g_factory = calloc(1, sizeof(IDStorageFactory));
-        if (g_factory) {
-            g_factory->lpVtbl = create_dsfactory_vtbl();
-            if (!g_factory->lpVtbl) {
-                free(g_factory);
-                g_factory = NULL;
+        IDStorageFactory *f = calloc(1, sizeof(IDStorageFactory));
+        if (f) {
+            f->lpVtbl = create_dsfactory_vtbl();
+            if (!f->lpVtbl) {
+                free(f);
             } else {
-                g_factory->ref_count = 1;
+                f->ref_count = 1;   /* initial reference returned to caller */
+                g_factory = f;
                 fprintf(stderr, DS_LOG "Factory created (synchronous pread backend)\n");
+                pthread_mutex_unlock(&g_factory_lock);
+                return f;
             }
         }
+        pthread_mutex_unlock(&g_factory_lock);
+        return NULL;
     }
+    /* Reuse existing singleton. Bump under the lock so a racing Release
+     * that would otherwise drop ref_count to 0 and NULL out g_factory
+     * cannot observe us mid-handoff. */
+    __sync_add_and_fetch(&g_factory->ref_count, 1);
+    IDStorageFactory *result = g_factory;
     pthread_mutex_unlock(&g_factory_lock);
-    return g_factory;
+    return result;
 }
 
 /* ========== DLL Entry Points ========== */
@@ -607,10 +674,11 @@ WINAPI_EXPORT HRESULT DStorageCreateFactory(const GUID *riid, void **ppv)
     (void)riid;
     if (!ppv) return E_INVALIDARG;
 
+    /* get_or_create_factory hands back the singleton with an extra reference
+     * already applied atomically under g_factory_lock. */
     IDStorageFactory *factory = get_or_create_factory();
     if (!factory) return E_OUTOFMEMORY;
 
-    factory->ref_count++;
     *ppv = factory;
     return S_OK;
 }

@@ -128,22 +128,22 @@ static __attribute__((ms_abi)) HRESULT did8_qi(IDirectInputDevice8 *self, const 
     *ppv = NULL;
     if (!iid || memcmp(iid, IID_IUnknown_bytes, 16) == 0) {
         *ppv = self;
-        self->ref_count++;
+        __sync_add_and_fetch(&self->ref_count, 1);
         return S_OK;
     }
     return E_NOINTERFACE;
 }
-static __attribute__((ms_abi)) uint32_t did8_addref(IDirectInputDevice8 *self) { return ++self->ref_count; }
+static __attribute__((ms_abi)) uint32_t did8_addref(IDirectInputDevice8 *self)
+{ return (uint32_t)__sync_add_and_fetch(&self->ref_count, 1); }
 static __attribute__((ms_abi)) uint32_t did8_release(IDirectInputDevice8 *self)
 {
-    int ref = --self->ref_count;
+    int ref = __sync_sub_and_fetch(&self->ref_count, 1);
     if (ref <= 0) {
         if (self->evdev_fd >= 0) close(self->evdev_fd);
-        free((void *)self->lpVtbl);
         free(self);
         return 0;
     }
-    return ref;
+    return (uint32_t)ref;
 }
 static __attribute__((ms_abi)) HRESULT did8_getcaps(IDirectInputDevice8 *self, void *caps)
 { (void)self; if (caps) memset(caps, 0, 64); return DI_OK; }
@@ -224,44 +224,44 @@ static __attribute__((ms_abi)) HRESULT did8_setactionmap(IDirectInputDevice8 *se
 static __attribute__((ms_abi)) HRESULT did8_getimginfo(IDirectInputDevice8 *self, void *i)
 { (void)self; (void)i; return E_NOTIMPL; }
 
+static const IDirectInputDevice8Vtbl g_did8_vtbl = {
+    .QueryInterface = did8_qi,
+    .AddRef = did8_addref,
+    .Release = did8_release,
+    .GetCapabilities = did8_getcaps,
+    .EnumObjects = did8_enumobj,
+    .GetProperty = did8_getprop,
+    .SetProperty = did8_setprop,
+    .Acquire = did8_acquire,
+    .Unacquire = did8_unacquire,
+    .GetDeviceState = did8_getdevstate,
+    .GetDeviceData = did8_getdevdata,
+    .SetDataFormat = did8_setdataformat,
+    .SetEventNotification = did8_setevnotif,
+    .SetCooperativeLevel = did8_setcooplevel,
+    .GetObjectInfo = did8_getobjinfo,
+    .GetDeviceInfo = did8_getdevinfo,
+    .RunControlPanel = did8_runcp,
+    .Initialize = did8_init,
+    .CreateEffect = did8_createfx,
+    .EnumEffects = did8_enumfx,
+    .GetEffectInfo = did8_getfxinfo,
+    .GetForceFeedbackState = did8_getffstate,
+    .SendForceFeedbackCommand = did8_sendffcmd,
+    .EnumCreatedEffectObjects = did8_enumcreatedfx,
+    .Escape = did8_escape,
+    .Poll = did8_poll,
+    .SendDeviceData = did8_senddata,
+    .BuildActionMap = did8_buildactionmap,
+    .SetActionMap = did8_setactionmap,
+    .GetImageInfo = did8_getimginfo,
+};
+
 static IDirectInputDevice8 *create_dinput_device(DWORD dev_type)
 {
-    IDirectInputDevice8Vtbl *v = calloc(1, sizeof(IDirectInputDevice8Vtbl));
-    if (!v) return NULL;
-    v->QueryInterface = did8_qi;
-    v->AddRef = did8_addref;
-    v->Release = did8_release;
-    v->GetCapabilities = did8_getcaps;
-    v->EnumObjects = did8_enumobj;
-    v->GetProperty = did8_getprop;
-    v->SetProperty = did8_setprop;
-    v->Acquire = did8_acquire;
-    v->Unacquire = did8_unacquire;
-    v->GetDeviceState = did8_getdevstate;
-    v->GetDeviceData = did8_getdevdata;
-    v->SetDataFormat = did8_setdataformat;
-    v->SetEventNotification = did8_setevnotif;
-    v->SetCooperativeLevel = did8_setcooplevel;
-    v->GetObjectInfo = did8_getobjinfo;
-    v->GetDeviceInfo = did8_getdevinfo;
-    v->RunControlPanel = did8_runcp;
-    v->Initialize = did8_init;
-    v->CreateEffect = did8_createfx;
-    v->EnumEffects = did8_enumfx;
-    v->GetEffectInfo = did8_getfxinfo;
-    v->GetForceFeedbackState = did8_getffstate;
-    v->SendForceFeedbackCommand = did8_sendffcmd;
-    v->EnumCreatedEffectObjects = did8_enumcreatedfx;
-    v->Escape = did8_escape;
-    v->Poll = did8_poll;
-    v->SendDeviceData = did8_senddata;
-    v->BuildActionMap = did8_buildactionmap;
-    v->SetActionMap = did8_setactionmap;
-    v->GetImageInfo = did8_getimginfo;
-
     IDirectInputDevice8 *dev = calloc(1, sizeof(IDirectInputDevice8));
-    if (!dev) { free(v); return NULL; }
-    dev->lpVtbl = v;
+    if (!dev) return NULL;
+    dev->lpVtbl = &g_did8_vtbl;
     dev->ref_count = 1;
     dev->dev_type = dev_type;
     dev->evdev_fd = -1;
@@ -299,17 +299,18 @@ static __attribute__((ms_abi)) HRESULT di8_qi(IDirectInput8 *self, const void *i
     *ppv = NULL;
     if (!iid || memcmp(iid, IID_IUnknown_bytes, 16) == 0) {
         *ppv = self;
-        self->ref_count++;
+        __sync_add_and_fetch(&self->ref_count, 1);
         return S_OK;
     }
     return E_NOINTERFACE;
 }
-static __attribute__((ms_abi)) uint32_t di8_addref(IDirectInput8 *self) { return ++self->ref_count; }
+static __attribute__((ms_abi)) uint32_t di8_addref(IDirectInput8 *self)
+{ return (uint32_t)__sync_add_and_fetch(&self->ref_count, 1); }
 static __attribute__((ms_abi)) uint32_t di8_release(IDirectInput8 *self)
 {
-    int ref = --self->ref_count;
-    if (ref <= 0) { free((void *)self->lpVtbl); free(self); return 0; }
-    return ref;
+    int ref = __sync_sub_and_fetch(&self->ref_count, 1);
+    if (ref <= 0) { free(self); return 0; }
+    return (uint32_t)ref;
 }
 
 static __attribute__((ms_abi)) HRESULT di8_createdevice(IDirectInput8 *self,
@@ -396,25 +397,25 @@ static __attribute__((ms_abi)) HRESULT di8_enumbysem(IDirectInput8 *self, LPCWST
 static __attribute__((ms_abi)) HRESULT di8_configdev(IDirectInput8 *self, void *cb, void *p, DWORD f, void *r)
 { (void)self; (void)cb; (void)p; (void)f; (void)r; return E_NOTIMPL; }
 
+static const IDirectInput8Vtbl g_di8_vtbl = {
+    .QueryInterface = di8_qi,
+    .AddRef = di8_addref,
+    .Release = di8_release,
+    .CreateDevice = di8_createdevice,
+    .EnumDevices = di8_enumdevices,
+    .GetDeviceStatus = di8_getdevstatus,
+    .RunControlPanel = di8_runcp,
+    .Initialize = di8_init,
+    .FindDevice = di8_finddev,
+    .EnumDevicesBySemantics = di8_enumbysem,
+    .ConfigureDevices = di8_configdev,
+};
+
 static IDirectInput8 *create_dinput8(void)
 {
-    IDirectInput8Vtbl *v = calloc(1, sizeof(IDirectInput8Vtbl));
-    if (!v) return NULL;
-    v->QueryInterface = di8_qi;
-    v->AddRef = di8_addref;
-    v->Release = di8_release;
-    v->CreateDevice = di8_createdevice;
-    v->EnumDevices = di8_enumdevices;
-    v->GetDeviceStatus = di8_getdevstatus;
-    v->RunControlPanel = di8_runcp;
-    v->Initialize = di8_init;
-    v->FindDevice = di8_finddev;
-    v->EnumDevicesBySemantics = di8_enumbysem;
-    v->ConfigureDevices = di8_configdev;
-
     IDirectInput8 *di = calloc(1, sizeof(IDirectInput8));
-    if (!di) { free(v); return NULL; }
-    di->lpVtbl = v;
+    if (!di) return NULL;
+    di->lpVtbl = &g_di8_vtbl;
     di->ref_count = 1;
     return di;
 }

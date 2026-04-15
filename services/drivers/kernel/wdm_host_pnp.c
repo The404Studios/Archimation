@@ -128,8 +128,11 @@ int wdm_pnp_remove_device(struct wdm_device *dev)
  * In a full implementation this would query hardware (PCI, USB, ...) and
  * create device objects for each matching device.  For now it only logs
  * and returns success.
+ *
+ * Static because this is not yet exposed to other translation units; when
+ * real enumeration is wired up add a declaration to wdm_host_internal.h.
  */
-int wdm_pnp_enumerate(struct wdm_driver *drv)
+static int __maybe_unused wdm_pnp_enumerate(struct wdm_driver *drv)
 {
 	if (!drv)
 		return -EINVAL;

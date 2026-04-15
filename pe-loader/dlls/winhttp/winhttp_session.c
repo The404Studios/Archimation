@@ -140,7 +140,11 @@ typedef void (*curl_global_cleanup_fn)(void);
 /* ================================================================== */
 
 static void *g_curl_lib = NULL;
-static int g_curl_init_tried = 0;
+/* Session 30: curl_load() previously used a plain int guard which let
+ * two concurrent WinHttpSendRequest calls each race to dlopen + re-assign
+ * g_curl_lib and leak one copy. pthread_once ensures a single initialization
+ * even under hot-startup contention. */
+static pthread_once_t g_curl_load_once = PTHREAD_ONCE_INIT;
 
 static curl_easy_init_fn      p_easy_init;
 static curl_easy_cleanup_fn   p_easy_cleanup;
@@ -153,11 +157,8 @@ static curl_slist_free_all_fn p_slist_free_all;
 static curl_global_init_fn    p_global_init;
 static curl_global_cleanup_fn p_global_cleanup;
 
-static int curl_load(void)
+static void curl_load_once_cb(void)
 {
-    if (g_curl_init_tried) return g_curl_lib ? 0 : -1;
-    g_curl_init_tried = 1;
-
     const char *libs[] = {
         "libcurl.so.4", "libcurl.so", "libcurl-gnutls.so.4", NULL
     };
@@ -167,7 +168,7 @@ static int curl_load(void)
     }
     if (!g_curl_lib) {
         fprintf(stderr, "[winhttp] libcurl not found - HTTP requests will fail\n");
-        return -1;
+        return;
     }
 
     p_easy_init      = (curl_easy_init_fn)dlsym(g_curl_lib, "curl_easy_init");
@@ -185,12 +186,17 @@ static int curl_load(void)
         fprintf(stderr, "[winhttp] libcurl loaded but missing critical functions\n");
         dlclose(g_curl_lib);
         g_curl_lib = NULL;
-        return -1;
+        return;
     }
 
     if (p_global_init) p_global_init(CURL_GLOBAL_DEFAULT);
     fprintf(stderr, "[winhttp] libcurl loaded successfully\n");
-    return 0;
+}
+
+static int curl_load(void)
+{
+    pthread_once(&g_curl_load_once, curl_load_once_cb);
+    return g_curl_lib ? 0 : -1;
 }
 
 /* ================================================================== */
@@ -739,8 +745,10 @@ WINAPI_EXPORT BOOL WinHttpSendRequest(HANDLE request, LPCWSTR headers,
         if (req->post_data) {
             memcpy(req->post_data, optional, optionalLen);
             req->post_len = optionalLen;
+            req->post_capacity = optionalLen;
         } else {
             req->post_len = 0;
+            req->post_capacity = 0;
         }
     }
 
@@ -1633,8 +1641,10 @@ WINAPI_EXPORT BOOL HttpSendRequestA(HANDLE request, LPCSTR headers,
         if (req->post_data) {
             memcpy(req->post_data, optional, optionalLen);
             req->post_len = optionalLen;
+            req->post_capacity = optionalLen;
         } else {
             req->post_len = 0;
+            req->post_capacity = 0;
         }
     }
 

@@ -31,6 +31,39 @@ from api_server import create_app, start_server
 logger = logging.getLogger("ai-control")
 
 
+def _install_sigchld_reaper():
+    """Install SIGCHLD = SIG_IGN to auto-reap orphaned children.
+
+    Session 23/24: desktop_automation.launch_app/launch_exe spawn fire-and-forget
+    children via subprocess.Popen(start_new_session=True) without calling wait().
+    Without this, each launch leaves a <defunct> entry in /proc until the daemon
+    exits. After hundreds of /contusion/launch calls the PID table bloats and
+    eventually `fork()` returns EAGAIN.
+
+    On Linux, SIG_IGN on SIGCHLD tells the kernel to reap children automatically
+    instead of delivering them as zombies. This is POSIX-specified behavior.
+
+    Interaction with subprocess/asyncio:
+    - CPython's subprocess module internally handles ECHILD on wait() via
+      os.waitpid retry loops — it does NOT rely on SIGCHLD delivery.
+    - asyncio on Linux 3.8+ uses ThreadedChildWatcher by default, which calls
+      waitpid(pid, 0) on a dedicated thread per child. Compatible with SIG_IGN
+      because it targets a specific pid (not -1), and kernel only auto-reaps
+      when parent has SIG_IGN AND no one calls waitpid. Specific-pid waits win.
+    - Must be installed BEFORE any subprocess is spawned (before uvicorn starts
+      workers, before FastAPI routes execute, before create_app).
+    """
+    # Only valid on POSIX. Windows/macOS SIGCHLD+SIG_IGN is a no-op but harmless.
+    try:
+        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        logger.info("SIGCHLD=SIG_IGN installed — orphaned children auto-reaped by kernel")
+    except (AttributeError, ValueError, OSError) as e:
+        # AttributeError: SIGCHLD missing (Windows)
+        # ValueError: not called from main thread
+        # OSError: platform rejection
+        logger.warning("Could not install SIGCHLD reaper: %s", e)
+
+
 def setup_logging(config: dict):
     level = getattr(logging, config.get("log_level", "INFO").upper())
     logging.basicConfig(
@@ -123,6 +156,12 @@ async def main():
 
     logger.info("AI Control Daemon starting...")
     check_root()
+
+    # Install SIGCHLD reaper BEFORE any subprocess can be spawned.
+    # Session 24: desktop_automation.launch_app/launch_exe fire-and-forget
+    # children accumulate as zombies without this. Must come before create_app
+    # and before any async task that could spawn a child.
+    _install_sigchld_reaper()
 
     # Detect and log session type (Wayland vs X11 vs headless)
     session = detect_session_type()

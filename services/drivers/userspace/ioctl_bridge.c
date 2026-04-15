@@ -493,6 +493,17 @@ unsigned long ioctl_bridge_dispatch(unsigned long ioctl_code,
 
     g_total_dispatches++;
 
+    /*
+     * Snapshot handler + context under the lock. This avoids a TOCTOU where
+     * another thread unregisters/re-registers the driver while we are
+     * running the handler with the lock released. The slot itself remains
+     * stable (slots are reused, not freed), so using the slot index for
+     * stats writes after re-acquiring the lock is safe.
+     */
+    ioctl_handler_fn handler_snap = drv->handler;
+    void *context_snap = drv->driver_context;
+    int slot_idx = (int)(drv - g_drivers);
+
     /* Build the request structure */
     unsigned long actual_returned = 0;
     ioctl_request_t req;
@@ -507,7 +518,16 @@ unsigned long ioctl_bridge_dispatch(unsigned long ioctl_code,
     req.output_buffer   = output_buffer;
     req.output_length   = output_length;
     req.bytes_returned  = bytes_returned ? bytes_returned : &actual_returned;
-    req.driver_context  = drv->driver_context;
+    req.driver_context  = context_snap;
+
+    /* Build a temporary driver struct for the dispatch_* helpers */
+    ioctl_driver_t local_drv;
+    memset(&local_drv, 0, sizeof(local_drv));
+    strncpy(local_drv.name, drv->name, sizeof(local_drv.name) - 1);
+    local_drv.device_type = device_type;
+    local_drv.handler = handler_snap;
+    local_drv.driver_context = context_snap;
+    local_drv.active = 1;
 
     /* Release the lock during handler execution to allow concurrent IOCTLs */
     pthread_mutex_unlock(&g_ioctl_lock);
@@ -516,16 +536,16 @@ unsigned long ioctl_bridge_dispatch(unsigned long ioctl_code,
     unsigned long status;
     switch (method) {
     case METHOD_BUFFERED:
-        status = dispatch_buffered(drv, &req);
+        status = dispatch_buffered(&local_drv, &req);
         break;
     case METHOD_IN_DIRECT:
-        status = dispatch_direct_in(drv, &req);
+        status = dispatch_direct_in(&local_drv, &req);
         break;
     case METHOD_OUT_DIRECT:
-        status = dispatch_direct_out(drv, &req);
+        status = dispatch_direct_out(&local_drv, &req);
         break;
     case METHOD_NEITHER:
-        status = dispatch_neither(drv, &req);
+        status = dispatch_neither(&local_drv, &req);
         break;
     default:
         fprintf(stderr, IOCTL_LOG_PREFIX
@@ -534,11 +554,13 @@ unsigned long ioctl_bridge_dispatch(unsigned long ioctl_code,
         break;
     }
 
-    /* Update statistics */
+    /* Update statistics on the real slot, guarded by the lock */
     pthread_mutex_lock(&g_ioctl_lock);
-    drv->calls_handled++;
-    if (status != STATUS_SUCCESS)
-        drv->calls_failed++;
+    if (slot_idx >= 0 && slot_idx < MAX_DRIVERS) {
+        g_drivers[slot_idx].calls_handled++;
+        if (status != STATUS_SUCCESS)
+            g_drivers[slot_idx].calls_failed++;
+    }
     pthread_mutex_unlock(&g_ioctl_lock);
 
     fprintf(stderr, IOCTL_LOG_PREFIX

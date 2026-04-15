@@ -139,6 +139,11 @@ static void *drain_thread_fn(void *arg)
         .tv_nsec = DRAIN_INTERVAL_NS
     };
 
+    /* Per-slot stall counter: bounded retries distinguish "producer is
+     * still writing" (retry next tick) from "slot was dropped and will
+     * never be ready" (skip to unstick the drain). */
+    uint32_t stall_count = 0;
+
     while (atomic_load(&g_drain_running)) {
         /* Drain all available events */
         uint64_t write_snapshot = atomic_load(&g_write_idx);
@@ -147,12 +152,19 @@ static void *drain_thread_fn(void *arg)
             uint32_t slot_idx = (uint32_t)(g_read_idx & RING_MASK);
             ring_slot_t *slot = &g_ring[slot_idx];
 
-            /* Check if the producer has finished writing this slot */
             if (!atomic_load(&slot->ready)) {
-                /* Producer is still writing.  We could spin, but to
-                 * keep things simple we'll pick it up next iteration. */
+                /* Either producer is still writing, or the slot was
+                 * dropped (producer saw ready==1 and returned without
+                 * setting ready). After a few ticks with no progress,
+                 * treat as dropped to avoid permanent drain stall. */
+                if (++stall_count >= 4) {
+                    g_read_idx++;
+                    stall_count = 0;
+                    continue;
+                }
                 break;
             }
+            stall_count = 0;
 
             /* Send the event as a datagram */
             if (g_sock_fd >= 0) {
@@ -175,8 +187,12 @@ static void *drain_thread_fn(void *arg)
         uint32_t slot_idx = (uint32_t)(g_read_idx & RING_MASK);
         ring_slot_t *slot = &g_ring[slot_idx];
 
-        if (!atomic_load(&slot->ready))
-            break;
+        if (!atomic_load(&slot->ready)) {
+            /* Skip not-ready slots on final drain so we exit promptly
+             * rather than wait forever on a dropped slot. */
+            g_read_idx++;
+            continue;
+        }
 
         if (g_sock_fd >= 0) {
             sendto(g_sock_fd, slot->data, slot->len, MSG_DONTWAIT,
@@ -209,7 +225,7 @@ int pe_event_init(void)
         fprintf(stderr, "[pe_event] Failed to allocate ring buffer (%zu bytes)\n",
                 (size_t)RING_SIZE * sizeof(ring_slot_t));
         atomic_store(&g_events_available, 0);
-        /* g_initialized already set to 1 by CAS above */
+        atomic_store(&g_initialized, 0);
         return -1;
     }
 
@@ -221,7 +237,7 @@ int pe_event_init(void)
         free(g_ring);
         g_ring = NULL;
         atomic_store(&g_events_available, 0);
-        /* g_initialized already set to 1 by CAS above */
+        atomic_store(&g_initialized, 0);
         return -1;
     }
 
@@ -258,7 +274,8 @@ int pe_event_init(void)
         free(g_ring);
         g_ring = NULL;
         atomic_store(&g_events_available, 0);
-        /* g_initialized already set to 1 by CAS above */
+        atomic_store(&g_drain_running, 0);
+        atomic_store(&g_initialized, 0);
         return -1;
     }
 

@@ -19,7 +19,7 @@ import signal
 import socket
 import struct
 import time
-from typing import Optional
+from typing import Dict, Optional
 
 from .autonomy import AutonomyController, Decision, AutonomyLevel, Domain
 
@@ -150,8 +150,13 @@ class Orchestrator:
         self._action_count: int = 0
         self._error_count: int = 0
         self._last_action_time: float = 0.0
-
-        self._open_trust_device()
+        # Score-query cache: pid -> (score, expires_at_monotonic).  The
+        # handle_pe_* paths call trust_get_score() on every event (thousands
+        # per second under load); each call is a syscall.  A 500ms cache is
+        # short enough that quarantine decisions stay responsive but long
+        # enough to collapse bursts.
+        self._score_cache: Dict[int, tuple] = {}
+        self._SCORE_CACHE_TTL: float = 0.5
 
     # -- Trust device ---------------------------------------------------------
 
@@ -195,7 +200,10 @@ class Orchestrator:
         """Create a decision and log the autonomy check."""
         decision = self._autonomy.create_decision(domain, action, desc)
         level = self._autonomy.effective_level(domain)
-        level_name = AutonomyLevel(level).name
+        try:
+            level_name = AutonomyLevel(level).name
+        except ValueError:
+            level_name = f"LEVEL_{level}"
 
         if decision.approved is True:
             logger.info("ACT [%s] %s (level=%s, auto-approved)", domain, desc, level_name)
@@ -278,6 +286,73 @@ class Orchestrator:
         except PermissionError:
             self._error_count += 1
             return _fail(f"Permission denied unfreezing pid={pid}")
+
+    # -- Ungated signal helpers (approval follow-through) --------------------
+    #
+    # These bypass the autonomy gate because the human has ALREADY approved
+    # (or denied) the underlying action via /decisions/{index}/approve|deny
+    # -- running them through _check_autonomy would re-gate the very thing
+    # the human just decided, and at OBSERVE level would leave the PE
+    # process frozen forever.  See Session 25 follow-through wiring.
+
+    def resume_after_approval(self, pid: int) -> dict:
+        """SIGCONT a pid whose freeze was already approved by a human.
+
+        Uses kill(pid, 0) first to check the process still exists -- it may
+        have died while waiting.  Never raises: all errors are returned as
+        failure dicts so a registered callback can be called without
+        try/except at the call site.
+        """
+        if pid <= 0:
+            return _fail(f"invalid pid={pid}")
+        try:
+            os.kill(pid, 0)  # existence probe
+        except ProcessLookupError:
+            logger.info("resume_after_approval: pid=%d already gone", pid)
+            return _fail(f"Process {pid} not found", pid=pid)
+        except PermissionError:
+            logger.warning("resume_after_approval: permission denied probing pid=%d", pid)
+            return _fail(f"Permission denied probing pid={pid}")
+
+        try:
+            os.kill(pid, signal.SIGCONT)
+            self._record_action()
+            logger.info("resume_after_approval: SIGCONT -> pid=%d", pid)
+            return _ok(f"SIGCONT sent to pid={pid}", pid=pid)
+        except ProcessLookupError:
+            return _fail(f"Process {pid} vanished between probe and SIGCONT")
+        except PermissionError:
+            self._error_count += 1
+            return _fail(f"Permission denied resuming pid={pid}")
+
+    def kill_after_rejection(self, pid: int) -> dict:
+        """SIGKILL a pid whose freeze was rejected by a human (or auto-expired).
+
+        Sends SIGKILL directly.  (SIGCONT is NOT sent first because the
+        kernel delivers SIGKILL to stopped processes -- the stop doesn't
+        mask termination.)  Never raises.
+        """
+        if pid <= 0:
+            return _fail(f"invalid pid={pid}")
+        try:
+            os.kill(pid, 0)  # existence probe
+        except ProcessLookupError:
+            logger.info("kill_after_rejection: pid=%d already gone", pid)
+            return _ok(f"Process {pid} already gone", pid=pid, note="already-gone")
+        except PermissionError:
+            logger.warning("kill_after_rejection: permission denied probing pid=%d", pid)
+            return _fail(f"Permission denied probing pid={pid}")
+
+        try:
+            os.kill(pid, signal.SIGKILL)
+            self._record_action()
+            logger.warning("kill_after_rejection: SIGKILL -> pid=%d", pid)
+            return _ok(f"SIGKILL sent to pid={pid}", pid=pid)
+        except ProcessLookupError:
+            return _ok(f"Process {pid} exited before SIGKILL", pid=pid, note="already-gone")
+        except PermissionError:
+            self._error_count += 1
+            return _fail(f"Permission denied killing pid={pid}")
 
     def set_priority(self, pid: int, nice: int) -> dict:
         """Set process scheduling priority (nice value)."""
@@ -377,17 +452,50 @@ class Orchestrator:
         return _fail(f"Token balance ioctl failed for pid={pid}")
 
     def trust_get_score(self, pid: int) -> dict:
-        """Query trust score for a process via trust.ko."""
+        """Query trust score for a process via trust.ko.
+
+        Results are cached for `_SCORE_CACHE_TTL` seconds per-pid so a burst
+        of handlers (pe_load + trust_deny + memory_anomaly) all touching the
+        same process don't each issue a separate ioctl syscall.
+        """
         # Score queries are read-only, no autonomy check needed
         if not self.trust_available:
             return _fail("trust device unavailable")
+
+        # Cache lookup -- cache hits skip the syscall entirely.
+        now = time.monotonic()
+        cached = self._score_cache.get(pid)
+        if cached is not None:
+            score, expires = cached
+            if now < expires:
+                return _ok(f"Score for pid={pid}: {score}", pid=pid, score=score)
 
         data = struct.pack(SCORE_FORMAT, pid, 0)  # subject_id, score=0 (output)
         result = self._trust_ioctl(TRUST_IOC_GET_SCORE, data)
         if result is not None:
             _, score = struct.unpack(SCORE_FORMAT, result)
+            self._score_cache[pid] = (score, now + self._SCORE_CACHE_TTL)
+            # Bound cache size to prevent growth with many short-lived pids.
+            if len(self._score_cache) > 4096:
+                # Evict expired/oldest entries.  Simple sweep -- amortised O(1).
+                self._score_cache = {
+                    p: (s, exp)
+                    for p, (s, exp) in self._score_cache.items()
+                    if exp > now
+                }
             return _ok(f"Score for pid={pid}: {score}", pid=pid, score=score)
         return _fail(f"Get score ioctl failed for pid={pid}")
+
+    def invalidate_score_cache(self, pid: Optional[int] = None) -> None:
+        """Drop cached trust scores. Called by score-change handlers.
+
+        Pass pid=None to drop all cached entries (e.g. after quarantine,
+        which changes trust scores in a way we can't predict).
+        """
+        if pid is None:
+            self._score_cache.clear()
+        else:
+            self._score_cache.pop(pid, None)
 
     def trust_register_cortex(
         self,
@@ -519,6 +627,7 @@ class Orchestrator:
         if urgency not in ("low", "normal", "critical"):
             urgency = "normal"
 
+        proc = None
         try:
             env = os.environ.copy()
             env.setdefault("DISPLAY", ":0")
@@ -549,7 +658,10 @@ class Orchestrator:
 
     async def notify_decision(self, decision: Decision) -> dict:
         """Format a decision as a user-friendly notification."""
-        level_name = AutonomyLevel(decision.autonomy_level).name
+        try:
+            level_name = AutonomyLevel(decision.autonomy_level).name
+        except ValueError:
+            level_name = f"LEVEL_{decision.autonomy_level}"
 
         if decision.approved is None:
             title = "Approval Needed"
@@ -684,6 +796,7 @@ class Orchestrator:
             if not decision.approved:
                 return _fail("not approved", decision_approved=decision.approved)
 
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "systemctl", action, unit,

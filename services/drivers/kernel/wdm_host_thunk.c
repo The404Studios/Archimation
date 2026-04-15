@@ -407,7 +407,9 @@ int wdm_thunk_dispatch(struct wdm_device *dev, struct wdm_irp *irp)
 	if (!dev || !dev->driver || !irp)
 		return -EINVAL;
 
-	if (irp->major_function > 27) {
+	/* WDM_IRP_MJ_COUNT from wdm_host_internal.h is the array size.
+	 * Valid indices are 0 .. WDM_IRP_MJ_COUNT - 1. */
+	if (irp->major_function >= WDM_IRP_MJ_COUNT) {
 		irp->status = NT_STATUS_NOT_SUPPORTED;
 		return -EINVAL;
 	}

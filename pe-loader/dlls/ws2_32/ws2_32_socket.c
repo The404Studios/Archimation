@@ -26,7 +26,11 @@
 #include "common/dll_common.h"
 #include "compat/trust_gate.h"
 
-/* Winsock error codes */
+/* Winsock error codes (WSA namespace; distinct from Win32 GetLastError() on
+ * real Windows, although values happen to be offset by 10000 from classic
+ * POSIX-ish errnos). All socket-api errors MUST land here via
+ * WSASetLastError() / ws2_map_errno_to_wsa(), never via kernel32!SetLastError.
+ */
 #define WSABASEERR          10000
 #define WSAEINTR            10004
 #define WSAEBADF            10009
@@ -45,18 +49,33 @@
 #define WSAEPROTONOSUPPORT  10043
 #define WSAESOCKTNOSUPPORT  10044
 #define WSAEOPNOTSUPP       10045
+#define WSAEPFNOSUPPORT     10046
 #define WSAEAFNOSUPPORT     10047
 #define WSAEADDRINUSE       10048
 #define WSAEADDRNOTAVAIL    10049
 #define WSAENETDOWN         10050
 #define WSAENETUNREACH      10051
+#define WSAENETRESET        10052
+#define WSAECONNABORTED     10053
 #define WSAECONNRESET       10054
 #define WSAENOBUFS          10055
 #define WSAEISCONN          10056
 #define WSAENOTCONN         10057
+#define WSAESHUTDOWN        10058
+#define WSAETOOMANYREFS     10059
 #define WSAETIMEDOUT        10060
 #define WSAECONNREFUSED     10061
+#define WSAELOOP            10062
+#define WSAENAMETOOLONG     10063
+#define WSAEHOSTDOWN        10064
 #define WSAEHOSTUNREACH     10065
+#define WSAENOTEMPTY        10066
+#define WSAEPROCLIM         10067
+#define WSAEUSERS           10068
+#define WSAEDQUOT           10069
+#define WSAESTALE           10070
+#define WSAEREMOTE          10071
+#define WSAEDISCON          10101
 #define WSANOTINITIALISED   10093
 #define WSAHOST_NOT_FOUND   11001
 #define WSATRY_AGAIN        11002
@@ -88,10 +107,15 @@ static __thread int wsa_last_error = 0;
 static atomic_int wsa_init_refcount = 0;
 static pthread_mutex_t wsa_init_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* Thread-safe check: returns 1 if WSAStartup has been called */
+/* Thread-safe check: returns 1 if WSAStartup has been called.
+ * Use relaxed memory order — wsa_init_refcount is a monotonic counter
+ * and every subsequent socket-op syscall establishes its own ordering,
+ * so we don't need seq_cst just to probe "any startup yet?". This shaves
+ * a memory-fence off every socket call on weakly-ordered platforms
+ * (irrelevant for x86 but matters on future ARM64 ports). */
 static inline int wsa_is_initialized(void)
 {
-    return atomic_load(&wsa_init_refcount) > 0;
+    return atomic_load_explicit(&wsa_init_refcount, memory_order_relaxed) > 0;
 }
 
 /* Map POSIX getaddrinfo/getnameinfo error codes to WSA error codes */
@@ -113,29 +137,107 @@ static int eai_to_wsa(int eai_err)
     }
 }
 
-static int errno_to_wsa(int err)
+/*
+ * Translate a Linux errno value into a Winsock WSA error code.
+ *
+ * Every ws2_32 wrapper that forwards to a libc socket primitive MUST call
+ * this after a failed call and store the result via WSASetLastError()
+ * (or directly into the thread-local wsa_last_error). Windows socket code
+ * expects to read raw WSA values (e.g. 10061 WSAECONNREFUSED) from
+ * WSAGetLastError(), NOT the Linux ECONNREFUSED (111).
+ *
+ * Public symbol (exported for sibling ws2_32 TUs if they get added later);
+ * the short alias errno_to_wsa() is retained for call-site brevity.
+ */
+int ws2_map_errno_to_wsa(int err)
 {
     switch (err) {
     case 0:             return 0;
+    /* --- Permission / handle --- */
     case EACCES:        return WSAEACCES;
-    case EADDRINUSE:    return WSAEADDRINUSE;
-    case EADDRNOTAVAIL: return WSAEADDRNOTAVAIL;
-    case EAFNOSUPPORT:  return WSAEAFNOSUPPORT;
-    case EAGAIN:        return WSAEWOULDBLOCK;
-    case ECONNREFUSED:  return WSAECONNREFUSED;
-    case ECONNRESET:    return WSAECONNRESET;
-    case EINPROGRESS:   return WSAEINPROGRESS;
-    case EINTR:         return WSAEINTR;
+    case EPERM:         return WSAEACCES;
+    case EBADF:         return WSAEBADF;
+    case EFAULT:        return WSAEFAULT;
     case EINVAL:        return WSAEINVAL;
     case EMFILE:        return WSAEMFILE;
+    case ENFILE:        return WSAEMFILE;
+    case EINTR:         return WSAEINTR;
+    /* --- Non-blocking / async --- */
+    case EAGAIN:        return WSAEWOULDBLOCK;
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+    case EWOULDBLOCK:   return WSAEWOULDBLOCK;
+#endif
+    case EINPROGRESS:   return WSAEINPROGRESS;
+    case EALREADY:      return WSAEALREADY;
+    /* --- Address / socket identity --- */
+    case ENOTSOCK:      return WSAENOTSOCK;
+    case EDESTADDRREQ:  return WSAEDESTADDRREQ;
+    case EMSGSIZE:      return WSAEMSGSIZE;
+    case EPROTOTYPE:    return WSAEPROTOTYPE;
+    case ENOPROTOOPT:   return WSAENOPROTOOPT;
+    case EPROTONOSUPPORT: return WSAEPROTONOSUPPORT;
+#ifdef ESOCKTNOSUPPORT
+    case ESOCKTNOSUPPORT: return WSAESOCKTNOSUPPORT;
+#endif
+    case EOPNOTSUPP:    return WSAEOPNOTSUPP;
+#if defined(ENOTSUP) && ENOTSUP != EOPNOTSUPP
+    case ENOTSUP:       return WSAEOPNOTSUPP;
+#endif
+#ifdef EPFNOSUPPORT
+    case EPFNOSUPPORT:  return WSAEPFNOSUPPORT;
+#endif
+    case EAFNOSUPPORT:  return WSAEAFNOSUPPORT;
+    case EADDRINUSE:    return WSAEADDRINUSE;
+    case EADDRNOTAVAIL: return WSAEADDRNOTAVAIL;
+    /* --- Network state --- */
     case ENETDOWN:      return WSAENETDOWN;
     case ENETUNREACH:   return WSAENETUNREACH;
+    case ENETRESET:     return WSAENETRESET;
+    case ECONNABORTED:  return WSAECONNABORTED;
+    case ECONNRESET:    return WSAECONNRESET;
     case ENOBUFS:       return WSAENOBUFS;
+    case ENOMEM:        return WSAENOBUFS;
+    case EISCONN:       return WSAEISCONN;
     case ENOTCONN:      return WSAENOTCONN;
-    case ENOTSOCK:      return WSAENOTSOCK;
+#ifdef ESHUTDOWN
+    case ESHUTDOWN:     return WSAESHUTDOWN;
+#endif
+    case EPIPE:         return WSAESHUTDOWN;
+#ifdef ETOOMANYREFS
+    case ETOOMANYREFS:  return WSAETOOMANYREFS;
+#endif
     case ETIMEDOUT:     return WSAETIMEDOUT;
-    default:            return WSAENOTSOCK;
+    case ECONNREFUSED:  return WSAECONNREFUSED;
+    case ELOOP:         return WSAELOOP;
+    case ENAMETOOLONG:  return WSAENAMETOOLONG;
+#ifdef EHOSTDOWN
+    case EHOSTDOWN:     return WSAEHOSTDOWN;
+#endif
+    case EHOSTUNREACH:  return WSAEHOSTUNREACH;
+    case ENOTEMPTY:     return WSAENOTEMPTY;
+#ifdef EUSERS
+    case EUSERS:        return WSAEUSERS;
+#endif
+#ifdef EDQUOT
+    case EDQUOT:        return WSAEDQUOT;
+#endif
+#ifdef ESTALE
+    case ESTALE:        return WSAESTALE;
+#endif
+#ifdef EREMOTE
+    case EREMOTE:       return WSAEREMOTE;
+#endif
+    default:
+        /* Unknown error — return a stable opaque value. Do NOT silently
+         * claim WSAENOTSOCK as before (that masked real bugs). */
+        return WSAEFAULT;
     }
+}
+
+/* Short internal alias — kept for readability at existing call sites. */
+static inline int errno_to_wsa(int err)
+{
+    return ws2_map_errno_to_wsa(err);
 }
 
 WINAPI_EXPORT int WSAStartup(WORD wVersionRequested, WSADATA *lpWSAData)
@@ -828,10 +930,23 @@ WINAPI_EXPORT DWORD WSAWaitForMultipleEvents(DWORD cEvents, const HANDLE *lphEve
                                               BOOL fAlertable)
 {
     (void)cEvents; (void)lphEvents; (void)fWaitAll; (void)fAlertable;
+    /* INFINITE (0xFFFFFFFF) treated as "no timeout — sleep until signaled".
+     * We have no real event plumbing here, so just return immediately for
+     * INFINITE instead of hanging forever. Session 30: previously this
+     * path spun through nanosleep with a 4.3M-second timeout. */
+    if (dwTimeout == 0xFFFFFFFFu) {
+        return 0;
+    }
     if (dwTimeout > 0) {
         struct timespec ts = { .tv_sec = dwTimeout / 1000,
                                .tv_nsec = (dwTimeout % 1000) * 1000000L };
-        nanosleep(&ts, NULL);
+        struct timespec rem;
+        /* Handle EINTR properly — a stray signal should not cut the wait
+         * short, which would starve HTTP download workers that use
+         * WSAWaitForMultipleEvents as a rate limiter. */
+        while (nanosleep(&ts, &rem) == -1 && errno == EINTR) {
+            ts = rem;
+        }
     }
     return 0; /* WSA_WAIT_EVENT_0 */
 }

@@ -135,8 +135,8 @@ WINAPI_EXPORT void NdisAllocatePacketPool(
     (void)NumberOfDescriptors;
     (void)ProtocolReservedLength;
     static int pool = 3;
-    *PoolHandle = &pool;
-    *Status = NDIS_STATUS_SUCCESS;
+    if (PoolHandle) *PoolHandle = &pool;
+    if (Status) *Status = PoolHandle ? NDIS_STATUS_SUCCESS : NDIS_STATUS_RESOURCES;
 }
 
 WINAPI_EXPORT void NdisFreePacketPool(PVOID PoolHandle)
@@ -166,8 +166,8 @@ WINAPI_EXPORT void NdisAllocateBufferPool(
 {
     (void)NumberOfBuffers;
     static int buf_pool = 4;
-    *PoolHandle = &buf_pool;
-    *Status = NDIS_STATUS_SUCCESS;
+    if (PoolHandle) *PoolHandle = &buf_pool;
+    if (Status) *Status = PoolHandle ? NDIS_STATUS_SUCCESS : NDIS_STATUS_RESOURCES;
 }
 
 WINAPI_EXPORT void NdisFreeBufferPool(PVOID PoolHandle)
@@ -196,12 +196,18 @@ WINAPI_EXPORT void NdisMIndicateStatusComplete(PVOID MiniportAdapterHandle)
 
 WINAPI_EXPORT void NdisAllocateSpinLock(PVOID SpinLock)
 {
+    if (!SpinLock)
+        return;
     /* Treat as KSPIN_LOCK */
     PKSPIN_LOCK lock = (PKSPIN_LOCK)SpinLock;
+    *lock = 0;  /* Ensure deterministic value on calloc failure */
     pthread_mutex_t *mtx = (pthread_mutex_t *)calloc(1, sizeof(pthread_mutex_t));
     if (mtx) {
-        pthread_mutex_init(mtx, NULL);
-        *lock = (KSPIN_LOCK)(uintptr_t)mtx;
+        if (pthread_mutex_init(mtx, NULL) == 0) {
+            *lock = (KSPIN_LOCK)(uintptr_t)mtx;
+        } else {
+            free(mtx);
+        }
     }
 }
 

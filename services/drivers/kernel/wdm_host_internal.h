@@ -201,11 +201,19 @@ int  wdm_host_loader_init(void);
 void wdm_host_loader_exit(void);
 int  wdm_load_driver(const char *path, const char *name);
 int  wdm_unload_driver(const char *name);
+struct wdm_driver *wdm_find_driver(const char *name);
 
 /* --- wdm_host_irp.c: IRP construction and dispatch --- */
 int  wdm_irp_init(void);
 void wdm_irp_exit(void);
 int  wdm_dispatch_irp(struct wdm_device *dev, struct wdm_irp *irp);
+struct wdm_irp *wdm_create_irp(uint8_t major, uint8_t minor);
+void wdm_free_irp(struct wdm_irp *irp);
+int  wdm_handle_create_irp(struct wdm_device *dev);
+int  wdm_handle_close_irp(struct wdm_device *dev);
+int32_t wdm_handle_ioctl_irp(struct wdm_device *dev, uint32_t code,
+			      void *in_buf, size_t in_len,
+			      void *out_buf, size_t out_len);
 
 /* --- wdm_host_device.c: Device creation and lookup --- */
 int  wdm_device_init(void);

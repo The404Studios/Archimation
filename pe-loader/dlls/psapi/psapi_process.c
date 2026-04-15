@@ -109,6 +109,8 @@ WINAPI_EXPORT uint32_t GetModuleFileNameExW(void *hProcess, void *hModule,
 WINAPI_EXPORT uint32_t GetModuleBaseNameA(void *hProcess, void *hModule,
                                             char *lpBaseName, uint32_t nSize)
 {
+    if (!lpBaseName || nSize == 0) return 0;
+
     char fullpath[1024];
     uint32_t len = GetModuleFileNameExA(hProcess, hModule, fullpath, sizeof(fullpath));
     if (len == 0) return 0;

@@ -37,8 +37,12 @@
 #define WDM_IRP_MJ_INTERNAL_DEVICE_CONTROL 0x0F
 #define WDM_IRP_MJ_PNP                     0x1B
 
-/* Maximum major function code (IRP_MJ_MAXIMUM_FUNCTION = 0x1B = 27) */
-#define WDM_IRP_MJ_MAX 27
+/*
+ * Maximum valid IRP major function index.
+ * WDM_IRP_MJ_COUNT is defined in wdm_host_internal.h as the array size
+ * (IRP_MJ_MAXIMUM_FUNCTION + 1 = 28); valid indices are 0..27.
+ */
+#define WDM_IRP_MJ_MAX (WDM_IRP_MJ_COUNT - 1)
 
 /* ============================================================================
  * IRP Allocation and Lifetime

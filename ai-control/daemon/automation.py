@@ -10,27 +10,118 @@ The AI has full system access. This module provides:
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
+import re
 import shlex
+import socket
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
+from urllib.parse import urlparse
 
-from filesystem import _BLOCKED_WRITE_PATHS, _BLOCKED_READ_PATHS
+from filesystem import (
+    _BLOCKED_WRITE_PATHS,
+    _BLOCKED_READ_PATHS,
+    _check_path_blocked,
+    _safe_realpath,
+)
 
 logger = logging.getLogger("ai-control.automation")
 
-# Dangerous commands that must never be executed via the SHELL step
-_BLOCKED_COMMANDS = [
-    "rm -rf /", "rm -rf /*", "mkfs", "dd if=", "shutdown", "reboot",
-    "poweroff", "halt", "init 0", "init 6", ":(){", "fork bomb",
-    "chmod -R 777 /", "chown -R", "mv / ", "> /dev/sda",
-    "wget|sh", "curl|sh",
+# Dangerous commands that must never be executed via the SHELL step.
+# Pattern list is a regex-normalized screen (whitespace-insensitive).
+_BLOCKED_COMMAND_PATTERNS = [
+    r"\brm\s+-[rRf]*[rR][rRf]*\s+/(\*|\s|$)",
+    r"\bmkfs\b",
+    r"\bdd\s+if=",
+    r"\bshutdown\b",
+    r"\breboot\b",
+    r"\bpoweroff\b",
+    r"\bhalt\b",
+    r"\binit\s+[06]\b",
+    r":\(\)\s*\{",
+    r"\bchmod\s+-R\s+777\s+/",
+    r"\bchown\s+-R\s+",
+    r"\bmv\s+/\s",
+    r">\s*/dev/sd[a-z]",
+    r">\s*/dev/nvme",
+    r"\bwget\s+[^|&;]+\s*\|\s*(sh|bash|zsh)",
+    r"\bcurl\s+[^|&;]+\s*\|\s*(sh|bash|zsh)",
+    r"\bnc\s+.*-e\b",
 ]
+
+_BLOCKED_COMMAND_RE = re.compile("|".join(_BLOCKED_COMMAND_PATTERNS), re.IGNORECASE)
+
+
+def _sanitize_log(s) -> str:
+    if not isinstance(s, str):
+        s = str(s)
+    return s.replace("\r", "\\r").replace("\n", "\\n").replace("\x00", "\\0")[:512]
+
+
+def _validate_unit_name(name: str) -> bool:
+    """Validate systemd unit / service name (no flag injection, no path)."""
+    if not isinstance(name, str) or not name or name.startswith("-"):
+        return False
+    if any(c in name for c in "\x00\n\r \t;|&$`<>*?\\\"'"):
+        return False
+    # Allow letter/digit/._@:- typical for unit names
+    return bool(re.fullmatch(r"[A-Za-z0-9._@:\-]{1,253}", name))
+
+
+def _validate_package_name(name: str) -> bool:
+    """Validate pacman package name (reject flag-like and path-like inputs)."""
+    if not isinstance(name, str) or not name or name.startswith("-"):
+        return False
+    if "/" in name or "\\" in name or any(c in name for c in "\x00\n\r \t;|&$`<>*?\"'"):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9._+\-]{1,128}", name))
+
+
+def _validate_url(url: str) -> tuple[bool, str]:
+    """Validate an HTTP(S) URL for the HTTP step.
+
+    Refuses non-http schemes and obvious SSRF targets (localhost,
+    RFC1918, link-local, cloud metadata IPs) without DNS resolution.
+    Returns (ok, reason).
+    """
+    if not isinstance(url, str) or not url:
+        return False, "empty url"
+    try:
+        u = urlparse(url)
+    except ValueError as e:
+        return False, f"bad url: {e}"
+    if u.scheme not in ("http", "https"):
+        return False, f"scheme not allowed: {u.scheme}"
+    host = (u.hostname or "").strip()
+    if not host:
+        return False, "missing host"
+    # Reject credentials in URL (phishing / log leak).
+    if u.username or u.password:
+        return False, "credentials in url not allowed"
+    # If host is a literal IP, block private / loopback / link-local / metadata.
+    try:
+        ip = ipaddress.ip_address(host)
+        if (ip.is_loopback or ip.is_private or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False, f"blocked ip range: {host}"
+        # Cloud metadata service (covered by link-local 169.254.*, but belt-and-braces)
+        if str(ip) in ("169.254.169.254", "100.100.100.200", "fd00:ec2::254"):
+            return False, "cloud metadata endpoint blocked"
+    except ValueError:
+        # Hostname — block obvious localhost forms; do NOT resolve DNS here
+        # (the HTTP client will, and this best-effort check catches literal names).
+        low = host.lower()
+        if low in ("localhost", "localhost.localdomain", "ip6-localhost"):
+            return False, "localhost blocked"
+        if low.endswith(".localhost") or low.endswith(".local"):
+            return False, "local TLD blocked"
+    return True, ""
 
 
 class TaskStatus(str, Enum):
@@ -106,15 +197,29 @@ class AutomationEngine:
         """Submit a multi-step automation task. Returns task_id."""
         self._cleanup_old_tasks()
         task_id = str(uuid.uuid4())[:12]
+        if not isinstance(steps, list):
+            raise ValueError("steps must be a list")
+        if len(steps) > 256:
+            raise ValueError("too many steps (max 256)")
         parsed_steps = []
         for i, s in enumerate(steps):
-            step_type = StepType(s.get("type", "shell"))
+            if not isinstance(s, dict):
+                raise ValueError(f"step {i} must be an object")
+            try:
+                step_type = StepType(s.get("type", "shell"))
+            except ValueError:
+                raise ValueError(f"step {i} has unknown type: {s.get('type')}")
+            try:
+                timeout = int(s.get("timeout", 120))
+            except (TypeError, ValueError):
+                timeout = 120
+            timeout = max(1, min(timeout, 3600))
             parsed_steps.append(Step(
                 type=step_type,
                 params=s.get("params", {}),
-                name=s.get("name", f"step-{i+1}"),
-                continue_on_error=s.get("continue_on_error", False),
-                timeout=s.get("timeout", 120),
+                name=str(s.get("name", f"step-{i+1}"))[:128],
+                continue_on_error=bool(s.get("continue_on_error", False)),
+                timeout=timeout,
             ))
 
         result = TaskResult(
@@ -129,7 +234,8 @@ class AutomationEngine:
             self._execute_task(task_id, name, parsed_steps, description)
         )
         self._running[task_id] = atask
-        logger.info("Task %s submitted: %s (%d steps)", task_id, name, len(parsed_steps))
+        logger.info("Task %s submitted: %s (%d steps)",
+                    task_id, _sanitize_log(name), len(parsed_steps))
         return task_id
 
     async def submit_quick(self, command: str, timeout: int = 60) -> dict:
@@ -151,13 +257,47 @@ class AutomationEngine:
         """Execute a multi-line script and return the result."""
         import tempfile
         task_id = str(uuid.uuid4())[:8]
+        # Restrict interpreter to a known-safe allowlist — user-supplied
+        # interpreter means user-controlled argv[0], which can be
+        # /bin/busybox or similar and bypass intent.
+        _ALLOWED_INTERPRETERS = {
+            "/bin/bash", "/usr/bin/bash",
+            "/bin/sh", "/usr/bin/sh",
+            "/bin/zsh", "/usr/bin/zsh",
+            "/usr/bin/python3", "/usr/bin/python",
+        }
+        if interpreter not in _ALLOWED_INTERPRETERS:
+            return {"task_id": task_id, "success": False,
+                    "error": f"interpreter not allowed: {interpreter}"}
+        if not isinstance(script, str):
+            return {"task_id": task_id, "success": False,
+                    "error": "script must be a string"}
+        if len(script) > 4 * 1024 * 1024:
+            return {"task_id": task_id, "success": False,
+                    "error": "script too large"}
         tmp_path = None
+        loop = asyncio.get_running_loop()
         try:
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.sh',
-                                              delete=False) as tmp:
-                tmp.write(script)
-                tmp_path = tmp.name
-            os.chmod(tmp_path, 0o700)
+            def _write_tmp():
+                # Create with restrictive mode atomically (O_CREAT|O_EXCL, 0o600)
+                # rather than letting tempfile choose default umask-dependent bits.
+                old_umask = os.umask(0o077)
+                try:
+                    fd, path = tempfile.mkstemp(prefix="ai-automation-", suffix=".sh")
+                finally:
+                    os.umask(old_umask)
+                try:
+                    with os.fdopen(fd, "w") as f:
+                        f.write(script)
+                    os.chmod(path, 0o700)
+                except Exception:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+                    raise
+                return path
+            tmp_path = await loop.run_in_executor(None, _write_tmp)
             result = await self._run_exec([interpreter, tmp_path], timeout)
             self._record_history(task_id, "script", f"({len(script)} bytes)",
                                  "completed" if result["returncode"] == 0 else "failed",
@@ -168,7 +308,7 @@ class AutomationEngine:
         finally:
             if tmp_path:
                 try:
-                    os.unlink(tmp_path)
+                    await loop.run_in_executor(None, os.unlink, tmp_path)
                 except OSError:
                     pass
 
@@ -291,65 +431,123 @@ class AutomationEngine:
     async def _execute_step(self, step: Step) -> dict:
         """Execute a single step and return result dict."""
         p = step.params
+        if not isinstance(p, dict):
+            return {"success": False, "error": "params must be an object"}
         try:
             if step.type == StepType.SHELL:
                 cmd = p.get("command", "")
-                cmd_lower = cmd.lower().strip()
-                for blocked in _BLOCKED_COMMANDS:
-                    if blocked in cmd_lower:
-                        return {"success": False, "error": f"Blocked command: {blocked}"}
+                if not isinstance(cmd, str):
+                    return {"success": False, "error": "command must be a string"}
+                # Screen against the regex blocklist (whitespace-insensitive).
+                m = _BLOCKED_COMMAND_RE.search(cmd)
+                if m:
+                    return {"success": False,
+                            "error": f"Blocked command pattern: {m.group(0)!r}"}
                 return await self._run_shell(cmd, step.timeout)
 
             elif step.type == StepType.EXEC:
                 argv = p.get("argv", [])
                 if isinstance(argv, str):
                     argv = shlex.split(argv)
+                if not isinstance(argv, list) or not argv:
+                    return {"success": False, "error": "argv must be a non-empty list"}
+                if not all(isinstance(a, str) for a in argv):
+                    return {"success": False, "error": "argv entries must be strings"}
+                # No path-traversal in argv[0] that would pick up a planted binary.
+                if not argv[0] or "\x00" in argv[0]:
+                    return {"success": False, "error": "invalid argv[0]"}
                 return await self._run_exec(argv, step.timeout)
 
             elif step.type == StepType.FILE_WRITE:
                 path = p.get("path", "")
-                abs_path = os.path.realpath(path)
-                for blocked in _BLOCKED_WRITE_PATHS:
-                    if blocked.endswith("/"):
-                        if abs_path.startswith(blocked) or abs_path == blocked.rstrip("/"):
-                            return {"success": False, "error": f"Write blocked: {abs_path} is inside protected path {blocked}"}
-                    elif abs_path == blocked or abs_path.startswith(blocked):
-                        return {"success": False, "error": f"Write blocked: {abs_path} is a protected file"}
+                try:
+                    abs_path = _safe_realpath(path)
+                except ValueError as e:
+                    return {"success": False, "error": str(e)}
+                err = _check_path_blocked(abs_path, _BLOCKED_WRITE_PATHS, "Write")
+                if err:
+                    return {"success": False, "error": err}
                 content = p.get("content", "")
+                if not isinstance(content, (str, bytes)):
+                    return {"success": False, "error": "content must be string or bytes"}
                 mode = p.get("mode", "w")
-                os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
-                with open(abs_path, mode) as f:
-                    f.write(content)
-                if "chmod" in p:
-                    os.chmod(abs_path, int(p["chmod"], 8) if isinstance(p["chmod"], str) else p["chmod"])
+                if mode not in ("w", "wb", "a", "ab"):
+                    return {"success": False, "error": f"mode not allowed: {mode}"}
+                chmod_val = p.get("chmod")
+                def _do_write():
+                    os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
+                    if "a" in mode:
+                        flags |= os.O_APPEND
+                    else:
+                        flags |= os.O_TRUNC
+                    old_umask = os.umask(0o077)
+                    try:
+                        fd = os.open(abs_path, flags, 0o600)
+                    finally:
+                        os.umask(old_umask)
+                    with os.fdopen(fd, mode) as f:
+                        f.write(content)
+                    if chmod_val is not None:
+                        cv = int(chmod_val, 8) if isinstance(chmod_val, str) else int(chmod_val)
+                        if cv < 0 or cv > 0o7777:
+                            raise ValueError("chmod out of range")
+                        os.chmod(abs_path, cv)
+                loop = asyncio.get_running_loop()
+                try:
+                    await loop.run_in_executor(None, _do_write)
+                except Exception as e:
+                    return {"success": False, "error": str(e)}
                 return {"success": True, "path": abs_path, "bytes": len(content)}
 
             elif step.type == StepType.FILE_READ:
                 path = p.get("path", "")
-                abs_path = os.path.realpath(path)
-                for blocked in _BLOCKED_READ_PATHS:
-                    if blocked.endswith("/"):
-                        if abs_path.startswith(blocked) or abs_path == blocked.rstrip("/"):
-                            return {"success": False, "error": f"Read blocked: {abs_path} is inside protected path {blocked}"}
-                    elif abs_path == blocked or abs_path.startswith(blocked):
-                        return {"success": False, "error": f"Read blocked: {abs_path} is a protected file"}
-                with open(abs_path, "r") as f:
-                    content = f.read()
+                try:
+                    abs_path = _safe_realpath(path)
+                except ValueError as e:
+                    return {"success": False, "error": str(e)}
+                err = _check_path_blocked(abs_path, _BLOCKED_READ_PATHS, "Read")
+                if err:
+                    return {"success": False, "error": err}
+                def _do_read():
+                    # Refuse symlink final-component (O_NOFOLLOW-equivalent).
+                    import stat as _stat
+                    st = os.lstat(abs_path)
+                    if _stat.S_ISLNK(st.st_mode):
+                        raise OSError("refusing to follow symlink")
+                    if st.st_size > 64 * 1024 * 1024:
+                        raise OSError(f"file too large ({st.st_size} bytes)")
+                    with open(abs_path, "r") as f:
+                        return f.read()
+                loop = asyncio.get_running_loop()
+                try:
+                    content = await loop.run_in_executor(None, _do_read)
+                except Exception as e:
+                    return {"success": False, "error": str(e)}
                 return {"success": True, "content": content, "bytes": len(content)}
 
             elif step.type == StepType.SERVICE:
                 action = p.get("action", "status")
                 service = p.get("service", "")
-                r = await self._run_exec(["systemctl", action, service], step.timeout)
+                if action not in ("start", "stop", "restart", "status",
+                                  "enable", "disable", "reload", "is-active",
+                                  "is-enabled"):
+                    return {"success": False, "error": f"action not allowed: {action}"}
+                if not _validate_unit_name(service):
+                    return {"success": False, "error": "invalid service name"}
+                r = await self._run_exec(["systemctl", "--", action, service], step.timeout)
                 return {"success": r["returncode"] == 0, **r}
 
             elif step.type == StepType.PACKAGE:
                 action = p.get("action", "install")
                 pkg = p.get("package", "")
+                if action in ("install", "remove"):
+                    if not _validate_package_name(pkg):
+                        return {"success": False, "error": "invalid package name"}
                 if action == "install":
-                    r = await self._run_exec(["pacman", "-S", "--noconfirm", pkg], step.timeout)
+                    r = await self._run_exec(["pacman", "-S", "--noconfirm", "--", pkg], step.timeout)
                 elif action == "remove":
-                    r = await self._run_exec(["pacman", "-R", "--noconfirm", pkg], step.timeout)
+                    r = await self._run_exec(["pacman", "-R", "--noconfirm", "--", pkg], step.timeout)
                 elif action == "update":
                     r = await self._run_exec(["pacman", "-Syu", "--noconfirm"], step.timeout)
                 else:
@@ -359,39 +557,58 @@ class AutomationEngine:
             elif step.type == StepType.HTTP:
                 import aiohttp
                 method = p.get("method", "GET").upper()
+                if method not in ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"):
+                    return {"success": False, "error": f"method not allowed: {method}"}
                 url = p.get("url", "")
+                ok, reason = _validate_url(url)
+                if not ok:
+                    return {"success": False, "error": f"url rejected: {reason}"}
                 headers = p.get("headers", {})
+                if not isinstance(headers, dict):
+                    return {"success": False, "error": "headers must be an object"}
+                # Strip CR/LF from header values to prevent header injection.
+                safe_headers = {}
+                for k, v in headers.items():
+                    if not isinstance(k, str) or not isinstance(v, (str, int, float)):
+                        continue
+                    sv = str(v)
+                    if "\r" in k or "\n" in k or "\r" in sv or "\n" in sv:
+                        return {"success": False, "error": "CRLF in header not allowed"}
+                    safe_headers[k] = sv
                 body = p.get("body", None)
                 async with aiohttp.ClientSession() as session:
-                    req_kwargs = {"headers": headers, "timeout": aiohttp.ClientTimeout(total=step.timeout)}
-                    if body:
+                    req_kwargs = {"headers": safe_headers,
+                                  "timeout": aiohttp.ClientTimeout(total=step.timeout),
+                                  "allow_redirects": False}
+                    if body is not None:
                         req_kwargs["json"] = body
                     async with session.request(method, url, **req_kwargs) as resp:
-                        text = await resp.text()
-                        return {"success": resp.status < 400, "status": resp.status, "body": text}
+                        # Cap response body to avoid memory exhaustion.
+                        raw = await resp.content.read(4 * 1024 * 1024)
+                        try:
+                            text = raw.decode("utf-8", errors="replace")
+                        except Exception:
+                            text = ""
+                        return {"success": resp.status < 400,
+                                "status": resp.status, "body": text}
 
             elif step.type == StepType.PYTHON:
-                code = p.get("code", "")
-                # Execute in a restricted namespace with safe builtins only
-                _SAFE_BUILTINS = {
-                    "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict,
-                    "enumerate": enumerate, "filter": filter, "float": float,
-                    "format": format, "frozenset": frozenset, "hasattr": hasattr,
-                    "hash": hash, "int": int, "isinstance": isinstance, "issubclass": issubclass,
-                    "iter": iter, "len": len, "list": list, "map": map, "max": max,
-                    "min": min, "next": next, "print": print, "range": range,
-                    "repr": repr, "reversed": reversed, "round": round, "set": set,
-                    "slice": slice, "sorted": sorted, "str": str, "sum": sum,
-                    "tuple": tuple, "type": type, "zip": zip,
-                    "True": True, "False": False, "None": None,
-                }
-                namespace = {"os": os, "asyncio": asyncio, "json": json,
-                             "result": None, "__builtins__": _SAFE_BUILTINS}
-                exec(code, namespace)
-                return {"success": True, "result": str(namespace.get("result", ""))}
+                # PYTHON exec is inherently unsafe: exec() in CPython cannot be
+                # sandboxed (dunder escapes trivially reach the file system and
+                # import machinery). Disable it entirely from the automation
+                # boundary; callers that legitimately need Python should use
+                # SHELL with /usr/bin/python3 -c or submit_script(interpreter="/usr/bin/python3").
+                return {"success": False,
+                        "error": "PYTHON step disabled; use SHELL or submit_script instead"}
 
             elif step.type == StepType.WAIT:
                 seconds = p.get("seconds", 1)
+                try:
+                    seconds = float(seconds)
+                except (TypeError, ValueError):
+                    return {"success": False, "error": "seconds must be a number"}
+                if seconds < 0 or seconds > 3600:
+                    return {"success": False, "error": "seconds out of range [0, 3600]"}
                 await asyncio.sleep(seconds)
                 return {"success": True, "waited": seconds}
 
@@ -400,11 +617,20 @@ class AutomationEngine:
                 message = p.get("message", "")
                 urgency = p.get("urgency", "normal")
                 icon = p.get("icon", "dialog-information")
+                if urgency not in ("low", "normal", "critical"):
+                    urgency = "normal"
+                # Clamp title/message/icon to plain strings of reasonable length.
+                title = str(title)[:256]
+                message = str(message)[:4096]
+                # Icon name: restrict charset to avoid argv injection.
+                if not isinstance(icon, str) or not re.fullmatch(r"[A-Za-z0-9._\-/]{1,128}", icon):
+                    icon = "dialog-information"
                 env = os.environ.copy()
                 env.setdefault("DISPLAY", ":0")
+                proc = None
                 try:
                     proc = await asyncio.create_subprocess_exec(
-                        "notify-send", "-u", urgency, "-i", icon, title, message,
+                        "notify-send", "-u", urgency, "-i", icon, "--", title, message,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                         env=env,
@@ -413,21 +639,58 @@ class AutomationEngine:
                     return {"success": proc.returncode == 0,
                             "returncode": proc.returncode,
                             "stderr": stderr.decode(errors="replace").strip()}
+                except asyncio.TimeoutError:
+                    # Session 24: reap notify-send if it hangs (e.g., no DBus session)
+                    if proc is not None:
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            await proc.wait()
+                        except Exception:
+                            pass
+                    return {"success": False, "error": "notify-send timed out"}
                 except Exception as e:
+                    if proc is not None:
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            await proc.wait()
+                        except Exception:
+                            pass
                     return {"success": False, "error": str(e)}
 
             elif step.type == StepType.CONDITION:
                 check = p.get("check", "")
                 if check == "file_exists":
-                    exists = os.path.exists(p.get("path", ""))
+                    cond_path = p.get("path", "")
+                    try:
+                        rp = _safe_realpath(cond_path)
+                    except ValueError as e:
+                        return {"success": False, "error": str(e)}
+                    exists = os.path.exists(rp)
                     return {"success": exists, "exists": exists}
                 elif check == "service_active":
+                    svc = p.get("service", "")
+                    if not _validate_unit_name(svc):
+                        return {"success": False, "error": "invalid service name"}
                     r = await self._run_exec(
-                        ["systemctl", "is-active", "--quiet", p.get("service", "")], 10
+                        ["systemctl", "is-active", "--quiet", "--", svc], 10
                     )
-                    return {"success": r["returncode"] == 0, "active": r["returncode"] == 0}
+                    return {"success": r["returncode"] == 0,
+                            "active": r["returncode"] == 0}
                 elif check == "command":
-                    r = await self._run_shell(p.get("command", ""), step.timeout)
+                    cmd = p.get("command", "")
+                    if not isinstance(cmd, str):
+                        return {"success": False, "error": "command must be a string"}
+                    m = _BLOCKED_COMMAND_RE.search(cmd)
+                    if m:
+                        return {"success": False,
+                                "error": f"Blocked command pattern: {m.group(0)!r}"}
+                    r = await self._run_shell(cmd, step.timeout)
                     return {"success": r["returncode"] == 0, **r}
                 else:
                     return {"success": False, "error": f"Unknown condition: {check}"}
@@ -445,6 +708,7 @@ class AutomationEngine:
     # ------------------------------------------------------------------
 
     async def _run_shell(self, cmd: str, timeout: int = 60) -> dict:
+        proc = None
         try:
             proc = await asyncio.create_subprocess_shell(
                 cmd,
@@ -459,13 +723,30 @@ class AutomationEngine:
                 "stderr": stderr.decode(errors="replace").strip(),
             }
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            if proc is not None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
             return {"success": False, "returncode": -1, "stdout": "", "stderr": "timeout"}
         except Exception as e:
+            if proc is not None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
             return {"success": False, "returncode": -1, "stdout": "", "stderr": str(e)}
 
     async def _run_exec(self, argv: list, timeout: int = 60) -> dict:
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -480,10 +761,26 @@ class AutomationEngine:
                 "stderr": stderr.decode(errors="replace").strip(),
             }
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            if proc is not None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
             return {"success": False, "returncode": -1, "stdout": "", "stderr": "timeout"}
         except Exception as e:
+            if proc is not None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
             return {"success": False, "returncode": -1, "stdout": "", "stderr": str(e)}
 
     # ------------------------------------------------------------------

@@ -2523,6 +2523,226 @@ APP_PROFILES: dict[str, AppProfile] = {
         },
         desktop_file="org.flameshot.Flameshot.desktop",
     ),
+
+    # ---- Common missing profiles (Round 3 audit) ----
+    "thunderbird": AppProfile(
+        name="Thunderbird",
+        launch_cmd="thunderbird",
+        app_type="gui",
+        package="thunderbird",
+        description="Mozilla Thunderbird email client",
+        categories=["email", "internet", "communication"],
+        operations={"launch": "thunderbird", "compose": "thunderbird -compose"},
+        kill_cmd="pkill thunderbird",
+        config_path="~/.thunderbird/",
+        desktop_file="org.mozilla.Thunderbird.desktop",
+    ),
+
+    "blender": AppProfile(
+        name="Blender",
+        launch_cmd="blender",
+        app_type="gui",
+        package="blender",
+        description="3D creation suite",
+        categories=["graphics", "3d", "modeling"],
+        operations={"open": "blender {path}", "render": "blender -b {path} -o {output} -a"},
+        kill_cmd="pkill blender",
+        desktop_file="blender.desktop",
+    ),
+
+    "inkscape": AppProfile(
+        name="Inkscape",
+        launch_cmd="inkscape",
+        app_type="gui",
+        package="inkscape",
+        description="Vector graphics editor",
+        categories=["graphics", "image_editing"],
+        operations={"open": "inkscape {path}", "export_png": "inkscape {input} -o {output}"},
+        kill_cmd="pkill inkscape",
+        desktop_file="org.inkscape.Inkscape.desktop",
+    ),
+
+    "krita": AppProfile(
+        name="Krita",
+        launch_cmd="krita",
+        app_type="gui",
+        package="krita",
+        description="Digital painting application",
+        categories=["graphics", "image_editing"],
+        operations={"open": "krita {path}"},
+        kill_cmd="pkill krita",
+        desktop_file="org.kde.krita.desktop",
+    ),
+
+    "spotify": AppProfile(
+        name="Spotify",
+        launch_cmd="spotify",
+        app_type="gui",
+        package="spotify",
+        description="Spotify music streaming client",
+        categories=["media", "audio", "streaming"],
+        operations={"launch": "spotify"},
+        kill_cmd="pkill spotify",
+        desktop_file="spotify.desktop",
+    ),
+
+    "telegram": AppProfile(
+        name="Telegram",
+        launch_cmd="telegram-desktop",
+        app_type="gui",
+        package="telegram-desktop",
+        description="Telegram messenger desktop client",
+        categories=["communication"],
+        operations={"launch": "telegram-desktop"},
+        kill_cmd="pkill telegram-desktop",
+        desktop_file="org.telegram.desktop.desktop",
+    ),
+
+    "signal": AppProfile(
+        name="Signal",
+        launch_cmd="signal-desktop",
+        app_type="gui",
+        package="signal-desktop",
+        description="Signal private messenger",
+        categories=["communication"],
+        operations={"launch": "signal-desktop"},
+        kill_cmd="pkill signal-desktop",
+        desktop_file="signal-desktop.desktop",
+    ),
+
+    "files": AppProfile(
+        # Generic "file manager" alias -- prefers thunar on this distro
+        # (XFCE default). Keeps "start file manager" from falsely
+        # matching Firefox.
+        name="File Manager",
+        launch_cmd="thunar",
+        app_type="gui",
+        package="thunar",
+        description="Default file manager (Thunar on XFCE)",
+        categories=["file_manager", "utility"],
+        operations={"open_dir": "thunar {path}"},
+        kill_cmd="pkill thunar",
+        desktop_file="thunar.desktop",
+    ),
+
+    "chrome": AppProfile(
+        # Alias profile: if google-chrome isn't installed, fall back
+        # to chromium. get_app_profile("chrome") also matches via
+        # APP_ALIASES for the common spoken form.
+        name="Google Chrome",
+        launch_cmd="google-chrome-stable 2>/dev/null || chromium",
+        app_type="gui",
+        package="google-chrome",
+        description="Google Chrome web browser (falls back to Chromium)",
+        categories=["browser", "internet"],
+        operations={
+            "open_url": "google-chrome-stable {url} 2>/dev/null || chromium {url}",
+            "incognito": "google-chrome-stable --incognito {url} 2>/dev/null || chromium --incognito {url}",
+        },
+        kill_cmd="pkill -f 'chrome|chromium'",
+        desktop_file="google-chrome.desktop",
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# Application aliases: common spoken/typed names -> canonical key.
+# Fixes things like "open google chrome", "launch vs code", "start browser".
+# All keys lowercase, stripped of punctuation. Multi-word aliases are
+# matched against full phrase (e.g. "google chrome", "visual studio code").
+# ---------------------------------------------------------------------------
+
+APP_ALIASES: dict[str, str] = {
+    # Browsers
+    "google chrome": "chrome",
+    "google-chrome": "chrome",
+    "chrome browser": "chrome",
+    "firefox browser": "firefox",
+    "mozilla firefox": "firefox",
+    "mozilla": "firefox",
+    "browser": "firefox",
+    "web browser": "firefox",
+    "internet": "firefox",
+    "chromium browser": "chromium",
+
+    # Email
+    "mozilla thunderbird": "thunderbird",
+    "email": "thunderbird",
+    "mail": "thunderbird",
+    "email client": "thunderbird",
+
+    # Editors / IDEs
+    "visual studio code": "vscode",
+    "vs code": "vscode",
+    "vs-code": "vscode",
+    "code editor": "vscode",
+    "code": "vscode",
+
+    # File managers
+    "file manager": "files",
+    "filemanager": "files",
+    "file-manager": "files",
+    "explorer": "files",
+    "finder": "files",
+
+    # Terminals
+    "terminal": "xfce4_terminal",
+    "console": "xfce4_terminal",
+    "shell": "xfce4_terminal",
+    "xterm": "xfce4_terminal",
+    "cmd": "xfce4_terminal",
+
+    # Media
+    "media player": "vlc",
+    "video player": "vlc",
+    "music": "spotify",
+    "music player": "spotify",
+    "audio": "audacity",
+    "audio editor": "audacity",
+
+    # Graphics
+    "image editor": "gimp",
+    "photo editor": "gimp",
+    "paint": "krita",
+    "drawing": "krita",
+    "vector": "inkscape",
+
+    # Office
+    "office": "libreoffice",
+    "word": "libreoffice",
+    "writer": "libreoffice",
+    "calc": "libreoffice",
+    "impress": "libreoffice",
+    "spreadsheet": "libreoffice",
+    "document": "libreoffice",
+
+    # Comms
+    "messenger": "telegram",
+    "telegram desktop": "telegram",
+    "signal-desktop": "signal",
+
+    # Recording/streaming
+    "streaming": "obs",
+    "recorder": "obs",
+    "obs studio": "obs",
+
+    # System / monitoring
+    "task manager": "htop_app",
+    "process manager": "htop_app",
+    "system monitor": "btop",
+    "htop": "htop_app",
+
+    # Screenshot
+    "screenshot tool": "flameshot",
+    "screenshot": "flameshot",
+
+    # Gaming
+    "steam client": "steam",
+    "valve": "steam",
+
+    # PDF
+    "pdf": "evince",
+    "pdf viewer": "evince",
 }
 
 
@@ -2693,18 +2913,45 @@ class ContextEngine:
         return results[:20]
 
     def get_app_profile(self, name: str) -> Optional[AppProfile]:
-        """Get application profile by name (case-insensitive, partial match)."""
-        name_lower = name.lower()
-        # Exact key match
+        """Get application profile by name (case-insensitive, alias-aware).
+
+        Matching order:
+          1. Exact key match
+          2. Explicit alias (APP_ALIASES)
+          3. Exact display-name match (case-insensitive)
+          4. Prefix match on key or display name
+          5. Word-boundary substring match (avoids 'file' -> 'firefox')
+        """
+        if not name:
+            return None
+        # Strip stray punctuation ("firefox!", "firefox.") that would
+        # otherwise break lookup. Keep hyphens and dots inside names
+        # (e.g. "xfce4-terminal", "yt-dlp").
+        name_lower = re.sub(r'[^\w.\-+]+$', '', name.lower()).strip()
+        name_lower = re.sub(r'^[^\w]+', '', name_lower)
+        if not name_lower:
+            return None
+        # 1. Exact key match
         if name_lower in APP_PROFILES:
             return APP_PROFILES[name_lower]
-        # Match on display name
+        # 2. Explicit alias
+        alias_key = APP_ALIASES.get(name_lower)
+        if alias_key and alias_key in APP_PROFILES:
+            return APP_PROFILES[alias_key]
+        # 3. Display-name exact match
         for key, profile in APP_PROFILES.items():
             if name_lower == profile.name.lower():
                 return profile
-        # Partial match
+        # 4. Prefix match (on key or display name) -- safer than
+        # substring ("chrome" prefixes "chromium" but not "firefox").
         for key, profile in APP_PROFILES.items():
-            if name_lower in key or name_lower in profile.name.lower():
+            if key.startswith(name_lower) or profile.name.lower().startswith(name_lower):
+                return profile
+        # 5. Word-boundary substring match. Avoids false positives like
+        # "file" matching "firefox" -- the query must be a whole word.
+        pattern = re.compile(rf'\b{re.escape(name_lower)}\b')
+        for key, profile in APP_PROFILES.items():
+            if pattern.search(key.replace('_', ' ')) or pattern.search(profile.name.lower()):
                 return profile
         return None
 
@@ -2754,14 +3001,110 @@ class ContextEngine:
         """Parse a single clause of a request."""
         actions: list[Action] = []
 
+        # --- GUI primitive verbs (must come before launch/run so that
+        # "run /tmp/foo" still works but "type hello world" doesn't
+        # fall through to the fallback raw-command handler).
+
+        # "type <text>" -> Action(type, "<text>")
+        type_match = re.match(r'type\s+(?:["\'](.+)["\']|(.+))$', part)
+        if type_match:
+            text = type_match.group(1) or type_match.group(2) or ""
+            return [Action(
+                type="type", value=text,
+                description=f"Type text: {text[:40]}",
+                security="safe", trust=100,
+            )]
+
+        # "press <key>" -> Action(press, "<key>")
+        press_match = re.match(r'press\s+([\w+\-]+)\s*$', part)
+        if press_match:
+            key = press_match.group(1)
+            return [Action(
+                type="press", value=key,
+                description=f"Press key: {key}",
+                security="safe", trust=100,
+            )]
+
+        # "click <x>,<y>" -> Action(click, "x,y")
+        click_match = re.match(r'click\s+(?:at\s+)?(\d+)[,\s]+(\d+)\s*$', part)
+        if click_match:
+            return [Action(
+                type="click",
+                value=f"{click_match.group(1)},{click_match.group(2)}",
+                description=f"Click at ({click_match.group(1)}, {click_match.group(2)})",
+                security="safe", trust=100,
+            )]
+
+        # "screenshot" / "take a screenshot" / "take screenshot" / "capture screen"
+        if re.match(
+            r'(?:take\s+(?:a\s+)?)?(?:screenshot|screen\s*shot|capture\s+screen|grab\s+screen)\s*$',
+            part,
+        ):
+            return [Action(
+                type="screenshot", value="",
+                description="Capture a screenshot",
+                security="safe", trust=100,
+            )]
+
+        # "close window" / "close active window"
+        if re.match(r'close\s+(?:the\s+)?(?:active\s+|current\s+)?window\s*$', part):
+            return [Action(
+                type="press", value="alt+F4",
+                description="Close active window",
+                security="safe", trust=100,
+            )]
+
+        # "minimize window"
+        if re.match(r'minimi[sz]e\s+(?:the\s+)?(?:active\s+|current\s+)?window\s*$', part):
+            return [Action(
+                type="run", value="xdotool getactivewindow windowminimize",
+                description="Minimize active window",
+                security="safe", trust=100,
+            )]
+
+        # "maximize window"
+        if re.match(r'(?:maximi[sz]e|fullscreen)\s+(?:the\s+)?(?:active\s+|current\s+)?window\s*$', part):
+            return [Action(
+                type="run", value="xdotool key --clearmodifiers super+Up",
+                description="Maximize active window",
+                security="safe", trust=100,
+            )]
+
+        # --- Time / date queries --------------------------------------
+        if re.search(r'\b(?:what\s+(?:is\s+)?(?:the\s+)?)?time\b', part) and \
+                not re.search(r'timezone|timer|runtime|realtime', part):
+            return [Action(
+                type="run", value="date +'%H:%M:%S %Z (%A, %B %d %Y)'",
+                description="Show current time",
+                security="safe", trust=100,
+            )]
+
+        if re.search(r'\b(?:what\s+(?:is\s+)?(?:the\s+)?)?date\b', part) and \
+                not re.search(r'update|up-to-date|outdated', part):
+            return [Action(
+                type="run", value="date +'%A, %B %d %Y'",
+                description="Show today's date",
+                security="safe", trust=100,
+            )]
+
         # --- App launch detection ---
         launch_match = re.match(
             r'(?:open|launch|start|run)\s+(.+?)(?:\s+(?:and|then)|\s*$)', part
         )
         if launch_match:
             app_name = launch_match.group(1).strip()
-            # Check for URL after app name  ("open firefox and go to github.com")
-            profile = self.get_app_profile(app_name.split()[0])
+            # Try progressively shorter phrase prefixes so multi-word
+            # app names ("google chrome", "visual studio code") resolve
+            # before falling back to the first token alone.
+            profile = None
+            words = app_name.split()
+            for n in range(len(words), 0, -1):
+                phrase = " ".join(words[:n])
+                profile = self.get_app_profile(phrase)
+                if profile:
+                    break
+            if profile is None:
+                profile = self.get_app_profile(app_name.split()[0] if app_name else "")
             if profile and profile.app_type == "gui":
                 # Check if there's a URL in the original text
                 url_match = _URL_RE.search(original)
@@ -2819,6 +3162,22 @@ class ContextEngine:
                     type="run",
                     value=f"pe-run-game {shlex.quote(exe_path)}",
                     description=f"Run Windows executable {exe_path}",
+                    security="moderate",
+                    trust=300,
+                ))
+                return actions
+
+            # No profile and not .exe. If the first token looks like a
+            # valid binary name (alphanumeric + dashes, no shell
+            # metacharacters), try launching it verbatim via bash. This
+            # covers apps that aren't in the profile dictionary but may
+            # still be on PATH -- e.g. "open htop", "launch lynx".
+            first_word = app_name.split()[0] if app_name else ""
+            if first_word and re.fullmatch(r'[a-zA-Z0-9][\w.\-+]*', first_word):
+                actions.append(Action(
+                    type="launch",
+                    value=shlex.quote(first_word),
+                    description=f"Launch {first_word} (not in app library)",
                     security="moderate",
                     trust=300,
                 ))

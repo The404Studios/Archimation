@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #include "common/dll_common.h"
 
@@ -128,33 +129,43 @@ typedef struct {
 } dialog_entry_t;
 
 static dialog_entry_t g_dialogs[MAX_DIALOGS];
+static pthread_mutex_t g_dialog_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static dialog_entry_t *find_dialog(HWND hwnd)
 {
+    pthread_mutex_lock(&g_dialog_lock);
     for (int i = 0; i < MAX_DIALOGS; i++) {
-        if (g_dialogs[i].used && g_dialogs[i].hwnd == hwnd)
+        if (g_dialogs[i].used && g_dialogs[i].hwnd == hwnd) {
+            pthread_mutex_unlock(&g_dialog_lock);
             return &g_dialogs[i];
+        }
     }
+    pthread_mutex_unlock(&g_dialog_lock);
     return NULL;
 }
 
 static dialog_entry_t *alloc_dialog(void)
 {
+    pthread_mutex_lock(&g_dialog_lock);
     for (int i = 0; i < MAX_DIALOGS; i++) {
         if (!g_dialogs[i].used) {
             memset(&g_dialogs[i], 0, sizeof(g_dialogs[i]));
             g_dialogs[i].used = 1;
+            pthread_mutex_unlock(&g_dialog_lock);
             return &g_dialogs[i];
         }
     }
+    pthread_mutex_unlock(&g_dialog_lock);
     return NULL;
 }
 
 static void free_dialog(dialog_entry_t *d)
 {
     if (d) {
+        pthread_mutex_lock(&g_dialog_lock);
         d->used = 0;
         d->hwnd = NULL;
+        pthread_mutex_unlock(&g_dialog_lock);
     }
 }
 
@@ -278,20 +289,40 @@ WINAPI_EXPORT INT_PTR DialogBoxParamA(
     DLGPROC lpDialogFunc,
     LPARAM dwInitParam)
 {
-    HWND hdlg = CreateDialogParamA(hInstance, lpTemplateName,
-                                    hWndParent, lpDialogFunc, dwInitParam);
-    if (!hdlg)
-        return -1;
+    (void)lpTemplateName;
 
-    dialog_entry_t *d = find_dialog(hdlg);
-    if (!d)
+    /* Allocate dialog entry with modal=1 BEFORE any DLGPROC invocation.
+     * If WM_INITDIALOG calls EndDialog, EndDialog must see modal=1 so it
+     * does not destroy-and-free the slot (leading to UAF in this function). */
+    dialog_entry_t *d = alloc_dialog();
+    if (!d) {
+        set_last_error(ERROR_OUTOFMEMORY);
         return -1;
-
+    }
+    d->dlgproc = lpDialogFunc;
+    d->owner = hWndParent;
     d->modal = 1;
 
-    /* Disable owner */
+    HWND hdlg = CreateWindowExA(
+        0x00000100 /* WS_EX_WINDOWEDGE */,
+        "DIALOG", "",
+        0x00C00000 | 0x10000000,  /* WS_CAPTION | WS_VISIBLE */
+        100, 100, 300, 200,
+        hWndParent, NULL, hInstance, NULL);
+    if (!hdlg) {
+        free_dialog(d);
+        return -1;
+    }
+    d->hwnd = hdlg;
+
+    /* Disable owner before WM_INITDIALOG in case the DLGPROC queries it */
     if (hWndParent)
         EnableWindow(hWndParent, FALSE);
+
+    /* Send WM_INITDIALOG. May call EndDialog — that path sees modal=1
+     * and only sets ended/result without destroying. */
+    if (d->dlgproc)
+        d->dlgproc(hdlg, WM_INITDIALOG, (WPARAM)0, dwInitParam);
 
     ShowWindow(hdlg, 1 /* SW_SHOWNORMAL */);
     UpdateWindow(hdlg);
@@ -303,7 +334,6 @@ WINAPI_EXPORT INT_PTR DialogBoxParamA(
         if (ret == 0 || ret == -1)
             break;
 
-        /* Give the dialog first crack */
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
@@ -404,14 +434,22 @@ WINAPI_EXPORT BOOL IsDialogMessageW(HWND hDlg, LPMSG lpMsg)
 
 WINAPI_EXPORT HWND GetDlgItem(HWND hDlg, int nIDDlgItem)
 {
-    /* First check dialog tracking table */
-    dialog_entry_t *d = find_dialog(hDlg);
-    if (d) {
-        for (int i = 0; i < d->control_count; i++) {
-            if (d->controls[i].used && d->controls[i].id == nIDDlgItem)
-                return d->controls[i].hwnd;
+    /* First check dialog tracking table under lock */
+    pthread_mutex_lock(&g_dialog_lock);
+    for (int i = 0; i < MAX_DIALOGS; i++) {
+        if (!g_dialogs[i].used || g_dialogs[i].hwnd != hDlg)
+            continue;
+        for (int j = 0; j < g_dialogs[i].control_count; j++) {
+            if (g_dialogs[i].controls[j].used &&
+                g_dialogs[i].controls[j].id == nIDDlgItem) {
+                HWND h = g_dialogs[i].controls[j].hwnd;
+                pthread_mutex_unlock(&g_dialog_lock);
+                return h;
+            }
         }
+        break;
     }
+    pthread_mutex_unlock(&g_dialog_lock);
 
     /* Fall back to searching the HWND map for child windows with matching control ID */
     return hwnd_find_child_by_id(hDlg, nIDDlgItem);
@@ -533,14 +571,19 @@ WINAPI_EXPORT BOOL MapDialogRect(HWND hDlg, LPRECT lpRect)
 WINAPI_EXPORT int GetDlgCtrlID(HWND hWnd)
 {
     /* First check dialog tracking */
+    pthread_mutex_lock(&g_dialog_lock);
     for (int d = 0; d < MAX_DIALOGS; d++) {
         if (!g_dialogs[d].used) continue;
         for (int c = 0; c < g_dialogs[d].control_count; c++) {
             if (g_dialogs[d].controls[c].used &&
-                g_dialogs[d].controls[c].hwnd == hWnd)
-                return g_dialogs[d].controls[c].id;
+                g_dialogs[d].controls[c].hwnd == hWnd) {
+                int id = g_dialogs[d].controls[c].id;
+                pthread_mutex_unlock(&g_dialog_lock);
+                return id;
+            }
         }
     }
+    pthread_mutex_unlock(&g_dialog_lock);
     /* Fall back to HWND entry control_id */
     return hwnd_get_control_id(hWnd);
 }

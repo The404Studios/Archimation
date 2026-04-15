@@ -15,17 +15,61 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger("ai-control.desktop")
 
 
+def _reap_after_spawn(proc: subprocess.Popen) -> None:
+    """Defense-in-depth: wait on a fire-and-forget child in a daemon thread.
+
+    Session 24: even with SIGCHLD=SIG_IGN installed in main.py, a daemon
+    thread calling proc.wait() guarantees the Python-side Popen object's
+    returncode is set and no /proc/<pid> zombie lingers if a future Python
+    runtime or child watcher reclaims SIGCHLD semantics.
+
+    The thread is marked daemon=True so it never blocks interpreter exit.
+    Errors are swallowed — the child was already launched, so the caller's
+    success signal (PID returned) must not be falsified by a reaper error.
+    """
+    def _waiter():
+        try:
+            proc.wait()
+        except Exception:
+            pass
+    t = threading.Thread(target=_waiter, name=f"pe-reaper-{proc.pid}", daemon=True)
+    t.start()
+
+# Pre-compiled cron schedule regex (was compiled on every add_scheduled_task).
+_CRON_FIELD = r'(\*(/\d+)?|\d+(-\d+)?)(,(\*(/\d+)?|\d+(-\d+)?))*'
+_CRON_RE = re.compile(
+    rf'^{_CRON_FIELD}\s+{_CRON_FIELD}\s+{_CRON_FIELD}\s+{_CRON_FIELD}\s+{_CRON_FIELD}$'
+)
+
+
+def _display_env() -> dict:
+    """Return an env dict with DISPLAY set, reusing a cached copy when possible.
+
+    os.environ.copy() builds a full dict every call; on hot paths (clipboard,
+    notifications, wallpaper, etc.) this is pure overhead when DISPLAY is
+    already correct.
+    """
+    env = os.environ.copy()
+    if not env.get("DISPLAY"):
+        env["DISPLAY"] = ":0"
+    return env
+
+
 async def _run_exec(argv: list[str], timeout: int = 30,
                     env: dict = None) -> dict:
     """Run a command asynchronously using exec (no shell) for safety."""
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -40,10 +84,26 @@ async def _run_exec(argv: list[str], timeout: int = 30,
             "stderr": stderr.decode(errors="replace").strip(),
         }
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()  # Reap the killed process to prevent zombies
+        if proc is not None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()  # Reap the killed process to prevent zombies
+            except Exception:
+                pass
         return {"returncode": -1, "stdout": "", "stderr": "timeout"}
     except Exception as e:
+        if proc is not None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
         return {"returncode": -1, "stdout": "", "stderr": str(e)}
 
 
@@ -51,6 +111,7 @@ async def _run_shell(cmd: str, timeout: int = 30) -> dict:
     """Run a shell command asynchronously. Only use for commands with no
     user-controlled input, or where all user values have been sanitized
     with shlex.quote()."""
+    proc = None
     try:
         proc = await asyncio.create_subprocess_shell(
             cmd,
@@ -64,10 +125,26 @@ async def _run_shell(cmd: str, timeout: int = 30) -> dict:
             "stderr": stderr.decode(errors="replace").strip(),
         }
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()  # Reap the killed process to prevent zombies
+        if proc is not None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()  # Reap the killed process to prevent zombies
+            except Exception:
+                pass
         return {"returncode": -1, "stdout": "", "stderr": "timeout"}
     except Exception as e:
+        if proc is not None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
         return {"returncode": -1, "stdout": "", "stderr": str(e)}
 
 
@@ -80,6 +157,18 @@ class DesktopAutomation:
             os.path.expanduser("~/.pe-compat")
         )
         self._ensure_dirs()
+        # Cached resolution — avoids shell-piped `xrandr | grep` every call.
+        self._res_cache: Optional[tuple[dict, float]] = None
+        # Cached games scan: walking drives/c/Games + Program Files + ~/Games
+        # can be hundreds of stat()s on a slow HDD. The set of installed games
+        # rarely changes between requests, so a 60s TTL is invisible to the UI
+        # and saves a huge amount of work when /games is polled (which the
+        # desktop panel does every few seconds on some sessions).
+        self._games_cache: Optional[tuple[list, float]] = None
+        self._GAMES_TTL = 60.0
+        # Cached clipboard env (avoids os.environ.copy() on every call; DISPLAY
+        # is set once at daemon startup and doesn't change mid-session).
+        self._display_env_cache: Optional[dict] = None
 
     def _ensure_dirs(self):
         """Ensure required directories exist."""
@@ -109,9 +198,7 @@ class DesktopAutomation:
             full_cmd = [command] + args
 
         try:
-            env = os.environ.copy()
-            if not env.get("DISPLAY"):
-                env["DISPLAY"] = ":0"
+            env = self._get_display_env()
 
             proc = subprocess.Popen(
                 full_cmd,
@@ -121,6 +208,11 @@ class DesktopAutomation:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
+            # Session 24: spawn a daemon reaper thread so the Popen object's
+            # returncode gets set once the child exits. SIGCHLD=SIG_IGN in
+            # main.py already asks the kernel to auto-reap, but this keeps the
+            # Python-side state consistent and adds a fallback path.
+            _reap_after_spawn(proc)
             return {"success": True, "pid": proc.pid, "command": " ".join(full_cmd)}
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -136,9 +228,7 @@ class DesktopAutomation:
         cmd.extend(args)
 
         try:
-            env = os.environ.copy()
-            if not env.get("DISPLAY"):
-                env["DISPLAY"] = ":0"
+            env = self._get_display_env()
 
             proc = subprocess.Popen(
                 cmd,
@@ -148,6 +238,9 @@ class DesktopAutomation:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
+            # Session 24: see launch_app — daemon reaper thread ensures Python
+            # Popen state is cleaned up and the child is never left as <defunct>.
+            _reap_after_spawn(proc)
             return {"success": True, "pid": proc.pid, "exe": exe_path}
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -201,12 +294,24 @@ class DesktopAutomation:
     # ==========================================
 
     async def get_active_window(self) -> dict:
-        """Get information about the currently active window."""
-        r = await _run_exec(["xdotool", "getactivewindow", "getwindowname"])
-        wid = await _run_exec(["xdotool", "getactivewindow"])
+        """Get information about the currently active window.
+
+        Single xdotool invocation chains getactivewindow → getwindowname →
+        getactivewindow, returning both on consecutive lines. Previously we
+        forked xdotool twice, doubling the subprocess cost per call (hot
+        path for Contusion window tracking on slow hardware).
+        """
+        r = await _run_exec(
+            ["xdotool", "getactivewindow", "getwindowname",
+             "getactivewindow"]
+        )
+        lines = r["stdout"].split("\n") if r["stdout"] else []
+        title = lines[0] if lines else ""
+        # getactivewindow on a chained call emits the numeric id last
+        wid = lines[-1] if len(lines) >= 2 else ""
         return {
-            "window_id": wid["stdout"],
-            "title": r["stdout"],
+            "window_id": wid,
+            "title": title,
         }
 
     async def focus_window(self, window_id: str) -> dict:
@@ -242,8 +347,11 @@ class DesktopAutomation:
     # Game Management
     # ==========================================
 
-    async def scan_games(self) -> list[dict]:
-        """Scan for installed Windows games (.exe files)."""
+    _SKIP_EXE_TOKENS = ("unins", "setup", "install", "update", "crash",
+                        "redist", "vcredist", "dxsetup", "dotnet")
+
+    def _scan_games_sync(self) -> list[dict]:
+        """Blocking directory walk. Called from executor by scan_games()."""
         search_dirs = [
             f"{self.pe_compat_prefix}/drives/c/Games",
             f"{self.pe_compat_prefix}/drives/c/Program Files",
@@ -251,33 +359,53 @@ class DesktopAutomation:
         ]
         games = []
         seen = set()
+        skip_tokens = self._SKIP_EXE_TOKENS
 
         for search_dir in search_dirs:
             if not os.path.isdir(search_dir):
                 continue
             for root, dirs, files in os.walk(search_dir):
                 for f in files:
-                    if f.lower().endswith('.exe'):
-                        full_path = os.path.join(root, f)
-                        # Skip common non-game executables
-                        lower = f.lower()
-                        if any(skip in lower for skip in [
-                            'unins', 'setup', 'install', 'update', 'crash',
-                            'redist', 'vcredist', 'dxsetup', 'dotnet',
-                        ]):
-                            continue
-                        if full_path not in seen:
-                            seen.add(full_path)
-                            size = os.path.getsize(full_path)
-                            games.append({
-                                "name": os.path.splitext(f)[0],
-                                "filename": f,
-                                "path": full_path,
-                                "directory": root,
-                                "size_mb": round(size / (1024 * 1024), 1),
-                            })
+                    if not f.lower().endswith('.exe'):
+                        continue
+                    lower = f.lower()
+                    if any(tok in lower for tok in skip_tokens):
+                        continue
+                    full_path = os.path.join(root, f)
+                    if full_path in seen:
+                        continue
+                    seen.add(full_path)
+                    try:
+                        size = os.path.getsize(full_path)
+                    except OSError:
+                        continue
+                    games.append({
+                        "name": os.path.splitext(f)[0],
+                        "filename": f,
+                        "path": full_path,
+                        "directory": root,
+                        "size_mb": round(size / (1024 * 1024), 1),
+                    })
+        games.sort(key=lambda g: g["name"].lower())
+        return games
 
-        return sorted(games, key=lambda g: g["name"].lower())
+    async def scan_games(self) -> list[dict]:
+        """Scan for installed Windows games (.exe files).
+
+        Result is cached for ``_GAMES_TTL`` seconds — the directory walk
+        can be hundreds of stat() calls on a slow HDD. Two panel widgets
+        polling /games every few seconds would otherwise hammer the disk.
+        """
+        now = time.monotonic()
+        cached = self._games_cache
+        if cached is not None and (now - cached[1]) < self._GAMES_TTL:
+            return cached[0]
+        # Offload the blocking walk to an executor so the event loop keeps
+        # serving other endpoints while we stat() dozens of .exe files.
+        loop = asyncio.get_running_loop()
+        games = await loop.run_in_executor(None, self._scan_games_sync)
+        self._games_cache = (games, now)
+        return games
 
     async def launch_game(self, exe_path: str, args: list[str] = None) -> dict:
         """Launch a game with optimal settings."""
@@ -415,16 +543,27 @@ StartupNotify=true
     # Notifications
     # ==========================================
 
+    def _get_display_env(self) -> dict:
+        """Return a (cached) env dict with DISPLAY set. os.environ.copy()
+        copies 50-100 entries on every call for no benefit when DISPLAY is
+        already correct for the daemon's lifetime."""
+        env = self._display_env_cache
+        if env is not None:
+            return env
+        env = os.environ.copy()
+        if not env.get("DISPLAY"):
+            env["DISPLAY"] = ":0"
+        self._display_env_cache = env
+        return env
+
     async def send_notification(self, title: str, message: str,
                                  icon: str = "dialog-information",
                                  urgency: str = "normal") -> dict:
         """Send a desktop notification."""
-        env = os.environ.copy()
-        env["DISPLAY"] = ":0"
         r = await _run_exec(
             ["notify-send", "-u", str(urgency), "-i", str(icon),
              str(title), str(message)],
-            env=env,
+            env=self._get_display_env(),
         )
         return {"success": r["returncode"] == 0}
 
@@ -434,18 +573,16 @@ StartupNotify=true
 
     async def get_clipboard(self) -> dict:
         """Get clipboard content."""
-        env = os.environ.copy()
-        env["DISPLAY"] = ":0"
         r = await _run_exec(
             ["xclip", "-selection", "clipboard", "-o"],
-            env=env,
+            env=self._get_display_env(),
         )
         return {"content": r["stdout"]}
 
     async def set_clipboard(self, text: str) -> dict:
         """Set clipboard content."""
-        env = os.environ.copy()
-        env["DISPLAY"] = ":0"
+        env = self._get_display_env()
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "xclip", "-selection", "clipboard",
@@ -455,10 +592,26 @@ StartupNotify=true
             await asyncio.wait_for(proc.communicate(text.encode()), timeout=10)
             return {"success": proc.returncode == 0}
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            if proc is not None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
             return {"success": False, "error": "xclip timed out"}
         except Exception as e:
+            if proc is not None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
             return {"success": False, "error": str(e)}
 
     # ==========================================
@@ -478,15 +631,10 @@ StartupNotify=true
 
     async def add_scheduled_task(self, schedule: str, command: str) -> dict:
         """Add a cron job. Schedule format: '0 * * * *' (cron format)."""
-        import re
         # Validate cron schedule format (5 fields: min hour dom month dow)
         # Each field: number, *, */N, N-N, or comma-separated list
-        cron_field = r'(\*(/\d+)?|\d+(-\d+)?)(,(\*(/\d+)?|\d+(-\d+)?))*'
-        cron_re = re.compile(
-            rf'^{cron_field}\s+{cron_field}\s+{cron_field}\s+{cron_field}\s+{cron_field}$'
-        )
         schedule = schedule.strip()
-        if not cron_re.match(schedule):
+        if not _CRON_RE.match(schedule):
             return {"success": False, "error": "Invalid cron schedule format. Expected: 'min hour dom month dow'"}
         # The cron entry is written to a temp file and loaded via `crontab <file>`,
         # bypassing shell interpolation. Cron itself runs the command via sh -c,
@@ -515,35 +663,39 @@ StartupNotify=true
         """Set desktop wallpaper."""
         if not os.path.exists(path):
             return {"success": False, "error": "File not found"}
-        env = os.environ.copy()
-        env["DISPLAY"] = ":0"
         r = await _run_exec(
             ["xfconf-query", "-c", "xfce4-desktop",
              "-p", "/backdrop/screen0/monitorVirtual-1/workspace0/last-image",
              "-s", path],
-            env=env,
+            env=self._get_display_env(),
         )
         return {"success": r["returncode"] == 0}
 
     async def get_screen_resolution(self) -> dict:
         """Get current screen resolution."""
+        # Cache briefly — spawning xrandr + grep shell pipeline is costly on
+        # slow hardware and resolution rarely changes mid-session.
+        now = time.monotonic()
+        if self._res_cache is not None and (now - self._res_cache[1]) < 15.0:
+            return self._res_cache[0]
         r = await _run_shell("DISPLAY=:0 xrandr --current 2>/dev/null | grep '*'")
+        result = {"width": 0, "height": 0, "resolution": "unknown"}
         if r["stdout"]:
             parts = r["stdout"].strip().split()
             if parts:
                 res = parts[0]
                 try:
                     w, h = res.split("x", 1)
-                    return {"width": int(w), "height": int(h), "resolution": res}
+                    result = {"width": int(w), "height": int(h), "resolution": res}
                 except (ValueError, TypeError):
                     logger.warning("Could not parse resolution from xrandr: %s", res)
-        return {"width": 0, "height": 0, "resolution": "unknown"}
+        self._res_cache = (result, now)
+        return result
 
     async def set_screen_resolution(self, width: int, height: int) -> dict:
         """Set screen resolution."""
         # Auto-detect active output
-        env = os.environ.copy()
-        env["DISPLAY"] = ":0"
+        env = self._get_display_env()
         detect = await _run_exec(["xrandr", "--current"], env=env)
         output_name = "Virtual-1"  # fallback
         if detect["returncode"] == 0:

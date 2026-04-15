@@ -241,15 +241,10 @@ WINAPI_EXPORT long Direct3DCreate9Ex(UINT SDKVersion, void **ppD3D)
 }
 
 /*
- * d3d9_cleanup - Release the DXVK dlopen handle at process exit.
- * Called from the D3D subsystem shutdown path.
+ * d3d9_cleanup - Intentionally does NOT dlclose the DXVK handle.
+ *
+ * Games routinely hold IDirect3D9 pointers (with vtable entries pointing
+ * into DXVK's d3d9.so) past our destructor. dlclose would unmap the code
+ * pages and cause a crash during exit-time Release() calls. The OS reclaims
+ * the memory at process exit anyway.
  */
-__attribute__((destructor))
-void d3d9_cleanup(void)
-{
-    if (g_dxvk_d3d9) {
-        dlclose(g_dxvk_d3d9);
-        g_dxvk_d3d9 = NULL;
-        g_dxvk_tried = 0;
-    }
-}

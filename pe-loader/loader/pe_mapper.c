@@ -5,6 +5,7 @@
  * applying appropriate memory protections.
  */
 
+#define _GNU_SOURCE  /* pread, MAP_POPULATE, MADV_* extensions */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +42,49 @@ static uint64_t align_up(uint64_t value, uint64_t alignment)
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
+/*
+ * pread_exact - Read exactly 'count' bytes at 'off' into 'buf', EINTR-safe.
+ *
+ * pread() avoids seek races and combines lseek+read into one syscall.
+ * Section loading previously did 2N syscalls (seek+read per section);
+ * this cuts to N.  For PEs with 10-40 sections this is a measurable win,
+ * particularly on old spinning HDDs where each seek costs ~10ms.
+ */
+static int pread_exact(int fd, void *buf, size_t count, off_t off)
+{
+    size_t total = 0;
+    while (total < count) {
+        ssize_t n = pread(fd, (char *)buf + total, count - total, off + total);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        total += n;
+    }
+    return 0;
+}
+
+/* Detect whether to MAP_POPULATE the image map.
+ *
+ * On high-RAM systems (>=4GB) prefaulting accelerates load (no page-fault
+ * storm during section copy).  On low-RAM systems (1GB Pentium-4 class)
+ * prefaulting can thrash; better to lazily page in only what's touched.
+ *
+ * We cache the decision at first call; sysconf is cheap but avoid hitting
+ * it on every PE load in long-running loaders. */
+static int should_map_populate(void)
+{
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long psz   = sysconf(_SC_PAGE_SIZE);
+    uint64_t total_bytes = (pages > 0 && psz > 0) ? (uint64_t)pages * (uint64_t)psz : 0;
+    /* Threshold: 3GB -- old HW commonly 1-2GB, modern HW 4GB+. */
+    cached = (total_bytes >= (3ull * 1024 * 1024 * 1024)) ? 1 : 0;
+    return cached;
+}
+
 int pe_map_sections(pe_image_t *image)
 {
     uint64_t base_addr = image->image_base;
@@ -56,10 +100,15 @@ int pe_map_sections(pe_image_t *image)
      * MAP_FIXED_NOREPLACE prevents silently clobbering existing mappings.
      * If the preferred address is taken, we fall back to any address
      * and apply base relocations later.
+     *
+     * MAP_POPULATE prefaults pages, avoiding a storm of minor page faults
+     * during section copy.  We only use it on high-RAM systems (>=3GB) to
+     * avoid OOM thrash on old hardware.
      */
+    int populate = should_map_populate() ? MAP_POPULATE : 0;
     void *mapped = mmap((void *)base_addr, total_size,
                         PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | populate,
                         -1, 0);
 
     if (mapped == MAP_FAILED) {
@@ -68,7 +117,7 @@ int pe_map_sections(pe_image_t *image)
                (unsigned long)base_addr);
         mapped = mmap(NULL, total_size,
                       PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS,
+                      MAP_PRIVATE | MAP_ANONYMOUS | populate,
                       -1, 0);
         if (mapped == MAP_FAILED) {
             fprintf(stderr, LOG_PREFIX "Failed to map image: %s\n", strerror(errno));
@@ -80,30 +129,29 @@ int pe_map_sections(pe_image_t *image)
     image->actual_base = (uint64_t)(uintptr_t)mapped;
     image->mapped_size = total_size;
 
+    /* Hint kernel about sequential access pattern for sections.
+     * The kernel may prefetch readahead from the PE file if backed by disk,
+     * but this is ignored for anonymous memory -- harmless either way. */
+    madvise(image->mapped_base, total_size, MADV_SEQUENTIAL);
+
     printf(LOG_PREFIX "Image mapped at 0x%lX (size=0x%lX, preferred=0x%lX)\n",
            (unsigned long)image->actual_base,
            (unsigned long)total_size,
            (unsigned long)image->image_base);
 
-    /* Copy PE headers to the mapped region */
-    if (lseek(image->fd, 0, SEEK_SET) < 0) {
-        fprintf(stderr, LOG_PREFIX "Failed to seek to file start\n");
-        return -1;
-    }
-
+    /* Copy PE headers -- pread() instead of lseek+read (atomic, no seek). */
     size_t headers_size = image->size_of_headers;
     if (headers_size > total_size)
         headers_size = total_size;
     if (headers_size > image->file_size)
         headers_size = image->file_size;
 
-    ssize_t n = read(image->fd, image->mapped_base, headers_size);
-    if (n < 0 || (size_t)n != headers_size) {
+    if (pread_exact(image->fd, image->mapped_base, headers_size, 0) < 0) {
         fprintf(stderr, LOG_PREFIX "Failed to read PE headers into mapped region\n");
         return -1;
     }
 
-    /* Map each section */
+    /* Map each section -- pread() eliminates per-section seek syscalls. */
     for (uint16_t i = 0; i < image->num_sections; i++) {
         pe_section_header_t *sec = &image->sections[i];
         char name[9] = {0};
@@ -119,32 +167,34 @@ int pe_map_sections(pe_image_t *image)
             continue;
         }
 
-        /* The actual size to consider is the larger of virtual_size and raw_size */
-        uint32_t section_size = vs > raw_size ? vs : raw_size;
-        (void)section_size; /* Used for logging */
-
         /* Copy raw data from file into the mapped region */
         if (raw_size > 0 && raw_offset > 0) {
-            if (lseek(image->fd, raw_offset, SEEK_SET) < 0) {
-                fprintf(stderr, LOG_PREFIX "  Section '%s': failed to seek to raw data\n", name);
-                return -1;
-            }
-
             size_t copy_size = raw_size;
             if (va >= total_size)
                 continue;  /* Malformed PE: section VA beyond image */
             if (copy_size > total_size - va)  /* Overflow-safe: total_size > va guaranteed */
                 copy_size = total_size - va;
 
-            n = read(image->fd, image->mapped_base + va, copy_size);
-            if (n < 0 || (size_t)n != copy_size) {
+            /* Bounds check: ensure raw_offset + copy_size fits in the file */
+            if ((uint64_t)raw_offset + copy_size > image->file_size) {
+                fprintf(stderr, LOG_PREFIX "  Section '%s': raw extends past file\n", name);
+                return -1;
+            }
+
+            if (pread_exact(image->fd, image->mapped_base + va,
+                            copy_size, raw_offset) < 0) {
                 fprintf(stderr, LOG_PREFIX "  Section '%s': failed to read raw data\n", name);
                 return -1;
             }
         }
 
-        /* Zero-fill the remainder (BSS-like portion) */
-        if (vs > raw_size) {
+        /* Zero-fill the remainder (BSS-like portion).
+         * The anonymous mapping is already zero-filled by the kernel, so this
+         * memset is redundant for pages that haven't been written.  However,
+         * when raw_size > 0 some of this range has had file bytes written
+         * into it, so we zero-fill only the vs-raw_size trailer.  Skip the
+         * memset entirely when raw_size == 0 (anonymous pages are zero). */
+        if (vs > raw_size && raw_size > 0) {
             uint64_t zero_start = (uint64_t)va + (uint64_t)raw_size;
             uint64_t zero_size = (uint64_t)vs - (uint64_t)raw_size;
             if (zero_start < total_size && zero_size <= total_size - zero_start)

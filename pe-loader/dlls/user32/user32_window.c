@@ -332,6 +332,11 @@ static hwnd_entry_t *hwnd_alloc(gfx_window_t *win, WNDPROC proc)
     pthread_mutex_lock(&g_wnd_lock);
     for (int i = 0; i < MAX_HWND_MAP; i++) {
         if (!g_hwnd_map[i].used) {
+            /* Clear stale data from previous occupant: parent, control_id,
+             * extra_bytes, extra_data may contain values from a destroyed
+             * window that would otherwise leak into this new window
+             * (notably corrupting GetDlgItem / GetWindowLong for cbWndExtra). */
+            memset(&g_hwnd_map[i], 0, sizeof(g_hwnd_map[i]));
             g_hwnd_map[i].used = 1;
             g_hwnd_map[i].hwnd = (HWND)(g_next_hwnd);
             g_next_hwnd += 4; /* 4-byte alignment for HWND values */
@@ -365,10 +370,9 @@ static void hwnd_free(HWND hwnd)
     pthread_mutex_lock(&g_wnd_lock);
     for (int i = 0; i < MAX_HWND_MAP; i++) {
         if (g_hwnd_map[i].used && g_hwnd_map[i].hwnd == hwnd) {
-            g_hwnd_map[i].used = 0;
-            g_hwnd_map[i].hwnd = NULL;
-            g_hwnd_map[i].gfx_win = NULL;
-            g_hwnd_map[i].wndproc = NULL;
+            /* Clear entire slot to prevent stale parent/control_id leaking
+             * into lookups (hwnd_find_child_by_id) before slot is reused. */
+            memset(&g_hwnd_map[i], 0, sizeof(g_hwnd_map[i]));
             pthread_mutex_unlock(&g_wnd_lock);
             return;
         }
@@ -379,8 +383,18 @@ static void hwnd_free(HWND hwnd)
 /* Get gfx_window_t from HWND */
 gfx_window_t *hwnd_to_gfx(HWND hwnd)
 {
-    hwnd_entry_t *e = hwnd_lookup(hwnd);
-    return e ? e->gfx_win : NULL;
+    /* Snapshot under lock — the entry can be freed concurrently. */
+    ensure_hwnd_map_init();
+    pthread_mutex_lock(&g_wnd_lock);
+    for (int i = 0; i < MAX_HWND_MAP; i++) {
+        if (g_hwnd_map[i].used && g_hwnd_map[i].hwnd == hwnd) {
+            gfx_window_t *w = g_hwnd_map[i].gfx_win;
+            pthread_mutex_unlock(&g_wnd_lock);
+            return w;
+        }
+    }
+    pthread_mutex_unlock(&g_wnd_lock);
+    return NULL;
 }
 
 /* Get HWND from gfx_window_t */
@@ -402,8 +416,18 @@ HWND gfx_to_hwnd(gfx_window_t *win)
 /* Get WNDPROC for a window */
 WNDPROC hwnd_get_wndproc(HWND hwnd)
 {
-    hwnd_entry_t *e = hwnd_lookup(hwnd);
-    return e ? e->wndproc : NULL;
+    /* Snapshot under lock — SetWindowLong/DestroyWindow can mutate wndproc. */
+    ensure_hwnd_map_init();
+    pthread_mutex_lock(&g_wnd_lock);
+    for (int i = 0; i < MAX_HWND_MAP; i++) {
+        if (g_hwnd_map[i].used && g_hwnd_map[i].hwnd == hwnd) {
+            WNDPROC p = g_hwnd_map[i].wndproc;
+            pthread_mutex_unlock(&g_wnd_lock);
+            return p;
+        }
+    }
+    pthread_mutex_unlock(&g_wnd_lock);
+    return NULL;
 }
 
 /*
@@ -439,8 +463,18 @@ HWND hwnd_find_child_by_id(HWND parent, int control_id)
 /* Get control ID for a window */
 int hwnd_get_control_id(HWND hwnd)
 {
-    hwnd_entry_t *e = hwnd_lookup(hwnd);
-    return e ? e->control_id : 0;
+    /* Snapshot under lock — entry may be freed concurrently. */
+    ensure_hwnd_map_init();
+    pthread_mutex_lock(&g_wnd_lock);
+    for (int i = 0; i < MAX_HWND_MAP; i++) {
+        if (g_hwnd_map[i].used && g_hwnd_map[i].hwnd == hwnd) {
+            int id = g_hwnd_map[i].control_id;
+            pthread_mutex_unlock(&g_wnd_lock);
+            return id;
+        }
+    }
+    pthread_mutex_unlock(&g_wnd_lock);
+    return 0;
 }
 
 /* --------------------------------------------------------------------------
@@ -571,11 +605,20 @@ WINAPI_EXPORT HWND CreateWindowExA(
     int is_atom = ((uintptr_t)lpClassName < 0x10000);
     const char *class_name_str = is_atom ? "ATOM_CLASS" : lpClassName;
 
-    /* Look up the window class */
-    window_class_entry_t *cls = is_atom ? NULL : find_class(lpClassName);
+    /* Look up the window class (snapshot WNDPROC + cbWndExtra under lock
+     * so concurrent UnregisterClassA cannot tear the read). */
     WNDPROC wndproc = NULL;
-    if (cls) {
-        wndproc = cls->wndproc;
+    int saved_cbWndExtra = 0;
+    int class_found = 0;
+    if (!is_atom) {
+        pthread_mutex_lock(&g_wnd_lock);
+        window_class_entry_t *cls_locked = find_class(lpClassName);
+        if (cls_locked) {
+            wndproc = cls_locked->wndproc;
+            saved_cbWndExtra = cls_locked->cbWndExtra;
+            class_found = 1;
+        }
+        pthread_mutex_unlock(&g_wnd_lock);
     }
     /* If class not found, we allow creation anyway with DefWindowProc */
 
@@ -645,8 +688,8 @@ WINAPI_EXPORT HWND CreateWindowExA(
         return NULL;
     }
 
-    if (cls)
-        entry->extra_bytes = cls->cbWndExtra;
+    if (class_found)
+        entry->extra_bytes = saved_cbWndExtra;
 
     /* Store parent and control ID */
     entry->parent = hWndParent;
@@ -1040,6 +1083,7 @@ WINAPI_EXPORT HWND GetDesktopWindow(void)
 WINAPI_EXPORT HWND FindWindowA(LPCSTR lpClassName, LPCSTR lpWindowName)
 {
     ensure_hwnd_map_init();
+    pthread_mutex_lock(&g_wnd_lock);
     for (int i = 0; i < MAX_HWND_MAP; i++) {
         if (!g_hwnd_map[i].used)
             continue;
@@ -1053,8 +1097,11 @@ WINAPI_EXPORT HWND FindWindowA(LPCSTR lpClassName, LPCSTR lpWindowName)
         if (lpWindowName && strcmp(win->title, lpWindowName) != 0)
             continue;
 
-        return g_hwnd_map[i].hwnd;
+        HWND result = g_hwnd_map[i].hwnd;
+        pthread_mutex_unlock(&g_wnd_lock);
+        return result;
     }
+    pthread_mutex_unlock(&g_wnd_lock);
     return NULL;
 }
 
@@ -1137,24 +1184,48 @@ WINAPI_EXPORT LONG GetWindowLongA(HWND hWnd, int nIndex)
 
 WINAPI_EXPORT LONG SetWindowLongA(HWND hWnd, int nIndex, LONG dwNewLong)
 {
-    hwnd_entry_t *entry = hwnd_lookup(hWnd);
-    if (!entry || !entry->gfx_win)
+    /* Mutate under lock — concurrent DestroyWindow can free the slot and
+     * hwnd_get_wndproc / dispatch may race with this write. */
+    ensure_hwnd_map_init();
+    pthread_mutex_lock(&g_wnd_lock);
+    hwnd_entry_t *entry = NULL;
+    for (int i = 0; i < MAX_HWND_MAP; i++) {
+        if (g_hwnd_map[i].used && g_hwnd_map[i].hwnd == hWnd) {
+            entry = &g_hwnd_map[i];
+            break;
+        }
+    }
+    if (!entry || !entry->gfx_win) {
+        pthread_mutex_unlock(&g_wnd_lock);
         return 0;
+    }
 
-    LONG old = GetWindowLongA(hWnd, nIndex);
-
+    LONG old = 0;
     switch (nIndex) {
-    case GWL_STYLE:     entry->gfx_win->style = dwNewLong; break;
-    case GWL_EXSTYLE:   entry->gfx_win->ex_style = dwNewLong; break;
-    case GWLP_USERDATA: entry->gfx_win->userdata = (void *)(intptr_t)dwNewLong; break;
-    case GWLP_WNDPROC:  entry->wndproc = (WNDPROC)(intptr_t)dwNewLong; break;
+    case GWL_STYLE:
+        old = (LONG)entry->gfx_win->style;
+        entry->gfx_win->style = dwNewLong;
+        break;
+    case GWL_EXSTYLE:
+        old = (LONG)entry->gfx_win->ex_style;
+        entry->gfx_win->ex_style = dwNewLong;
+        break;
+    case GWLP_USERDATA:
+        old = (LONG)(LONG_PTR)entry->gfx_win->userdata;
+        entry->gfx_win->userdata = (void *)(intptr_t)dwNewLong;
+        break;
+    case GWLP_WNDPROC:
+        old = (LONG)(LONG_PTR)entry->wndproc;
+        entry->wndproc = (WNDPROC)(intptr_t)dwNewLong;
+        break;
     default:
         if (nIndex >= 0 && nIndex + (int)sizeof(LONG) <= entry->extra_bytes) {
+            memcpy(&old, entry->extra_data + nIndex, sizeof(LONG));
             memcpy(entry->extra_data + nIndex, &dwNewLong, sizeof(LONG));
         }
         break;
     }
-
+    pthread_mutex_unlock(&g_wnd_lock);
     return old;
 }
 
@@ -1185,27 +1256,50 @@ WINAPI_EXPORT LONG_PTR GetWindowLongPtrA(HWND hWnd, int nIndex)
 
 WINAPI_EXPORT LONG_PTR SetWindowLongPtrA(HWND hWnd, int nIndex, LONG_PTR dwNewLong)
 {
-    hwnd_entry_t *entry = hwnd_lookup(hWnd);
+    /* Mutate under lock to serialize with hwnd_get_wndproc and other readers. */
+    ensure_hwnd_map_init();
+    pthread_mutex_lock(&g_wnd_lock);
+    hwnd_entry_t *entry = NULL;
+    for (int i = 0; i < MAX_HWND_MAP; i++) {
+        if (g_hwnd_map[i].used && g_hwnd_map[i].hwnd == hWnd) {
+            entry = &g_hwnd_map[i];
+            break;
+        }
+    }
     if (!entry || !entry->gfx_win) {
+        pthread_mutex_unlock(&g_wnd_lock);
         set_last_error(1400); /* ERROR_INVALID_WINDOW_HANDLE */
         return 0;
     }
 
-    LONG_PTR old = GetWindowLongPtrA(hWnd, nIndex);
-
+    LONG_PTR old = 0;
     switch (nIndex) {
-    case GWLP_WNDPROC:   entry->wndproc = (WNDPROC)(uintptr_t)dwNewLong; break;
-    case GWLP_USERDATA:  entry->gfx_win->userdata = (void *)(uintptr_t)dwNewLong; break;
-    case GWLP_HINSTANCE: break; /* No per-window hInstance tracked */
-    case GWL_STYLE:      entry->gfx_win->style = (uint32_t)dwNewLong; break;
-    case GWL_EXSTYLE:    entry->gfx_win->ex_style = (uint32_t)dwNewLong; break;
+    case GWLP_WNDPROC:
+        old = (LONG_PTR)(uintptr_t)entry->wndproc;
+        entry->wndproc = (WNDPROC)(uintptr_t)dwNewLong;
+        break;
+    case GWLP_USERDATA:
+        old = (LONG_PTR)(uintptr_t)entry->gfx_win->userdata;
+        entry->gfx_win->userdata = (void *)(uintptr_t)dwNewLong;
+        break;
+    case GWLP_HINSTANCE:
+        break; /* No per-window hInstance tracked */
+    case GWL_STYLE:
+        old = (LONG_PTR)entry->gfx_win->style;
+        entry->gfx_win->style = (uint32_t)dwNewLong;
+        break;
+    case GWL_EXSTYLE:
+        old = (LONG_PTR)entry->gfx_win->ex_style;
+        entry->gfx_win->ex_style = (uint32_t)dwNewLong;
+        break;
     default:
         if (nIndex >= 0 && nIndex + (int)sizeof(LONG_PTR) <= entry->extra_bytes) {
+            memcpy(&old, entry->extra_data + nIndex, sizeof(LONG_PTR));
             memcpy(entry->extra_data + nIndex, &dwNewLong, sizeof(LONG_PTR));
         }
         break;
     }
-
+    pthread_mutex_unlock(&g_wnd_lock);
     return old;
 }
 
@@ -1903,14 +1997,18 @@ WINAPI_EXPORT BOOL UnregisterClassA(LPCSTR lpClassName, HINSTANCE hInstance)
     (void)hInstance;
     if (!lpClassName) return FALSE;
 
+    pthread_mutex_lock(&g_wnd_lock);
     window_class_entry_t *cls = find_class(lpClassName);
     if (!cls) {
+        pthread_mutex_unlock(&g_wnd_lock);
         set_last_error(ERROR_CLASS_DOES_NOT_EXIST);
         return FALSE;
     }
 
-    cls->used = 0;
-    memset(cls->name, 0, sizeof(cls->name));
+    /* Zero all fields so stale wndproc/style/extra cannot leak to a
+     * subsequent RegisterClassA for a different class. */
+    memset(cls, 0, sizeof(*cls));
+    pthread_mutex_unlock(&g_wnd_lock);
     return TRUE;
 }
 
@@ -1924,12 +2022,22 @@ WINAPI_EXPORT BOOL EnumWindows(WNDENUMPROC lpEnumFunc, LPARAM lParam)
 {
     if (!lpEnumFunc) return FALSE;
 
+    /* Snapshot HWNDs under lock, then invoke callbacks without lock.
+     * The callback may call CreateWindow/DestroyWindow and would deadlock
+     * (or race with concurrent destroy corrupting the iteration). */
     ensure_hwnd_map_init();
+    HWND snapshot[MAX_HWND_MAP];
+    int count = 0;
+    pthread_mutex_lock(&g_wnd_lock);
     for (int i = 0; i < MAX_HWND_MAP; i++) {
-        if (g_hwnd_map[i].used) {
-            if (!lpEnumFunc(g_hwnd_map[i].hwnd, lParam))
-                return FALSE;
-        }
+        if (g_hwnd_map[i].used)
+            snapshot[count++] = g_hwnd_map[i].hwnd;
+    }
+    pthread_mutex_unlock(&g_wnd_lock);
+
+    for (int i = 0; i < count; i++) {
+        if (!lpEnumFunc(snapshot[i], lParam))
+            return FALSE;
     }
     return TRUE;
 }
@@ -1941,12 +2049,21 @@ WINAPI_EXPORT BOOL EnumChildWindows(HWND hWndParent, WNDENUMPROC lpEnumFunc, LPA
     ensure_hwnd_map_init();
     gfx_window_t *parent_gfx = hwnd_to_gfx(hWndParent);
 
+    /* Snapshot matching child HWNDs under lock, then invoke callbacks without lock. */
+    HWND snapshot[MAX_HWND_MAP];
+    int count = 0;
+    pthread_mutex_lock(&g_wnd_lock);
     for (int i = 0; i < MAX_HWND_MAP; i++) {
         if (g_hwnd_map[i].used && g_hwnd_map[i].gfx_win &&
             g_hwnd_map[i].gfx_win->parent == parent_gfx) {
-            if (!lpEnumFunc(g_hwnd_map[i].hwnd, lParam))
-                return FALSE;
+            snapshot[count++] = g_hwnd_map[i].hwnd;
         }
+    }
+    pthread_mutex_unlock(&g_wnd_lock);
+
+    for (int i = 0; i < count; i++) {
+        if (!lpEnumFunc(snapshot[i], lParam))
+            return FALSE;
     }
     return TRUE;
 }
@@ -2709,14 +2826,6 @@ WINAPI_EXPORT int ScrollWindowEx(HWND hWnd, int dx, int dy,
 }
 
 /* Class Long functions */
-WINAPI_EXPORT ULONG_PTR GetClassLongPtrA(HWND hWnd, int nIndex)
-{
-    hwnd_entry_t *entry = hwnd_lookup(hWnd);
-    if (!entry || !entry->gfx_win) return 0;
-
-    window_class_entry_t *cls = find_class(entry->gfx_win->class_name);
-    if (!cls) return 0;
-
 #define GCL_HBRBACKGROUND (-10)
 #define GCL_HCURSOR       (-12)
 #define GCL_HICON         (-14)
@@ -2728,13 +2837,43 @@ WINAPI_EXPORT ULONG_PTR GetClassLongPtrA(HWND hWnd, int nIndex)
 #define GCLP_HICON        (-14)
 #define GCLP_HICONSM      (-34)
 
-    switch (nIndex) {
-    case GCL_WNDPROC:     return (ULONG_PTR)cls->wndproc;
-    case GCL_HBRBACKGROUND: return (ULONG_PTR)cls->hbrBackground;
-    case GCL_STYLE:       return (ULONG_PTR)cls->style;
-    case GCL_CBWNDEXTRA:  return (ULONG_PTR)cls->cbWndExtra;
-    default:              return 0;
+WINAPI_EXPORT ULONG_PTR GetClassLongPtrA(HWND hWnd, int nIndex)
+{
+    /* Snapshot class fields under lock: gfx_win and class entry can both
+     * be freed by DestroyWindow/UnregisterClassA on other threads. */
+    char class_name_buf[256];
+    ensure_hwnd_map_init();
+    pthread_mutex_lock(&g_wnd_lock);
+    hwnd_entry_t *entry = NULL;
+    for (int i = 0; i < MAX_HWND_MAP; i++) {
+        if (g_hwnd_map[i].used && g_hwnd_map[i].hwnd == hWnd) {
+            entry = &g_hwnd_map[i];
+            break;
+        }
     }
+    if (!entry || !entry->gfx_win) {
+        pthread_mutex_unlock(&g_wnd_lock);
+        return 0;
+    }
+    strncpy(class_name_buf, entry->gfx_win->class_name, sizeof(class_name_buf) - 1);
+    class_name_buf[sizeof(class_name_buf) - 1] = '\0';
+
+    window_class_entry_t *cls = find_class(class_name_buf);
+    if (!cls) {
+        pthread_mutex_unlock(&g_wnd_lock);
+        return 0;
+    }
+
+    ULONG_PTR result = 0;
+    switch (nIndex) {
+    case GCL_WNDPROC:       result = (ULONG_PTR)cls->wndproc; break;
+    case GCL_HBRBACKGROUND: result = (ULONG_PTR)cls->hbrBackground; break;
+    case GCL_STYLE:         result = (ULONG_PTR)cls->style; break;
+    case GCL_CBWNDEXTRA:    result = (ULONG_PTR)cls->cbWndExtra; break;
+    default:                result = 0; break;
+    }
+    pthread_mutex_unlock(&g_wnd_lock);
+    return result;
 }
 
 WINAPI_EXPORT ULONG_PTR GetClassLongPtrW(HWND hWnd, int nIndex)
@@ -2744,11 +2883,30 @@ WINAPI_EXPORT ULONG_PTR GetClassLongPtrW(HWND hWnd, int nIndex)
 
 WINAPI_EXPORT ULONG_PTR SetClassLongPtrA(HWND hWnd, int nIndex, LONG_PTR dwNewLong)
 {
-    hwnd_entry_t *entry = hwnd_lookup(hWnd);
-    if (!entry || !entry->gfx_win) return 0;
+    /* Mutate class fields under lock to serialize with GetClassLongPtrA
+     * and UnregisterClassA. */
+    char class_name_buf[256];
+    ensure_hwnd_map_init();
+    pthread_mutex_lock(&g_wnd_lock);
+    hwnd_entry_t *entry = NULL;
+    for (int i = 0; i < MAX_HWND_MAP; i++) {
+        if (g_hwnd_map[i].used && g_hwnd_map[i].hwnd == hWnd) {
+            entry = &g_hwnd_map[i];
+            break;
+        }
+    }
+    if (!entry || !entry->gfx_win) {
+        pthread_mutex_unlock(&g_wnd_lock);
+        return 0;
+    }
+    strncpy(class_name_buf, entry->gfx_win->class_name, sizeof(class_name_buf) - 1);
+    class_name_buf[sizeof(class_name_buf) - 1] = '\0';
 
-    window_class_entry_t *cls = find_class(entry->gfx_win->class_name);
-    if (!cls) return 0;
+    window_class_entry_t *cls = find_class(class_name_buf);
+    if (!cls) {
+        pthread_mutex_unlock(&g_wnd_lock);
+        return 0;
+    }
 
     ULONG_PTR old = 0;
     switch (nIndex) {
@@ -2767,6 +2925,7 @@ WINAPI_EXPORT ULONG_PTR SetClassLongPtrA(HWND hWnd, int nIndex, LONG_PTR dwNewLo
     default:
         break;
     }
+    pthread_mutex_unlock(&g_wnd_lock);
     return old;
 }
 

@@ -135,10 +135,21 @@ WINAPI_EXPORT void __std_exception_copy(const void *src, void *dst)
 
 WINAPI_EXPORT void __std_exception_destroy(void *exc)
 {
-    if (exc) {
-        void **p = (void **)exc;
-        free(p[0]);
-        p[0] = NULL;
+    /*
+     * MSVC __std_exception_data layout: { const char* What; bool DoFree; }
+     * The What string is heap-allocated ONLY when DoFree is true.
+     * Session 23 flagged the original code which called free(exc[0]) on the
+     * vtable pointer, corrupting the heap.  Check DoFree flag first.
+     */
+    if (!exc) return;
+    struct {
+        const char *what;
+        unsigned char do_free;
+    } *data = exc;
+    if (data->do_free && data->what) {
+        free((void *)data->what);
+        data->what = NULL;
+        data->do_free = 0;
     }
 }
 

@@ -625,7 +625,7 @@ HRESULT dsbuf_QueryInterface(IDirectSoundBuffer *self, const void *riid, void **
     *ppv = NULL;
     if (!riid || memcmp(riid, IID_IUnknown_bytes, 16) == 0) {
         *ppv = self;
-        self->ref_count++;
+        __sync_add_and_fetch(&self->ref_count, 1);
         return DS_OK;
     }
     return E_NOINTERFACE;
@@ -634,13 +634,13 @@ HRESULT dsbuf_QueryInterface(IDirectSoundBuffer *self, const void *riid, void **
 static __attribute__((ms_abi))
 uint32_t dsbuf_AddRef(IDirectSoundBuffer *self)
 {
-    return (uint32_t)(++self->ref_count);
+    return (uint32_t)__sync_add_and_fetch(&self->ref_count, 1);
 }
 
 static __attribute__((ms_abi))
 uint32_t dsbuf_Release(IDirectSoundBuffer *self)
 {
-    int ref = --self->ref_count;
+    int ref = __sync_sub_and_fetch(&self->ref_count, 1);
     if (ref <= 0) {
         /* Stop playback and clean up */
         self->playing = 0;
@@ -648,7 +648,6 @@ uint32_t dsbuf_Release(IDirectSoundBuffer *self)
         dsbuf_destroy_pa_stream(self);
         pthread_mutex_destroy(&self->lock);
         free(self->pcm_data);
-        free((void *)self->lpVtbl);
         free(self);
         return 0;
     }
@@ -971,38 +970,32 @@ HRESULT dsbuf_Restore(IDirectSoundBuffer *self)
 }
 
 /* ================================================================== */
-/*  IDirectSoundBuffer vtable construction                             */
+/*  IDirectSoundBuffer vtable (shared, immutable)                      */
 /* ================================================================== */
 
-static IDirectSoundBufferVtbl *create_dsbuf_vtbl(void)
-{
-    IDirectSoundBufferVtbl *v = calloc(1, sizeof(IDirectSoundBufferVtbl));
-    if (!v) return NULL;
-
-    v->QueryInterface    = dsbuf_QueryInterface;
-    v->AddRef            = dsbuf_AddRef;
-    v->Release           = dsbuf_Release;
-    v->GetCaps           = dsbuf_GetCaps;
-    v->GetCurrentPosition = dsbuf_GetCurrentPosition;
-    v->GetFormat         = dsbuf_GetFormat;
-    v->GetVolume         = dsbuf_GetVolume;
-    v->GetPan            = dsbuf_GetPan;
-    v->GetFrequency      = dsbuf_GetFrequency;
-    v->GetStatus         = dsbuf_GetStatus;
-    v->Initialize        = dsbuf_Initialize;
-    v->Lock              = dsbuf_Lock;
-    v->Play              = dsbuf_Play;
-    v->SetCurrentPosition = dsbuf_SetCurrentPosition;
-    v->SetFormat         = dsbuf_SetFormat;
-    v->SetVolume         = dsbuf_SetVolume;
-    v->SetPan            = dsbuf_SetPan;
-    v->SetFrequency      = dsbuf_SetFrequency;
-    v->Stop              = dsbuf_Stop;
-    v->Unlock            = dsbuf_Unlock;
-    v->Restore           = dsbuf_Restore;
-
-    return v;
-}
+static const IDirectSoundBufferVtbl g_dsbuf_vtbl = {
+    .QueryInterface     = dsbuf_QueryInterface,
+    .AddRef             = dsbuf_AddRef,
+    .Release            = dsbuf_Release,
+    .GetCaps            = dsbuf_GetCaps,
+    .GetCurrentPosition = dsbuf_GetCurrentPosition,
+    .GetFormat          = dsbuf_GetFormat,
+    .GetVolume          = dsbuf_GetVolume,
+    .GetPan             = dsbuf_GetPan,
+    .GetFrequency       = dsbuf_GetFrequency,
+    .GetStatus          = dsbuf_GetStatus,
+    .Initialize         = dsbuf_Initialize,
+    .Lock               = dsbuf_Lock,
+    .Play               = dsbuf_Play,
+    .SetCurrentPosition = dsbuf_SetCurrentPosition,
+    .SetFormat          = dsbuf_SetFormat,
+    .SetVolume          = dsbuf_SetVolume,
+    .SetPan             = dsbuf_SetPan,
+    .SetFrequency       = dsbuf_SetFrequency,
+    .Stop               = dsbuf_Stop,
+    .Unlock             = dsbuf_Unlock,
+    .Restore            = dsbuf_Restore,
+};
 
 /* ================================================================== */
 /*  Buffer creation helper                                             */
@@ -1013,12 +1006,7 @@ static IDirectSoundBuffer *create_dsbuffer(const DSBUFFERDESC *desc)
     IDirectSoundBuffer *buf = calloc(1, sizeof(IDirectSoundBuffer));
     if (!buf) return NULL;
 
-    buf->lpVtbl = create_dsbuf_vtbl();
-    if (!buf->lpVtbl) {
-        free(buf);
-        return NULL;
-    }
-
+    buf->lpVtbl = &g_dsbuf_vtbl;
     buf->ref_count = 1;
     pthread_mutex_init(&buf->lock, NULL);
     buf->volume = 0;   /* full volume */
@@ -1063,7 +1051,6 @@ static IDirectSoundBuffer *create_dsbuffer(const DSBUFFERDESC *desc)
 
     buf->pcm_data = calloc(1, buf->pcm_size);
     if (!buf->pcm_data) {
-        free((void *)buf->lpVtbl);
         pthread_mutex_destroy(&buf->lock);
         free(buf);
         return NULL;
@@ -1114,7 +1101,7 @@ HRESULT ds8_QueryInterface(IDirectSound8 *self, const void *riid, void **ppv)
     *ppv = NULL;
     if (!riid || memcmp(riid, IID_IUnknown_bytes, 16) == 0) {
         *ppv = self;
-        self->ref_count++;
+        __sync_add_and_fetch(&self->ref_count, 1);
         return DS_OK;
     }
     return E_NOINTERFACE;
@@ -1123,17 +1110,19 @@ HRESULT ds8_QueryInterface(IDirectSound8 *self, const void *riid, void **ppv)
 static __attribute__((ms_abi))
 uint32_t ds8_AddRef(IDirectSound8 *self)
 {
-    return (uint32_t)(++self->ref_count);
+    return (uint32_t)__sync_add_and_fetch(&self->ref_count, 1);
 }
 
 static __attribute__((ms_abi))
 uint32_t ds8_Release(IDirectSound8 *self)
 {
-    int ref = --self->ref_count;
+    int ref = __sync_sub_and_fetch(&self->ref_count, 1);
     if (ref <= 0) {
-        if (self->primary)
-            self->primary->lpVtbl->Release(self->primary);
-        free((void *)self->lpVtbl);
+        if (self->primary) {
+            IDirectSoundBuffer *p = self->primary;
+            self->primary = NULL;
+            p->lpVtbl->Release(p);
+        }
         free(self);
         return 0;
     }
@@ -1155,7 +1144,7 @@ HRESULT ds8_CreateSoundBuffer(IDirectSound8 *self, const DSBUFFERDESC *desc,
             self->primary = create_dsbuffer(desc);
 
         if (self->primary) {
-            self->primary->ref_count++;
+            __sync_add_and_fetch(&self->primary->ref_count, 1);
             *ppBuf = self->primary;
             fprintf(stderr, "[dsound] CreateSoundBuffer: primary buffer (%u Hz, %u-bit, %u ch)\n",
                     self->primary->fmt.nSamplesPerSec,
@@ -1308,6 +1297,25 @@ HRESULT ds8_VerifyCertification(IDirectSound8 *self, DWORD *certified)
 }
 
 /* ================================================================== */
+/*  IDirectSound8 shared vtable                                        */
+/* ================================================================== */
+
+static const IDirectSound8Vtbl g_ds8_vtbl = {
+    .QueryInterface       = ds8_QueryInterface,
+    .AddRef               = ds8_AddRef,
+    .Release              = ds8_Release,
+    .CreateSoundBuffer    = ds8_CreateSoundBuffer,
+    .GetCaps              = ds8_GetCaps,
+    .DuplicateSoundBuffer = ds8_DuplicateSoundBuffer,
+    .SetCooperativeLevel  = ds8_SetCooperativeLevel,
+    .Compact              = ds8_Compact,
+    .GetSpeakerConfig     = ds8_GetSpeakerConfig,
+    .SetSpeakerConfig     = ds8_SetSpeakerConfig,
+    .Initialize           = ds8_Initialize,
+    .VerifyCertification  = ds8_VerifyCertification,
+};
+
+/* ================================================================== */
 /*  IDirectSound8 object creation                                      */
 /* ================================================================== */
 
@@ -1316,29 +1324,10 @@ static IDirectSound8 *create_dsound8_object(void)
     /* Ensure PulseAudio is loaded */
     pulse_load();
 
-    IDirectSound8Vtbl *vtbl = calloc(1, sizeof(IDirectSound8Vtbl));
-    if (!vtbl) return NULL;
-
-    vtbl->QueryInterface      = ds8_QueryInterface;
-    vtbl->AddRef              = ds8_AddRef;
-    vtbl->Release             = ds8_Release;
-    vtbl->CreateSoundBuffer   = ds8_CreateSoundBuffer;
-    vtbl->GetCaps             = ds8_GetCaps;
-    vtbl->DuplicateSoundBuffer = ds8_DuplicateSoundBuffer;
-    vtbl->SetCooperativeLevel = ds8_SetCooperativeLevel;
-    vtbl->Compact             = ds8_Compact;
-    vtbl->GetSpeakerConfig    = ds8_GetSpeakerConfig;
-    vtbl->SetSpeakerConfig    = ds8_SetSpeakerConfig;
-    vtbl->Initialize          = ds8_Initialize;
-    vtbl->VerifyCertification = ds8_VerifyCertification;
-
     IDirectSound8 *ds = calloc(1, sizeof(IDirectSound8));
-    if (!ds) {
-        free(vtbl);
-        return NULL;
-    }
+    if (!ds) return NULL;
 
-    ds->lpVtbl    = vtbl;
+    ds->lpVtbl    = &g_ds8_vtbl;
     ds->ref_count = 1;
     ds->coop_level = DSSCL_NORMAL;
 

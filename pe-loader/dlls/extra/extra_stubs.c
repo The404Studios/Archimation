@@ -221,25 +221,31 @@ WINAPI_EXPORT int IdnToAscii(uint32_t dwFlags, const void *lpUnicodeCharStr,
                               int cchUnicodeChar, void *lpASCIICharStr, int cchASCIIChar)
 {
     (void)dwFlags;
-    /* Passthrough: just copy if it's ASCII */
-    if (lpUnicodeCharStr && lpASCIICharStr && cchUnicodeChar > 0) {
-        int len = cchUnicodeChar < cchASCIIChar ? cchUnicodeChar : cchASCIIChar;
-        memcpy(lpASCIICharStr, lpUnicodeCharStr, len * 2);
-        return len;
+    /* IDN output is ASCII: narrow both sides despite wide input name.
+     * MSDN: both input and output are WCHAR buffers for this API. */
+    if (!lpUnicodeCharStr || cchUnicodeChar <= 0) return 0;
+    if (!lpASCIICharStr || cchASCIIChar <= 0) {
+        /* Caller probing required size */
+        return cchUnicodeChar;
     }
-    return 0;
+    int len = cchUnicodeChar < cchASCIIChar ? cchUnicodeChar : cchASCIIChar;
+    /* Both buffers are wchar (uint16_t); copy len wchars */
+    memcpy(lpASCIICharStr, lpUnicodeCharStr, (size_t)len * sizeof(uint16_t));
+    return len;
 }
 
 WINAPI_EXPORT int IdnToUnicode(uint32_t dwFlags, const void *lpASCIICharStr,
                                 int cchASCIIChar, void *lpUnicodeCharStr, int cchUnicodeChar)
 {
     (void)dwFlags;
-    if (lpASCIICharStr && lpUnicodeCharStr && cchASCIIChar > 0) {
-        int len = cchASCIIChar < cchUnicodeChar ? cchASCIIChar : cchUnicodeChar;
-        memcpy(lpUnicodeCharStr, lpASCIICharStr, len * 2);
-        return len;
+    if (!lpASCIICharStr || cchASCIIChar <= 0) return 0;
+    if (!lpUnicodeCharStr || cchUnicodeChar <= 0) {
+        /* Caller probing required size */
+        return cchASCIIChar;
     }
-    return 0;
+    int len = cchASCIIChar < cchUnicodeChar ? cchASCIIChar : cchUnicodeChar;
+    memcpy(lpUnicodeCharStr, lpASCIICharStr, (size_t)len * sizeof(uint16_t));
+    return len;
 }
 
 WINAPI_EXPORT BOOL IsNormalizedString(uint32_t NormForm, const void *lpString, int cwLength)

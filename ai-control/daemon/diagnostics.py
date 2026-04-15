@@ -32,6 +32,7 @@ def _check(name: str, status: str, detail: str = "", **extra) -> dict:
 
 async def _run_cmd(cmd: list[str], timeout: float = 5.0) -> tuple[int, str]:
     """Run a command with timeout, return (returncode, stdout)."""
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -45,13 +46,20 @@ async def _run_cmd(cmd: list[str], timeout: float = 5.0) -> tuple[int, str]:
     except FileNotFoundError:
         return -1, f"Command not found: {cmd[0]}"
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-            await proc.wait()
-        except Exception:
-            pass
+        if proc is not None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
         return -2, "Command timed out"
     except Exception as e:
+        if proc is not None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
         return -3, str(e)
 
 
@@ -59,9 +67,19 @@ async def check_layer0_kernel() -> list[dict]:
     """Layer 0: Kernel checks (trust.ko, binfmt_pe)."""
     results = []
 
-    # Check trust.ko module
-    rc, out = await _run_cmd(["lsmod"])
-    if rc == 0 and "trust" in out:
+    # Check trust.ko module via /proc/modules (avoids spawning lsmod)
+    trust_loaded = False
+    try:
+        with open("/proc/modules", "r") as f:
+            for line in f:
+                # Each line: <name> <size> <used> <by> <state> <offset>
+                name = line.split(" ", 1)[0] if line else ""
+                if name == "trust" or name.startswith("trust"):
+                    trust_loaded = True
+                    break
+    except (FileNotFoundError, PermissionError):
+        pass
+    if trust_loaded:
         results.append(_check("trust.ko", STATUS_OK, "Trust kernel module loaded"))
     else:
         results.append(_check("trust.ko", STATUS_WARN,
@@ -91,10 +109,12 @@ async def check_layer0_kernel() -> list[dict]:
         results.append(_check("binfmt_pe", STATUS_WARN,
                               "PE binary format not registered"))
 
-    # Check kernel version
-    rc, out = await _run_cmd(["uname", "-r"])
-    if rc == 0:
-        results.append(_check("kernel", STATUS_OK, f"Linux {out}"))
+    # Check kernel version via os.uname() (avoids subprocess)
+    try:
+        release = os.uname().release
+        results.append(_check("kernel", STATUS_OK, f"Linux {release}"))
+    except (AttributeError, OSError):
+        pass
 
     return results
 
@@ -273,14 +293,30 @@ async def check_desktop() -> list[dict]:
     else:
         results.append(_check("display", STATUS_WARN, "No display server detected"))
 
-    # Check GPU
-    rc, out = await _run_cmd(["lspci", "-v"])
-    if rc == 0:
-        gpu_lines = [l for l in out.split("\n") if "VGA" in l or "3D" in l]
-        if gpu_lines:
-            results.append(_check("gpu", STATUS_OK, gpu_lines[0].strip()))
-        else:
-            results.append(_check("gpu", STATUS_WARN, "No GPU detected"))
+    # Check GPU via sysfs (PCI class 0x03xxxx = Display controller)
+    gpu_found = None
+    try:
+        pci_root = Path("/sys/bus/pci/devices")
+        if pci_root.exists():
+            for dev in pci_root.iterdir():
+                try:
+                    cls = (dev / "class").read_text().strip()
+                    # 0x030000 VGA, 0x030200 3D controller, 0x030100 XGA
+                    if not cls.startswith("0x03"):
+                        continue
+                    vendor = (dev / "vendor").read_text().strip()
+                    device = (dev / "device").read_text().strip()
+                    kind = "VGA" if cls == "0x030000" else ("3D" if cls == "0x030200" else "Display")
+                    gpu_found = f"{kind} {vendor[2:]}:{device[2:]}"
+                    break
+                except (FileNotFoundError, PermissionError, OSError):
+                    continue
+    except (FileNotFoundError, PermissionError):
+        pass
+    if gpu_found:
+        results.append(_check("gpu", STATUS_OK, gpu_found))
+    else:
+        results.append(_check("gpu", STATUS_WARN, "No GPU detected"))
 
     # Check NVIDIA driver
     rc, out = await _run_cmd(["nvidia-smi", "--query-gpu=driver_version",

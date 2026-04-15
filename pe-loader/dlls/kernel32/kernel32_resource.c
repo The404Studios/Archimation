@@ -354,11 +354,13 @@ WINAPI_EXPORT HRSRC FindResourceA(HMODULE hModule, LPCSTR lpName, LPCSTR lpType)
     }
     if (slot < 0) {
         if (g_rsrc_handle_count >= MAX_RSRC_HANDLES) {
-            /* Try to recycle slot 0 as last resort */
-            slot = 0;
-        } else {
-            slot = g_rsrc_handle_count++;
+            /* Table exhausted — refuse rather than recycling an in-use slot
+             * (the existing handle owner would see a stale/UAF pointer). */
+            pthread_mutex_unlock(&g_rsrc_lock);
+            set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+            return NULL;
         }
+        slot = g_rsrc_handle_count++;
     }
 
     rsrc_handle_t *rh = &g_rsrc_handles[slot];

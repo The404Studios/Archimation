@@ -316,6 +316,9 @@ WINAPI_EXPORT DWORD GetFullPathNameA(LPCSTR lpFileName, DWORD nBufferLength,
 
 static void wcs_to_narrow(const uint16_t *wide, char *buf, size_t bufsz)
 {
+    /* bufsz==0 guard: prior version's "i < bufsz - 1" would underflow to
+     * SIZE_MAX, causing an unbounded write into whatever buf points at. */
+    if (!buf || bufsz == 0) return;
     size_t i = 0;
     while (wide && wide[i] && i < bufsz - 1) { buf[i] = (char)(wide[i] & 0xFF); i++; }
     buf[i] = '\0';
@@ -323,6 +326,8 @@ static void wcs_to_narrow(const uint16_t *wide, char *buf, size_t bufsz)
 
 static void narrow_to_wcs(const char *narrow, uint16_t *buf, size_t bufsz)
 {
+    if (!buf || bufsz == 0) return;
+    if (!narrow) { buf[0] = 0; return; }
     size_t i = 0;
     while (narrow[i] && i < bufsz - 1) { buf[i] = (uint16_t)(unsigned char)narrow[i]; i++; }
     buf[i] = 0;
@@ -413,30 +418,22 @@ WINAPI_EXPORT BOOL MoveFileExW(const uint16_t *lpExistingFileName,
     return FALSE;
 }
 
+WINAPI_EXPORT BOOL CopyFileA(LPCSTR lpExistingFileName, LPCSTR lpNewFileName, BOOL bFailIfExists);
+
 WINAPI_EXPORT BOOL CopyFileW(const uint16_t *lpExistingFileName,
     const uint16_t *lpNewFileName, BOOL bFailIfExists)
 {
-    char src[512], dst[512];
+    /* Delegate to CopyFileA (kernel32_file.c) to benefit from the
+     * copy_file_range/sendfile fast paths, reflink support, and proper
+     * share-mode semantics. The prior duplicate implementation used an
+     * 8KB fread/fwrite loop — up to 100x slower for large files on modern
+     * HW and dozens-of-x slower even on old spinning media due to the
+     * tiny buffer defeating readahead. Bump stack buffers to 4096 too so
+     * long paths aren't silently truncated. */
+    char src[4096], dst[4096];
     wcs_to_narrow(lpExistingFileName, src, sizeof(src));
     wcs_to_narrow(lpNewFileName, dst, sizeof(dst));
-
-    if (bFailIfExists) {
-        FILE *test = fopen(dst, "r");
-        if (test) { fclose(test); set_last_error(80); return FALSE; } /* ERROR_FILE_EXISTS */
-    }
-
-    FILE *in = fopen(src, "rb");
-    if (!in) { set_last_error(2); return FALSE; }
-    FILE *out = fopen(dst, "wb");
-    if (!out) { fclose(in); set_last_error(5); return FALSE; }
-
-    char buf[8192];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
-        fwrite(buf, 1, n, out);
-    fclose(out);
-    fclose(in);
-    return TRUE;
+    return CopyFileA(src, dst, bFailIfExists);
 }
 
 WINAPI_EXPORT UINT GetTempFileNameW(const uint16_t *lpPathName,

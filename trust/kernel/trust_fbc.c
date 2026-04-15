@@ -55,10 +55,21 @@ void trust_policy_init_defaults(void)
     };
 
     int i;
+    /*
+     * Policy rules are append-only from this point on, and readers
+     * snapshot count via READ_ONCE() without taking the lock (see
+     * _record_action_cb / trust_risc_threshold_check).  We publish
+     * each new rule's bytes BEFORE incrementing count, with a
+     * smp_wmb() fence, so any reader that sees the new count is
+     * guaranteed to see the rule's fully-written contents.
+     */
     spin_lock(&g_trust_policy.lock);
     for (i = 0; i < (int)(sizeof(defaults) / sizeof(defaults[0])); i++) {
-        if (g_trust_policy.count < TRUST_MAX_POLICIES) {
-            g_trust_policy.rules[g_trust_policy.count++] = defaults[i];
+        int slot = g_trust_policy.count;
+        if (slot < TRUST_MAX_POLICIES) {
+            g_trust_policy.rules[slot] = defaults[i];
+            smp_wmb();
+            WRITE_ONCE(g_trust_policy.count, slot + 1);
         }
     }
     spin_unlock(&g_trust_policy.lock);
@@ -67,9 +78,15 @@ void trust_policy_init_defaults(void)
 int trust_policy_add_rule(const trust_policy_rule_t *rule)
 {
     int ret = -1;
+    int slot;
     spin_lock(&g_trust_policy.lock);
-    if (g_trust_policy.count < TRUST_MAX_POLICIES) {
-        g_trust_policy.rules[g_trust_policy.count++] = *rule;
+    slot = g_trust_policy.count;
+    if (slot < TRUST_MAX_POLICIES) {
+        g_trust_policy.rules[slot] = *rule;
+        /* Publish the rule bytes before the count bump so lockless
+         * readers never observe a partially-initialized rule. */
+        smp_wmb();
+        WRITE_ONCE(g_trust_policy.count, slot + 1);
         ret = 0;
     }
     spin_unlock(&g_trust_policy.lock);
@@ -99,124 +116,192 @@ int trust_fbc_policy_eval(u32 subject_id, u32 action, u32 *matching_rule_idx)
         return TRUST_RESULT_DENY;
     }
 
-    spin_lock(&g_trust_policy.lock);
-    for (i = 0; i < g_trust_policy.count; i++) {
-        trust_policy_rule_t *rule = &g_trust_policy.rules[i];
+    /* Lock-free read: rules are append-only; count is monotonic. */
+    {
+        int count = READ_ONCE(g_trust_policy.count);
+        if (count > TRUST_MAX_POLICIES)
+            count = TRUST_MAX_POLICIES;
+        smp_rmb();
 
-        /* Check domain match (0xFFFFFFFF = all domains) */
-        if (rule->domain != 0xFFFFFFFF && rule->domain != subj.domain)
-            continue;
+        for (i = 0; i < count; i++) {
+            const trust_policy_rule_t *rule = &g_trust_policy.rules[i];
 
-        /* Check action match */
-        if (rule->action_type != action)
-            continue;
+            /* Check domain match (0xFFFFFFFF = all domains) */
+            if (rule->domain != 0xFFFFFFFF && rule->domain != subj.domain)
+                continue;
 
-        /* Found matching rule */
-        if (matching_rule_idx) *matching_rule_idx = (u32)i;
+            /* Check action match */
+            if (READ_ONCE(rule->action_type) != action)
+                continue;
 
-        /* TRC Integration: apply threshold bias to min_trust */
-        {
-            /* Clamp threshold_bias to prevent overflow from flipping the comparison */
-            int32_t bias = subj.trc.threshold_bias;
-            if (bias > 50) bias = 50;
-            if (bias < -50) bias = -50;
-            int32_t biased_min = rule->min_trust + bias;
-            /* Clamp result to valid trust range [0, 100] */
-            if (biased_min < 0) biased_min = 0;
-            if (biased_min > 100) biased_min = 100;
+            /* Found matching rule */
+            if (matching_rule_idx) *matching_rule_idx = (u32)i;
 
-            if (subj.trust_score < biased_min) {
-                result = TRUST_RESULT_DENY;
+            /* TRC Integration: apply threshold bias to min_trust */
+            {
+                /* Clamp threshold_bias to prevent overflow from flipping the comparison */
+                int32_t bias = subj.trc.threshold_bias;
+                int32_t biased_min;
+                if (bias > 50) bias = 50;
+                if (bias < -50) bias = -50;
+                biased_min = rule->min_trust + bias;
+                /* Clamp result to valid trust range [0, 100] */
+                if (biased_min < 0) biased_min = 0;
+                if (biased_min > 100) biased_min = 100;
+
+                if (subj.trust_score < biased_min) {
+                    result = TRUST_RESULT_DENY;
+                    break;
+                }
+            }
+
+            /* Check required capabilities */
+            if (rule->required_caps &&
+                (subj.capabilities & rule->required_caps) != rule->required_caps) {
+                /* Missing capabilities: might need escalation */
+                result = TRUST_RESULT_ESCALATE;
                 break;
             }
-        }
 
-        /* Check required capabilities */
-        if (rule->required_caps &&
-            (subj.capabilities & rule->required_caps) != rule->required_caps) {
-            /* Missing capabilities: might need escalation */
-            result = TRUST_RESULT_ESCALATE;
+            result = TRUST_RESULT_ALLOW;
             break;
         }
-
-        result = TRUST_RESULT_ALLOW;
-        break;
     }
-    spin_unlock(&g_trust_policy.lock);
 
     return result;
 }
 
 /* --- TRUST_ESCALATE --- */
+
+/*
+ * Escalate decision is a read-then-modify cycle on subject state that
+ * is concurrent with record_action, decay, and propagate. Using the
+ * old lookup / copy / insert pattern let another writer's changes (to
+ * trust_score, capabilities, flags) be silently overwritten.
+ *
+ * We run the mutation through trust_tlb_modify so the subject stays
+ * pinned under its set-lock for the duration of the decision.
+ */
+enum escalate_outcome {
+    ESC_OUT_GRANTED,
+    ESC_OUT_DENIED_SCORE,
+    ESC_OUT_PENDING_AI,
+    ESC_OUT_FROZEN,
+    ESC_OUT_BAD_AUTH,
+    ESC_OUT_NOOP_ALREADY,
+};
+
+struct escalate_ctx {
+    u32                    requested_authority;
+    int32_t                score_snapshot;
+    enum escalate_outcome  outcome;
+};
+
+static int _escalate_decide_cb(trust_subject_t *subj, void *data)
+{
+    struct escalate_ctx *c = data;
+    int32_t required;
+
+    if (subj->flags & TRUST_FLAG_FROZEN) {
+        c->outcome = ESC_OUT_FROZEN;
+        c->score_snapshot = subj->trust_score;
+        return 0;
+    }
+
+    if (subj->authority_level >= c->requested_authority) {
+        c->outcome = ESC_OUT_NOOP_ALREADY;
+        c->score_snapshot = subj->trust_score;
+        return 0;
+    }
+
+    switch (c->requested_authority) {
+    case TRUST_AUTH_USER:    required = 100; break;
+    case TRUST_AUTH_SERVICE: required = 300; break;
+    case TRUST_AUTH_ADMIN:   required = 600; break;
+    case TRUST_AUTH_KERNEL:  required = 900; break;
+    default:
+        c->outcome = ESC_OUT_BAD_AUTH;
+        c->score_snapshot = subj->trust_score;
+        return 0;
+    }
+
+    /* Apply TRC threshold bias */
+    required += subj->trc.threshold_bias;
+
+    if (subj->trust_score < required) {
+        /* Denied: apply penalty atomically */
+        subj->trust_score = trust_clamp_score(subj->trust_score - 20);
+        c->outcome = ESC_OUT_DENIED_SCORE;
+        c->score_snapshot = subj->trust_score;
+        return 0;
+    }
+
+    /* High-authority escalations require AI approval: mark pending */
+    if (c->requested_authority >= TRUST_AUTH_ADMIN) {
+        subj->flags |= TRUST_FLAG_ESCALATING;
+        c->outcome = ESC_OUT_PENDING_AI;
+        c->score_snapshot = subj->trust_score;
+        return 0;
+    }
+
+    /* Auto-grant USER/SERVICE */
+    subj->authority_level = c->requested_authority;
+    subj->capabilities = trust_default_caps(c->requested_authority);
+    subj->flags &= ~TRUST_FLAG_ESCALATING;
+    c->outcome = ESC_OUT_GRANTED;
+    c->score_snapshot = subj->trust_score;
+    return 0;
+}
+
+/* Rollback ESCALATING flag when queue is full (runs atomically too). */
+static int _escalate_rollback_cb(trust_subject_t *subj, void *data)
+{
+    (void)data;
+    subj->flags &= ~TRUST_FLAG_ESCALATING;
+    return 0;
+}
+
 int trust_fbc_escalate(u32 subject_id, u32 requested_authority,
                        const char *justification)
 {
-    trust_subject_t subj;
-    int32_t required_score;
+    struct escalate_ctx ctx = { .requested_authority = requested_authority };
+    int ret;
 
-    if (trust_tlb_lookup(subject_id, &subj) < 0)
+    ret = trust_tlb_modify(subject_id, _escalate_decide_cb, &ctx);
+    if (ret == -ENOENT)
+        return -1;
+    if (ret != 0)
+        return ret;
+
+    switch (ctx.outcome) {
+    case ESC_OUT_FROZEN:
+    case ESC_OUT_BAD_AUTH:
+    case ESC_OUT_DENIED_SCORE:
         return -1;
 
-    if (subj.flags & TRUST_FLAG_FROZEN)
-        return -1;
-
-    /* Already at or above requested level */
-    if (subj.authority_level >= requested_authority)
+    case ESC_OUT_NOOP_ALREADY:
         return 0;
 
-    /* Score requirements for escalation */
-    switch (requested_authority) {
-    case TRUST_AUTH_USER:    required_score = 100; break;
-    case TRUST_AUTH_SERVICE: required_score = 300; break;
-    case TRUST_AUTH_ADMIN:   required_score = 600; break;
-    case TRUST_AUTH_KERNEL:  required_score = 900; break;
-    default:                 return -1;
-    }
+    case ESC_OUT_GRANTED:
+        pr_info("trust: subject %u escalated to authority %u (score=%d)\n",
+                subject_id, requested_authority, ctx.score_snapshot);
+        return 0;
 
-    /* TRC Integration: apply threshold bias to escalation requirements */
-    required_score += subj.trc.threshold_bias;
-
-    if (subj.trust_score < required_score) {
-        /* Denied: apply penalty */
-        subj.trust_score = trust_clamp_score(subj.trust_score - 20);
-        trust_tlb_insert(&subj);
-        return -1;
-    }
-
-    /*
-     * For ADMIN and KERNEL escalations, require AI observer approval.
-     * Queue the request and return -EAGAIN to indicate pending.
-     * The AI daemon polls the escalation queue and responds.
-     * USER and SERVICE escalations are auto-granted if score is sufficient.
-     */
-    if (requested_authority >= TRUST_AUTH_ADMIN) {
-        subj.flags |= TRUST_FLAG_ESCALATING;
-        trust_tlb_insert(&subj);
-
+    case ESC_OUT_PENDING_AI:
         if (trust_escalation_enqueue(subject_id, requested_authority,
-                                      justification, subj.trust_score) == 0) {
+                                     justification,
+                                     ctx.score_snapshot) == 0) {
             pr_info("trust: subject %u escalation to %u queued for AI approval (score=%d)\n",
-                    subject_id, requested_authority, subj.trust_score);
-            return -EAGAIN; /* Pending AI approval */
+                    subject_id, requested_authority, ctx.score_snapshot);
+            return -EAGAIN;
         }
-        /* Queue full: DENY escalation rather than auto-grant (security) */
-        subj.flags &= ~TRUST_FLAG_ESCALATING;
-        trust_tlb_insert(&subj);
+        /* Queue full: roll back the ESCALATING flag */
+        trust_tlb_modify(subject_id, _escalate_rollback_cb, NULL);
         pr_warn("trust: escalation queue full, DENYING subject %u escalation to %u\n",
                 subject_id, requested_authority);
         return -EAGAIN;
     }
-
-    /* Grant escalation (auto-grant for USER/SERVICE, or queue-full fallback) */
-    subj.authority_level = requested_authority;
-    subj.capabilities = trust_default_caps(requested_authority);
-    subj.flags &= ~TRUST_FLAG_ESCALATING;
-    trust_tlb_insert(&subj);
-
-    pr_info("trust: subject %u escalated to authority %u (score=%d)\n",
-            subject_id, requested_authority, subj.trust_score);
-
-    return 0;
+    return -1;
 }
 
 /* --- TRUST_DOMAIN_TRANSFER --- */
@@ -249,27 +334,71 @@ static int _find_dependents(u32 subject_id, u32 *out, int max_out)
     return count;
 }
 
+/*
+ * Apply a delta atomically inside the subject's TLB set lock.
+ * Used by both the origin subject and each dependent, eliminating the
+ * previous lookup-copy-insert TOCTOU race.
+ */
+struct propagate_ctx {
+    int32_t delta;
+    int     check_threshold;    /* 1 = also enforce low threshold */
+    int     skip_frozen;        /* 1 = skip if frozen (no mutation) */
+    int     frozen_skipped;     /* out: 1 if skipped due to frozen */
+    int32_t old_score;          /* out */
+    u32     old_caps;           /* out */
+    int32_t new_score;          /* out */
+    u32     new_caps;           /* out */
+};
+
+static int _propagate_cb(trust_subject_t *subj, void *data)
+{
+    struct propagate_ctx *c = data;
+
+    c->old_score = subj->trust_score;
+    c->old_caps  = subj->capabilities;
+    c->frozen_skipped = 0;
+
+    if (c->skip_frozen && (subj->flags & TRUST_FLAG_FROZEN)) {
+        c->frozen_skipped = 1;
+        c->new_score = subj->trust_score;
+        c->new_caps  = subj->capabilities;
+        return 0;
+    }
+
+    subj->trust_score = trust_clamp_score(subj->trust_score + c->delta);
+    subj->last_action_ts = trust_get_timestamp();
+
+    if (c->check_threshold &&
+        subj->trust_score <= subj->threshold_low) {
+        subj->capabilities &= trust_default_caps(TRUST_AUTH_NONE);
+        if (subj->authority_level > TRUST_AUTH_NONE)
+            subj->authority_level = TRUST_AUTH_NONE;
+    }
+
+    c->new_score = subj->trust_score;
+    c->new_caps  = subj->capabilities;
+    return 0;
+}
+
 void trust_fbc_propagate(u32 subject_id, int32_t delta)
 {
-    trust_subject_t subj;
+    struct propagate_ctx origin_ctx = {
+        .delta = delta,
+        .check_threshold = 0,
+        .skip_frozen = 0,
+    };
     u32 dependents[32];
-    int dep_count, i;
+    int dep_count, i, ret;
     int32_t scaled_delta;
-    u32 old_caps;
-    int32_t old_score;
 
-    /* Step 1: Apply delta to the originating subject */
-    if (trust_tlb_lookup(subject_id, &subj) < 0)
+    /* Step 1: Apply delta to the originating subject atomically */
+    ret = trust_tlb_modify(subject_id, _propagate_cb, &origin_ctx);
+    if (ret != 0)
         return;
 
-    old_score = subj.trust_score;
-    old_caps = subj.capabilities;
-    subj.trust_score = trust_clamp_score(subj.trust_score + delta);
-    subj.last_action_ts = trust_get_timestamp();
-    trust_tlb_insert(&subj);
-
     trust_fbc_audit(subject_id, TRUST_ACTION_TRUST_CHANGE,
-                    old_score, subj.trust_score, old_caps, subj.capabilities);
+                    origin_ctx.old_score, origin_ctx.new_score,
+                    origin_ctx.old_caps, origin_ctx.new_caps);
 
     /* Step 2: Find subjects that depend on this one and cascade */
     spin_lock(&g_trust_deps.lock);
@@ -290,34 +419,23 @@ void trust_fbc_propagate(u32 subject_id, int32_t delta)
         scaled_delta = (delta > 0) ? 1 : -1;
 
     for (i = 0; i < dep_count; i++) {
-        trust_subject_t dep_subj;
+        struct propagate_ctx dep_ctx = {
+            .delta = scaled_delta,
+            .check_threshold = 1,
+            .skip_frozen = 1,
+        };
 
-        if (trust_tlb_lookup(dependents[i], &dep_subj) < 0)
+        if (trust_tlb_modify(dependents[i], _propagate_cb, &dep_ctx) != 0)
             continue;
-
-        if (dep_subj.flags & TRUST_FLAG_FROZEN)
+        if (dep_ctx.frozen_skipped)
             continue;
-
-        old_score = dep_subj.trust_score;
-        old_caps = dep_subj.capabilities;
-        dep_subj.trust_score = trust_clamp_score(dep_subj.trust_score + scaled_delta);
-        dep_subj.last_action_ts = trust_get_timestamp();
-
-        /* Check threshold crossings on dependents */
-        if (dep_subj.trust_score <= dep_subj.threshold_low) {
-            dep_subj.capabilities &= trust_default_caps(TRUST_AUTH_NONE);
-            if (dep_subj.authority_level > TRUST_AUTH_NONE)
-                dep_subj.authority_level = TRUST_AUTH_NONE;
-        }
-
-        trust_tlb_insert(&dep_subj);
 
         trust_fbc_audit(dependents[i], TRUST_ACTION_TRUST_CHANGE,
-                        old_score, dep_subj.trust_score, old_caps,
-                        dep_subj.capabilities);
+                        dep_ctx.old_score, dep_ctx.new_score,
+                        dep_ctx.old_caps, dep_ctx.new_caps);
 
         pr_debug("trust: propagated %+d to dependent %u (new score=%d)\n",
-                 scaled_delta, dependents[i], dep_subj.trust_score);
+                 scaled_delta, dependents[i], dep_ctx.new_score);
     }
 
     pr_debug("trust: propagated delta %+d from subject %u to %d dependents\n",
@@ -332,18 +450,28 @@ void trust_fbc_repartition(void)
      * based on current trust landscape. This is the "emergent governance"
      * mechanism — the system self-organizes trust relationships.
      *
-     * In a full implementation, this would:
-     * 1. Scan all active subjects
-     * 2. Compute percentile boundaries
-     * 3. Adjust threshold_low/threshold_high per subject
-     * 4. Promote/demote subjects whose scores crossed new boundaries
+     * Called from both process context (ioctl) and softirq context
+     * (trust_decay_timer_fn). TLB set locks are also held across these
+     * two contexts, so we MUST use irqsave or risk softirq-vs-process
+     * deadlock on the same CPU.
+     *
+     * We also skip empty sets via a lock-free READ_ONCE check to avoid
+     * thrashing 1024 cachelines when most sets are empty at boot.
      */
     int set, way;
+    unsigned long flags;
+
+    if (!g_trust_tlb.sets)
+        return;
 
     for (set = 0; set < TRUST_TLB_SETS; set++) {
         trust_tlb_set_t *s = &g_trust_tlb.sets[set];
 
-        spin_lock(&s->lock);
+        /* Skip empty sets without acquiring the lock */
+        if (READ_ONCE(s->valid_mask) == 0)
+            continue;
+
+        spin_lock_irqsave(&s->lock, flags);
         for (way = 0; way < TRUST_TLB_WAYS; way++) {
             trust_subject_t *subj;
 
@@ -356,7 +484,7 @@ void trust_fbc_repartition(void)
             subj->threshold_low = -100 - (int32_t)(subj->authority_level * 100);
             subj->threshold_high = 100 + (int32_t)(subj->authority_level * 200);
         }
-        spin_unlock(&s->lock);
+        spin_unlock_irqrestore(&s->lock, flags);
     }
 }
 
@@ -540,55 +668,76 @@ int trust_escalation_dequeue(trust_escalation_request_t *out)
     return 0;
 }
 
+/*
+ * Apply escalation response atomically to the subject.  Closes the
+ * previous TOCTOU: record_action / propagate could mutate the subject
+ * between the lookup and the insert below, silently dropping those
+ * updates.  trust_tlb_modify holds the TLB set lock across the whole
+ * mutation.
+ */
+struct esc_respond_ctx {
+    u32 auth;
+    u32 approved;
+};
+
+static int _esc_respond_cb(trust_subject_t *subj, void *data)
+{
+    struct esc_respond_ctx *c = data;
+
+    if (c->approved) {
+        subj->authority_level = c->auth;
+        subj->capabilities = trust_default_caps(c->auth);
+    } else {
+        subj->trust_score = trust_clamp_score(subj->trust_score - 30);
+    }
+    subj->flags &= ~TRUST_FLAG_ESCALATING;
+    return 0;
+}
+
 int trust_escalation_respond(u32 seq, u32 approved)
 {
-    trust_subject_t subj;
+    struct esc_respond_ctx ctx = { .approved = approved };
+    u32 sid = 0, auth = 0;
+    int found = 0;
     u32 i;
 
     /*
-     * Walk the recent queue to find the request with this sequence number.
-     * Since we've already dequeued, we scan the TLB for the subject and
-     * apply the approval.
+     * Reject seq == 0 explicitly — uninitialized queue slots have seq=0,
+     * which would otherwise let a caller "respond" to a nonexistent
+     * escalation and grant authority.  seq_counter starts at 1.
      */
+    if (seq == 0)
+        return -EINVAL;
 
-    /* Find the escalating subject by scanning TLB for ESCALATING flag */
+    /* Find the request by seq and mark it answered under the queue lock. */
     spin_lock(&g_trust_escalations.lock);
-
-    /* Search recent entries (they may have been dequeued already) */
     for (i = 0; i < TRUST_ESCALATION_QUEUE_SIZE; i++) {
-        if (g_trust_escalations.entries[i].seq == seq) {
+        if (g_trust_escalations.entries[i].seq == seq &&
+            g_trust_escalations.entries[i].status == 0) {
             trust_escalation_request_t *req = &g_trust_escalations.entries[i];
-            u32 sid = req->subject_id;
-            u32 auth = req->requested_authority;
-
+            sid = req->subject_id;
+            auth = req->requested_authority;
             req->status = approved ? 1 : 2;
-            spin_unlock(&g_trust_escalations.lock);
-
-            if (trust_tlb_lookup(sid, &subj) < 0)
-                return -1;
-
-            if (approved) {
-                subj.authority_level = auth;
-                subj.capabilities = trust_default_caps(auth);
-                subj.flags &= ~TRUST_FLAG_ESCALATING;
-                trust_tlb_insert(&subj);
-
-                pr_info("trust: AI approved escalation for subject %u to authority %u\n",
-                        sid, auth);
-            } else {
-                subj.trust_score = trust_clamp_score(subj.trust_score - 30);
-                subj.flags &= ~TRUST_FLAG_ESCALATING;
-                trust_tlb_insert(&subj);
-
-                pr_info("trust: AI denied escalation for subject %u (penalty applied)\n",
-                        sid);
-            }
-            return 0;
+            found = 1;
+            break;
         }
     }
-
     spin_unlock(&g_trust_escalations.lock);
-    return -1; /* Request not found */
+
+    if (!found)
+        return -1;
+
+    ctx.auth = auth;
+    if (trust_tlb_modify(sid, _esc_respond_cb, &ctx) != 0)
+        return -1;
+
+    if (approved)
+        pr_info("trust: AI approved escalation for subject %u to authority %u\n",
+                sid, auth);
+    else
+        pr_info("trust: AI denied escalation for subject %u (penalty applied)\n",
+                sid);
+    return 0;
 }
 
 MODULE_LICENSE("GPL");

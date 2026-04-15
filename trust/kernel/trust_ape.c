@@ -95,13 +95,147 @@ static int compute_proof(u32 hash_cfg, const u8 *data, u32 data_len,
     return ret;
 }
 
-/* Find an APE entry by subject_id */
+/*
+ * Sentinel marking a tombstoned (destroyed) entry slot.
+ * We never compact the entries array (that would move per-entry spinlocks
+ * while concurrent consumers hold them), so destroy leaves a tombstone
+ * that create can later reuse.
+ */
+#define APE_TOMBSTONE 0xFFFFFFFFU
+
+/*
+ * Subject_id -> entries[] index lookup.  Previously every APE op did an
+ * O(n) linear scan of up to TRUST_APE_MAX_ENTITIES (1024) pairs, paid
+ * on every proof mint/consume/verify/nonce/destroy.  With many active
+ * subjects this was the hottest path in the module.
+ *
+ * We replace the scan with a bounded-probe open-addressed hash index
+ * sized 2x the pool so fill factor stays <= 50%, guaranteeing almost
+ * all lookups finish in 1-2 probes.  The index is maintained in the
+ * same lock as g_trust_ape.lock so no separate synchronization is
+ * needed.  Empty slots are 0xFFFF; live slots hold the entries[] index.
+ *
+ * Memory: 2048 * 2 bytes = 4KB — trivial, fits in L1 on both old and
+ * new hardware, no per-CPU duplication.
+ */
+#define APE_INDEX_SIZE  (TRUST_APE_MAX_ENTITIES * 2)
+#define APE_INDEX_EMPTY 0xFFFFU
+#define APE_INDEX_MAX_PROBE 64
+
+static u16 g_ape_index[APE_INDEX_SIZE];
+
+/* FNV-1a 32-bit mixing folded to APE_INDEX_SIZE */
+static inline u32 ape_index_hash(u32 subject_id)
+{
+    u32 h = subject_id;
+    h ^= h >> 16;
+    h *= 0x85ebca6bU;
+    h ^= h >> 13;
+    return h & (APE_INDEX_SIZE - 1);
+}
+
+/* Find index slot for subject_id.  Returns APE_INDEX_SIZE if not found. */
+static u32 ape_index_find(u32 subject_id)
+{
+    u32 h = ape_index_hash(subject_id);
+    u32 i;
+
+    for (i = 0; i < APE_INDEX_MAX_PROBE; i++) {
+        u32 slot = (h + i) & (APE_INDEX_SIZE - 1);
+        u16 idx = g_ape_index[slot];
+        if (idx == APE_INDEX_EMPTY)
+            return APE_INDEX_SIZE;
+        if (idx < TRUST_APE_MAX_ENTITIES &&
+            g_trust_ape.entries[idx].subject_id == subject_id)
+            return slot;
+    }
+    return APE_INDEX_SIZE;
+}
+
+/* Insert subject_id -> entries_idx mapping.  Returns 0 on success. */
+static int ape_index_insert(u32 subject_id, u16 entries_idx)
+{
+    u32 h = ape_index_hash(subject_id);
+    u32 i;
+
+    for (i = 0; i < APE_INDEX_MAX_PROBE; i++) {
+        u32 slot = (h + i) & (APE_INDEX_SIZE - 1);
+        if (g_ape_index[slot] == APE_INDEX_EMPTY) {
+            g_ape_index[slot] = entries_idx;
+            return 0;
+        }
+    }
+    return -ENOSPC;
+}
+
+/*
+ * Remove the index entry for subject_id.  We use backward-shift deletion
+ * to maintain probe-chain integrity — critical for open addressing.
+ */
+static void ape_index_remove(u32 subject_id)
+{
+    u32 slot = ape_index_find(subject_id);
+    u32 mask = APE_INDEX_SIZE - 1;
+    u32 i;
+
+    if (slot == APE_INDEX_SIZE)
+        return;
+
+    g_ape_index[slot] = APE_INDEX_EMPTY;
+
+    /* Shift displaced entries back to preserve probe chains. */
+    for (i = 1; i < APE_INDEX_MAX_PROBE; i++) {
+        u32 next = (slot + i) & mask;
+        u16 idx = g_ape_index[next];
+        u32 desired;
+
+        if (idx == APE_INDEX_EMPTY)
+            break;
+
+        desired = ape_index_hash(g_trust_ape.entries[idx].subject_id);
+        /* Distance from desired to current (next) */
+        if (((next - desired) & mask) == 0)
+            continue; /* Already at its home */
+
+        /* Empty slot is behind 'next'; shift entry into it */
+        g_ape_index[slot] = idx;
+        g_ape_index[next] = APE_INDEX_EMPTY;
+        slot = next;
+    }
+}
+
+/* Find an APE entry by subject_id. O(1) hash lookup with tombstone skip. */
 static trust_ape_entry_t *ape_find(u32 subject_id)
+{
+    u32 slot;
+    u16 idx;
+
+    if (subject_id == APE_TOMBSTONE)
+        return NULL;
+    slot = ape_index_find(subject_id);
+    if (slot == APE_INDEX_SIZE)
+        return NULL;
+    idx = g_ape_index[slot];
+    if (idx >= TRUST_APE_MAX_ENTITIES)
+        return NULL;
+    return &g_trust_ape.entries[idx];
+}
+
+/*
+ * Find a reusable tombstone slot for a new entity.  Returns NULL if
+ * none.  Only walks up to g_trust_ape.count (not MAX) since tombstones
+ * live inside the already-allocated range.  This is a slow path
+ * (create-time only) so the linear scan is acceptable.
+ */
+static trust_ape_entry_t *ape_find_free_slot(u16 *idx_out)
 {
     int i;
     for (i = 0; i < g_trust_ape.count; i++) {
-        if (g_trust_ape.entries[i].subject_id == subject_id)
+        if (g_trust_ape.entries[i].subject_id == APE_TOMBSTONE) {
+            if (idx_out)
+                *idx_out = (u16)i;
             return &g_trust_ape.entries[i];
+        }
     }
     return NULL;
 }
@@ -111,8 +245,13 @@ static trust_ape_entry_t *ape_find(u32 subject_id)
  */
 void trust_ape_init(void)
 {
+    u32 i;
+
     memset(&g_trust_ape, 0, sizeof(g_trust_ape));
     spin_lock_init(&g_trust_ape.lock);
+    /* 0xFFFF != 0, so a plain memset wouldn't work — init each slot */
+    for (i = 0; i < APE_INDEX_SIZE; i++)
+        g_ape_index[i] = APE_INDEX_EMPTY;
     pr_info("trust_ape: Authority Proof Engine initialized (software emulation)\n");
 }
 
@@ -174,28 +313,54 @@ int trust_ape_create_entity(u32 subject_id, const u8 *seed, u32 seed_len)
         return -EEXIST;
     }
 
-    /* Allocate slot */
-    if (g_trust_ape.count >= TRUST_APE_MAX_ENTITIES) {
+    /* Allocate slot: prefer reusing a tombstone, else extend the array. */
+    {
+        u16 entries_idx;
+        entry = ape_find_free_slot(&entries_idx);
+        if (!entry) {
+            if (g_trust_ape.count >= TRUST_APE_MAX_ENTITIES) {
+                /*
+                 * Pool exhaustion: no created_at field available for LRU eviction.
+                 * last_proof_ts in the proof state could serve as a proxy, but
+                 * evicting actively-used entries is dangerous — better to let
+                 * callers clean up stale entities via trust_ape_destroy_entity().
+                 */
+                spin_unlock(&g_trust_ape.lock);
+                memzero_explicit(initial_proof, TRUST_PROOF_SIZE);
+                pr_warn("trust_ape: proof pool exhausted (%d/%d entities), "
+                        "cannot create entity for subject %u\n",
+                        g_trust_ape.count, TRUST_APE_MAX_ENTITIES, subject_id);
+                return -ENOSPC;
+            }
+            entries_idx = (u16)g_trust_ape.count;
+            entry = &g_trust_ape.entries[entries_idx];
+            g_trust_ape.count++;
+            spin_lock_init(&entry->lock);  /* Fresh slot: init lock. */
+        }
         /*
-         * Pool exhaustion: no created_at field available for LRU eviction.
-         * TODO: Add created_at to trust_ape_entry_t and implement LRU
-         * eviction here instead of failing. For now, last_proof_ts in the
-         * proof state could serve as a proxy, but evicting actively-used
-         * entries is dangerous — better to let callers clean up stale
-         * entities explicitly via trust_ape_destroy_entity().
+         * For reused tombstones, the spinlock is already initialized and was
+         * released by the previous holder; do not re-init (would race with
+         * anyone still observing the lock).  Just zero the state payload.
          */
-        spin_unlock(&g_trust_ape.lock);
-        memzero_explicit(initial_proof, TRUST_PROOF_SIZE);
-        pr_warn("trust_ape: proof pool exhausted (%d/%d entities), "
-                "cannot create entity for subject %u\n",
-                g_trust_ape.count, TRUST_APE_MAX_ENTITIES, subject_id);
-        return -ENOSPC;
-    }
+        entry->subject_id = subject_id;
+        memset(&entry->state, 0, sizeof(entry->state));
 
-    entry = &g_trust_ape.entries[g_trust_ape.count];
-    memset(entry, 0, sizeof(*entry));
-    entry->subject_id = subject_id;
-    spin_lock_init(&entry->lock);
+        /* Maintain fast-lookup index */
+        if (ape_index_insert(subject_id, entries_idx) != 0) {
+            /*
+             * Index full (probe chain too long).  Revert: the entry slot
+             * is left as a tombstone ready for re-use.  With size = 2x
+             * pool and bounded probes this should never happen in
+             * practice, but fail closed for safety.
+             */
+            entry->subject_id = APE_TOMBSTONE;
+            spin_unlock(&g_trust_ape.lock);
+            memzero_explicit(initial_proof, TRUST_PROOF_SIZE);
+            pr_warn("trust_ape: index probe overflow for subject %u\n",
+                    subject_id);
+            return -ENOSPC;
+        }
+    }
 
     /* Write seed (write-once — will never be exposed to userspace) */
     memcpy(entry->state.seed, local_seed, TRUST_SEED_SIZE);
@@ -212,7 +377,6 @@ int trust_ape_create_entity(u32 subject_id, const u8 *seed, u32 seed_len)
     entry->state.hash_cfg = derive_hash_cfg(entry->state.proof);
     entry->state.last_proof_ts = ts;
 
-    g_trust_ape.count++;
     spin_unlock(&g_trust_ape.lock);
 
     /* Securely zero temporary proof material */
@@ -231,7 +395,6 @@ int trust_ape_create_entity(u32 subject_id, const u8 *seed, u32 seed_len)
 int trust_ape_destroy_entity(u32 subject_id)
 {
     trust_ape_entry_t *entry;
-    int idx;
 
     spin_lock(&g_trust_ape.lock);
     entry = ape_find(subject_id);
@@ -240,17 +403,26 @@ int trust_ape_destroy_entity(u32 subject_id)
         return -ENOENT;
     }
 
+    /*
+     * Wait for any active consumer to finish before tombstoning.
+     * A concurrent trust_ape_consume_proof() may hold entry->lock after
+     * releasing g_trust_ape.lock; taking entry->lock here serializes with
+     * it.  We do NOT compact the array — that would relocate the spinlock
+     * itself and break any waiter.  Instead we tombstone the slot so
+     * subsequent creates can reuse it with the same (still-valid) lock.
+     */
+    spin_lock(&entry->lock);
+
+    /* Remove from fast-lookup index before tombstoning the entry so
+     * concurrent lookups skip straight to "not found" instead of
+     * racing through the tombstone. */
+    ape_index_remove(subject_id);
+
     /* Securely zero all proof material */
     memzero_explicit(&entry->state, sizeof(entry->state));
+    entry->subject_id = APE_TOMBSTONE;
 
-    /* Compact array */
-    idx = entry - g_trust_ape.entries;
-    if (idx < g_trust_ape.count - 1) {
-        memmove(&g_trust_ape.entries[idx],
-                &g_trust_ape.entries[idx + 1],
-                sizeof(trust_ape_entry_t) * (g_trust_ape.count - idx - 1));
-    }
-    g_trust_ape.count--;
+    spin_unlock(&entry->lock);
     spin_unlock(&g_trust_ape.lock);
 
     pr_info("trust_ape: destroyed proof chain for subject %u\n", subject_id);
@@ -433,9 +605,15 @@ int trust_ape_get_nonce(u32 subject_id, u64 *nonce_out)
         return -ENOENT;
     }
 
-    /* Copy while holding lock — entry may be invalidated after unlock */
-    nonce = entry->state.nonce;
+    /*
+     * Take the per-entry lock before reading the 64-bit nonce.
+     * trust_ape_consume_proof() mutates state.nonce under entry->lock
+     * (not g_trust_ape.lock), so reading without it can tear on 32-bit.
+     */
+    spin_lock(&entry->lock);
     spin_unlock(&g_trust_ape.lock);
+    nonce = entry->state.nonce;
+    spin_unlock(&entry->lock);
 
     *nonce_out = nonce;
     return 0;
@@ -456,9 +634,12 @@ int trust_ape_get_chain_length(u32 subject_id, u32 *length_out)
         return -ENOENT;
     }
 
-    /* Copy while holding lock — entry may be invalidated after unlock */
-    length = entry->state.chain_length;
+    /* Take entry->lock for a coherent read of state fields that consume
+     * mutates under entry->lock (not g_trust_ape.lock). */
+    spin_lock(&entry->lock);
     spin_unlock(&g_trust_ape.lock);
+    length = entry->state.chain_length;
+    spin_unlock(&entry->lock);
 
     *length_out = length;
     return 0;

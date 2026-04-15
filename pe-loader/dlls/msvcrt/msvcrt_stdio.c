@@ -22,18 +22,30 @@
 #include "common/dll_common.h"
 #include "compat/ms_abi_format.h"
 
-/* _snprintf is the MSVC name for snprintf */
+/* _snprintf is the MSVC name for snprintf.
+ * NOTE: MS _snprintf returns the number that WOULD have been written when
+ * the buffer is too small (same as C99 snprintf), but it does NOT guarantee
+ * NUL-termination on truncation.  ms_abi_vformat always NUL-terminates when
+ * size>0; we don't "fix" that here because apps that check the return value
+ * still behave identically.  (If size==0, we route through the NULL-buf
+ * branch to avoid the bufsz-1 underflow inside the format engine.) */
 WINAPI_EXPORT int _snprintf(char *str, size_t size, const char *format, ...)
 {
     __builtin_ms_va_list args;
     __builtin_ms_va_start(args, format);
-    int ret = ms_abi_vformat(NULL, str, size, format, args);
+    int ret;
+    if (!str || size == 0)
+        ret = ms_abi_vformat(NULL, NULL, 0, format, args);
+    else
+        ret = ms_abi_vformat(NULL, str, size, format, args);
     __builtin_ms_va_end(args);
     return ret;
 }
 
 WINAPI_EXPORT int _vsnprintf(char *str, size_t size, const char *format, __builtin_ms_va_list ap)
 {
+    if (!str || size == 0)
+        return ms_abi_vformat(NULL, NULL, 0, format, ap);
     return ms_abi_vformat(NULL, str, size, format, ap);
 }
 
@@ -47,10 +59,184 @@ WINAPI_EXPORT FILE **__iob_func(void)
     return iob;
 }
 
-/* MSVCRT _errno */
+/* ================================================================
+ * Windows errno mapping.
+ *
+ * Linux and Windows define disjoint numeric values for several errno
+ * codes (EILSEQ, ENAMETOOLONG, ENOTEMPTY, EDEADLK, ENOLCK, ENOSYS).
+ * PE apps that compare *_errno() to a numeric constant from their
+ * MSVC errno.h will misidentify errors unless we translate here.
+ *
+ * We keep a thread-local mapped int; every call to _errno / _errno_func
+ * / _o__errno refreshes it from the live libc errno so that subsequent
+ * libc calls still report through the real TLS location.
+ * ================================================================ */
+
+/* Windows errno values (from MSVC errno.h) */
+#define W_EPERM         1
+#define W_ENOENT        2
+#define W_ESRCH         3
+#define W_EINTR         4
+#define W_EIO           5
+#define W_ENXIO         6
+#define W_E2BIG         7
+#define W_ENOEXEC       8
+#define W_EBADF         9
+#define W_ECHILD        10
+#define W_EAGAIN        11
+#define W_ENOMEM        12
+#define W_EACCES        13
+#define W_EFAULT        14
+#define W_EBUSY         16
+#define W_EEXIST        17
+#define W_EXDEV         18
+#define W_ENODEV        19
+#define W_ENOTDIR       20
+#define W_EISDIR        21
+#define W_EINVAL        22
+#define W_ENFILE        23
+#define W_EMFILE        24
+#define W_ENOTTY        25
+#define W_EFBIG         27
+#define W_ENOSPC        28
+#define W_ESPIPE        29
+#define W_EROFS         30
+#define W_EMLINK        31
+#define W_EPIPE         32
+#define W_EDOM          33
+#define W_ERANGE        34
+#define W_EDEADLK       36
+#define W_ENAMETOOLONG  38
+#define W_ENOLCK        39
+#define W_ENOSYS        40
+#define W_ENOTEMPTY     41
+#define W_EILSEQ        42
+#define W_STRUNCATE     80
+
+/* Forward translation: libc (Linux) errno -> MSVC errno. */
+int pe_map_errno_linux_to_win(int e)
+{
+    switch (e) {
+    case 0:             return 0;
+    case EPERM:         return W_EPERM;
+    case ENOENT:        return W_ENOENT;
+    case ESRCH:         return W_ESRCH;
+    case EINTR:         return W_EINTR;
+    case EIO:           return W_EIO;
+    case ENXIO:         return W_ENXIO;
+    case E2BIG:         return W_E2BIG;
+    case ENOEXEC:       return W_ENOEXEC;
+    case EBADF:         return W_EBADF;
+    case ECHILD:        return W_ECHILD;
+    case EAGAIN:        return W_EAGAIN;
+    case ENOMEM:        return W_ENOMEM;
+    case EACCES:        return W_EACCES;
+    case EFAULT:        return W_EFAULT;
+    case EBUSY:         return W_EBUSY;
+    case EEXIST:        return W_EEXIST;
+    case EXDEV:         return W_EXDEV;
+    case ENODEV:        return W_ENODEV;
+    case ENOTDIR:       return W_ENOTDIR;
+    case EISDIR:        return W_EISDIR;
+    case EINVAL:        return W_EINVAL;
+    case ENFILE:        return W_ENFILE;
+    case EMFILE:        return W_EMFILE;
+    case ENOTTY:        return W_ENOTTY;
+    case EFBIG:         return W_EFBIG;
+    case ENOSPC:        return W_ENOSPC;
+    case ESPIPE:        return W_ESPIPE;
+    case EROFS:         return W_EROFS;
+    case EMLINK:        return W_EMLINK;
+    case EPIPE:         return W_EPIPE;
+    case EDOM:          return W_EDOM;
+    case ERANGE:        return W_ERANGE;
+    case EDEADLK:       return W_EDEADLK;
+    case ENAMETOOLONG:  return W_ENAMETOOLONG;
+    case ENOLCK:        return W_ENOLCK;
+    case ENOSYS:        return W_ENOSYS;
+    case ENOTEMPTY:     return W_ENOTEMPTY;
+    case EILSEQ:        return W_EILSEQ;
+    default:            return e;  /* passthrough for unmapped codes */
+    }
+}
+
+/* Reverse translation: MSVC errno -> libc (Linux) errno.
+ * Used by _set_errno so subsequent libc calls see the right errno. */
+int pe_map_errno_win_to_linux(int e)
+{
+    switch (e) {
+    case 0:               return 0;
+    case W_EPERM:         return EPERM;
+    case W_ENOENT:        return ENOENT;
+    case W_ESRCH:         return ESRCH;
+    case W_EINTR:         return EINTR;
+    case W_EIO:           return EIO;
+    case W_ENXIO:         return ENXIO;
+    case W_E2BIG:         return E2BIG;
+    case W_ENOEXEC:       return ENOEXEC;
+    case W_EBADF:         return EBADF;
+    case W_ECHILD:        return ECHILD;
+    case W_EAGAIN:        return EAGAIN;
+    case W_ENOMEM:        return ENOMEM;
+    case W_EACCES:        return EACCES;
+    case W_EFAULT:        return EFAULT;
+    case W_EBUSY:         return EBUSY;
+    case W_EEXIST:        return EEXIST;
+    case W_EXDEV:         return EXDEV;
+    case W_ENODEV:        return ENODEV;
+    case W_ENOTDIR:       return ENOTDIR;
+    case W_EISDIR:        return EISDIR;
+    case W_EINVAL:        return EINVAL;
+    case W_ENFILE:        return ENFILE;
+    case W_EMFILE:        return EMFILE;
+    case W_ENOTTY:        return ENOTTY;
+    case W_EFBIG:         return EFBIG;
+    case W_ENOSPC:        return ENOSPC;
+    case W_ESPIPE:        return ESPIPE;
+    case W_EROFS:         return EROFS;
+    case W_EMLINK:        return EMLINK;
+    case W_EPIPE:         return EPIPE;
+    case W_EDOM:          return EDOM;
+    case W_ERANGE:        return ERANGE;
+    case W_EDEADLK:       return EDEADLK;
+    case W_ENAMETOOLONG:  return ENAMETOOLONG;
+    case W_ENOLCK:        return ENOLCK;
+    case W_ENOSYS:        return ENOSYS;
+    case W_ENOTEMPTY:     return ENOTEMPTY;
+    case W_EILSEQ:        return EILSEQ;
+    default:              return e;  /* passthrough */
+    }
+}
+
+/* Thread-local Windows-space errno buffer. GCC __thread suffices
+ * for libpe_msvcrt.so (glibc TLS, no static linking quirks). */
+static __thread int g_win_errno = 0;
+
+/* MSVCRT _errno.  MSVC apps read *_errno(); we translate from live
+ * libc errno on each call so the value is always fresh.  Writes
+ * through the returned pointer only update g_win_errno (the next
+ * _errno() call will overwrite it from libc errno anyway — the
+ * "correct" way for apps to set errno is _set_errno()). */
 WINAPI_EXPORT int *_errno(void)
 {
-    return &errno;
+    g_win_errno = pe_map_errno_linux_to_win(errno);
+    return &g_win_errno;
+}
+
+/* _get_errno(int *) — return current errno in Windows space. */
+WINAPI_EXPORT int _get_errno(int *pValue)
+{
+    if (!pValue) return W_EINVAL;
+    *pValue = pe_map_errno_linux_to_win(errno);
+    return 0;
+}
+
+/* _set_errno(int) — accept Windows-space errno, translate to libc. */
+WINAPI_EXPORT int _set_errno(int value)
+{
+    errno = pe_map_errno_win_to_linux(value);
+    g_win_errno = value;
+    return 0;
 }
 
 /* MSVCRT exit functions */
@@ -362,6 +548,7 @@ WINAPI_EXPORT uintptr_t _beginthreadex(
 struct beginthread_trampoline_data {
     _beginthread_proc func;
     void *arg;
+    thread_data_t *tdata;
 };
 
 static void *beginthread_trampoline(void *raw)
@@ -369,8 +556,15 @@ static void *beginthread_trampoline(void *raw)
     struct beginthread_trampoline_data *data = (struct beginthread_trampoline_data *)raw;
     _beginthread_proc func = data->func;
     void *arg = data->arg;
+    thread_data_t *tdata = data->tdata;
     free(data);
     func(arg);
+    /* Signal finish so WaitForSingleObject on the returned HANDLE works. */
+    pthread_mutex_lock(&tdata->finish_lock);
+    tdata->exit_code = 0;
+    tdata->finished = 1;
+    pthread_cond_broadcast(&tdata->finish_cond);
+    pthread_mutex_unlock(&tdata->finish_lock);
     return NULL;
 }
 
@@ -379,26 +573,41 @@ WINAPI_EXPORT uintptr_t _beginthread(
     unsigned stack_size,
     void *arglist)
 {
+    /* MS _beginthread returns an opaque handle that can be passed to
+     * WaitForSingleObject / CloseHandle.  Previous implementation returned
+     * the raw pthread_t which is meaningless to Win32 handle consumers and
+     * prevented apps from synchronising on thread exit. */
+    thread_data_t *tdata = calloc(1, sizeof(thread_data_t));
+    if (!tdata) return (uintptr_t)-1;
+    pthread_mutex_init(&tdata->suspend_lock, NULL);
+    pthread_cond_init(&tdata->suspend_cond, NULL);
+    pthread_mutex_init(&tdata->finish_lock, NULL);
+    pthread_cond_init(&tdata->finish_cond, NULL);
+
     struct beginthread_trampoline_data *data = malloc(sizeof(*data));
-    if (!data) return (uintptr_t)-1;
+    if (!data) { free(tdata); return (uintptr_t)-1; }
     data->func = start_address;
     data->arg = arglist;
+    data->tdata = tdata;
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     if (stack_size > 0)
         pthread_attr_setstacksize(&attr, stack_size);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    /* Must be joinable so the HANDLE can observe exit via pthread_join. */
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
 
-    pthread_t tid;
-    int ret = pthread_create(&tid, &attr, beginthread_trampoline, data);
+    int ret = pthread_create(&tdata->pthread, &attr, beginthread_trampoline, data);
     pthread_attr_destroy(&attr);
 
     if (ret != 0) {
         free(data);
+        free(tdata);
         return (uintptr_t)-1;
     }
-    return (uintptr_t)tid;
+
+    HANDLE h = handle_alloc(HANDLE_TYPE_THREAD, -1, tdata);
+    return (uintptr_t)h;
 }
 
 WINAPI_EXPORT void _endthread(void)
@@ -479,7 +688,10 @@ WINAPI_EXPORT int __stdio_common_vsprintf(
     const char *format, void *locale, __builtin_ms_va_list argptr)
 {
     (void)options; (void)locale;
-    if (buffer && bufferCount > 0) buffer[0] = '\0';
+    /* When buffer is NULL or bufferCount is 0 UCRT acts as size query. */
+    if (!buffer || bufferCount == 0)
+        return ms_abi_vformat(NULL, NULL, 0, format, argptr);
+    buffer[0] = '\0';
     return ms_abi_vformat(NULL, buffer, bufferCount, format, argptr);
 }
 
@@ -488,7 +700,9 @@ WINAPI_EXPORT int __stdio_common_vsprintf_s(
     const char *format, void *locale, __builtin_ms_va_list argptr)
 {
     (void)options; (void)locale;
-    if (buffer && bufferCount > 0) buffer[0] = '\0';
+    if (!buffer || bufferCount == 0)
+        return ms_abi_vformat(NULL, NULL, 0, format, argptr);
+    buffer[0] = '\0';
     return ms_abi_vformat(NULL, buffer, bufferCount, format, argptr);
 }
 
@@ -644,6 +858,7 @@ WINAPI_EXPORT int __stdio_common_vswprintf(
     const uint16_t *format, void *locale, __builtin_ms_va_list argptr)
 {
     (void)options; (void)locale;
+    if (!format) return -1;
     /* Format to narrow buffer, then widen each byte to uint16_t */
     char narrow_fmt[2048], narrow_out[4096];
     int i = 0;
@@ -653,9 +868,11 @@ WINAPI_EXPORT int __stdio_common_vswprintf(
     }
     narrow_fmt[i] = '\0';
     int len = ms_abi_vformat(NULL, narrow_out, sizeof(narrow_out), narrow_fmt, argptr);
+    /* bufferCount==0 ==> measure-only.  bufferCount==1 ==> only NUL fits. */
     if (buffer && bufferCount > 0) {
+        size_t max_out = bufferCount - 1;
         size_t j;
-        for (j = 0; j < bufferCount - 1 && narrow_out[j]; j++)
+        for (j = 0; j < max_out && narrow_out[j]; j++)
             buffer[j] = (uint16_t)(unsigned char)narrow_out[j];
         buffer[j] = 0;
     }
@@ -945,10 +1162,13 @@ WINAPI_EXPORT int tmpnam_s(char *str, size_t sizeInChars)
     if (!str || sizeInChars < 16) return 22;
     char *tmp = tmpnam(NULL);
     if (tmp) {
-        strncpy(str, tmp, sizeInChars - 1);
-        str[sizeInChars - 1] = '\0';
+        size_t len = strlen(tmp);
+        if (len >= sizeInChars) len = sizeInChars - 1;
+        memcpy(str, tmp, len);
+        str[len] = '\0';
         return 0;
     }
+    str[0] = '\0';
     return 22;
 }
 
@@ -1268,7 +1488,9 @@ WINAPI_EXPORT int _o__set_new_mode(int mode) { (void)mode; return 0; }
 WINAPI_EXPORT void _o__invalid_parameter_noinfo(void) { }
 WINAPI_EXPORT int _o__purecall(void) { fprintf(stderr, "[msvcrt] pure virtual call\n"); abort(); return 0; }
 WINAPI_EXPORT int _o__configthreadlocale(int type) { (void)type; return 1; }
-WINAPI_EXPORT int *_o__errno(void) { return &errno; }
+WINAPI_EXPORT int *_o__errno(void) { return _errno(); }
+WINAPI_EXPORT int _o__get_errno(int *p) { return _get_errno(p); }
+WINAPI_EXPORT int _o__set_errno(int v) { return _set_errno(v); }
 WINAPI_EXPORT int _o__callnewh(size_t size) { (void)size; return 0; }
 WINAPI_EXPORT int _o__crt_atexit(void (*f)(void)) { return pe_atexit_register(f); }
 
@@ -1315,7 +1537,18 @@ WINAPI_EXPORT void _o___std_exception_copy(const void *src, void *dst) {
     if (src && dst) memcpy(dst, src, sizeof(void*) * 2);
 }
 WINAPI_EXPORT void _o___std_exception_destroy(void *exc) {
-    if (exc) { void **p = (void**)exc; free(p[0]); p[0] = NULL; }
+    /*
+     * Match the DoFree-flag-aware implementation in msvcrt_except.c.
+     * Original code called free(p[0]) on the What pointer unconditionally,
+     * which corrupts the heap when What is a string literal (DoFree==false).
+     */
+    if (!exc) return;
+    struct { const char *what; unsigned char do_free; } *data = exc;
+    if (data->do_free && data->what) {
+        free((void *)data->what);
+        data->what = NULL;
+        data->do_free = 0;
+    }
 }
 
 /* Additional _o_ prefixed UCRT private aliases for stdio/runtime functions */
@@ -1514,11 +1747,14 @@ WINAPI_EXPORT int _open(const char *filename, int oflag, ...)
 
 WINAPI_EXPORT int _wopen(const uint16_t *filename, int oflag, ...)
 {
+    if (!filename) { errno = EINVAL; return -1; }
     char path[4096] = {0};
-    for (int i = 0; filename && filename[i] && i < 4095; i++)
+    for (int i = 0; filename[i] && i < 4095; i++)
         path[i] = (char)filename[i];
     __builtin_ms_va_list ap; __builtin_ms_va_start(ap, oflag);
-    int mode = *(int *)ap;
+    /* Only consume a mode argument when O_CREAT is set — reading an
+     * unset va_list slot is UB.  _open below re-parses ap for mode. */
+    int mode = (oflag & WIN_O_CREAT) ? *(int *)ap : 0666;
     __builtin_ms_va_end(ap);
     return _open(path, oflag, mode);
 }

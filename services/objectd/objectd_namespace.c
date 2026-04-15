@@ -340,6 +340,14 @@ int objectd_namespace_handle(uint8_t req_type, const void *payload,
                              void *resp_buf, size_t resp_buf_size,
                              size_t *resp_len)
 {
+    /* Guard against undersized response buffer.  If resp_buf_size is
+     * smaller than the response header, resp_data_max would underflow
+     * to a huge value and subsequent memcpy would clobber memory. */
+    if (resp_buf_size < sizeof(objectd_response_t) || !resp_buf || !resp_len) {
+        if (resp_len) *resp_len = 0;
+        return -1;
+    }
+
     objectd_response_t *resp = (objectd_response_t *)resp_buf;
     uint8_t *resp_data = (uint8_t *)resp_buf + sizeof(objectd_response_t);
     size_t resp_data_max = resp_buf_size - sizeof(objectd_response_t);
@@ -429,13 +437,12 @@ int objectd_namespace_handle(uint8_t req_type, const void *payload,
         int count = 0;
         namespace_enumerate(prefix, entries, 64, &count);
 
-        /* Build response: ns_enumerate_response_t + entries */
-        ns_enumerate_response_t ne;
-        ne.count = (uint32_t)count;
-
-        size_t offset = sizeof(ne);
+        /* Build response: ns_enumerate_response_t + entries.
+         * Emit count matches entries actually written, not entries found,
+         * so clients parsing the payload don't walk past the end. */
+        size_t offset = sizeof(ns_enumerate_response_t);
         uint8_t tmp_buf[8192];
-        memcpy(tmp_buf, &ne, sizeof(ne));
+        int emitted = 0;
 
         for (int i = 0; i < count; i++) {
             uint32_t nlen = (uint32_t)strlen(entries[i].win_path);
@@ -453,7 +460,13 @@ int objectd_namespace_handle(uint8_t req_type, const void *payload,
             offset += sizeof(tlen);
             memcpy(tmp_buf + offset, entries[i].linux_path, tlen + 1);
             offset += tlen + 1;
+            emitted++;
         }
+
+        /* Write header now that we know how many entries we actually emitted */
+        ns_enumerate_response_t ne;
+        ne.count = (uint32_t)emitted;
+        memcpy(tmp_buf, &ne, sizeof(ne));
 
         if (offset <= resp_data_max) {
             memcpy(resp_data, tmp_buf, offset);

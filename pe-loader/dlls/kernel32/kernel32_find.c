@@ -147,7 +147,14 @@ WINAPI_EXPORT HANDLE FindFirstFileA(LPCSTR lpFileName, WIN32_FIND_DATAA *lpFindF
 
         if (fnmatch(fdata->pattern, ent->d_name, FNM_CASEFOLD) == 0) {
             fill_find_data(lpFindFileData, fdata->dir_path, ent->d_name);
-            return handle_alloc(HANDLE_TYPE_FIND, -1, fdata);
+            HANDLE h = handle_alloc(HANDLE_TYPE_FIND, -1, fdata);
+            if (h == INVALID_HANDLE_VALUE) {
+                closedir(fdata->dir);
+                free(fdata);
+                set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+                return INVALID_HANDLE_VALUE;
+            }
+            return h;
         }
     }
 

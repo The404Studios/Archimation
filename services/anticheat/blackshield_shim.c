@@ -21,6 +21,7 @@
  * import level and route through this shim. The shim returns success stubs.
  */
 
+#define _GNU_SOURCE  /* for pthread_timedjoin_np */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -539,10 +540,20 @@ int bs_stop(void)
 
     fprintf(stderr, BS_LOG_PREFIX "Stopping Blackshield shim\n");
 
-    /* Stop heartbeat */
+    /* Stop heartbeat (bounded wait; detach if stuck) */
     if (__atomic_load_n(&g_bs.heartbeat_active, __ATOMIC_ACQUIRE)) {
         __atomic_store_n(&g_bs.heartbeat_active, 0, __ATOMIC_RELEASE);
-        pthread_join(g_bs.heartbeat_thread, NULL);
+
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += 5;
+
+        int join_ret = pthread_timedjoin_np(g_bs.heartbeat_thread, NULL, &deadline);
+        if (join_ret != 0) {
+            fprintf(stderr, BS_LOG_PREFIX "Heartbeat join timed out (%d), detaching\n",
+                    join_ret);
+            pthread_detach(g_bs.heartbeat_thread);
+        }
     }
 
     g_bs.status = BS_STATUS_STOPPED;

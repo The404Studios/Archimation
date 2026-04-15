@@ -59,11 +59,11 @@ int pe_tls_init(pe_image_t *image)
         return 0;
 
     /* Check if TLS directory exists */
-    if (image->number_of_rva_and_sizes <= 9)
+    if (image->number_of_rva_and_sizes <= PE_DIR_TLS)
         return 0;
 
-    uint32_t tls_rva = image->data_directory[9].virtual_address;
-    uint32_t tls_size = image->data_directory[9].size;
+    uint32_t tls_rva = image->data_directory[PE_DIR_TLS].virtual_address;
+    uint32_t tls_size = image->data_directory[PE_DIR_TLS].size;
 
     if (tls_rva == 0 || tls_size == 0)
         return 0;
@@ -162,6 +162,9 @@ void pe_tls_alloc_thread(void)
             continue;
         }
 
+        if (pthread_getspecific(g_tls_keys[i]) != NULL)
+            continue;
+
         void *data = calloc(1, total_size);
         if (!data)
             continue;
@@ -229,7 +232,15 @@ void pe_tls_cleanup(void)
 
     for (int i = 0; i < g_tls_count; i++) {
         void *data = pthread_getspecific(g_tls_keys[i]);
-        free(data);
+        /* CRITICAL: clear the specific *before* freeing so tls_destructor
+         * (still armed until pthread_key_delete) can't double-free the
+         * same block if this thread's specific hook fires during exit.
+         * Also stops other threads holding the same key from observing
+         * a dangling pointer after we free their data below. */
+        if (data) {
+            pthread_setspecific(g_tls_keys[i], NULL);
+            free(data);
+        }
         pthread_key_delete(g_tls_keys[i]);
     }
     g_tls_count = 0;

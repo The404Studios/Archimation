@@ -12,6 +12,11 @@
 #include <string.h>
 #include <ctype.h>
 #include <pthread.h>
+#include <unistd.h>
+#include <errno.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 
 #include "common/dll_common.h"
 
@@ -344,22 +349,24 @@ WINAPI_EXPORT HRESULT CoGetClassObject(
 
     pthread_mutex_lock(&g_registry_lock);
     void *factory = find_class_factory(rclsid);
+    /* AddRef while holding the lock so CoRevokeClassObject on another
+     * thread cannot drop the last reference and destroy the factory
+     * between lookup and AddRef. */
+    if (factory &&
+        (guid_equal(riid, &IID_IClassFactory) || guid_equal(riid, &IID_IUnknown))) {
+        IClassFactoryVtbl **vtbl_ptr = (IClassFactoryVtbl **)factory;
+        if (*vtbl_ptr && (*vtbl_ptr)->AddRef)
+            (*vtbl_ptr)->AddRef(factory);
+        pthread_mutex_unlock(&g_registry_lock);
+        *ppv = factory;
+        return S_OK;
+    }
     pthread_mutex_unlock(&g_registry_lock);
 
     if (!factory) {
         fprintf(stderr, "[ole32] CoGetClassObject: CLSID {%08X-...} not registered\n",
                 rclsid->Data1);
         return REGDB_E_CLASSNOTREG;
-    }
-
-    /* QI the factory for the requested interface */
-    if (guid_equal(riid, &IID_IClassFactory) || guid_equal(riid, &IID_IUnknown)) {
-        /* AddRef through the vtable */
-        IClassFactoryVtbl **vtbl_ptr = (IClassFactoryVtbl **)factory;
-        if (*vtbl_ptr && (*vtbl_ptr)->AddRef)
-            (*vtbl_ptr)->AddRef(factory);
-        *ppv = factory;
-        return S_OK;
     }
 
     return E_NOINTERFACE;
@@ -585,19 +592,40 @@ WINAPI_EXPORT HRESULT CoCreateGuid(GUID *pguid)
     if (!pguid)
         return E_POINTER;
 
-    /* Read 16 random bytes from /dev/urandom */
-    FILE *f = fopen("/dev/urandom", "rb");
-    if (!f) {
-        /* Fallback: use a weak PRNG if /dev/urandom is unavailable */
-        srand((unsigned int)((uintptr_t)pguid ^ (uintptr_t)&f));
+    int filled = 0;
+    /* Session 30: CoCreateGuid was opening /dev/urandom on every call with
+     * fopen, adding two syscalls per GUID. Games/installers generate a lot
+     * of GUIDs at startup (one per registered class). Use getrandom(2) first
+     * for a single syscall, falling back to /dev/urandom. We don't link against
+     * bcrypt here to avoid a cross-DLL ms_abi/sysv_abi calling-convention
+     * mismatch — a direct syscall / read() stays in sysv_abi. */
+#if defined(__linux__)
+    {
+# ifndef SYS_getrandom
+#  define SYS_getrandom 318
+# endif
+        ssize_t got = 0;
+        while ((size_t)got < 16) {
+            long r = syscall(SYS_getrandom, (uint8_t *)pguid + got, 16 - got, 0);
+            if (r > 0) { got += r; continue; }
+            if (r < 0 && errno == EINTR) continue;
+            break;
+        }
+        if (got == 16) filled = 1;
+    }
+#endif
+    if (!filled) {
+        FILE *f = fopen("/dev/urandom", "rb");
+        if (f) {
+            if (fread(pguid, 1, 16, f) == 16) filled = 1;
+            fclose(f);
+        }
+    }
+    if (!filled) {
+        /* Last-resort weak PRNG — never in normal operation. */
+        srand((unsigned int)((uintptr_t)pguid ^ (uintptr_t)&filled));
         for (int i = 0; i < 16; i++)
             ((BYTE *)pguid)[i] = (BYTE)(rand() & 0xFF);
-    } else {
-        if (fread(pguid, 1, 16, f) != 16) {
-            fclose(f);
-            return E_FAIL;
-        }
-        fclose(f);
     }
 
     /* Set version to 4 (random) in Data3: top nibble = 0100b */

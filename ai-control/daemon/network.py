@@ -11,10 +11,98 @@ All subprocess operations are async to avoid blocking the FastAPI event loop.
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
+import re
+import time
 
 logger = logging.getLogger("ai-control.network")
+
+# Cache DNS / routes / wifi scan for a short TTL. These data sources rarely
+# change between back-to-back requests, and nmcli/ip/resolvectl spawns are
+# not free on slow hardware. Per-function TTL since stale WiFi data is more
+# harmful than stale route tables.
+_DNS_CACHE_TTL = 10.0
+_ROUTES_CACHE_TTL = 5.0
+_IPADDR_CACHE_TTL = 5.0
+_WIFI_SCAN_TTL = 15.0
+
+
+def _sanitize_log(s) -> str:
+    if not isinstance(s, str):
+        s = str(s)
+    return s.replace("\r", "\\r").replace("\n", "\\n").replace("\x00", "\\0")[:512]
+
+
+def _valid_hostname(host: str) -> bool:
+    """Accept either a plain IPv4/IPv6 literal or a DNS label chain.
+
+    Refuses anything that starts with '-' (argument injection into ping/nmcli),
+    contains shell metacharacters, or contains whitespace/NUL.
+    """
+    if not isinstance(host, str) or not host or len(host) > 253:
+        return False
+    if host.startswith("-"):
+        return False
+    if any(c in host for c in "\x00\n\r \t;|&$`<>*?\"'\\"):
+        return False
+    # IP literal?
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    # Hostname: labels of [A-Za-z0-9-], separated by '.'. Underscores allowed
+    # for SRV-style names.
+    return all(
+        re.fullmatch(r"[A-Za-z0-9_]([A-Za-z0-9_\-]{0,61}[A-Za-z0-9_])?", lbl) is not None
+        for lbl in host.rstrip(".").split(".")
+    )
+
+
+def _valid_ssid(ssid: str) -> bool:
+    """SSIDs can be up to 32 bytes; reject flag-lead and control chars."""
+    if not isinstance(ssid, str) or not ssid:
+        return False
+    if ssid.startswith("-"):
+        return False
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in ssid):
+        return False
+    try:
+        if len(ssid.encode("utf-8")) > 32:
+            return False
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _valid_wifi_password(pw: str) -> bool:
+    """WPA-PSK passphrases are 8..63 printable ASCII, or 64 hex."""
+    if not isinstance(pw, str) or not pw:
+        return False
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in pw):
+        return False
+    if not (8 <= len(pw) <= 63 or (len(pw) == 64 and all(c in "0123456789abcdefABCDEF" for c in pw))):
+        return False
+    return True
+
+
+def _valid_connection_name(name: str) -> bool:
+    """NetworkManager connection name — saved-connection identifier."""
+    if not isinstance(name, str) or not name:
+        return False
+    if name.startswith("-"):
+        return False
+    if any(c in name for c in "\x00\n\r"):
+        return False
+    return len(name) <= 256
+
+
+def _valid_nm_device(dev: str) -> bool:
+    if not isinstance(dev, str) or not dev or dev.startswith("-"):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9._:\-]{1,32}", dev))
 
 
 async def _run(*args, timeout: int = 10):
@@ -30,8 +118,14 @@ async def _run(*args, timeout: int = 10):
         return proc.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace")
     except asyncio.TimeoutError:
         if proc is not None:
-            proc.kill()
-            await proc.wait()  # Reap the killed process to prevent zombies
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()  # Reap the killed process to prevent zombies
+            except Exception:
+                pass
         return -1, "", "timeout"
     except FileNotFoundError:
         return -1, "", f"{args[0]} not found"
@@ -53,7 +147,11 @@ class NetworkController:
     """Full network control capabilities."""
 
     def __init__(self):
-        pass
+        # Per-call TTL caches — bounded by time, not size.
+        self._ipaddr_cache: tuple[list, float] | None = None
+        self._routes_cache: tuple[list, float] | None = None
+        self._dns_cache: tuple[list, float] | None = None
+        self._wifi_scan_cache: tuple[dict, float] | None = None
 
     async def get_connections(self) -> list[dict]:
         # Use \n as field separator to avoid colon-splitting issues
@@ -103,7 +201,16 @@ class NetworkController:
         return networks
 
     async def wifi_scan(self) -> dict:
-        """Force a WiFi rescan and return deduplicated results with full info."""
+        """Force a WiFi rescan and return deduplicated results with full info.
+
+        Cached for _WIFI_SCAN_TTL seconds. NetworkManager throttles its own
+        rescan internally (min 30s between hard scans), so polling this API
+        faster than the TTL wastes a 2s sleep + nmcli fork per request.
+        """
+        now = time.monotonic()
+        cached = self._wifi_scan_cache
+        if cached is not None and (now - cached[1]) < _WIFI_SCAN_TTL:
+            return cached[0]
         await _run("nmcli", "device", "wifi", "rescan", timeout=15)
         # Brief pause so NetworkManager populates scan results
         await asyncio.sleep(2)
@@ -159,10 +266,22 @@ class NetworkController:
             if n["ssid"] and n["ssid"] not in seen:
                 seen.add(n["ssid"])
                 unique.append(n)
-        return {"status": "ok", "networks": unique}
+        result = {"status": "ok", "networks": unique}
+        # Re-sample time: the rescan + 2s sleep + nmcli list can take 15s+.
+        self._wifi_scan_cache = (result, time.monotonic())
+        return result
 
     async def connect_wifi(self, ssid: str, password: str = None) -> dict:
-        cmd = ["nmcli", "device", "wifi", "connect", ssid]
+        if not _valid_ssid(ssid):
+            return {"status": "error", "connected": False,
+                    "message": "invalid SSID"}
+        if password is not None and not _valid_wifi_password(password):
+            return {"status": "error", "connected": False,
+                    "message": "invalid password"}
+        # `--` ends option parsing so an SSID that happens to start with '-'
+        # (even after passing the validator change in the future) can't be
+        # reinterpreted as a flag by nmcli.
+        cmd = ["nmcli", "device", "wifi", "connect", "--", ssid]
         if password:
             cmd.extend(["password", password])
         rc, out, err = await _run(*cmd, timeout=30)
@@ -195,7 +314,9 @@ class NetworkController:
         }
 
     async def disconnect(self, device: str = "wlan0") -> dict:
-        rc, _, _ = await _run("nmcli", "device", "disconnect", device, timeout=10)
+        if not _valid_nm_device(device):
+            return {"success": False}
+        rc, _, _ = await _run("nmcli", "device", "disconnect", "--", device, timeout=10)
         return {"success": rc == 0}
 
     async def wifi_saved(self) -> dict:
@@ -221,8 +342,10 @@ class NetworkController:
 
     async def wifi_forget(self, name: str) -> dict:
         """Delete a saved WiFi connection by name."""
+        if not _valid_connection_name(name):
+            return {"status": "error", "message": "invalid connection name"}
         rc, out, err = await _run(
-            "nmcli", "connection", "delete", name,
+            "nmcli", "connection", "delete", "--", name,
             timeout=10,
         )
         return {
@@ -307,25 +430,43 @@ class NetworkController:
         return result
 
     async def get_ip_addresses(self) -> list[dict]:
+        now = time.monotonic()
+        cached = self._ipaddr_cache
+        if cached is not None and (now - cached[1]) < _IPADDR_CACHE_TTL:
+            return cached[0]
         rc, out, _ = await _run("ip", "-j", "addr", "show", timeout=5)
         if rc == 0:
             try:
-                return json.loads(out)
+                result = json.loads(out)
+                self._ipaddr_cache = (result, now)
+                return result
             except json.JSONDecodeError:
                 pass
         rc, out, _ = await _run("ip", "addr", "show", timeout=5)
-        return [{"raw": out}]
+        result = [{"raw": out}]
+        self._ipaddr_cache = (result, now)
+        return result
 
     async def get_routes(self) -> list[dict]:
+        now = time.monotonic()
+        cached = self._routes_cache
+        if cached is not None and (now - cached[1]) < _ROUTES_CACHE_TTL:
+            return cached[0]
         rc, out, _ = await _run("ip", "-j", "route", "show", timeout=5)
         if rc == 0:
             try:
-                return json.loads(out)
+                result = json.loads(out)
+                self._routes_cache = (result, now)
+                return result
             except json.JSONDecodeError:
                 pass
         return []
 
     async def get_dns_servers(self) -> list[str]:
+        now = time.monotonic()
+        cached = self._dns_cache
+        if cached is not None and (now - cached[1]) < _DNS_CACHE_TTL:
+            return cached[0]
         rc, out, _ = await _run("resolvectl", "status", timeout=5)
         if rc == 0:
             servers = []
@@ -333,11 +474,14 @@ class NetworkController:
                 if "DNS Servers:" in line:
                     servers.extend(line.split(":")[1].strip().split())
             if servers:
+                self._dns_cache = (servers, now)
                 return servers
 
         # Fallback to /etc/resolv.conf
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._read_resolv_conf)
+        servers = await loop.run_in_executor(None, self._read_resolv_conf)
+        self._dns_cache = (servers, now)
+        return servers
 
     @staticmethod
     def _read_resolv_conf() -> list[str]:
@@ -352,8 +496,15 @@ class NetworkController:
             return []
 
     async def ping(self, host: str, count: int = 4) -> dict:
+        if not _valid_hostname(host):
+            return {"success": False, "output": "invalid host"}
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            return {"success": False, "output": "invalid count"}
+        count = max(1, min(count, 20))
         rc, out, _ = await _run(
-            "ping", "-c", str(count), "-W", "2", host,
+            "ping", "-c", str(count), "-W", "2", "--", host,
             timeout=count * 3 + 5,
         )
         return {"success": rc == 0, "output": out}

@@ -68,9 +68,12 @@ void objects_shutdown(void)
         if (g_objects[i].active) {
             fprintf(stderr, "[objectd] Destroying object [%d] '%s' (refs=%u)\n",
                     i, g_objects[i].name, g_objects[i].ref_count);
-            if (g_objects[i].shm_fd >= 0)
+            if (g_objects[i].shm_fd >= 0) {
                 close(g_objects[i].shm_fd);
+                g_objects[i].shm_fd = -1;
+            }
             shm_free(g_objects[i].shm_name, g_objects[i].shm_ptr);
+            g_objects[i].shm_ptr = NULL;
             g_objects[i].active = 0;
         }
     }
@@ -194,7 +197,13 @@ int objects_create(const char *name, uint8_t type, int initial_state,
         break;
     default:
         fprintf(stderr, "[objectd] Unknown object type %u\n", type);
+        if (obj->shm_fd >= 0) {
+            close(obj->shm_fd);
+            obj->shm_fd = -1;
+        }
         shm_free(obj->shm_name, obj->shm_ptr);
+        obj->shm_ptr = NULL;
+        obj->shm_name[0] = '\0';
         if (status) *status = OBJ_STATUS_INVALID;
         pthread_mutex_unlock(&g_obj_lock);
         return -1;
@@ -221,9 +230,17 @@ int objects_create(const char *name, uint8_t type, int initial_state,
         }
     }
     if (!inserted) {
-        /* Hash table full — revert object allocation */
+        /* Hash table full — revert object allocation.
+         * Must release fd, unmap, unlink the shm segment, and clear
+         * identifying fields so this slot can be safely reused. */
         obj->active = 0;
         if (obj->shm_fd >= 0) { close(obj->shm_fd); obj->shm_fd = -1; }
+        shm_free(obj->shm_name, obj->shm_ptr);
+        obj->shm_ptr = NULL;
+        obj->shm_name[0] = '\0';
+        obj->name[0] = '\0';
+        obj->ref_count = 0;
+        obj->type = 0;
         if (status) *status = OBJ_STATUS_FULL;
         pthread_mutex_unlock(&g_obj_lock);
         return -1;

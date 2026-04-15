@@ -88,31 +88,52 @@ WINAPI_EXPORT NTSTATUS IoCreateDevice(
 
     /* Register device name */
     if (DeviceName && DeviceName->Buffer) {
-        copy_ustr(dev->DeviceName.Buffer ? dev->DeviceName.Buffer : (WCHAR[260]){0},
-                  260, DeviceName);
-        /* Allocate name buffer on the device */
-        dev->DeviceName.Length = DeviceName->Length;
-        dev->DeviceName.MaximumLength = DeviceName->Length + sizeof(WCHAR);
-        dev->DeviceName.Buffer = (PWSTR)malloc(dev->DeviceName.MaximumLength);
+        /* Allocate name buffer on the device.  Use ULONG math to avoid USHORT
+         * wrap when DeviceName->Length is near 0xFFFF (yields 0x10001 which
+         * would truncate to 1 and cause a heap overflow on memcpy). */
+        ULONG name_max32 = (ULONG)DeviceName->Length + sizeof(WCHAR);
+        USHORT copy_len = DeviceName->Length;
+        USHORT name_max;
+        if (name_max32 > 0xFFFF) {
+            name_max = 0xFFFE;
+            if (copy_len > (USHORT)(name_max - sizeof(WCHAR)))
+                copy_len = (USHORT)(name_max - sizeof(WCHAR));
+        } else {
+            name_max = (USHORT)name_max32;
+        }
+        dev->DeviceName.Buffer = (PWSTR)malloc(name_max);
         if (dev->DeviceName.Buffer) {
-            memcpy(dev->DeviceName.Buffer, DeviceName->Buffer, DeviceName->Length);
-            dev->DeviceName.Buffer[DeviceName->Length / sizeof(WCHAR)] = 0;
+            dev->DeviceName.Length = copy_len;
+            dev->DeviceName.MaximumLength = name_max;
+            memcpy(dev->DeviceName.Buffer, DeviceName->Buffer, copy_len);
+            dev->DeviceName.Buffer[copy_len / sizeof(WCHAR)] = 0;
+        } else {
+            dev->DeviceName.Length = 0;
+            dev->DeviceName.MaximumLength = 0;
         }
 
         pthread_mutex_lock(&g_device_lock);
-        if (g_device_count < MAX_DEVICES) {
-            copy_ustr(g_device_table[g_device_count].name, 260, DeviceName);
-            g_device_table[g_device_count].device = dev;
-            g_device_table[g_device_count].in_use = 1;
-            g_device_count++;
+        /* Scan for a free slot (supports slot reuse after IoDeleteDevice) */
+        int slot = -1;
+        for (int i = 0; i < g_device_count; i++) {
+            if (!g_device_table[i].in_use) { slot = i; break; }
+        }
+        if (slot < 0 && g_device_count < MAX_DEVICES)
+            slot = g_device_count++;
+        if (slot >= 0) {
+            copy_ustr(g_device_table[slot].name, 260, DeviceName);
+            g_device_table[slot].device = dev;
+            g_device_table[slot].in_use = 1;
         }
         pthread_mutex_unlock(&g_device_lock);
 
         {
             char dnb[512];
-            size_t di;
-            for (di = 0; dev->DeviceName.Buffer[di] && di < 511; di++)
-                dnb[di] = (char)(dev->DeviceName.Buffer[di] & 0xFF);
+            size_t di = 0;
+            if (dev->DeviceName.Buffer) {
+                for (; dev->DeviceName.Buffer[di] && di < 511; di++)
+                    dnb[di] = (char)(dev->DeviceName.Buffer[di] & 0xFF);
+            }
             dnb[di] = '\0';
             printf(LOG_PREFIX "IoCreateDevice: '%s' type=0x%x ext=%u\n",
                    dnb, DeviceType, DeviceExtensionSize);
@@ -170,12 +191,18 @@ WINAPI_EXPORT NTSTATUS IoCreateSymbolicLink(
     PUNICODE_STRING DeviceName)
 {
     pthread_mutex_lock(&g_symlink_lock);
-    if (g_symlink_count >= MAX_SYMLINKS) {
-        pthread_mutex_unlock(&g_symlink_lock);
-        return STATUS_INSUFFICIENT_RESOURCES;
+    /* Scan for a free slot (supports slot reuse after IoDeleteSymbolicLink) */
+    int idx = -1;
+    for (int i = 0; i < g_symlink_count; i++) {
+        if (!g_symlink_table[i].in_use) { idx = i; break; }
     }
-
-    int idx = g_symlink_count++;
+    if (idx < 0) {
+        if (g_symlink_count >= MAX_SYMLINKS) {
+            pthread_mutex_unlock(&g_symlink_lock);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        idx = g_symlink_count++;
+    }
     copy_ustr(g_symlink_table[idx].link_name, 260, SymbolicLinkName);
     copy_ustr(g_symlink_table[idx].target_name, 260, DeviceName);
     g_symlink_table[idx].in_use = 1;
@@ -246,9 +273,14 @@ WINAPI_EXPORT PIRP IoAllocateIrp(CHAR StackSize, BOOLEAN ChargeQuota)
     if (!irp)
         return NULL;
 
+    /* Clamp StackSize to the fixed-size stack array to avoid OOB access */
+    CHAR clamped = StackSize;
+    if (clamped < 1) clamped = 1;
+    if (clamped > IRP_MAX_STACK) clamped = IRP_MAX_STACK;
+
     irp->Type = IO_TYPE_IRP;
     irp->Size = sizeof(IRP);
-    irp->StackCount = StackSize;
+    irp->StackCount = clamped;
     irp->CurrentLocation = 0;
 
     return irp;
@@ -264,6 +296,9 @@ WINAPI_EXPORT void IoFreeIrp(PIRP Irp)
 WINAPI_EXPORT NTSTATUS IoCallDriver(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     if (!DeviceObject || !DeviceObject->DriverObject || !Irp)
+        return STATUS_INVALID_PARAMETER;
+
+    if (Irp->CurrentLocation < 0 || Irp->CurrentLocation >= IRP_MAX_STACK)
         return STATUS_INVALID_PARAMETER;
 
     PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);

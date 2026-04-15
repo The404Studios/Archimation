@@ -34,15 +34,33 @@ extern LONG registry_enum_value(HKEY hKey, DWORD index, char *name, DWORD *name_
 /* Forward declaration - implemented in registry/registry_defaults.c */
 extern void registry_populate_defaults(void);
 
-/* Shared library constructor: populate registry defaults when advapi32.so loads */
+/* Shared library constructor: populate registry defaults when advapi32.so
+ * loads.
+ *
+ * When pe-objectd is running it is the authoritative source of truth for
+ * the registry and populates the default hive itself in objectd_registry_init().
+ * We skip per-process default population in that case -- writing directly
+ * to the filesystem here bypasses the broker, races with other PE processes,
+ * and regenerates non-idempotent values like MachineGuid on every startup.
+ *
+ * Fallback: if the broker is NOT running (standalone PE invocation) we
+ * still populate locally so a solo .exe run has sensible defaults.
+ * registry_populate_defaults() is idempotent-for-reads via reg_set_sz_once.
+ */
 __attribute__((constructor))
 static void advapi32_registry_init(void)
 {
     static int done = 0;
-    if (!done) {
-        done = 1;
-        registry_populate_defaults();
-    }
+    if (done)
+        return;
+    done = 1;
+
+    /* If objectd is available, it owns the hive -- defaults already populated
+     * in its startup path.  Don't double-write. */
+    if (objectd_available())
+        return;
+
+    registry_populate_defaults();
 }
 
 /* Registry access rights (ignored in our implementation) */
@@ -323,6 +341,16 @@ WINAPI_EXPORT LONG RegDeleteValueA(HKEY hKey, LPCSTR lpValueName)
 WINAPI_EXPORT LONG RegEnumKeyA(HKEY hKey, DWORD dwIndex, LPSTR lpName, DWORD cchName)
 {
     DWORD size = cchName;
+    if (objectd_available()) {
+        uint32_t len = cchName;
+        int ret = objectd_reg_enum_key((uint64_t)(uintptr_t)hKey,
+                                       dwIndex, lpName, &len);
+        if (ret == OBJ_STATUS_OK)
+            return ERROR_SUCCESS;
+        if (ret == OBJ_STATUS_NOT_FOUND)
+            return 259; /* ERROR_NO_MORE_ITEMS */
+        /* Broker error -- fall through to local */
+    }
     return registry_enum_key(hKey, dwIndex, lpName, &size);
 }
 

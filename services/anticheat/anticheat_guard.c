@@ -90,6 +90,17 @@ typedef struct {
 
 #define MAX_CALLBACKS   16
 
+/*
+ * Small open-addressing PID->index map.  Access checks are in the cross-
+ * process memory read/write hot path (every RPM/WPM call from the guest
+ * kernel shim).  Linear scan over a 256-entry table for every check adds
+ * noticeable cost under heavy anti-cheat traffic.  A direct PID-hashed
+ * index lookup turns it into O(1).
+ */
+#define ACG_PID_HASH_BUCKETS (MAX_PROTECTED * 2)
+#define ACG_PID_EMPTY        -1
+#define ACG_PID_TOMBSTONE    -2
+
 /* Guard state */
 typedef struct {
     int                     initialized;
@@ -98,6 +109,10 @@ typedef struct {
     acg_callback_entry_t    callbacks[MAX_CALLBACKS];
     int                     num_callbacks;
     pthread_mutex_t         lock;
+
+    /* PID -> entry index hash (512 slots).  Caller must hold .lock.
+     * Populated by protect/unprotect paths; find_protected_index walks it. */
+    int                     pid_hash[ACG_PID_HASH_BUCKETS];
 
     /* Global statistics */
     unsigned long           total_access_checks;
@@ -108,18 +123,76 @@ typedef struct {
 
 static acg_state_t g_guard = {0};
 
+static inline unsigned int acg_hash_pid(pid_t pid)
+{
+    /* Knuth multiplicative hash, truncated to table size.  PIDs on Linux
+     * are well-distributed low integers, so this gives good spread. */
+    unsigned int h = (unsigned int)pid;
+    h = (h * 2654435761u) & 0xffffffffu;
+    return h % ACG_PID_HASH_BUCKETS;
+}
+
+static void acg_pid_hash_init(void)
+{
+    for (int i = 0; i < ACG_PID_HASH_BUCKETS; i++)
+        g_guard.pid_hash[i] = ACG_PID_EMPTY;
+}
+
+static void acg_pid_hash_insert(pid_t pid, int idx)
+{
+    unsigned int bucket = acg_hash_pid(pid);
+    for (unsigned int step = 0; step < ACG_PID_HASH_BUCKETS; step++) {
+        unsigned int probe = (bucket + step) % ACG_PID_HASH_BUCKETS;
+        if (g_guard.pid_hash[probe] == ACG_PID_EMPTY ||
+            g_guard.pid_hash[probe] == ACG_PID_TOMBSTONE) {
+            g_guard.pid_hash[probe] = idx;
+            return;
+        }
+    }
+    /* Saturated - caller falls back to linear scan */
+}
+
+static void acg_pid_hash_remove(pid_t pid)
+{
+    unsigned int bucket = acg_hash_pid(pid);
+    for (unsigned int step = 0; step < ACG_PID_HASH_BUCKETS; step++) {
+        unsigned int probe = (bucket + step) % ACG_PID_HASH_BUCKETS;
+        int idx = g_guard.pid_hash[probe];
+        if (idx == ACG_PID_EMPTY) return;
+        if (idx == ACG_PID_TOMBSTONE) continue;
+        if (idx >= 0 && idx < MAX_PROTECTED &&
+            g_guard.entries[idx].pid == pid) {
+            g_guard.pid_hash[probe] = ACG_PID_TOMBSTONE;
+            return;
+        }
+    }
+}
+
 /* --- Internal helpers --- */
 
 /*
  * Find a protected entry by PID.
  * Caller must hold g_guard.lock.
  * Returns index or -1 if not found.
+ *
+ * Probe the PID hash table (O(1) amortized).  Since every protect/unprotect
+ * path updates the hash, a missing entry == not protected; no fallback needed.
  */
 static int find_protected_index(pid_t pid)
 {
-    for (int i = 0; i < g_guard.num_entries; i++) {
-        if (g_guard.entries[i].active && g_guard.entries[i].pid == pid)
-            return i;
+    unsigned int bucket = acg_hash_pid(pid);
+    for (unsigned int step = 0; step < ACG_PID_HASH_BUCKETS; step++) {
+        unsigned int probe = (bucket + step) % ACG_PID_HASH_BUCKETS;
+        int idx = g_guard.pid_hash[probe];
+        if (idx == ACG_PID_EMPTY)
+            return -1;
+        if (idx == ACG_PID_TOMBSTONE)
+            continue;
+        if (idx >= 0 && idx < MAX_PROTECTED &&
+            g_guard.entries[idx].active &&
+            g_guard.entries[idx].pid == pid) {
+            return idx;
+        }
     }
     return -1;
 }
@@ -231,6 +304,7 @@ int anticheat_guard_init(void)
 
     memset(&g_guard, 0, sizeof(g_guard));
     pthread_mutex_init(&g_guard.lock, NULL);
+    acg_pid_hash_init();
     g_guard.initialized = 1;
 
     fprintf(stderr, ACG_LOG_PREFIX "Guard ready (max %d protected processes)\n",
@@ -346,6 +420,9 @@ int anticheat_protect_pid(pid_t pid)
     entry->active = 1;
     snprintf(entry->game_name, sizeof(entry->game_name), "process_%d", pid);
 
+    /* Index for O(1) lookup on the hot access-check path */
+    acg_pid_hash_insert(pid, slot);
+
     fprintf(stderr, ACG_LOG_PREFIX "Protected PID %d (slot %d, total %d)\n",
             pid, slot, g_guard.num_entries);
 
@@ -379,6 +456,7 @@ int anticheat_unprotect_pid(pid_t pid)
     }
 
     g_guard.entries[idx].active = 0;
+    acg_pid_hash_remove(pid);
 
     fprintf(stderr, ACG_LOG_PREFIX "Unprotected PID %d (denied %lu accesses total)\n",
             pid, g_guard.entries[idx].access_denied_count);
@@ -621,6 +699,7 @@ void anticheat_notify_process_exit(pid_t pid)
 
         /* Remove from protected set */
         g_guard.entries[idx].active = 0;
+        acg_pid_hash_remove(pid);
     }
 
     pthread_mutex_unlock(&g_guard.lock);
@@ -732,20 +811,29 @@ int anticheat_register_callback(acg_thread_notify_fn on_thread,
 
     pthread_mutex_lock(&g_guard.lock);
 
-    if (g_guard.num_callbacks >= MAX_CALLBACKS) {
-        fprintf(stderr, ACG_LOG_PREFIX "Callback table full\n");
-        pthread_mutex_unlock(&g_guard.lock);
-        return -1;
+    /* Prefer reusing an inactive slot before growing the table */
+    int id = -1;
+    for (int i = 0; i < g_guard.num_callbacks; i++) {
+        if (!g_guard.callbacks[i].active) {
+            id = i;
+            break;
+        }
+    }
+    if (id < 0) {
+        if (g_guard.num_callbacks >= MAX_CALLBACKS) {
+            fprintf(stderr, ACG_LOG_PREFIX "Callback table full\n");
+            pthread_mutex_unlock(&g_guard.lock);
+            return -1;
+        }
+        id = g_guard.num_callbacks++;
     }
 
-    int id = g_guard.num_callbacks;
     acg_callback_entry_t *cb = &g_guard.callbacks[id];
     cb->on_thread_create = on_thread;
     cb->on_image_load = on_image;
     cb->on_process_exit = on_exit;
     cb->context = context;
     cb->active = 1;
-    g_guard.num_callbacks++;
 
     fprintf(stderr, ACG_LOG_PREFIX "Registered callback #%d\n", id);
 

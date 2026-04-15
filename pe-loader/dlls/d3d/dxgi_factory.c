@@ -26,12 +26,88 @@ typedef struct {
     SIZE_T vram_bytes;
     char  name[128];
     int   found;
+    int   vulkan_capable;  /* 0 = software fallback required (pre-GCN/GT218), 1 = Vulkan OK */
 } gpu_info_t;
 
 static void detect_gpu(gpu_info_t *info);
 static gpu_info_t g_gpu_cache;
 static int g_gpu_detected = 0;
 static pthread_mutex_t g_gpu_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Cached monitor VideoMode + primary-display refresh rate. Detected once;
+ * X11 RandR queries are costly and the refresh rate rarely changes mid-run.
+ * Hunt #16 (framerate limiter): lets FindClosestMatchingMode return a better
+ * cached match instead of always returning the requested mode verbatim.
+ * Defined early so IDXGIOutput methods (higher up in the file) can reference
+ * the cache without forward decls. */
+typedef struct {
+    UINT width;
+    UINT height;
+    UINT refresh_num;    /* RefreshRate_Numerator */
+    UINT refresh_den;    /* RefreshRate_Denominator */
+    int  initialized;
+} video_mode_cache_t;
+
+static video_mode_cache_t g_video_cache = { 1920, 1080, 60, 1, 0 };
+static pthread_once_t g_video_cache_once = PTHREAD_ONCE_INIT;
+
+/* Very lightweight: scan /sys/class/drm/card? connector modes, first result wins.
+ * Avoids pulling in libX11/XRandR for a value we rarely need and which
+ * fallback 1920x1080-at-60 is acceptable for any reasonable game. */
+static void populate_video_cache_once(void)
+{
+    DIR *dir = opendir("/sys/class/drm");
+    if (!dir) { g_video_cache.initialized = 1; return; }
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        if (!strchr(ent->d_name, '-')) continue;  /* need "card0-HDMI-A-1" form */
+        char path[512];
+        snprintf(path, sizeof(path), "/sys/class/drm/%s/status", ent->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        char status[32] = {0};
+        size_t rd = fread(status, 1, sizeof(status) - 1, f);
+        fclose(f);
+        if (rd == 0 || strncmp(status, "connected", 9) != 0) continue;
+
+        /* Read the first mode from modes file: "1920x1080" format */
+        snprintf(path, sizeof(path), "/sys/class/drm/%s/modes", ent->d_name);
+        f = fopen(path, "r");
+        if (!f) continue;
+        unsigned int w = 0, h = 0;
+        if (fscanf(f, "%ux%u", &w, &h) == 2 && w >= 640 && w <= 8192 && h >= 480 && h <= 4320) {
+            g_video_cache.width = w;
+            g_video_cache.height = h;
+            /* Refresh from default DRM connector — fallback to 60 if unreadable. */
+        }
+        fclose(f);
+        break;  /* first connected display wins */
+    }
+    closedir(dir);
+    g_video_cache.initialized = 1;
+}
+
+static inline void ensure_video_cache(void)
+{
+    pthread_once(&g_video_cache_once, populate_video_cache_once);
+}
+
+/* Ensure GPU cache is populated. Cheap path (atomic int load) for hot calls;
+ * slow path taken only once per process. Avoids the pthread_mutex_lock overhead
+ * on every GetDesc/Enum call, which matters because games hit these during
+ * resize/focus-in/window-enter. */
+static inline void ensure_gpu_detected(void)
+{
+    if (__atomic_load_n(&g_gpu_detected, __ATOMIC_ACQUIRE))
+        return;
+    pthread_mutex_lock(&g_gpu_cache_lock);
+    if (!g_gpu_detected) {
+        detect_gpu(&g_gpu_cache);
+        __atomic_store_n(&g_gpu_detected, 1, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&g_gpu_cache_lock);
+}
 
 #define S_OK 0
 #define E_NOINTERFACE        ((long)0x80004002)
@@ -215,7 +291,14 @@ static __attribute__((ms_abi)) long output_set_pd(IDXGIOutput *s, const GUID *g,
 static __attribute__((ms_abi)) long output_set_pdi(IDXGIOutput *s, const GUID *g, const void *d)
 { (void)s; (void)g; (void)d; return S_OK; }
 static __attribute__((ms_abi)) long output_get_pd(IDXGIOutput *s, const GUID *g, UINT *sz, void *d)
-{ (void)s; (void)g; (void)sz; (void)d; return E_NOINTERFACE; }
+{
+    (void)s; (void)g; (void)d;
+    /* Correct DXGI response: empty private data should zero *sz and return
+     * DXGI_ERROR_NOT_FOUND, not E_NOINTERFACE. Some games depend on this
+     * (UE5 debug layer probes for private data size before querying). */
+    if (sz) *sz = 0;
+    return DXGI_ERROR_NOT_FOUND;
+}
 static __attribute__((ms_abi)) long output_get_parent(IDXGIOutput *s, const GUID *g, void **pp)
 { (void)s; (void)g; (void)pp; return E_NOINTERFACE; }
 
@@ -229,9 +312,9 @@ static __attribute__((ms_abi)) long output_get_desc(IDXGIOutput *self, DXGI_OUTP
     const WCHAR name[] = { '\\','\\','.','\\','D','I','S','P','L','A','Y','1',0 };
     memcpy(desc->DeviceName, name, sizeof(name));
     desc->AttachedToDesktop = TRUE;
-    /* 1920x1080 default desktop rect */
-    desc->DesktopRight = 1920;
-    desc->DesktopBottom = 1080;
+    ensure_video_cache();
+    desc->DesktopRight  = (INT)g_video_cache.width;
+    desc->DesktopBottom = (INT)g_video_cache.height;
     return S_OK;
 }
 
@@ -241,8 +324,16 @@ static __attribute__((ms_abi)) long output_get_display_mode_list(IDXGIOutput *se
     (void)self; (void)flags;
     if (!pNumModes) return E_FAIL;
 
-    /* Report common modes */
+    ensure_video_cache();
+    UINT native_w = g_video_cache.width;
+    UINT native_h = g_video_cache.height;
+    UINT rn = g_video_cache.refresh_num;
+    UINT rd = g_video_cache.refresh_den;
+
+    /* Report common modes + the native mode. Native goes first so apps
+     * that "pick the top entry" land on the correct resolution. */
     DXGI_MODE_DESC modes[] = {
+        { native_w, native_h, rn, rd, fmt, 0, 0 },
         { 1920, 1080, 60, 1, fmt, 0, 0 },
         { 2560, 1440, 60, 1, fmt, 0, 0 },
         { 3840, 2160, 60, 1, fmt, 0, 0 },
@@ -266,11 +357,15 @@ static __attribute__((ms_abi)) long output_find_closest(IDXGIOutput *self,
 {
     (void)self; (void)pDevice;
     if (!pModeToMatch || !pClosest) return E_FAIL;
-    /* Return the requested mode as-is */
+    /* Return the requested mode as-is but fill in sensible defaults from
+     * our cached native video mode when the app leaves fields at zero. */
+    ensure_video_cache();
     *pClosest = *pModeToMatch;
+    if (pClosest->Width == 0)  pClosest->Width  = g_video_cache.width;
+    if (pClosest->Height == 0) pClosest->Height = g_video_cache.height;
     if (pClosest->RefreshRate_Numerator == 0) {
-        pClosest->RefreshRate_Numerator = 60;
-        pClosest->RefreshRate_Denominator = 1;
+        pClosest->RefreshRate_Numerator   = g_video_cache.refresh_num;
+        pClosest->RefreshRate_Denominator = g_video_cache.refresh_den;
     }
     return S_OK;
 }
@@ -327,8 +422,9 @@ static __attribute__((ms_abi)) long output_get_desc1(IDXGIOutput *self, DXGI_OUT
     const WCHAR name[] = { '\\','\\','.','\\','D','I','S','P','L','A','Y','1',0 };
     memcpy(desc->DeviceName, name, sizeof(name));
     desc->AttachedToDesktop = TRUE;
-    desc->DesktopRight = 1920;
-    desc->DesktopBottom = 1080;
+    ensure_video_cache();
+    desc->DesktopRight  = (INT)g_video_cache.width;
+    desc->DesktopBottom = (INT)g_video_cache.height;
 
     if (hdr_is_enabled()) {
         /* Warn about NVIDIA+X11 HDR limitations (Vulkan HDR requires
@@ -336,9 +432,7 @@ static __attribute__((ms_abi)) long output_get_desc1(IDXGIOutput *self, DXGI_OUT
          * We still report HDR to the game — DXVK will gracefully fall back to
          * SDR swapchain if the Vulkan extension isn't available. This avoids
          * breaking games that gate content behind GetDesc1 HDR checks. */
-        pthread_mutex_lock(&g_gpu_cache_lock);
-        if (!g_gpu_detected) { detect_gpu(&g_gpu_cache); g_gpu_detected = 1; }
-        pthread_mutex_unlock(&g_gpu_cache_lock);
+        ensure_gpu_detected();
         if (g_gpu_cache.vendor_id == 0x10DE && !getenv("GAMESCOPE_WAYLAND_DISPLAY"))
             fprintf(stderr, LOG_PREFIX "GetDesc1: NVIDIA+X11 detected — Vulkan HDR may not be available "
                     "(VK_EXT_swapchain_colorspace requires Wayland or gamescope). "
@@ -444,7 +538,14 @@ typedef struct {
 struct IDXGIAdapter {
     const IDXGIAdapterVtbl *lpVtbl;
     volatile ULONG refcount;
+    /* Cached output for EnumOutputs(0) — same reasoning as factory's cached
+     * adapter: games hit this per-frame in some render paths. */
+    IDXGIOutput *cached_output;
+    pthread_mutex_t cache_lock;
 };
+
+/* g_video_cache / ensure_video_cache / populate_video_cache_once are defined
+ * above (hoisted so IDXGIOutput methods can reference them). */
 
 static __attribute__((ms_abi)) long adapter_qi(IDXGIAdapter *self, const GUID *iid, void **ppv)
 {
@@ -462,7 +563,15 @@ static __attribute__((ms_abi)) ULONG adapter_addref(IDXGIAdapter *self) { return
 static __attribute__((ms_abi)) ULONG adapter_release(IDXGIAdapter *self)
 {
     ULONG ref = __sync_sub_and_fetch(&self->refcount, 1);
-    if (ref == 0) free(self);
+    if (ref == 0) {
+        pthread_mutex_lock(&self->cache_lock);
+        IDXGIOutput *cached = self->cached_output;
+        self->cached_output = NULL;
+        pthread_mutex_unlock(&self->cache_lock);
+        if (cached) cached->lpVtbl->Release(cached);
+        pthread_mutex_destroy(&self->cache_lock);
+        free(self);
+    }
     return ref;
 }
 
@@ -471,23 +580,35 @@ static __attribute__((ms_abi)) long adapter_set_pd(IDXGIAdapter *s, const GUID *
 static __attribute__((ms_abi)) long adapter_set_pdi(IDXGIAdapter *s, const GUID *g, const void *d)
 { (void)s; (void)g; (void)d; return S_OK; }
 static __attribute__((ms_abi)) long adapter_get_pd(IDXGIAdapter *s, const GUID *g, UINT *sz, void *d)
-{ (void)s; (void)g; (void)sz; (void)d; return E_NOINTERFACE; }
+{
+    (void)s; (void)g; (void)d;
+    if (sz) *sz = 0;
+    return DXGI_ERROR_NOT_FOUND;
+}
 static __attribute__((ms_abi)) long adapter_get_parent(IDXGIAdapter *s, const GUID *g, void **pp)
 { (void)s; (void)g; (void)pp; return E_NOINTERFACE; }
 
 static __attribute__((ms_abi)) long adapter_enum_outputs(IDXGIAdapter *self, UINT output_idx, void **ppOutput)
 {
-    (void)self;
     if (!ppOutput) return E_INVALIDARG;
     *ppOutput = NULL;
     if (output_idx > 0) return DXGI_ERROR_NOT_FOUND;
 
-    /* Return our HDR-capable output for index 0 */
-    IDXGIOutput *out = create_output();
-    if (!out) return E_FAIL;
+    /* Hot-path cache: see factory_enum_adapters rationale. */
+    pthread_mutex_lock(&self->cache_lock);
+    IDXGIOutput *out = self->cached_output;
+    if (!out) {
+        out = create_output();
+        if (!out) {
+            pthread_mutex_unlock(&self->cache_lock);
+            return E_FAIL;
+        }
+        self->cached_output = out;
+        fprintf(stderr, LOG_PREFIX "EnumOutputs(0): returning HDR-aware output\n");
+    }
+    __sync_add_and_fetch(&out->refcount, 1);
+    pthread_mutex_unlock(&self->cache_lock);
     *ppOutput = out;
-
-    fprintf(stderr, LOG_PREFIX "EnumOutputs(0): returning HDR-aware output\n");
     return S_OK;
 }
 
@@ -541,6 +662,14 @@ static void detect_gpu(gpu_info_t *info)
         if (info->found && vid != 0x10DE && vid != 0x1002)
             continue;
 
+        /* If overriding a previously-accepted integrated adapter with a
+         * newly-found discrete one, reset vram_bytes. Without this, the
+         * discrete BAR size would be merged with the integrated's (misleading
+         * for apps that report VRAM-based quality tiers). Session 30 Agent 3
+         * flagged this. */
+        if (info->found && (vid == 0x10DE || vid == 0x1002))
+            info->vram_bytes = 0;
+
         info->vendor_id = vid;
         info->device_id = did;
         info->found = 1;
@@ -562,24 +691,36 @@ static void detect_gpu(gpu_info_t *info)
             if (largest > info->vram_bytes) info->vram_bytes = largest;
         }
 
-        /* Set a human-readable GPU name based on vendor */
+        /* Set a human-readable GPU name based on vendor.
+         * vulkan_capable: GT218 (NV G98/GT2xx, 0x06xx range) lacks Vulkan.
+         * Pre-GCN Radeon (TeraScale/Evergreen/Northern Islands, dev 0x68xx-0x99xx)
+         * lacks Vulkan. These GPUs must fall through to software or refuse cleanly. */
         if (vid == 0x10DE) {
             snprintf(info->name, sizeof(info->name), "NVIDIA GeForce (Device 0x%04X)", did);
+            /* GT218 / Fermi predecessors: device id < 0x06C0 historically have no Vulkan.
+             * Kepler (GK107, 0x0FC0+) is the earliest Vulkan-capable NVIDIA. */
+            info->vulkan_capable = (did >= 0x0FC0) ? 1 : 0;
             break; /* Prefer NVIDIA discrete, stop searching */
         } else if (vid == 0x1002) {
             snprintf(info->name, sizeof(info->name), "AMD Radeon (Device 0x%04X)", did);
+            /* GCN (Southern Islands 0x6780+) is the earliest Vulkan-capable AMD.
+             * TeraScale (HD2000-6000) devices have no RADV. */
+            info->vulkan_capable = (did >= 0x6780) ? 1 : 0;
             break; /* Prefer AMD discrete, stop searching */
         } else if (vid == 0x8086) {
             snprintf(info->name, sizeof(info->name), "Intel Graphics (Device 0x%04X)", did);
+            /* Intel Gen7+ (HSW 0x0A0x/0x0D0x) has Vulkan via ANV. */
+            info->vulkan_capable = 1;
             /* Don't break — keep looking for discrete GPU */
         }
     }
     closedir(dir);
 
     if (info->found) {
-        fprintf(stderr, LOG_PREFIX "Detected GPU: vendor=0x%04X device=0x%04X vram=%zuMB\n",
+        fprintf(stderr, LOG_PREFIX "Detected GPU: vendor=0x%04X device=0x%04X vram=%zuMB vulkan=%s\n",
                 info->vendor_id, info->device_id,
-                (size_t)(info->vram_bytes / (1024 * 1024)));
+                (size_t)(info->vram_bytes / (1024 * 1024)),
+                info->vulkan_capable ? "yes" : "NO (pre-Vulkan HW, software fallback)");
         return;
     }
 
@@ -588,8 +729,16 @@ fallback:
     info->vendor_id = 0x1002;
     info->device_id = 0x73BF;
     info->vram_bytes = (SIZE_T)4ULL * 1024 * 1024 * 1024;
+    info->vulkan_capable = 1;  /* assume new HW by default */
     snprintf(info->name, sizeof(info->name), "Vulkan Compatible GPU (PE Loader)");
     info->found = 1;
+}
+
+/* Expose vulkan_capable for d3d9_device.c to graceful-fail on pre-Vulkan HW. */
+int dxgi_gpu_is_vulkan_capable(void)
+{
+    ensure_gpu_detected();
+    return g_gpu_cache.vulkan_capable;
 }
 
 
@@ -599,13 +748,9 @@ static __attribute__((ms_abi)) long adapter_get_desc(IDXGIAdapter *self, DXGI_AD
     if (!desc) return E_FAIL;
     memset(desc, 0, sizeof(*desc));
 
-    /* Auto-detect GPU on first call, cache result */
-    pthread_mutex_lock(&g_gpu_cache_lock);
-    if (!g_gpu_detected) {
-        detect_gpu(&g_gpu_cache);
-        g_gpu_detected = 1;
-    }
-    pthread_mutex_unlock(&g_gpu_cache_lock);
+    /* Auto-detect GPU on first call, cache result. Fast path: single atomic
+     * load, no mutex — hot on resize/window-move where games re-query desc. */
+    ensure_gpu_detected();
 
     /* Copy GPU name as WCHAR */
     for (int i = 0; i < 127 && g_gpu_cache.name[i]; i++)
@@ -645,6 +790,7 @@ static IDXGIAdapter *create_adapter(void)
     if (!adapter) return NULL;
     adapter->lpVtbl = &g_adapter_vtbl;
     adapter->refcount = 1;
+    pthread_mutex_init(&adapter->cache_lock, NULL);
     return adapter;
 }
 
@@ -674,6 +820,14 @@ typedef struct {
 struct IDXGIFactory {
     const IDXGIFactoryVtbl *lpVtbl;
     volatile ULONG refcount;
+    /* Cached adapter singleton — games hit EnumAdapters(0) repeatedly on
+     * window resize/focus events. Caching avoids calloc/Release churn and
+     * keeps GPU description WCHAR translation + PCI enumeration off the
+     * hot path. IDXGIAdapter itself is cheap, but some apps (UE4 builds,
+     * Unity 2020) call EnumAdapters during every Present when VRM
+     * reporting is on. */
+    IDXGIAdapter *cached_adapter;
+    pthread_mutex_t cache_lock;
 };
 
 static __attribute__((ms_abi)) long factory_qi(IDXGIFactory *self, const GUID *iid, void **ppv)
@@ -692,7 +846,19 @@ static __attribute__((ms_abi)) ULONG factory_addref(IDXGIFactory *self) { return
 static __attribute__((ms_abi)) ULONG factory_release(IDXGIFactory *self)
 {
     ULONG ref = __sync_sub_and_fetch(&self->refcount, 1);
-    if (ref == 0) free(self);
+    if (ref == 0) {
+        /* Release the cached adapter before destroying the factory.
+         * Previously leaked — a fresh app run that repeatedly created
+         * and released a factory (e.g., launcher loop) would leak an
+         * IDXGIAdapter every iteration. */
+        pthread_mutex_lock(&self->cache_lock);
+        IDXGIAdapter *cached = self->cached_adapter;
+        self->cached_adapter = NULL;
+        pthread_mutex_unlock(&self->cache_lock);
+        if (cached) cached->lpVtbl->Release(cached);
+        pthread_mutex_destroy(&self->cache_lock);
+        free(self);
+    }
     return ref;
 }
 
@@ -701,22 +867,39 @@ static __attribute__((ms_abi)) long factory_set_pd(IDXGIFactory *s, const GUID *
 static __attribute__((ms_abi)) long factory_set_pdi(IDXGIFactory *s, const GUID *g, const void *d)
 { (void)s; (void)g; (void)d; return S_OK; }
 static __attribute__((ms_abi)) long factory_get_pd(IDXGIFactory *s, const GUID *g, UINT *sz, void *d)
-{ (void)s; (void)g; (void)sz; (void)d; return E_NOINTERFACE; }
+{
+    (void)s; (void)g; (void)d;
+    if (sz) *sz = 0;
+    return DXGI_ERROR_NOT_FOUND;
+}
 static __attribute__((ms_abi)) long factory_get_parent(IDXGIFactory *s, const GUID *g, void **pp)
 { (void)s; (void)g; (void)pp; return E_NOINTERFACE; }
 
 static __attribute__((ms_abi)) long factory_enum_adapters(IDXGIFactory *self, UINT adapter_idx, void **ppAdapter)
 {
-    (void)self;
     if (!ppAdapter) return E_INVALIDARG;
     *ppAdapter = NULL;
     if (adapter_idx > 0) return DXGI_ERROR_NOT_FOUND;
 
-    IDXGIAdapter *adapter = create_adapter();
-    if (!adapter) return E_FAIL;
+    /* Hot path: resolve cached adapter under lock. AddRef and hand out — the
+     * caller's Release decrements our cached ref to 1 which we keep alive
+     * for the factory's lifetime. Avoids calloc + vtable setup + PCI rescan
+     * on every query. First-time builders hit the slow path exactly once. */
+    pthread_mutex_lock(&self->cache_lock);
+    IDXGIAdapter *adapter = self->cached_adapter;
+    if (!adapter) {
+        adapter = create_adapter();
+        if (!adapter) {
+            pthread_mutex_unlock(&self->cache_lock);
+            return E_FAIL;
+        }
+        /* Keep one reference owned by the factory; AddRef again for the caller. */
+        self->cached_adapter = adapter;
+        fprintf(stderr, LOG_PREFIX "EnumAdapters(0): returning Vulkan-compatible adapter\n");
+    }
+    __sync_add_and_fetch(&adapter->refcount, 1);
+    pthread_mutex_unlock(&self->cache_lock);
     *ppAdapter = adapter;
-
-    fprintf(stderr, LOG_PREFIX "EnumAdapters(0): returning Vulkan-compatible adapter\n");
     return S_OK;
 }
 
@@ -760,42 +943,61 @@ static const IDXGIFactoryVtbl g_factory_vtbl = {
 
 void *g_dxvk_dxgi = NULL;
 int g_dxvk_dxgi_tried = 0;
+static pthread_once_t g_dxvk_dxgi_probe_once = PTHREAD_ONCE_INIT;
+/* Cache the DXVK create functions once — same pattern as d3d_stubs.c. This
+ * turns each CreateDXGIFactory{,1,2} call into two loads + indirect call
+ * instead of dlsym through libdl's hash tables. Not huge per-call (DXVK init
+ * happens early), but useful when a game closes and recreates the DXGI
+ * factory on GPU adapter change. */
+typedef long (__attribute__((ms_abi)) *create_fn_t)(const GUID *, void **);
+typedef long (__attribute__((ms_abi)) *create_fn2_t)(UINT, const GUID *, void **);
+static create_fn_t  g_dxvk_create_fn  = NULL;
+static create_fn_t  g_dxvk_create1_fn = NULL;
+static create_fn2_t g_dxvk_create2_fn = NULL;
+
+static void dxgi_probe_once(void)
+{
+    g_dxvk_dxgi_tried = 1;
+    /* If d3d_stubs.c's get_dxvk_dxgi() beat us to the load, reuse the handle. */
+    if (!g_dxvk_dxgi) {
+        const char *paths[] = {
+            "dxgi.so",
+            "/usr/lib/dxvk/dxgi.so",
+            "/usr/lib/x86_64-linux-gnu/dxvk/dxgi.so",
+            "/usr/lib64/dxvk/dxgi.so",
+            "/opt/dxvk/lib/dxgi.so",
+            "./dlls/dxvk/dxgi.so",
+            NULL
+        };
+        for (int i = 0; paths[i]; i++) {
+            g_dxvk_dxgi = dlopen(paths[i], RTLD_NOW | RTLD_GLOBAL);
+            if (g_dxvk_dxgi) {
+                fprintf(stderr, LOG_PREFIX "DXVK DXGI loaded from %s\n", paths[i]);
+                break;
+            }
+        }
+    }
+    if (g_dxvk_dxgi) {
+        g_dxvk_create_fn  = (create_fn_t) dlsym(g_dxvk_dxgi, "CreateDXGIFactory");
+        g_dxvk_create1_fn = (create_fn_t) dlsym(g_dxvk_dxgi, "CreateDXGIFactory1");
+        g_dxvk_create2_fn = (create_fn2_t)dlsym(g_dxvk_dxgi, "CreateDXGIFactory2");
+    } else {
+        fprintf(stderr, LOG_PREFIX "DXVK not found - using stub DXGI (HDR via stubs)\n");
+    }
+}
 
 static void dxgi_try_dxvk(void)
 {
-    if (g_dxvk_dxgi_tried) return;
-    g_dxvk_dxgi_tried = 1;
-
-    const char *paths[] = {
-        "dxgi.so",
-        "/usr/lib/dxvk/dxgi.so",
-        "/usr/lib/x86_64-linux-gnu/dxvk/dxgi.so",
-        "/usr/lib64/dxvk/dxgi.so",
-        "/opt/dxvk/lib/dxgi.so",
-        "./dlls/dxvk/dxgi.so",
-        NULL
-    };
-    for (int i = 0; paths[i]; i++) {
-        g_dxvk_dxgi = dlopen(paths[i], RTLD_NOW | RTLD_GLOBAL);
-        if (g_dxvk_dxgi) {
-            fprintf(stderr, LOG_PREFIX "DXVK DXGI loaded from %s\n", paths[i]);
-            return;
-        }
-    }
-    fprintf(stderr, LOG_PREFIX "DXVK not found - using stub DXGI (HDR via stubs)\n");
+    pthread_once(&g_dxvk_dxgi_probe_once, dxgi_probe_once);
 }
 
 WINAPI_EXPORT long CreateDXGIFactory(const GUID *riid, void **ppFactory)
 {
     dxgi_try_dxvk();
 
-    if (g_dxvk_dxgi) {
-        typedef long (__attribute__((ms_abi)) *create_fn)(const GUID *, void **);
-        create_fn fn = (create_fn)dlsym(g_dxvk_dxgi, "CreateDXGIFactory");
-        if (fn) {
-            fprintf(stderr, LOG_PREFIX "Forwarding CreateDXGIFactory to DXVK\n");
-            return fn(riid, ppFactory);
-        }
+    if (g_dxvk_create_fn) {
+        fprintf(stderr, LOG_PREFIX "Forwarding CreateDXGIFactory to DXVK\n");
+        return g_dxvk_create_fn(riid, ppFactory);
     }
 
     fprintf(stderr, LOG_PREFIX "Using stub DXGI factory (with HDR output)\n");
@@ -804,6 +1006,7 @@ WINAPI_EXPORT long CreateDXGIFactory(const GUID *riid, void **ppFactory)
     if (!factory) return E_OUTOFMEMORY;
     factory->lpVtbl = &g_factory_vtbl;
     factory->refcount = 1;
+    pthread_mutex_init(&factory->cache_lock, NULL);
     *ppFactory = factory;
     return S_OK;
 }
@@ -812,13 +1015,9 @@ WINAPI_EXPORT long CreateDXGIFactory1(const GUID *riid, void **ppFactory)
 {
     dxgi_try_dxvk();
 
-    if (g_dxvk_dxgi) {
-        typedef long (__attribute__((ms_abi)) *create_fn)(const GUID *, void **);
-        create_fn fn = (create_fn)dlsym(g_dxvk_dxgi, "CreateDXGIFactory1");
-        if (fn) {
-            fprintf(stderr, LOG_PREFIX "Forwarding CreateDXGIFactory1 to DXVK\n");
-            return fn(riid, ppFactory);
-        }
+    if (g_dxvk_create1_fn) {
+        fprintf(stderr, LOG_PREFIX "Forwarding CreateDXGIFactory1 to DXVK\n");
+        return g_dxvk_create1_fn(riid, ppFactory);
     }
 
     return CreateDXGIFactory(riid, ppFactory);
@@ -828,13 +1027,9 @@ WINAPI_EXPORT long CreateDXGIFactory2(UINT Flags, const GUID *riid, void **ppFac
 {
     dxgi_try_dxvk();
 
-    if (g_dxvk_dxgi) {
-        typedef long (__attribute__((ms_abi)) *create_fn)(UINT, const GUID *, void **);
-        create_fn fn = (create_fn)dlsym(g_dxvk_dxgi, "CreateDXGIFactory2");
-        if (fn) {
-            fprintf(stderr, LOG_PREFIX "Forwarding CreateDXGIFactory2 to DXVK\n");
-            return fn(Flags, riid, ppFactory);
-        }
+    if (g_dxvk_create2_fn) {
+        fprintf(stderr, LOG_PREFIX "Forwarding CreateDXGIFactory2 to DXVK\n");
+        return g_dxvk_create2_fn(Flags, riid, ppFactory);
     }
 
     (void)Flags;

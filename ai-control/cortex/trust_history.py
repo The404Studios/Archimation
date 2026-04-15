@@ -12,6 +12,7 @@ Key: SHA256 hash of the executable path (not content -- faster, good enough)
 import json
 import os
 import hashlib
+import threading
 import time
 import logging
 from collections import OrderedDict
@@ -106,6 +107,15 @@ class TrustHistoryStore:
         self._all_cache: Optional[List[TrustRecord]] = None
         self._all_cache_time: float = 0.0
         self._save_count: int = 0  # Tracks saves for periodic disk pruning
+        # Serialize cache mutations.  cortex event handlers invoke
+        # record_start/record_exit from different dispatcher tasks; under
+        # the GIL each dict op is atomic but the compound LRU touch
+        # ("if key in cache: move_to_end; while len>limit: popitem") is
+        # not — two concurrent record_start calls can both see the cache
+        # at the limit and both popitem, evicting more than intended.
+        # The critical sections here are microseconds (dict ops only;
+        # file IO is outside the lock); threading.Lock suffices.
+        self._lock = threading.Lock()
         try:
             os.makedirs(self._dir, exist_ok=True)
         except OSError as e:
@@ -113,7 +123,12 @@ class TrustHistoryStore:
         logger.info("Trust history store: %s", self._dir)
 
     def _touch_cache(self, key: str) -> None:
-        """Mark a cache key as recently used and evict LRU entries if over limit."""
+        """Mark a cache key as recently used and evict LRU entries if over limit.
+
+        Caller MUST hold ``self._lock`` -- the move_to_end/popitem pair is
+        a compound op that must not be interleaved with a concurrent
+        record_start().
+        """
         # O(1) move to MRU end
         if key in self._cache:
             self._cache.move_to_end(key, last=True)
@@ -154,10 +169,14 @@ class TrustHistoryStore:
         for _, path, fname in file_mtimes:
             if removed >= excess:
                 break
-            # Don't remove files for currently cached (active) executables
+            # Don't remove files for currently cached (active) executables.
+            # Take the lock just for the membership test; `in dict` itself
+            # is GIL-atomic, so this is really belt-and-braces for when we
+            # later need to read multiple attrs.
             cache_key = fname.replace(".json", "")
-            if cache_key in self._cache:
-                continue
+            with self._lock:
+                if cache_key in self._cache:
+                    continue
             try:
                 os.unlink(path)
                 removed += 1
@@ -167,7 +186,8 @@ class TrustHistoryStore:
         if removed > 0:
             logger.info("Pruned %d old trust history files (had %d, limit %d)",
                         removed, len(file_mtimes), self.MAX_DISK_FILES)
-            self._all_cache = None  # Invalidate get_all() cache
+            with self._lock:
+                self._all_cache = None  # Invalidate get_all() cache
 
     def _key(self, exe_path: str) -> str:
         """Generate storage key from exe path (32 hex chars to reduce collision risk)."""
@@ -211,34 +231,44 @@ class TrustHistoryStore:
         """
         key = self._key(exe_path)
 
-        # Check cache
-        cached = self._cache.get(key)
-        if cached is not None:
-            self._touch_cache(key)
-            return cached
+        # Cache / miss-set read under the lock (compound check + touch).
+        with self._lock:
+            cached = self._cache.get(key)
+            if cached is not None:
+                self._touch_cache(key)
+                return cached
+            if key in self._miss_cache:
+                return None
 
-        # Negative cache: if we've recently confirmed this exe isn't on disk,
-        # don't re-open().
-        if key in self._miss_cache:
-            return None
-
-        # Check disk (no separate exists() call -- open() raises ENOENT)
+        # Disk read outside the lock: _load_and_validate may block on slow
+        # storage; holding the lock would serialize every consumer.
         record = self._load_and_validate(self._path(key))
-        if record is not None:
-            self._cache[key] = record
-            self._touch_cache(key)
-            return record
 
-        # Record the miss, bounded to prevent unbounded growth
-        self._miss_cache.add(key)
-        if len(self._miss_cache) > self.MAX_CACHE_ENTRIES:
-            # Evict half; next call rebuilds as needed
-            self._miss_cache = set()
-        return None
+        with self._lock:
+            if record is not None:
+                # Another caller may have inserted while we were on disk.
+                # Prefer the existing cached value (it may be more recent
+                # than the disk snapshot we just read).
+                existing = self._cache.get(key)
+                if existing is not None:
+                    self._touch_cache(key)
+                    return existing
+                self._cache[key] = record
+                self._touch_cache(key)
+                return record
+
+            # Record the miss, bounded to prevent unbounded growth
+            self._miss_cache.add(key)
+            if len(self._miss_cache) > self.MAX_CACHE_ENTRIES:
+                # Evict half; next call rebuilds as needed
+                self._miss_cache = set()
+            return None
 
     def record_start(self, exe_path: str) -> TrustRecord:
         """Record that an executable is starting. Creates record if new."""
         key = self._key(exe_path)
+        # get() itself takes the lock internally; do the lookup first
+        # outside any lock we hold, then mutate under the lock.
         record = self.get(exe_path)
 
         if record is None:
@@ -252,10 +282,12 @@ class TrustHistoryStore:
         record.total_runs += 1
         record.last_seen = time.time()
 
-        self._cache[key] = record
-        # A newly-created record invalidates any negative-cache entry.
-        self._miss_cache.discard(key)
-        self._touch_cache(key)
+        with self._lock:
+            self._cache[key] = record
+            # A newly-created record invalidates any negative-cache entry.
+            self._miss_cache.discard(key)
+            self._touch_cache(key)
+        # _save does file IO — keep it out of the lock.
         self._save(key, record)
         return record
 
@@ -282,9 +314,10 @@ class TrustHistoryStore:
                 last_seen=time.time(),
                 total_runs=1,
             )
-            self._cache[key] = record
-            self._miss_cache.discard(key)
-            self._touch_cache(key)
+            with self._lock:
+                self._cache[key] = record
+                self._miss_cache.discard(key)
+                self._touch_cache(key)
             self._save(key, record)
 
         if exit_code == 0:
@@ -317,8 +350,9 @@ class TrustHistoryStore:
         if len(record.recent_runs) > 10:
             record.recent_runs = record.recent_runs[-10:]
 
-        self._cache[key] = record
-        self._touch_cache(key)
+        with self._lock:
+            self._cache[key] = record
+            self._touch_cache(key)
         self._save(key, record)
 
     def record_quarantine(self, exe_path: str) -> None:
@@ -328,8 +362,9 @@ class TrustHistoryStore:
         if record is not None:
             record.quarantines += 1
             record.trust_score = max(0, record.trust_score - 10)
-            self._cache[key] = record
-            self._touch_cache(key)
+            with self._lock:
+                self._cache[key] = record
+                self._touch_cache(key)
             self._save(key, record)
             logger.info(
                 "Quarantine recorded for %s (total=%d, score=%d)",
@@ -350,15 +385,20 @@ class TrustHistoryStore:
             # when we actually re-read the directory.  Patching the
             # existing list in place (when present) keeps the common-case
             # dashboard poll O(1) during bursts of save activity.
-            if self._all_cache is not None:
-                replaced = False
-                for i, r in enumerate(self._all_cache):
-                    if r.exe_path == record.exe_path:
-                        self._all_cache[i] = record
-                        replaced = True
-                        break
-                if not replaced:
-                    self._all_cache.append(record)
+            #
+            # Lock: _all_cache iteration + conditional append is a
+            # compound op that must not race with get_all() rebuilding
+            # the list.
+            with self._lock:
+                if self._all_cache is not None:
+                    replaced = False
+                    for i, r in enumerate(self._all_cache):
+                        if r.exe_path == record.exe_path:
+                            self._all_cache[i] = record
+                            replaced = True
+                            break
+                    if not replaced:
+                        self._all_cache.append(record)
         except OSError as e:
             logger.error("Failed to save trust record %s: %s", path, e)
             try:
@@ -366,7 +406,9 @@ class TrustHistoryStore:
             except OSError:
                 pass
 
-        # Periodically prune old disk files to prevent unbounded growth
+        # Periodically prune old disk files to prevent unbounded growth.
+        # _save_count increment is GIL-atomic as a single += on an int;
+        # the prune call is outside the lock (file IO).
         self._save_count += 1
         if self._save_count % 100 == 0:
             self._prune_disk_files()
@@ -378,8 +420,11 @@ class TrustHistoryStore:
         os.listdir() and skips non-.json entries without a stat() call.
         """
         now = time.time()
-        if self._all_cache is not None and now - self._all_cache_time < 5.0:
-            return self._all_cache
+        # Fast lockless check -- coherent under the GIL.
+        cached_all = self._all_cache
+        cached_time = self._all_cache_time
+        if cached_all is not None and now - cached_time < 5.0:
+            return cached_all
 
         records: List[TrustRecord] = []
         try:
@@ -390,7 +435,8 @@ class TrustHistoryStore:
                         continue
                     # Prefer the cache: identical record and saves a file read.
                     key = name[:-5]  # strip .json
-                    cached = self._cache.get(key)
+                    with self._lock:
+                        cached = self._cache.get(key)
                     if cached is not None:
                         records.append(cached)
                         continue
@@ -400,8 +446,9 @@ class TrustHistoryStore:
         except OSError:
             pass
         records = sorted(records, key=lambda r: r.last_seen, reverse=True)
-        self._all_cache = records
-        self._all_cache_time = now
+        with self._lock:
+            self._all_cache = records
+            self._all_cache_time = now
         return records
 
     def clear(self, exe_path: str) -> bool:
@@ -410,11 +457,12 @@ class TrustHistoryStore:
         path = self._path(key)
         removed = False
 
-        if key in self._cache:
-            del self._cache[key]
-            removed = True
-        # Drop any stale negative-cache entry so the next get() re-checks disk.
-        self._miss_cache.discard(key)
+        with self._lock:
+            if key in self._cache:
+                del self._cache[key]
+                removed = True
+            # Drop any stale negative-cache entry so the next get() re-checks disk.
+            self._miss_cache.discard(key)
 
         # Attempt unlink directly; ENOENT is fine (file already gone).
         try:
@@ -427,7 +475,8 @@ class TrustHistoryStore:
 
         # Invalidate get_all aggregate so the dashboard reflects the deletion.
         if removed:
-            self._all_cache = None
+            with self._lock:
+                self._all_cache = None
 
         return removed
 

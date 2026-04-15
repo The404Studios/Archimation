@@ -14,7 +14,85 @@
 
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/percpu.h>
 #include "trust_internal.h"
+#include "trust_isa.h"
+
+/* ============================================================
+ * Predicate flag register (per-CPU, session 31 addition).
+ *
+ * The extended ISA lets a predicated instruction gate its own
+ * execution on the last ALU-style op's result.  We keep that
+ * "last result" in a per-CPU 64-bit signed variable.
+ *
+ * Rules:
+ *   * Updated ONLY by ALU-style primitives that return a
+ *     meaningful value (score, balance, bitmap count, etc.).
+ *   * Reset on dispatch entry (trust_isa_pred_reset()) so
+ *     stale state from a different submit cannot leak in.
+ *   * Does NOT survive a schedule: reset is called at the
+ *     start of every dispatcher entry point.
+ *
+ * Thread safety:
+ *   Per-CPU storage + preempt_disable around read-modify-write
+ *   gives us atomic semantics without a spinlock.  The value
+ *   is consumed immediately by the next instruction in the
+ *   same dispatch — no cross-CPU handoff is ever expected.
+ * ============================================================ */
+
+static DEFINE_PER_CPU(s64, trust_isa_pred_reg);
+
+void trust_isa_pred_reset(void)
+{
+    preempt_disable();
+    __this_cpu_write(trust_isa_pred_reg, 0);
+    preempt_enable();
+}
+EXPORT_SYMBOL_GPL(trust_isa_pred_reset);
+
+void trust_isa_pred_set(int64_t result)
+{
+    preempt_disable();
+    __this_cpu_write(trust_isa_pred_reg, result);
+    preempt_enable();
+}
+EXPORT_SYMBOL_GPL(trust_isa_pred_set);
+
+int64_t trust_isa_pred_get(void)
+{
+    s64 v;
+    preempt_disable();
+    v = __this_cpu_read(trust_isa_pred_reg);
+    preempt_enable();
+    return v;
+}
+EXPORT_SYMBOL_GPL(trust_isa_pred_get);
+
+/*
+ * trust_risc_eval_predicated - Check the predicate bit on an
+ * instruction word and return:
+ *   1  => the instruction should execute
+ *   0  => the instruction should be skipped (predicate fail)
+ *
+ * This is a pure function; callers can use it before invoking
+ * trust_isa_exec_vec/trust_isa_exec_fused or the legacy scalar
+ * handlers.  Unpredicated (bit 31 = 0) instructions always
+ * return 1.
+ */
+int trust_risc_eval_predicated(u32 instr)
+{
+    s64 flag;
+    u32 cond, sense;
+
+    if (!trust_isa_instr_is_predicated(instr))
+        return 1;
+
+    cond  = trust_isa_pred_cond(instr);
+    sense = trust_isa_pred_sense(instr);
+    flag  = trust_isa_pred_get();
+    return trust_isa_pred_match(cond, sense, flag);
+}
+EXPORT_SYMBOL_GPL(trust_risc_eval_predicated);
 
 /* --- TRUST_CHECK_CAP --- */
 int trust_risc_check_cap(u32 subject_id, u32 capability)

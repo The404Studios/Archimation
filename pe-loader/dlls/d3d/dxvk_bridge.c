@@ -29,8 +29,13 @@ typedef Window (*XDefaultRootWindow_fn)(Display *);
 typedef int (*XFlush_fn)(Display *);
 
 static void *g_x11_lib = NULL;
-static int g_x11_tried = 0;
+static pthread_once_t g_x11_once = PTHREAD_ONCE_INIT;
+static int g_x11_load_ok = 0;
 static Display *g_display = NULL;
+/* Separate mutex for display creation — x11_load() can be called
+ * concurrently on multiple Present threads in games with separate
+ * render + compositor threads. */
+static pthread_mutex_t g_display_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static XOpenDisplay_fn        p_XOpenDisplay;
 static XCloseDisplay_fn       p_XCloseDisplay;
@@ -54,16 +59,13 @@ typedef struct {
 static window_mapping_t g_window_map[MAX_WINDOW_MAP];
 static pthread_mutex_t g_map_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static int x11_load(void)
+static void x11_load_impl(void)
 {
-    if (g_x11_tried) return g_x11_lib ? 0 : -1;
-    g_x11_tried = 1;
-
     g_x11_lib = dlopen("libX11.so.6", RTLD_NOW);
     if (!g_x11_lib) g_x11_lib = dlopen("libX11.so", RTLD_NOW);
     if (!g_x11_lib) {
         fprintf(stderr, "[dxvk_bridge] libX11 not found\n");
-        return -1;
+        return;
     }
 
     p_XOpenDisplay        = (XOpenDisplay_fn)dlsym(g_x11_lib, "XOpenDisplay");
@@ -78,21 +80,35 @@ static int x11_load(void)
         fprintf(stderr, "[dxvk_bridge] libX11 missing required functions\n");
         dlclose(g_x11_lib);
         g_x11_lib = NULL;
-        return -1;
+        return;
     }
 
-    return 0;
+    g_x11_load_ok = 1;
 }
 
+static int x11_load(void)
+{
+    pthread_once(&g_x11_once, x11_load_impl);
+    return g_x11_load_ok ? 0 : -1;
+}
+
+/* Lock-protected lazy display initialization. Multiple render threads can
+ * race into get_display on first window creation; XOpenDisplay is NOT
+ * threadsafe under concurrent entry on some libX11 builds. */
 static Display *get_display(void)
 {
+    Display *dpy = __atomic_load_n(&g_display, __ATOMIC_ACQUIRE);
+    if (dpy) return dpy;
+    if (x11_load() < 0) return NULL;
+    pthread_mutex_lock(&g_display_lock);
     if (!g_display) {
-        if (x11_load() < 0) return NULL;
-        g_display = p_XOpenDisplay(NULL);
-        if (!g_display)
-            fprintf(stderr, "[dxvk_bridge] Cannot open X11 display\n");
+        Display *d = p_XOpenDisplay(NULL);
+        if (!d) fprintf(stderr, "[dxvk_bridge] Cannot open X11 display\n");
+        __atomic_store_n(&g_display, d, __ATOMIC_RELEASE);
     }
-    return g_display;
+    dpy = g_display;
+    pthread_mutex_unlock(&g_display_lock);
+    return dpy;
 }
 
 /*
@@ -118,11 +134,27 @@ void dxvk_bridge_init(void)
 }
 
 /*
- * dxvk_register_window - Associate an HWND with an X11 Window
+ * dxvk_register_window - Associate an HWND with an X11 Window.
+ *
+ * First checks for an existing mapping to avoid duplicate entries — without
+ * this check, an app that re-registers the same HWND (e.g. on window-class
+ * change) consumes mapping slots and eventually exhausts MAX_WINDOW_MAP.
+ * If a mapping already exists, update its dimensions in-place.
  */
 void dxvk_register_window(void *hwnd, unsigned long x11_window, int width, int height)
 {
     pthread_mutex_lock(&g_map_lock);
+    /* First scan: update if already present. */
+    for (int i = 0; i < MAX_WINDOW_MAP; i++) {
+        if (g_window_map[i].valid && g_window_map[i].hwnd == hwnd) {
+            g_window_map[i].x11_win = (Window)x11_window;
+            g_window_map[i].width = width;
+            g_window_map[i].height = height;
+            pthread_mutex_unlock(&g_map_lock);
+            return;
+        }
+    }
+    /* Second scan: find free slot. */
     for (int i = 0; i < MAX_WINDOW_MAP; i++) {
         if (!g_window_map[i].valid) {
             g_window_map[i].hwnd = hwnd;

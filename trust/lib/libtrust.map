@@ -1,0 +1,106 @@
+/*
+ * libtrust.map - linker version script
+ *
+ * Policy: additive only — existing symbols stay in LIBTRUST_1.0,
+ * new (Session 31) APIs land in LIBTRUST_1.2. soname stays libtrust.so.1
+ * because no ABI break occurred. The soname Makefile will emit
+ * libtrust.so.1.2 as the realname, libtrust.so.1 as the soname,
+ * libtrust.so as the linker name.
+ *
+ * The internal helper trust_fd_snapshot() is intentionally NOT exported:
+ * libtrust_batch.c and libtrust_events.c link against it inside the
+ * same shared object, never across.
+ */
+
+LIBTRUST_1.0 {
+    global:
+        /* Core lifecycle */
+        trust_init;
+        trust_cleanup;
+        trust_available;
+
+        /* RISC fast-path */
+        trust_check_capability;
+        trust_get_score;
+        trust_record_action;
+        trust_threshold_check;
+
+        /* FBC complex-path */
+        trust_register_subject;
+        trust_register_subject_ex;
+        trust_unregister_subject;
+        trust_request_escalation;
+        trust_policy_eval;
+        trust_domain_transfer;
+        trust_get_subject;
+        trust_propagate;
+        trust_repartition;
+        trust_flush_tlb;
+        trust_get_audit;
+
+        /* Dependency graph */
+        trust_dep_add;
+        trust_dep_remove;
+
+        /* Escalation queue */
+        trust_escalation_poll;
+        trust_escalation_respond;
+
+        /* Proof chain */
+        trust_proof_mint;
+        trust_proof_consume;
+        trust_proof_fence;
+        trust_proof_verify;
+        trust_proof_get_nonce;
+
+        /* Token economy */
+        trust_token_balance;
+        trust_token_max_balance;
+        trust_token_burn_action;
+        trust_token_transfer;
+        trust_token_get_cost;
+
+        /* Lifecycle */
+        trust_mitotic_divide;
+        trust_meiotic_combine;
+        trust_meiotic_release;
+        trust_apoptosis;
+
+        /* Chromosome */
+        trust_get_chromosome;
+        trust_get_sex;
+
+        /* Immune */
+        trust_immune_status;
+        trust_quarantine;
+        trust_release_quarantine;
+
+    local:
+        *;
+};
+
+LIBTRUST_1.2 {
+    global:
+        /* Version & probe */
+        trust_library_version;
+        trust_probe_caps;
+
+        /* Batch submission */
+        trust_batch_new;
+        trust_batch_free;
+        trust_batch_decay;
+        trust_batch_escalate_check;
+        trust_batch_fused_auth_gate;
+        trust_batch_submit;
+
+        /* Binary event stream */
+        trust_events_open;
+        trust_events_read;
+        trust_events_close;
+
+        /* Compressed event log */
+        trust_log_open;
+        trust_log_append;
+        trust_log_rotate;
+        trust_log_close;
+} LIBTRUST_1.0;

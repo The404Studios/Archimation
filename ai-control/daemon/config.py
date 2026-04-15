@@ -13,6 +13,7 @@ Callers that want hard-fail behaviour should pass ``strict=True``.
 
 import logging
 import os
+import sys
 from pathlib import Path
 
 logger = logging.getLogger("ai-control.config")
@@ -294,6 +295,35 @@ def _detect_hardware_class() -> str:
     return "mid"
 
 
+def _detect_iouring_support() -> tuple[bool, dict]:
+    """Probe kernel io_uring availability.
+
+    Returns ``(available, feature_bitmap_dict)``.  Probe is cheap (one
+    setup+teardown of a depth-2 ring) and cached by :class:`IOUring`
+    itself, so repeated calls are free.  Never raises -- a failed probe
+    just returns ``(False, {})`` and the observers stay on /proc text
+    reads.
+    """
+    if sys.platform != "linux":
+        return (False, {})
+    try:
+        # Import is intentionally deferred so non-Linux tooling
+        # (mkarchiso on WSL, Windows test harness) doesn't pay the
+        # ctypes/mmap setup cost at import time.
+        from iouring import IOUring  # type: ignore[import-not-found]
+    except ImportError:
+        try:
+            from daemon.iouring import IOUring  # type: ignore[import-not-found,no-redef]
+        except ImportError:
+            return (False, {})
+    try:
+        ok = IOUring.available()
+        return (ok, IOUring.features() if ok else {})
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("iouring probe raised: %s", exc)
+        return (False, {})
+
+
 def _apply_hardware_defaults(config: dict) -> None:
     """Set observer + cache defaults based on detected hardware class.
 
@@ -332,6 +362,57 @@ def _apply_hardware_defaults(config: dict) -> None:
         _default("memory_max_processes", 512)
         _default("syscall_poll_interval", 2.0)
         _default("syscall_max_processes", 512)
+
+    # ── io_uring (R32) -------------------------------------------------
+    #
+    # Default policy:
+    #   - old HW: never.  SQPOLL would burn the only spare core, and the
+    #     /proc text-read path works fine at its reduced poll cadence.
+    #   - mid HW: enable if the kernel supports it, no SQPOLL.
+    #   - new HW: enable with SQPOLL (kernel poll thread pinned to the
+    #     last CPU) for the lowest-latency observer ticks.
+    #
+    # Operators can override:
+    #   use_iouring         : false -> force classic /proc text I/O
+    #                         true  -> force on (probe still gates)
+    #   iouring_sqpoll      : false -> disable SQPOLL even on new HW
+    #   iouring_sq_cpu      : int   -> pin the SQPOLL thread to this CPU
+    #   iouring_depth       : int   -> SQ depth per ring (power of two)
+    ok, feats = _detect_iouring_support()
+    config.setdefault("iouring_available", ok)
+    config.setdefault("iouring_features", feats)
+
+    if hw == "old":
+        _default("use_iouring", False)
+        _default("iouring_sqpoll", False)
+    elif hw == "mid":
+        _default("use_iouring", ok)
+        _default("iouring_sqpoll", False)
+    else:
+        _default("use_iouring", ok)
+        # SQPOLL pins a kernel thread to a CPU; only safe with >= 4 cores.
+        cpu_count = os.cpu_count() or 1
+        _default("iouring_sqpoll", ok and cpu_count >= 4)
+        if config["iouring_sqpoll"]:
+            # Pin to last physical CPU (observers don't need cache locality
+            # with any particular user thread).
+            _default("iouring_sq_cpu", cpu_count - 1)
+
+    _default("iouring_depth", 64 if hw == "new" else 32)
+
+    if config.get("use_iouring"):
+        logger.info(
+            "config: io_uring enabled (sqpoll=%s, depth=%d, features=0x%x)",
+            config.get("iouring_sqpoll", False),
+            config.get("iouring_depth", 32),
+            feats.get("features", 0) if isinstance(feats, dict) else 0,
+        )
+    elif ok:
+        logger.debug(
+            "config: io_uring available but disabled on hardware_class=%s", hw
+        )
+    else:
+        logger.debug("config: io_uring unavailable (kernel <5.1 or non-Linux)")
 
 
 def load_config(path: str) -> dict:

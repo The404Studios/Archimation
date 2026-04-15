@@ -19,7 +19,9 @@ CFLAGS = -Wall -Wextra -Werror -Wno-stringop-truncation -Wno-format-truncation \
          -I$(CURDIR)/include -I$(TRUST_DIR)/include
 TRUST_DIR = $(CURDIR)/../trust
 LDFLAGS = -ldl -lpthread
-LOADER_LDFLAGS = $(LDFLAGS) -rdynamic -L$(TRUST_DIR)/lib -ltrust -lm -lrt -Wl,-rpath,/usr/lib
+# -lzstd is required by loader/pe_patch_cache.c for compressed patch plans.
+# zstd is a base Arch package so no probe needed.
+LOADER_LDFLAGS = $(LDFLAGS) -rdynamic -L$(TRUST_DIR)/lib -ltrust -lm -lrt -lzstd -Wl,-rpath,/usr/lib
 
 INSTALL_PREFIX ?= /usr
 BIN_DIR ?= $(INSTALL_PREFIX)/bin
@@ -53,6 +55,10 @@ LOADER_SRCS = loader/main.c \
               loader/pe_event.c \
               loader/cortex_cmd.c \
               loader/objectd_client.c \
+              loader/pe_patch.c \
+              loader/pe_patch_crt.c \
+              loader/pe_patch_cache.c \
+              loader/sigill_trampoline.c \
               dlls/common/wchar_util.c \
               loader/abi_thunk.S
 LOADER_OBJS = $(LOADER_SRCS:.c=.o)

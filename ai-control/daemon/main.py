@@ -155,6 +155,12 @@ async def main():
     setup_logging(config)
 
     logger.info("AI Control Daemon starting...")
+    # Log hardware class up-front so thermal/power orchestrators' poll-rate
+    # choices are visible to operators reading the journal on boot.
+    logger.info(
+        "hardware_class=%s (controls thermal poll rate and observer tuning)",
+        config.get("hardware_class", "unknown"),
+    )
     check_root()
 
     # Install SIGCHLD reaper BEFORE any subprocess can be spawned.
@@ -162,6 +168,15 @@ async def main():
     # children accumulate as zombies without this. Must come before create_app
     # and before any async task that could spawn a child.
     _install_sigchld_reaper()
+
+    # Round 32: pre-create cgroup v2 slice directories so the first
+    # /contusion/launch invocation doesn't pay a systemd lazy-instantiation
+    # cost.  Idempotent; logs and continues on systems without cgroup v2.
+    try:
+        from cgroup import ensure_slices
+        ensure_slices()
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug("cgroup slice pre-creation skipped: %s", e)
 
     # Detect and log session type (Wayland vs X11 vs headless)
     session = detect_session_type()
@@ -229,6 +244,28 @@ async def main():
     except Exception as e:
         logger.critical("Failed to create application: %s", e, exc_info=True)
         sys.exit(1)
+
+    # Direct-HW routers: GPU enumeration/PRIME + input aggregator.
+    # Mounted post-create_app so api_server.py does not need to import them.
+    # Each router is fault-isolated: import errors are logged and the daemon
+    # continues without that specific endpoint group.
+    try:
+        import gpu as _gpu_mod
+        _gpu_router = _gpu_mod.build_router()
+        if _gpu_router is not None:
+            app.include_router(_gpu_router)
+            logger.info("GPU router mounted at /gpu")
+    except Exception as e:
+        logger.warning("GPU router unavailable: %s", e)
+
+    try:
+        import input as _input_mod
+        _input_router = _input_mod.build_router()
+        if _input_router is not None:
+            app.include_router(_input_router)
+            logger.info("Input router mounted at /input")
+    except Exception as e:
+        logger.warning("Input router unavailable: %s", e)
 
     # Handle shutdown gracefully
     loop = asyncio.get_running_loop()

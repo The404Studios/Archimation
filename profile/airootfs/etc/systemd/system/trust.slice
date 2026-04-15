@@ -1,0 +1,72 @@
+[Unit]
+Description=AI Arch Trust Layer (L0 kernel trust + libtrust helpers)
+Documentation=https://github.com/ai-arch-linux
+# Trust is the authority root for the whole stack: the trust kernel module
+# plus its userspace helpers MUST remain responsive even when a game is
+# pegging every CPU.  If trust stalls, ISA instructions from PE binaries
+# time out and anti-cheat kits flag the system as frozen.
+#
+# We therefore reserve (not cap) CPU/RAM for this slice so the kernel
+# scheduler always has work from trust when it's runnable, regardless of
+# how busy pe-compat.slice gets.
+DefaultDependencies=no
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Slice]
+# Accounting first: without these, CPUWeight/IOWeight tuning silently no-ops
+# because systemd won't enable the controller for the slice subtree.
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+TasksAccounting=yes
+
+# --- CPU ------------------------------------------------------------------
+# CPUWeight is proportional share (default 100).  1000 means trust gets
+# 10x the timeslice of default services when CPUs are contended.  We
+# deliberately use weight (not quota) because trust is almost always
+# idle -- it only needs to be snappy when it IS runnable.
+CPUWeight=1000
+
+# --- Memory ---------------------------------------------------------------
+# MemoryMin: guaranteed reservation -- the kernel will NEVER reclaim this
+# memory from us under pressure.  64 MiB is enough for the trust library
+# plus a handful of registered subjects.  Unused bytes still stay in this
+# slice's cache.
+MemoryMin=64M
+# MemoryLow: soft floor, reclaim only when absolutely necessary.  Between
+# MemoryMin and MemoryLow the kernel will try every other slice first.
+MemoryLow=96M
+# MemoryHigh: soft cap.  We want trust to BE responsive, not to bloat;
+# 256 MiB is an upper bound that signals "something leaked" if ever hit.
+MemoryHigh=256M
+# Never swap the trust library to disk -- swap-in during an ISA request
+# would add 10+ ms latency under a loaded HDD.
+MemorySwapMax=0
+MemoryZSwapMax=0
+
+# --- IO -------------------------------------------------------------------
+# IOWeight same scale as CPUWeight.  Trust reads a few small files at
+# boot and a trickle thereafter, but must win against pe-compat when it
+# does.
+IOWeight=1000
+
+# --- Process limits -------------------------------------------------------
+# 128 tasks: trust_daemon + worker threads + APE proof consumers.
+# Guards against fork bombs without cramping legitimate use.
+TasksMax=128
+
+# --- OOM killer ordering --------------------------------------------------
+# -500: the OOM killer prefers to kill everything else (user processes,
+# PE apps, even most system services) before touching trust.  We can't
+# use -1000 (that's reserved for the init system), so -500 is the
+# practical floor.  pe-compat gets -100, observer gets +500.
+#
+# Note: OOMScoreAdjust is a [Service] key normally; on a slice it
+# propagates to all direct children that don't override it.
+ManagedOOMSwap=auto
+ManagedOOMMemoryPressure=auto
+ManagedOOMMemoryPressureLimit=80%
+
+[Install]
+WantedBy=multi-user.target

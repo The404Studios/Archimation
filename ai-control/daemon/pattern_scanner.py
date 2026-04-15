@@ -14,6 +14,20 @@ from dataclasses import dataclass, field
 from typing import Optional
 from pathlib import Path
 
+# io_uring batch reader (R32).  Optional -- daemon keeps working on
+# kernels <5.1 and non-Linux hosts where the import returns the stub.
+try:
+    from iouring import IOUring, batch_read_proc_files
+    _IOURING_IMPORT_OK = True
+except Exception:
+    try:
+        from daemon.iouring import IOUring, batch_read_proc_files  # type: ignore
+        _IOURING_IMPORT_OK = True
+    except Exception:
+        IOUring = None  # type: ignore[assignment]
+        batch_read_proc_files = None  # type: ignore[assignment]
+        _IOURING_IMPORT_OK = False
+
 logger = logging.getLogger("ai-control.scanner")
 
 
@@ -200,11 +214,26 @@ class PatternDatabase:
 class MemoryScanner:
     """Scans process memory against the pattern database."""
 
-    def __init__(self, db: PatternDatabase = None):
+    def __init__(
+        self,
+        db: PatternDatabase = None,
+        use_iouring: bool = False,
+        iouring_sqpoll: bool = False,
+        iouring_sq_cpu: Optional[int] = None,
+        iouring_depth: int = 32,
+    ):
         self.db = db or PatternDatabase()
         # (pat_bytes, pat_mask, literal_or_None) per pattern id.
         self._compiled: dict[str, tuple[bytes, bytes, bytes | None]] = {}
         self._compile_patterns()
+        # io_uring params (R32).  When enabled, scan_process pipelines
+        # region reads -- substring search overlaps kernel DMA/copy so
+        # wall-clock scan time drops ~2x on large processes.
+        self._use_iouring = bool(use_iouring and _IOURING_IMPORT_OK)
+        self._iouring_sqpoll = bool(iouring_sqpoll)
+        self._iouring_sq_cpu = iouring_sq_cpu
+        self._iouring_depth = max(8, int(iouring_depth))
+        self._iouring_disabled: bool = False
 
     def _compile_patterns(self):
         """Compile hex patterns into byte+mask pairs for fast matching.
@@ -354,8 +383,14 @@ class MemoryScanner:
         return matches
 
     def scan_process(self, pid: int) -> list[ScanMatch]:
-        """Scan a process's memory via /proc/PID/mem."""
-        all_matches = []
+        """Scan a process's memory via /proc/PID/mem.
+
+        With io_uring enabled (R32) region reads are pipelined: the
+        substring scan on region N runs in parallel with the kernel
+        fetching region N+1.  Falls back to the serial loop on kernels
+        <5.1 or if any ring op errors out.
+        """
+        all_matches: list[ScanMatch] = []
         maps_path = f"/proc/{pid}/maps"
         mem_path = f"/proc/{pid}/mem"
 
@@ -365,42 +400,146 @@ class MemoryScanner:
         except (OSError, PermissionError):
             return []
 
+        # Pre-parse region descriptors so both paths share the filter.
+        scan_regions: list[tuple[int, int, str]] = []
+        for line in regions:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            addr_range = parts[0].split('-')
+            try:
+                start = int(addr_range[0], 16)
+                end = int(addr_range[1], 16)
+            except (ValueError, IndexError):
+                continue
+            perms = parts[1]
+            size = end - start
+            if 'r' not in perms or size > 64 * 1024 * 1024:
+                continue
+            label = parts[5].strip() if len(parts) > 5 else f"anon@{start:#x}"
+            scan_regions.append((start, size, label))
+
+        if not scan_regions:
+            return []
+
         try:
             mem_fd = os.open(mem_path, os.O_RDONLY)
         except (OSError, PermissionError):
             return []
 
         try:
-            for line in regions:
-                parts = line.split()
-                if len(parts) < 2:
-                    continue
-                addr_range = parts[0].split('-')
-                start = int(addr_range[0], 16)
-                end = int(addr_range[1], 16)
-                perms = parts[1]
-                size = end - start
-
-                # Skip non-readable or very large regions
-                if 'r' not in perms or size > 64 * 1024 * 1024:
-                    continue
-
-                label = parts[5].strip() if len(parts) > 5 else f"anon@{start:#x}"
-
-                try:
-                    os.lseek(mem_fd, start, os.SEEK_SET)
-                    data = os.read(mem_fd, min(size, 4 * 1024 * 1024))
-                    if data:
-                        region_matches = self.scan_bytes(data, label)
-                        for m in region_matches:
-                            m.va += start  # Adjust to absolute VA
-                        all_matches.extend(region_matches)
-                except OSError:
-                    continue
+            if (
+                self._use_iouring
+                and not self._iouring_disabled
+                and _IOURING_IMPORT_OK
+                and IOUring is not None
+                and IOUring.available()
+                and len(scan_regions) > 1
+            ):
+                ok = self._scan_process_iouring(
+                    mem_fd, scan_regions, all_matches,
+                )
+                if not ok:
+                    all_matches.clear()
+                    self._scan_process_sync(mem_fd, scan_regions, all_matches)
+            else:
+                self._scan_process_sync(mem_fd, scan_regions, all_matches)
         finally:
             os.close(mem_fd)
 
         return all_matches
+
+    def _scan_process_sync(
+        self,
+        mem_fd: int,
+        scan_regions: list[tuple[int, int, str]],
+        all_matches: list[ScanMatch],
+    ) -> None:
+        """Synchronous per-region scan -- the portable fallback."""
+        for start, size, label in scan_regions:
+            try:
+                os.lseek(mem_fd, start, os.SEEK_SET)
+                data = os.read(mem_fd, min(size, 4 * 1024 * 1024))
+            except OSError:
+                continue
+            if not data:
+                continue
+            region_matches = self.scan_bytes(data, label)
+            for m in region_matches:
+                m.va += start
+            all_matches.extend(region_matches)
+
+    def _scan_process_iouring(
+        self,
+        mem_fd: int,
+        scan_regions: list[tuple[int, int, str]],
+        all_matches: list[ScanMatch],
+    ) -> bool:
+        """Pipeline reads via io_uring so scan + I/O overlap.
+
+        Returns False if a ring op failed -- the caller retries sync.
+        """
+        if IOUring is None:
+            return False
+        try:
+            ring = IOUring(
+                depth=self._iouring_depth,
+                sqpoll=self._iouring_sqpoll,
+                sq_cpu=self._iouring_sq_cpu,
+            )
+            ring._setup()
+        except OSError as e:
+            logger.debug("pattern_scanner: io_uring setup failed (%s)", e)
+            self._iouring_disabled = True
+            return False
+
+        # Cap per-region buffer to the same 4 MiB budget the sync path uses.
+        MAX_PER_REGION = 4 * 1024 * 1024
+        depth = max(2, min(self._iouring_depth, 16))
+        in_flight: dict[int, tuple[int, str, bytearray, int]] = {}
+        idx = 0
+        total = len(scan_regions)
+        try:
+            while idx < total or in_flight:
+                # Fill the pipeline.
+                while idx < total and len(in_flight) < depth:
+                    start, size, label = scan_regions[idx]
+                    to_read = min(size, MAX_PER_REGION)
+                    buf = bytearray(to_read)
+                    ud = ring.submit_read(mem_fd, buf, offset=start)
+                    if ud is None:
+                        break
+                    in_flight[ud] = (start, label, buf, to_read)
+                    idx += 1
+                if not in_flight:
+                    break
+                completions = ring.drain(min_complete=1)
+                for c in completions:
+                    meta = in_flight.pop(c.user_data, None)
+                    if meta is None:
+                        continue
+                    start, label, buf, reqlen = meta
+                    if not c.ok:
+                        # /proc/PID/mem returns EIO for unreadable pages --
+                        # same as the sync path (lseek + read on a hole).
+                        continue
+                    n = c.res if c.res >= 0 else 0
+                    if n == 0:
+                        continue
+                    data = bytes(buf[:n])
+                    region_matches = self.scan_bytes(data, label)
+                    for m in region_matches:
+                        m.va += start
+                    all_matches.extend(region_matches)
+            return True
+        except OSError as e:
+            logger.warning(
+                "pattern_scanner: io_uring drain failed (%s); disabling", e,
+            )
+            self._iouring_disabled = True
+            return False
+        finally:
+            ring.close()
 
     def analyze_process(self, pid: int) -> dict:
         """High-level analysis: what does this process need?"""

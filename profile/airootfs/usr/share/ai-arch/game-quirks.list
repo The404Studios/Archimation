@@ -1,0 +1,27 @@
+# game-quirks.list -- per-exe environment overrides consumed by
+# /usr/lib/ai-arch/pe-launch-wrapper.sh.
+#
+# Format:  <exe_basename>\t<VAR=val>[\t<VAR=val>...]
+# Fields are TAB-separated; no spaces around '='.
+# Lines starting with '#' are ignored.
+#
+# The wrapper `eval`s each VAR=val under `set -a` so matched values get
+# exported to the game process.
+
+# --- Known-problem titles ------------------------------------------------
+# Nier:Automata wants a specific DXVK memory cap or it stalls on load.
+NieRAutomata.exe	DXVK_MEMORY_LIMIT=2048	DXVK_ASYNC=0
+
+# Kingdom Come: Deliverance has a shader compile avalanche; enable async
+# hard even on OLD tier (the user paid the RAM cost).
+KingdomCome.exe	DXVK_ASYNC=1
+
+# Final Fantasy XV renders 4096 meshes in the intro — clamp async
+# workers on old HW.
+ffxv_s.exe	DXVK_NUM_COMPILER_THREADS=2
+
+# Microsoft Flight Simulator prefers the host-cached VKD3D path.
+FlightSimulator.exe	VKD3D_CONFIG=force_host_cached,no_upload_hvv
+
+# GTA V on D3D9 -- clamp max frame latency so mouse feels responsive.
+GTA5.exe	DXVK_FRAME_RATE=0	MESA_GL_THREAD=1

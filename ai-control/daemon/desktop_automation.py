@@ -23,6 +23,16 @@ import time
 from pathlib import Path
 from typing import Optional
 
+# Round 32: cgroup v2 slice orchestration.  launch_pe_exe spawns .exe
+# processes directly into pe-compat.slice/<app>.scope via systemd-run
+# so they inherit the slice's CPU/memory/IO budget without a post-hoc
+# PID move.  Falls back to plain Popen if cgroup v2 / systemd-run are
+# unavailable, so this import is safe on non-Arch development hosts.
+try:  # pragma: no cover - import guarded for dev hosts
+    from cgroup import launch_pe_exe as _cg_launch_pe_exe
+except Exception:  # pylint: disable=broad-except
+    _cg_launch_pe_exe = None  # type: ignore[assignment]
+
 logger = logging.getLogger("ai-control.desktop")
 
 
@@ -229,17 +239,39 @@ class DesktopAutomation:
 
         try:
             env = self._get_display_env()
-
-            proc = subprocess.Popen(
-                cmd,
-                cwd=os.path.dirname(exe_path) if os.path.isabs(exe_path) else None,
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            # Session 24: see launch_app — daemon reaper thread ensures Python
-            # Popen state is cleaned up and the child is never left as <defunct>.
+            cwd = os.path.dirname(exe_path) if os.path.isabs(exe_path) else None
+            # Round 32: use cgroup.launch_pe_exe so the process starts
+            # already inside pe-compat.slice/<app>.scope.  It handles the
+            # fallback to ambient-cgroup Popen when cgroup v2 isn't
+            # available, so from the caller's perspective the return
+            # value is identical.  The scope's CPUWeight/MemoryHigh/
+            # IOWeight come from the slice definition at boot time.
+            app_name = os.path.basename(exe_path) or "pe-app"
+            if _cg_launch_pe_exe is not None:
+                proc = _cg_launch_pe_exe(
+                    cmd,
+                    app_name,
+                    env=env,
+                    cwd=cwd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if proc is None:
+                    # launch_pe_exe already logged; fall back to plain
+                    # Popen so the user still sees the game attempt to run.
+                    proc = subprocess.Popen(
+                        cmd, cwd=cwd, env=env,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+            else:
+                proc = subprocess.Popen(
+                    cmd, cwd=cwd, env=env,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            # Session 24: daemon reaper thread ensures Python Popen state
+            # is cleaned up and the child is never left as <defunct>.
             _reap_after_spawn(proc)
             return {"success": True, "pid": proc.pid, "exe": exe_path}
         except Exception as e:

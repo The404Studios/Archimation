@@ -80,6 +80,17 @@ if [ -f /etc/systemd/system/pe-compat.slice ]; then
         "$WANTS_DIR/pe-compat.slice"
 fi
 
+# Round 32: resource-orchestration slices.
+# Each slice carries CPUWeight/MemoryHigh/IOWeight tuning; ai-hw-detect
+# writes HW-tiered overrides at boot.  They must be active before the
+# first service that references them via Slice= starts, hence
+# multi-user.target.wants placement.
+for unit in trust.slice ai-daemon.slice observer.slice game.slice; do
+    if [ -f "/etc/systemd/system/$unit" ]; then
+        ln -sf "/etc/systemd/system/$unit" "$WANTS_DIR/$unit"
+    fi
+done
+
 # PE-compat firewall - Windows-style firewall layer
 # After= pe-compat.slice so the slice directory exists before the firewall
 # daemon starts moving PIDs into it.

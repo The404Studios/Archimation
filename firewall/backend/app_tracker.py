@@ -12,6 +12,7 @@ import os
 import re
 import struct
 import socket
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -139,6 +140,17 @@ class AppTracker:
         # frontend populates this via register_rule_target() when a
         # per-app rule is added.  Empty set == no scoping attempted.
         self._rule_target_apps: set[str] = set()
+        # Lock serializing mutations to the shared caches and tracking
+        # sets above.  GUI threads (2s refresh) and ConnectionMonitor's
+        # poll thread (2s poll) both call get_connections() → which
+        # walks _history and _cgrouped_pids.  Under GIL each individual
+        # dict/set op is atomic, but compound patterns like "check then
+        # evict then insert" in _record_history() and _maybe_scope_pid()
+        # are not: without a lock, two racing callers can double-evict
+        # or double-add (burning cgroup.procs writes).  threading.Lock
+        # because the critical sections are short; RLock not needed
+        # since no method here calls another locked method recursively.
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -235,16 +247,21 @@ class AppTracker:
         """
         if not app_path:
             return
-        self._rule_target_apps.add(app_path)
-        # Invalidate memoisation for this app so any already-running
-        # processes get re-checked on the next enumeration pass.
-        prefix = None
-        if _cgroup_manager is not None:
-            prefix = _cgroup_manager.app_name_from_path(app_path)
-        if prefix is not None:
-            self._cgrouped_pids = {
-                (pid, app) for pid, app in self._cgrouped_pids if app != prefix
-            }
+        # Lock: the set-comprehension rebuild of _cgrouped_pids below is
+        # a read-then-write sequence that a concurrent _maybe_scope_pid()
+        # on another thread could interleave with, losing the just-added
+        # entry or (worse) overwriting it with a stale snapshot.
+        with self._lock:
+            self._rule_target_apps.add(app_path)
+            # Invalidate memoisation for this app so any already-running
+            # processes get re-checked on the next enumeration pass.
+            prefix = None
+            if _cgroup_manager is not None:
+                prefix = _cgroup_manager.app_name_from_path(app_path)
+            if prefix is not None:
+                self._cgrouped_pids = {
+                    (pid, app) for pid, app in self._cgrouped_pids if app != prefix
+                }
 
     def unregister_rule_target(self, app_path: str) -> None:
         """Stop auto-scoping *app_path*'s processes.  Idempotent."""
@@ -323,12 +340,17 @@ class AppTracker:
             return
 
         key = (pid, app_name)
-        if key in self._cgrouped_pids:
-            return
-        # Mark as attempted BEFORE the call so a persistent failure
-        # (e.g. kernel thread, permission denied) doesn't spam logs on
-        # every poll cycle.
-        self._cgrouped_pids.add(key)
+        # Lock so the "check+add" to the memoisation set is atomic.
+        # Two threads racing without the lock can both observe the key
+        # missing and both schedule a cgroup move (a wasted write into
+        # cgroup.procs that can also log a noisy warning for each).
+        with self._lock:
+            if key in self._cgrouped_pids:
+                return
+            # Mark as attempted BEFORE the call so a persistent failure
+            # (e.g. kernel thread, permission denied) doesn't spam logs
+            # on every poll cycle.
+            self._cgrouped_pids.add(key)
 
         if _cgroup_manager.ensure_app_scoped(pid, app_name):
             logger.debug(
@@ -466,12 +488,23 @@ class AppTracker:
         -- common on laptops coming out of suspend.
         """
         now = time.monotonic()
-        if (self._inode_map_cache is not None
+        # Fast lockless check: attribute reads are GIL-atomic.  If the
+        # cache is fresh, return it without paying for the lock; this
+        # is the 99% case across bursty callers on an idle system.
+        cached = self._inode_map_cache
+        if (cached is not None
                 and now - self._inode_map_cache_time < self._INODE_MAP_TTL):
+            return cached
+        # Slow path: serialize the /proc walk so two concurrent callers
+        # don't each spend ~50-200 ms walking /proc/*/fd simultaneously.
+        with self._lock:
+            cached = self._inode_map_cache
+            if (cached is not None
+                    and now - self._inode_map_cache_time < self._INODE_MAP_TTL):
+                return cached
+            self._inode_map_cache = self._build_inode_map()
+            self._inode_map_cache_time = now
             return self._inode_map_cache
-        self._inode_map_cache = self._build_inode_map()
-        self._inode_map_cache_time = now
-        return self._inode_map_cache
 
     def _build_inode_map(self) -> dict[int, tuple[int, str, str]]:
         """Build a mapping of socket inode -> (pid, process_name, exe_path).
@@ -538,32 +571,42 @@ class AppTracker:
     # ------------------------------------------------------------------
 
     def _record_history(self, conn: AppConnection) -> None:
-        """Record a connection in the per-application history."""
+        """Record a connection in the per-application history.
+
+        Runs under ``self._lock`` because the check-then-evict-then-insert
+        sequence below is not GIL-atomic: two threads racing this method
+        could both observe ``len(_history) >= MAX_TRACKED_APPS``, both
+        call _evict_stale_apps(), and then both insert, leaving the map
+        over-full by one entry.  Likewise, the AppHistory inner list
+        mutations (``hist.connections = hist.connections[drop:]`` + the
+        subsequent ``.append``) are compound ops that need serialization.
+        """
         if not conn.exe_path:
             return
 
-        # Evict stale apps if we're at the limit and this is a new app
-        if (conn.exe_path not in self._history
-                and len(self._history) >= self.MAX_TRACKED_APPS):
-            self._evict_stale_apps()
+        with self._lock:
+            # Evict stale apps if we're at the limit and this is a new app
+            if (conn.exe_path not in self._history
+                    and len(self._history) >= self.MAX_TRACKED_APPS):
+                self._evict_stale_apps()
 
-        hist = self._history[conn.exe_path]
-        if hist.app_path == "":
-            hist.app_path = conn.exe_path
+            hist = self._history[conn.exe_path]
+            if hist.app_path == "":
+                hist.app_path = conn.exe_path
 
-        now = time.time()
-        if hist.first_seen == 0.0:
-            hist.first_seen = now
-        hist.last_seen = now
-        hist.total_connections += 1
+            now = time.time()
+            if hist.first_seen == 0.0:
+                hist.first_seen = now
+            hist.last_seen = now
+            hist.total_connections += 1
 
-        # Keep bounded history
-        if len(hist.connections) >= self.MAX_HISTORY_PER_APP:
-            # Drop the oldest quarter
-            drop = self.MAX_HISTORY_PER_APP // 4
-            hist.connections = hist.connections[drop:]
+            # Keep bounded history
+            if len(hist.connections) >= self.MAX_HISTORY_PER_APP:
+                # Drop the oldest quarter
+                drop = self.MAX_HISTORY_PER_APP // 4
+                hist.connections = hist.connections[drop:]
 
-        hist.connections.append(conn)
+            hist.connections.append(conn)
 
     def _evict_stale_apps(self) -> None:
         """Evict the oldest quarter of tracked apps when at capacity."""

@@ -46,6 +46,8 @@ _behavioral_model = None
 _win_api_db = None
 _syscall_translator = None
 _syscall_monitor = None
+_thermal = None
+_power = None
 
 
 def _init_controllers(config: dict):
@@ -56,6 +58,7 @@ def _init_controllers(config: dict):
     global _memory_observer, _memory_diff, _binary_signatures
     global _stub_generator, _behavioral_model, _win_api_db
     global _syscall_translator, _syscall_monitor
+    global _thermal, _power
 
     def _safe_init(name, factory):
         try:
@@ -239,6 +242,39 @@ def _init_controllers(config: dict):
         logger.error("Failed to init syscall monitor: %s", e)
         _syscall_monitor = None
 
+    # Thermal + power orchestrators. These depend on memory_observer +
+    # pattern_scanner references (for throttle-on-hot) so they must be
+    # constructed AFTER those modules above.
+    try:
+        from thermal import ThermalOrchestrator
+        _thermal = ThermalOrchestrator(
+            hardware_class=config.get("hardware_class", "mid"),
+        )
+        logger.info(
+            "Thermal orchestrator initialized (hw=%s, msr=%s, gpu=%s)",
+            _thermal.hardware_class, _thermal.msr_available,
+            _thermal.gpu_vendor or "none",
+        )
+    except Exception as e:
+        logger.error("Failed to init thermal orchestrator: %s", e)
+        _thermal = None
+
+    try:
+        from power import PowerOrchestrator
+        _power = PowerOrchestrator(
+            thermal_orchestrator=_thermal,
+            hardware_class=config.get("hardware_class", "mid"),
+            memory_observer=_memory_observer,
+            scanner=_scanner,
+        )
+        logger.info(
+            "Power orchestrator initialized (baseline=%s)",
+            _power.baseline_governor or "auto",
+        )
+    except Exception as e:
+        logger.error("Failed to init power orchestrator: %s", e)
+        _power = None
+
 
 def create_app(config: dict):
     """Create the FastAPI application."""
@@ -286,6 +322,16 @@ def create_app(config: dict):
                 await _syscall_monitor.start()
             except Exception as e:
                 logger.error("Syscall monitor failed to start: %s (continuing without it)", e)
+        if _thermal:
+            try:
+                await _thermal.start()
+            except Exception as e:
+                logger.error("Thermal orchestrator failed to start: %s (continuing without it)", e)
+        if _power:
+            try:
+                await _power.start()
+            except Exception as e:
+                logger.error("Power orchestrator failed to start: %s (continuing without it)", e)
         yield
         # Shutdown: close all WebSocket clients, then stop trust observer
         for ws in list(_ws_clients):
@@ -295,6 +341,18 @@ def create_app(config: dict):
                 pass
         _ws_clients.clear()
         _ws_queues.clear()
+        # Stop power/thermal BEFORE observers so PowerOrchestrator can revert
+        # the poll-interval mutations it applied on throttle entry.
+        if _power:
+            try:
+                await _power.stop()
+            except Exception as e:
+                logger.error("Power orchestrator failed to stop cleanly: %s", e)
+        if _thermal:
+            try:
+                await _thermal.stop()
+            except Exception as e:
+                logger.error("Thermal orchestrator failed to stop cleanly: %s", e)
         if _syscall_monitor:
             try:
                 await _syscall_monitor.stop()
@@ -365,6 +423,8 @@ def create_app(config: dict):
         "syscall_translator": _syscall_translator,
         "syscall_monitor": _syscall_monitor,
         "behavioral_model": _behavioral_model,
+        "thermal": _thermal,
+        "power": _power,
     }
     loaded = [n for n, c in _controllers.items() if c is not None]
     failed = [n for n, c in _controllers.items() if c is None]
@@ -522,6 +582,8 @@ def create_app(config: dict):
             "syscall_monitor": _syscall_monitor is not None,
             "syscall_translator": _syscall_translator is not None,
             "behavioral_model": _behavioral_model is not None,
+            "thermal": _thermal is not None,
+            "power": _power is not None,
         }
 
     @app.get("/diagnostics")
@@ -1037,6 +1099,12 @@ def create_app(config: dict):
     _gpu_module_prefixes = ("nvidia", "amdgpu", "i915", "nouveau")
     _drivers_cache: dict = {"data": None, "ts": 0.0}
     _DRIVERS_TTL = 5.0
+    # asyncio.Lock: uvicorn runs FastAPI endpoints on a single event loop,
+    # but async cache-miss handling awaits run_in_executor() so other
+    # coroutines can interleave and each launch their own /proc/modules
+    # parse.  This lock coalesces concurrent misses into one.  Cheap
+    # on the hit path because we lookup-without-await.
+    _drivers_cache_lock = asyncio.Lock()
 
     def _parse_proc_modules_sync() -> list:
         modules = []
@@ -1072,51 +1140,60 @@ def create_app(config: dict):
         is invisible to callers.
         """
         now = time.monotonic()
+        # Fast path: attribute reads are atomic under GIL.
         cached = _drivers_cache["data"]
         if cached is not None and (now - _drivers_cache["ts"]) < _DRIVERS_TTL:
             return cached
-        modules = await asyncio.get_running_loop().run_in_executor(
-            None, _parse_proc_modules_sync)
-        if not modules:
-            # /proc/modules absent (extremely unusual) — fall back to lsmod.
-            proc = None
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "lsmod",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            except asyncio.TimeoutError:
-                if proc is not None:
-                    try:
-                        proc.kill()
-                        await proc.wait()
-                    except (ProcessLookupError, OSError):
-                        pass
-                raise HTTPException(status_code=504, detail="lsmod timed out")
-            except FileNotFoundError:
-                raise HTTPException(status_code=503, detail="lsmod not found")
-            for line in stdout.decode(errors="replace").split("\n")[1:]:
-                parts = line.split()
-                if len(parts) >= 3:
-                    name = parts[0]
-                    try:
-                        size = int(parts[1])
-                        used_by = int(parts[2])
-                    except (ValueError, IndexError):
-                        continue
-                    modules.append({
-                        "name": name,
-                        "size": size,
-                        "used_by": used_by,
-                        "pe_related": name in _pe_related_module_names,
-                        "gpu": name.startswith(_gpu_module_prefixes),
-                    })
-        result = {"status": "ok", "modules": modules, "count": len(modules)}
-        _drivers_cache["data"] = result
-        _drivers_cache["ts"] = now
-        return result
+        # Slow path: serialize cache refill so concurrent requests don't
+        # each launch a /proc/modules walk in the executor pool.
+        async with _drivers_cache_lock:
+            # Re-check under the lock; another coroutine may have already
+            # refreshed the cache while we were awaiting acquisition.
+            cached = _drivers_cache["data"]
+            if cached is not None and (now - _drivers_cache["ts"]) < _DRIVERS_TTL:
+                return cached
+            modules = await asyncio.get_running_loop().run_in_executor(
+                None, _parse_proc_modules_sync)
+            if not modules:
+                # /proc/modules absent (extremely unusual) — fall back to lsmod.
+                proc = None
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "lsmod",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+                except asyncio.TimeoutError:
+                    if proc is not None:
+                        try:
+                            proc.kill()
+                            await proc.wait()
+                        except (ProcessLookupError, OSError):
+                            pass
+                    raise HTTPException(status_code=504, detail="lsmod timed out")
+                except FileNotFoundError:
+                    raise HTTPException(status_code=503, detail="lsmod not found")
+                for line in stdout.decode(errors="replace").split("\n")[1:]:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        name = parts[0]
+                        try:
+                            size = int(parts[1])
+                            used_by = int(parts[2])
+                        except (ValueError, IndexError):
+                            continue
+                        modules.append({
+                            "name": name,
+                            "size": size,
+                            "used_by": used_by,
+                            "pe_related": name in _pe_related_module_names,
+                            "gpu": name.startswith(_gpu_module_prefixes),
+                        })
+            result = {"status": "ok", "modules": modules, "count": len(modules)}
+            _drivers_cache["data"] = result
+            _drivers_cache["ts"] = now
+            return result
 
     # --- Hardware Summary ---
     #
@@ -1255,6 +1332,72 @@ def create_app(config: dict):
             _hw_cache["ts"] = now
 
         return {"status": "ok", "hardware": result}
+
+    # --- Thermal + Power -------------------------------------------------
+    #
+    # /thermal/current    snapshot of temps/frequencies/load/battery
+    # /thermal/packed     24-byte binary event (for subscribers that stream)
+    # /thermal/events     recent packed events, hex-encoded
+    # /power/current      governor + PE-boost + throttling state
+    # /power/governor     GET list / POST set governor (admin-only)
+
+    @app.get("/thermal/current")
+    async def thermal_current():
+        """Live thermal snapshot: CPU+GPU temps, freq, load, RAPL, battery."""
+        t = _require(_thermal, "thermal")
+        return await t.snapshot()
+
+    @app.get("/thermal/packed")
+    async def thermal_packed():
+        """Return the 24-byte packed event for the latest snapshot.
+
+        Response is ``application/octet-stream`` for low-overhead polling
+        from embedded dashboards — 24 bytes vs 150+ bytes of JSON.
+        """
+        t = _require(_thermal, "thermal")
+        buf = await t.snapshot_packed()
+        return Response(content=buf, media_type="application/octet-stream")
+
+    @app.get("/thermal/events")
+    async def thermal_events(count: int = 32):
+        """Recent packed thermal events (hex-encoded for JSON transport)."""
+        t = _require(_thermal, "thermal")
+        if count <= 0:
+            count = 32
+        if count > 1024:
+            count = 1024
+        events = t.recent_events(count)
+        return {
+            "count": len(events),
+            "event_size": 24,
+            "events_hex": [e.hex() for e in events],
+        }
+
+    @app.get("/power/current")
+    async def power_current():
+        """Governor + CPU/GPU state + throttling status."""
+        p = _require(_power, "power")
+        return await p.snapshot()
+
+    @app.get("/power/governor")
+    async def power_governor():
+        """List available governors and current setting."""
+        p = _require(_power, "power")
+        snap = await p.snapshot()
+        return snap.get("governor", {})
+
+    class GovernorRequest(BaseModel):
+        governor: str
+
+    @app.post("/power/governor")
+    async def power_governor_set(req: GovernorRequest):
+        """Manually set the CPU governor (root-only; audited)."""
+        p = _require(_power, "power")
+        result = await p.set_governor(req.governor, reason="api")
+        if not result.get("success"):
+            # 400 keeps the error payload but signals invalid input.
+            raise HTTPException(status_code=400, detail=result)
+        return result
 
     # --- Trust System ---
 

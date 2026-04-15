@@ -31,6 +31,7 @@
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 #include <linux/highmem.h>
+#include <linux/cache.h>
 #include <net/sock.h>
 
 #include "trust_internal.h"
@@ -40,6 +41,15 @@
  * Global TMS state
  * ======================================================================== */
 
+/*
+ * False-sharing layout:
+ *   - The pattern table is guarded by pattern_lock and updated rarely.
+ *   - `event_seq` is incremented by every CPU on every emitted TMS event
+ *     (mmap/mprotect/munmap hits) — a pure write hot path.  Splitting it
+ *     off prevents its cacheline bounces from invalidating the read-mostly
+ *     `maps`/`max_subjects`/`enabled` fields that every kprobe handler
+ *     reads before deciding whether to emit.
+ */
 static struct {
     struct tms_subject_map *maps;       /* Array of TMS_MAX_SUBJECTS maps */
     u32                     max_subjects;
@@ -47,8 +57,9 @@ static struct {
     u32                     pattern_count;
     spinlock_t              pattern_lock;
     struct sock            *nl_sock;    /* Netlink socket for events */
-    atomic_t                event_seq;  /* Monotonic event sequence number */
     bool                    enabled;
+    /* event_seq: written by every CPU on every mmap/mprotect/munmap hit. */
+    atomic_t                event_seq ____cacheline_aligned_in_smp;
 } g_tms;
 
 /* Forward declarations for kprobe handlers */

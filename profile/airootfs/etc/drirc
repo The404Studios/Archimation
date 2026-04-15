@@ -1,0 +1,115 @@
+<?xml version="1.0" standalone="yes"?>
+<!-- /etc/drirc : Mesa driconf per-app GL driver tuning.
+     Read by the Mesa i965, iris, radeonsi, crocus, llvmpipe and nouveau
+     drivers.  Users can override any value in ~/.drirc.  Values here are
+     merged UNDER per-GPU defaults: driver-specific drirc.d files still win.
+
+     Sections are matched by exe name; unmatched apps use defaults.  We
+     prioritise:
+       - browsers (Chromium / Firefox / VLC): disable vsync so video stays
+         smooth under compositor backpressure.
+       - games (Steam, PE-runtime common exe names): enable adaptive vsync
+         and GL threading regardless of global default.
+       - known-broken apps (older Blender): force compat profile to avoid
+         GL 4.5 core-only panics on pre-Fermi HW.
+     -->
+<driconf>
+    <!-- Global defaults for every Mesa driver -->
+    <device>
+        <application name="Default" executable="">
+            <option name="adaptive_sync" value="true"/>
+            <option name="mesa_glthread" value="true"/>
+            <option name="disable_glsl_line_continuations" value="false"/>
+        </application>
+
+        <!-- Browsers: do not cap to vblank; let compositor own pacing. -->
+        <application name="Firefox" executable="firefox">
+            <option name="vblank_mode" value="0"/>
+            <option name="mesa_glthread" value="true"/>
+        </application>
+        <application name="Chromium" executable="chromium">
+            <option name="vblank_mode" value="0"/>
+            <option name="mesa_glthread" value="true"/>
+        </application>
+        <application name="Chrome" executable="chrome">
+            <option name="vblank_mode" value="0"/>
+            <option name="mesa_glthread" value="true"/>
+        </application>
+        <application name="Google Chrome" executable="google-chrome">
+            <option name="vblank_mode" value="0"/>
+            <option name="mesa_glthread" value="true"/>
+        </application>
+
+        <!-- Video players: disable vsync, glthread yes.  Avoids the
+             classic "audio drift on seek" on old HW. -->
+        <application name="VLC" executable="vlc">
+            <option name="vblank_mode" value="0"/>
+            <option name="mesa_glthread" value="true"/>
+        </application>
+        <application name="mpv" executable="mpv">
+            <option name="vblank_mode" value="0"/>
+            <option name="mesa_glthread" value="true"/>
+        </application>
+
+        <!-- Steam / common game launchers: adaptive + glthread. -->
+        <application name="Steam" executable="steam">
+            <option name="adaptive_sync" value="true"/>
+            <option name="mesa_glthread" value="true"/>
+        </application>
+        <application name="Lutris" executable="lutris">
+            <option name="adaptive_sync" value="true"/>
+            <option name="mesa_glthread" value="true"/>
+        </application>
+
+        <!-- PE loader: games run under /usr/bin/peloader; fallback exe
+             names are typed out here since Mesa matches on the current
+             process's /proc/self/exe (which for a PE binary is
+             peloader itself). -->
+        <application name="PE Loader" executable="peloader">
+            <option name="adaptive_sync" value="true"/>
+            <option name="mesa_glthread" value="true"/>
+        </application>
+
+        <!-- XFCE Terminal + other GL-accelerated VTEs: no vsync, saves
+             battery without visible cost. -->
+        <application name="XFCE Terminal" executable="xfce4-terminal">
+            <option name="vblank_mode" value="0"/>
+        </application>
+
+        <!-- Blender 2.x / older versions: force legacy GL profile. -->
+        <application name="Blender" executable="blender">
+            <option name="force_gl_renderer" value=""/>
+            <option name="allow_higher_compat_version" value="true"/>
+        </application>
+
+        <!-- OBS Studio: glthread on, vsync on (prevents capture tearing). -->
+        <application name="OBS Studio" executable="obs">
+            <option name="mesa_glthread" value="true"/>
+            <option name="vblank_mode" value="2"/>
+        </application>
+    </device>
+
+    <!-- RadeonSI-specific: prefer compute for compositor blits -->
+    <device driver="radeonsi">
+        <application name="Default" executable="">
+            <option name="radeonsi_zerovram" value="false"/>
+            <option name="mesa_glthread" value="true"/>
+        </application>
+    </device>
+
+    <!-- Intel iris-specific -->
+    <device driver="iris">
+        <application name="Default" executable="">
+            <option name="mesa_glthread" value="true"/>
+            <option name="adaptive_sync" value="true"/>
+        </application>
+    </device>
+
+    <!-- Nouveau: aggressive throttle on Tesla-gen cards; safe on newer. -->
+    <device driver="nouveau">
+        <application name="Default" executable="">
+            <option name="mesa_glthread" value="true"/>
+            <option name="disable_throttling" value="false"/>
+        </application>
+    </device>
+</driconf>

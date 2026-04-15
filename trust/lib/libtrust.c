@@ -42,6 +42,17 @@ static inline void trust_fd_store(int fd)
     __atomic_store_n(&g_trust_fd, fd, __ATOMIC_RELAXED);
 }
 
+/*
+ * trust_fd_snapshot - Hidden inter-module helper for libtrust_batch.c
+ * and libtrust_events.c. Returns the current atomic-snapshotted fd so
+ * those modules don't need to keep their own copy. Hidden from public
+ * callers via the version script (libtrust.map).
+ */
+int trust_fd_snapshot(void)
+{
+    return trust_fd_load();
+}
+
 /* Error logging is off by default; enable by setting LIBTRUST_DEBUG=1 in
  * the environment.  Checked once on first use so we don't pay a getenv()
  * per ioctl.  -1 = unchecked, 0 = disabled, 1 = enabled. */
@@ -103,6 +114,12 @@ void trust_cleanup(void)
 int trust_available(void)
 {
     return (trust_fd_load() >= 0) ? 1 : 0;
+}
+
+uint32_t trust_library_version(void)
+{
+    return ((uint32_t)LIBTRUST_ABI_MAJOR << 16) |
+           ((uint32_t)LIBTRUST_ABI_MINOR & 0xFFFFU);
 }
 
 /* --- RISC fast-path --- */

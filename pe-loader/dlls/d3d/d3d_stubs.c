@@ -38,6 +38,11 @@ extern void *g_dxvk_d3d9;
 /* Note: d3d9_device.c uses g_dxvk_tried (not g_dxvk_d3d9_tried) */
 extern int   g_dxvk_tried;
 
+/* From dxgi_factory.c: returns 1 if the detected GPU has Vulkan support.
+ * Pre-GCN Radeon and GT218/Fermi-older NVIDIA lack Vulkan on Linux.
+ * Using __attribute__((weak)) so link order doesn't matter. */
+extern int dxgi_gpu_is_vulkan_capable(void) __attribute__((weak));
+
 static void *g_dxvk_d3d11 = NULL;
 /* Session 30: plain 'tried' flags were raced by concurrent D3D init from
  * the UI thread + Unity job system. Replace with pthread_once so each
@@ -86,20 +91,31 @@ static const char *g_vkd3d_search_paths[] = {
 
 static __attribute__((unused)) void *get_dxvk_d3d9(void)
 {
-    if (!g_dxvk_tried) {
-        g_dxvk_tried = 1;
-        g_dxvk_d3d9 = try_dlopen_paths("d3d9.so", g_dxvk_search_paths, DXVK_NPATHS);
-        if (g_dxvk_d3d9)
-            fprintf(stderr, "[d3d] DXVK D3D9 found and loaded\n");
-    }
+    /* Deprecated helper — Direct3DCreate9 in d3d9_device.c is the real
+     * load path (with its own pthread_once). We just return the shared
+     * pointer here. The old racy "g_dxvk_tried" flag path was a subtle
+     * data-race hazard if both modules' init raced; we avoid it by letting
+     * d3d9_device.c own the load. */
     return g_dxvk_d3d9;
 }
+
+/* Cached symbol pointers — resolved once at probe time so every CreateDevice
+ * call reduces to a single indirect CALL instead of dlsym(). dlsym involves
+ * hashtable lookups inside libdl and is decidedly not free on hot paths
+ * (D3D11CreateDevice can be called repeatedly during device-reset cycles). */
+typedef HRESULT (__attribute__((ms_abi)) *d3d11_create_fn)(void*, UINT, HANDLE, UINT, void*, UINT, UINT, void**, void*, void**);
+typedef HRESULT (__attribute__((ms_abi)) *d3d11_create_sc_fn)(void*, UINT, HANDLE, UINT, void*, UINT, UINT, void*, void**, void**, void*, void**);
+static d3d11_create_fn    g_d3d11_create_fn    = NULL;
+static d3d11_create_sc_fn g_d3d11_create_sc_fn = NULL;
 
 static void dxvk_d3d11_probe_once(void)
 {
     g_dxvk_d3d11 = try_dlopen_paths("d3d11.so", g_dxvk_search_paths, DXVK_NPATHS);
-    if (g_dxvk_d3d11)
+    if (g_dxvk_d3d11) {
+        g_d3d11_create_fn    = (d3d11_create_fn)dlsym(g_dxvk_d3d11, "D3D11CreateDevice");
+        g_d3d11_create_sc_fn = (d3d11_create_sc_fn)dlsym(g_dxvk_d3d11, "D3D11CreateDeviceAndSwapChain");
         fprintf(stderr, "[d3d] DXVK D3D11 found and loaded\n");
+    }
 }
 
 static void *get_dxvk_d3d11(void)
@@ -108,16 +124,36 @@ static void *get_dxvk_d3d11(void)
     return g_dxvk_d3d11;
 }
 
-static void *get_dxvk_dxgi(void)
+static pthread_once_t g_dxvk_dxgi_once = PTHREAD_ONCE_INIT;
+static void dxvk_dxgi_probe_once(void)
 {
-    if (!g_dxvk_dxgi_tried) {
+    if (!g_dxvk_dxgi) {
         g_dxvk_dxgi_tried = 1;
         g_dxvk_dxgi = try_dlopen_paths("dxgi.so", g_dxvk_search_paths, DXVK_NPATHS);
         if (g_dxvk_dxgi)
             fprintf(stderr, "[d3d] DXVK DXGI found and loaded\n");
     }
+}
+
+static void *get_dxvk_dxgi(void)
+{
+    /* Shared with dxgi_factory.c's dxgi_try_dxvk(); pthread_once guarantees
+     * at most one dlopen overall no matter which module triggers first. */
+    pthread_once(&g_dxvk_dxgi_once, dxvk_dxgi_probe_once);
     return g_dxvk_dxgi;
 }
+
+/* Cache D3D12 hot-path function pointers at probe time — see d3d11 note. */
+typedef HRESULT (__attribute__((ms_abi)) *d3d12_create_fn)(void*, int, const GUID*, void**);
+typedef HRESULT (__attribute__((ms_abi)) *d3d12_debug_fn)(const GUID*, void**);
+typedef HRESULT (__attribute__((ms_abi)) *d3d12_serialize_rs_fn)(void*, int, void**, void**);
+typedef HRESULT (__attribute__((ms_abi)) *d3d12_serialize_vrs_fn)(void*, void**, void**);
+typedef HRESULT (__attribute__((ms_abi)) *d3d12_create_rsd_fn)(const void*, SIZE_T, const GUID*, void**);
+static d3d12_create_fn        g_d3d12_create_fn        = NULL;
+static d3d12_debug_fn         g_d3d12_debug_fn         = NULL;
+static d3d12_serialize_rs_fn  g_d3d12_serialize_rs_fn  = NULL;
+static d3d12_serialize_vrs_fn g_d3d12_serialize_vrs_fn = NULL;
+static d3d12_create_rsd_fn    g_d3d12_create_rsd_fn    = NULL;
 
 static void vkd3d_d3d12_probe_once(void)
 {
@@ -126,8 +162,14 @@ static void vkd3d_d3d12_probe_once(void)
     if (!g_vkd3d_d3d12)
         g_vkd3d_d3d12 = try_dlopen_paths("d3d12.so",
                                           g_vkd3d_search_paths, VKD3D_NPATHS);
-    if (g_vkd3d_d3d12)
+    if (g_vkd3d_d3d12) {
+        g_d3d12_create_fn        = (d3d12_create_fn)dlsym(g_vkd3d_d3d12, "D3D12CreateDevice");
+        g_d3d12_debug_fn         = (d3d12_debug_fn)dlsym(g_vkd3d_d3d12, "D3D12GetDebugInterface");
+        g_d3d12_serialize_rs_fn  = (d3d12_serialize_rs_fn)dlsym(g_vkd3d_d3d12, "D3D12SerializeRootSignature");
+        g_d3d12_serialize_vrs_fn = (d3d12_serialize_vrs_fn)dlsym(g_vkd3d_d3d12, "D3D12SerializeVersionedRootSignature");
+        g_d3d12_create_rsd_fn    = (d3d12_create_rsd_fn)dlsym(g_vkd3d_d3d12, "D3D12CreateRootSignatureDeserializer");
         fprintf(stderr, "[d3d] VKD3D-Proton D3D12 found and loaded\n");
+    }
 }
 
 static void *get_vkd3d_d3d12(void)
@@ -147,14 +189,19 @@ WINAPI_EXPORT HRESULT D3D11CreateDevice(
     void *featureLevels, UINT numFeatureLevels, UINT sdkVersion,
     void **device, void *featureLevel, void **deviceContext)
 {
-    void *dxvk = get_dxvk_d3d11();
-    if (dxvk) {
-        typedef HRESULT (__attribute__((ms_abi)) *fn_t)(void*, UINT, HANDLE, UINT, void*, UINT, UINT, void**, void*, void**);
-        fn_t fn = (fn_t)dlsym(dxvk, "D3D11CreateDevice");
-        if (fn) return fn(adapter, driverType, software, flags, featureLevels,
-                         numFeatureLevels, sdkVersion, device, featureLevel, deviceContext);
+    /* Probe triggers dlsym caching; subsequent calls skip both. */
+    if (get_dxvk_d3d11() && g_d3d11_create_fn) {
+        return g_d3d11_create_fn(adapter, driverType, software, flags, featureLevels,
+                                 numFeatureLevels, sdkVersion, device, featureLevel, deviceContext);
     }
-    fprintf(stderr, "[d3d] D3D11CreateDevice(): no DXVK - install dxvk for GPU acceleration\n");
+    /* Pre-Vulkan HW: return E_NOTIMPL clean so the game can display "GPU not
+     * supported". Previously this hit the generic "install dxvk" message even
+     * though installing DXVK won't help on a GT218. */
+    if (dxgi_gpu_is_vulkan_capable && !dxgi_gpu_is_vulkan_capable()) {
+        fprintf(stderr, "[d3d] D3D11CreateDevice(): GPU lacks Vulkan support (pre-GCN/GT218)\n");
+    } else {
+        fprintf(stderr, "[d3d] D3D11CreateDevice(): no DXVK - install dxvk for GPU acceleration\n");
+    }
     if (device) *device = NULL;
     if (deviceContext) *deviceContext = NULL;
     return E_NOTIMPL;
@@ -166,13 +213,10 @@ WINAPI_EXPORT HRESULT D3D11CreateDeviceAndSwapChain(
     void *swapChainDesc, void **swapChain, void **device,
     void *featureLevel, void **deviceContext)
 {
-    void *dxvk = get_dxvk_d3d11();
-    if (dxvk) {
-        typedef HRESULT (__attribute__((ms_abi)) *fn_t)(void*, UINT, HANDLE, UINT, void*, UINT, UINT, void*, void**, void**, void*, void**);
-        fn_t fn = (fn_t)dlsym(dxvk, "D3D11CreateDeviceAndSwapChain");
-        if (fn) return fn(adapter, driverType, software, flags, featureLevels,
-                         numFeatureLevels, sdkVersion, swapChainDesc, swapChain,
-                         device, featureLevel, deviceContext);
+    if (get_dxvk_d3d11() && g_d3d11_create_sc_fn) {
+        return g_d3d11_create_sc_fn(adapter, driverType, software, flags, featureLevels,
+                                     numFeatureLevels, sdkVersion, swapChainDesc, swapChain,
+                                     device, featureLevel, deviceContext);
     }
     fprintf(stderr, "[d3d] D3D11CreateDeviceAndSwapChain(): no DXVK\n");
     if (swapChain) *swapChain = NULL;
@@ -188,25 +232,21 @@ WINAPI_EXPORT HRESULT D3D11CreateDeviceAndSwapChain(
 WINAPI_EXPORT HRESULT D3D12CreateDevice(
     void *pAdapter, int MinimumFeatureLevel, const GUID *riid, void **ppDevice)
 {
-    void *vkd3d = get_vkd3d_d3d12();
-    if (vkd3d) {
-        typedef HRESULT (__attribute__((ms_abi)) *fn_t)(void*, int, const GUID*, void**);
-        fn_t fn = (fn_t)dlsym(vkd3d, "D3D12CreateDevice");
-        if (fn) return fn(pAdapter, MinimumFeatureLevel, riid, ppDevice);
+    if (get_vkd3d_d3d12() && g_d3d12_create_fn)
+        return g_d3d12_create_fn(pAdapter, MinimumFeatureLevel, riid, ppDevice);
+    if (dxgi_gpu_is_vulkan_capable && !dxgi_gpu_is_vulkan_capable()) {
+        fprintf(stderr, "[d3d] D3D12CreateDevice(): GPU lacks Vulkan support (pre-GCN/GT218)\n");
+    } else {
+        fprintf(stderr, "[d3d] D3D12CreateDevice(): no VKD3D-Proton - install vkd3d-proton for DX12\n");
     }
-    fprintf(stderr, "[d3d] D3D12CreateDevice(): no VKD3D-Proton - install vkd3d-proton for DX12\n");
     if (ppDevice) *ppDevice = NULL;
     return E_NOTIMPL;
 }
 
 WINAPI_EXPORT HRESULT D3D12GetDebugInterface(const GUID *riid, void **ppvDebug)
 {
-    void *vkd3d = get_vkd3d_d3d12();
-    if (vkd3d) {
-        typedef HRESULT (__attribute__((ms_abi)) *fn_t)(const GUID*, void**);
-        fn_t fn = (fn_t)dlsym(vkd3d, "D3D12GetDebugInterface");
-        if (fn) return fn(riid, ppvDebug);
-    }
+    if (get_vkd3d_d3d12() && g_d3d12_debug_fn)
+        return g_d3d12_debug_fn(riid, ppvDebug);
     if (ppvDebug) *ppvDebug = NULL;
     return E_NOTIMPL;
 }
@@ -214,12 +254,8 @@ WINAPI_EXPORT HRESULT D3D12GetDebugInterface(const GUID *riid, void **ppvDebug)
 WINAPI_EXPORT HRESULT D3D12SerializeRootSignature(
     void *pRootSignature, int Version, void **ppBlob, void **ppErrorBlob)
 {
-    void *vkd3d = get_vkd3d_d3d12();
-    if (vkd3d) {
-        typedef HRESULT (__attribute__((ms_abi)) *fn_t)(void*, int, void**, void**);
-        fn_t fn = (fn_t)dlsym(vkd3d, "D3D12SerializeRootSignature");
-        if (fn) return fn(pRootSignature, Version, ppBlob, ppErrorBlob);
-    }
+    if (get_vkd3d_d3d12() && g_d3d12_serialize_rs_fn)
+        return g_d3d12_serialize_rs_fn(pRootSignature, Version, ppBlob, ppErrorBlob);
     if (ppBlob) *ppBlob = NULL;
     if (ppErrorBlob) *ppErrorBlob = NULL;
     return E_NOTIMPL;
@@ -228,12 +264,8 @@ WINAPI_EXPORT HRESULT D3D12SerializeRootSignature(
 WINAPI_EXPORT HRESULT D3D12SerializeVersionedRootSignature(
     void *pRootSignature, void **ppBlob, void **ppErrorBlob)
 {
-    void *vkd3d = get_vkd3d_d3d12();
-    if (vkd3d) {
-        typedef HRESULT (__attribute__((ms_abi)) *fn_t)(void*, void**, void**);
-        fn_t fn = (fn_t)dlsym(vkd3d, "D3D12SerializeVersionedRootSignature");
-        if (fn) return fn(pRootSignature, ppBlob, ppErrorBlob);
-    }
+    if (get_vkd3d_d3d12() && g_d3d12_serialize_vrs_fn)
+        return g_d3d12_serialize_vrs_fn(pRootSignature, ppBlob, ppErrorBlob);
     if (ppBlob) *ppBlob = NULL;
     if (ppErrorBlob) *ppErrorBlob = NULL;
     return E_NOTIMPL;
@@ -242,12 +274,8 @@ WINAPI_EXPORT HRESULT D3D12SerializeVersionedRootSignature(
 WINAPI_EXPORT HRESULT D3D12CreateRootSignatureDeserializer(
     const void *pSrcData, SIZE_T SrcDataSizeInBytes, const GUID *riid, void **ppRootSignature)
 {
-    void *vkd3d = get_vkd3d_d3d12();
-    if (vkd3d) {
-        typedef HRESULT (__attribute__((ms_abi)) *fn_t)(const void*, SIZE_T, const GUID*, void**);
-        fn_t fn = (fn_t)dlsym(vkd3d, "D3D12CreateRootSignatureDeserializer");
-        if (fn) return fn(pSrcData, SrcDataSizeInBytes, riid, ppRootSignature);
-    }
+    if (get_vkd3d_d3d12() && g_d3d12_create_rsd_fn)
+        return g_d3d12_create_rsd_fn(pSrcData, SrcDataSizeInBytes, riid, ppRootSignature);
     if (ppRootSignature) *ppRootSignature = NULL;
     return E_NOTIMPL;
 }
@@ -551,7 +579,7 @@ typedef struct {
 } xinput_pad_t;
 
 static xinput_pad_t g_pads[XUSER_MAX_COUNT];
-static int g_xinput_scanned = 0;
+static pthread_once_t g_xinput_scan_once = PTHREAD_ONCE_INIT;
 static int g_xinput_enabled = 1;
 
 /* ---- Helper: normalize a centered axis (thumbstick) to -32768..32767 ---- */
@@ -664,11 +692,8 @@ static int xinput_check_ff(int fd)
 }
 
 /* ---- Scan /dev/input for gamepad devices ---- */
-static void xinput_scan(void)
+static void xinput_scan_impl(void)
 {
-    if (g_xinput_scanned) return;
-    g_xinput_scanned = 1;
-
     for (int i = 0; i < XUSER_MAX_COUNT; i++) {
         g_pads[i].fd = -1;
         g_pads[i].packet = 0;
@@ -728,6 +753,14 @@ static void xinput_scan(void)
     }
 }
 
+/* Thread-safe wrapper: pthread_once handles the thundering-herd case where
+ * multiple threads hit XInputGetState from separate game subsystems (UI,
+ * simulation, audio polling) in the first frames of a launch. */
+static inline void xinput_scan(void)
+{
+    pthread_once(&g_xinput_scan_once, xinput_scan_impl);
+}
+
 /* ---- Read current state from evdev ---- */
 static int xinput_read_state(int pad_idx, XINPUT_GAMEPAD_T *gp)
 {
@@ -735,10 +768,15 @@ static int xinput_read_state(int pad_idx, XINPUT_GAMEPAD_T *gp)
     xinput_pad_t *pad = &g_pads[pad_idx];
     if (pad->fd < 0) return -1;
 
-    /* Drain all pending input events so the kernel's internal
-       state is up-to-date when we query via ioctl below */
-    struct input_event ev;
-    while (read(pad->fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+    /* Drain all pending input events in one batch. Previously a naive per-sizeof
+     * read loop: on a busy gamepad the kernel had ~50-100 events queued and we
+     * did one syscall per event. Batch reading 16 events per call drops syscall
+     * count by ~16x on intense gameplay (explosions = many accelerometer updates
+     * on Xbox Elite / DualSense). The remaining loop cost is amortized. */
+    struct input_event ev_batch[16];
+    ssize_t rd;
+    while ((rd = read(pad->fd, ev_batch, sizeof(ev_batch))) > 0) {
+        if (rd < (ssize_t)sizeof(struct input_event)) break;
         /* events are consumed; actual state is fetched via ioctls */
     }
 

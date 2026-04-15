@@ -234,5 +234,34 @@ if [ -x /usr/lib/ai-arch/sysctl-tune.sh ]; then
     /usr/lib/ai-arch/sysctl-tune.sh || true
 fi
 
+# --- HW-tiered cgroup v2 slice application --------------------------------
+# Writes /run/systemd/system/*.slice.d/10-hw.conf drop-ins so each slice's
+# CPUQuota / MemoryHigh / MemoryMax / IOReadBandwidthMax scales with the
+# detected hardware class (OLD uses tight caps, NEW uses 80% of RAM for
+# pe-compat, DEFAULT sits in between).  Must run AFTER the profile file
+# is written and AFTER sysctl-tune so memory accounting settings from
+# sysctl are in place before systemd re-reads unit state.
+if [ -x /usr/lib/ai-arch/slice-apply.sh ]; then
+    /usr/lib/ai-arch/slice-apply.sh || true
+fi
+
+# --- GPU-tiered shader / DXVK / VKD3D env generation ----------------------
+# Invokes gpu-profile.sh which probes vulkaninfo / lspci and writes
+# /run/ai-arch/gpu-env.sh for /etc/profile.d/gpu-tuning.sh to source.
+# Runs AFTER the profile file is written so GPU_VENDOR is available.
+if [ -x /usr/lib/ai-arch/gpu-profile.sh ]; then
+    /usr/lib/ai-arch/gpu-profile.sh || true
+fi
+
+# --- GT218 nouveau Xorg-conf removal --------------------------------------
+# hw-detect.sh above already renames /etc/modprobe.d/nouveau-legacy.conf on
+# Maxwell+ hosts; extend the quirk to the Xorg-conf drop-in so TearFree
+# isn't forcibly off on modern NVIDIA boxes.
+if [ "$GPU_VENDOR" = "nvidia" ] && [ "$GPU_OLD_NVIDIA" -eq 0 ]; then
+    [ -f /etc/X11/xorg.conf.d/20-nouveau-legacy.conf ] && \
+        mv /etc/X11/xorg.conf.d/20-nouveau-legacy.conf \
+           /etc/X11/xorg.conf.d/20-nouveau-legacy.conf.disabled 2>/dev/null
+fi
+
 echo "ai-hw-detect: profile=$PROFILE reasons=${REASONS[*]:-default}"
 exit 0

@@ -9,10 +9,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <pthread.h>
 
 #include "common/dll_common.h"
 
 #define LOG_PREFIX "[d3d9] "
+
+/* Forward: dxgi_factory.c exposes Vulkan-capability detection. Used by the
+ * software fallback path so we can return E_NOTIMPL cleanly on pre-Vulkan HW
+ * (GT218, pre-GCN Radeon) instead of pretending support exists. */
+extern int dxgi_gpu_is_vulkan_capable(void) __attribute__((weak));
 
 /* COM IIDs - GUID is defined in windef.h */
 typedef GUID IID;
@@ -167,13 +173,25 @@ static __attribute__((ms_abi)) HANDLE d3d9_get_adapter_monitor(IDirect3D9 *s, UI
 
 static __attribute__((ms_abi)) long d3d9_register_sw(IDirect3D9 *s, void *p) { (void)s; (void)p; return D3D_OK; }
 
-/* Simple D3DDevice9 stub */
+/* Simple D3DDevice9 stub. On pre-Vulkan HW (GT218 / pre-GCN Radeon) we must
+ * return a well-defined error so the app can display "GPU not supported"
+ * instead of crashing deep inside a NULL-device callchain. Other paths
+ * reach DXVK via the real Direct3DCreate9 fork below. */
 static __attribute__((ms_abi)) long d3d9_create_device(IDirect3D9 *self, UINT adapter, DWORD devtype,
                                 HANDLE focus, DWORD behavior, void *pp, IDirect3DDevice9 **ppdev)
 {
     (void)self; (void)adapter; (void)devtype; (void)focus; (void)behavior; (void)pp;
-    fprintf(stderr, LOG_PREFIX "CreateDevice: no GPU device available (stub)\n");
+    if (!ppdev) return E_POINTER;
     *ppdev = NULL;
+
+    /* Dual-HW policy: pre-Vulkan HW gets explicit E_NOTIMPL (apps handle it
+     * gracefully). Vulkan-capable HW without DXVK installed gets the legacy
+     * D3DERR_NOTAVAILABLE so DX9-only apps suggest installing the runtime. */
+    if (dxgi_gpu_is_vulkan_capable && !dxgi_gpu_is_vulkan_capable()) {
+        fprintf(stderr, LOG_PREFIX "CreateDevice: pre-Vulkan GPU (GT218/pre-GCN), returning E_NOTIMPL\n");
+        return E_NOTIMPL;
+    }
+    fprintf(stderr, LOG_PREFIX "CreateDevice: no GPU device available (DXVK not loaded)\n");
     return D3DERR_NOTAVAILABLE;
 }
 
@@ -199,33 +217,49 @@ static const IDirect3D9Vtbl g_d3d9_vtbl = {
 
 /* ========== Direct3DCreate9 ========== */
 
-/* Try DXVK first */
+/* Shared with d3d_stubs.c (which uses g_dxvk_tried flag). Kept as a plain
+ * int + pthread_once for consistency with Session 30's d3d11/d3d12 fix.
+ * g_dxvk_tried is still exposed (extern in d3d_stubs.c) so the older get_dxvk_d3d9
+ * helper observes the load; we guard the actual dlopen with a pthread_once to
+ * avoid the startup thundering-herd race the plain flag had. */
 void *g_dxvk_d3d9 = NULL;
 int g_dxvk_tried = 0;
+static pthread_once_t g_dxvk_d3d9_once = PTHREAD_ONCE_INIT;
+/* Cached Direct3DCreate9 function pointer inside DXVK's d3d9.so: resolved
+ * once so the per-call hot path becomes a single indirect CALL instead of
+ * dlsym() (which scans hash tables). dlsym under glibc takes ~hundreds of
+ * ns; on Present-heavy init patterns this saved real frame time. */
+static IDirect3D9 *(__attribute__((ms_abi)) *g_dxvk_create9_fn)(UINT) = NULL;
+/* Log-once guards to keep per-call stderr clean (some apps call Create9 per
+ * screen-change). */
+static int g_dxvk_logged = 0;
+static int g_stub_logged = 0;
+
+static void dxvk_d3d9_probe_once(void)
+{
+    g_dxvk_tried = 1;
+    g_dxvk_d3d9 = dlopen("d3d9.so", RTLD_NOW);
+    if (!g_dxvk_d3d9)
+        g_dxvk_d3d9 = dlopen("/usr/lib/dxvk/d3d9.so", RTLD_NOW);
+    if (g_dxvk_d3d9) {
+        g_dxvk_create9_fn = (IDirect3D9 *(__attribute__((ms_abi)) *)(UINT))
+            dlsym(g_dxvk_d3d9, "Direct3DCreate9");
+    }
+}
 
 WINAPI_EXPORT IDirect3D9 *Direct3DCreate9(UINT SDKVersion)
 {
-    (void)SDKVersion;
+    pthread_once(&g_dxvk_d3d9_once, dxvk_d3d9_probe_once);
 
-    /* Try DXVK */
-    if (!g_dxvk_tried) {
-        g_dxvk_tried = 1;
-        g_dxvk_d3d9 = dlopen("d3d9.so", RTLD_NOW);
-        if (!g_dxvk_d3d9)
-            g_dxvk_d3d9 = dlopen("/usr/lib/dxvk/d3d9.so", RTLD_NOW);
-    }
-
-    if (g_dxvk_d3d9) {
-        typedef IDirect3D9 *(__attribute__((ms_abi)) *create_fn)(UINT);
-        create_fn fn = (create_fn)dlsym(g_dxvk_d3d9, "Direct3DCreate9");
-        if (fn) {
-            printf(LOG_PREFIX "Using DXVK d3d9\n");
-            return fn(SDKVersion);
-        }
+    if (g_dxvk_create9_fn) {
+        if (!__atomic_exchange_n(&g_dxvk_logged, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, LOG_PREFIX "Using DXVK d3d9\n");
+        return g_dxvk_create9_fn(SDKVersion);
     }
 
     /* Fallback: our stub implementation */
-    printf(LOG_PREFIX "Using stub D3D9 (DXVK not found)\n");
+    if (!__atomic_exchange_n(&g_stub_logged, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, LOG_PREFIX "Using stub D3D9 (DXVK not found)\n");
     IDirect3D9 *d3d = calloc(1, sizeof(IDirect3D9));
     if (!d3d) return NULL;
     d3d->lpVtbl = &g_d3d9_vtbl;

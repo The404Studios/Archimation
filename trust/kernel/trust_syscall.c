@@ -29,6 +29,7 @@
 #include <linux/vmalloc.h>
 #include <linux/bitmap.h>
 #include <linux/hashtable.h>
+#include <linux/cache.h>
 #include <net/sock.h>
 
 #include "trust_internal.h"
@@ -46,13 +47,25 @@
  */
 #define TSC_PID_BITMAP_SIZE     32768
 
+/*
+ * False-sharing layout:
+ *   - `enabled` and `slots`/`max_slots`/`pid_bitmap` are read on the hot
+ *     path (kprobe handler, once per traced syscall) from every CPU.
+ *   - `event_seq` is incremented (atomic_inc_return) on every emitted
+ *     event — every CPU that hits a kprobe writes it.  If it sits in
+ *     the same cacheline as the read-mostly pointers/flags, every write
+ *     invalidates every CPU's next hot-path read.
+ * Split event_seq onto its own cacheline so the pointer/flag cluster
+ * stays shared-clean across all CPUs.
+ */
 static struct {
     struct tsc_pid_slot *slots;         /* Array of TSC_MAX_SUBJECTS slots */
     u32                  max_slots;
     unsigned long       *pid_bitmap;    /* O(1) PID lookup */
     struct sock         *nl_sock;       /* Netlink socket for events */
-    atomic_t             event_seq;     /* Monotonic event sequence number */
     bool                 enabled;
+    /* event_seq: written by every CPU on every emitted syscall event. */
+    atomic_t             event_seq      ____cacheline_aligned_in_smp;
 } g_tsc;
 
 /* ========================================================================

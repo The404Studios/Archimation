@@ -1,0 +1,15 @@
+DXVK per-application configuration overlays.
+
+Each *.conf file here is copied by /usr/lib/ai-arch/pe-launch-wrapper.sh to
+<exe_dir>/<basename>.dxvk.conf on game launch if the destination dir is
+writable, otherwise passed via DXVK_CONFIG_FILE env.
+
+Format: standard DXVK conf syntax — see upstream dxvk documentation at
+https://github.com/doitsujin/dxvk/blob/master/dxvk.conf
+
+File name MUST match the exe basename WITHOUT the .exe suffix, e.g.:
+    witcher3.conf   -> matches witcher3.exe
+    GTAV.conf       -> matches GTAV.exe (case-sensitive)
+
+The wrapper also checks the lowercased basename, so witcher3.conf will
+match Witcher3.EXE on case-insensitive filesystems.

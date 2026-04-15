@@ -1,0 +1,64 @@
+[Unit]
+Description=AI Arch Background Observer Slice (memory/pattern/syscall observers)
+Documentation=https://github.com/ai-arch-linux
+# Background observers (memory_observer, pattern_scanner, syscall_monitor,
+# trust_observer) are explicitly BEST EFFORT.  They exist to enrich the
+# decision engine with context but none of their output is on the critical
+# path for trust or PE execution.  When a game pegs the CPU, these get
+# throttled to the floor.
+#
+# Design: this slice is instantiated as a CHILD of ai-daemon.slice by the
+# daemon itself via cgroup.py (PR-31) when it detects a running game --
+# tasks get moved from ai-daemon.slice to observer.slice, dropping their
+# CPU share from 200 to 10 and their IO to near-idle.
+DefaultDependencies=no
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+TasksAccounting=yes
+
+# --- CPU ------------------------------------------------------------------
+# CPUWeight=10 (10% of default).  Observers get timeslice only when
+# nothing else wants the CPU.
+CPUWeight=10
+# CPUQuota=5%: hard cap.  Even on an idle system, observers can't burn
+# more than 5% of one CPU (5% of 4 cores = 20% of ONE core, still low).
+# ai-hw-detect tightens this to 2% on OLD-tier HW; see slice-apply.sh.
+CPUQuota=5%
+
+# --- Memory ---------------------------------------------------------------
+# Observers maintain large LRU caches of patterns/signatures.  On NEW HW
+# we allow up to 128 MiB; slice-apply.sh tightens this to 32 MiB on OLD HW.
+MemoryHigh=128M
+MemoryMax=256M
+# Observers are the FIRST thing to swap out under pressure -- their state
+# is entirely reconstructable from /proc on resume.
+MemorySwapMax=1G
+
+# --- IO -------------------------------------------------------------------
+# Observers read /proc and /sys heavily but touch disk only for cache.
+# IOWeight=10 keeps them behind everything else; on rotational disks
+# slice-apply.sh adds IOReadBandwidthMax=1M to prevent head-thrashing
+# during a game install.
+IOWeight=10
+
+# --- Process limits -------------------------------------------------------
+# Each observer is a single thread within the daemon; allow a small
+# margin for transient Popen/fork scanners.
+TasksMax=512
+
+# --- OOM preference -------------------------------------------------------
+# Observers are explicitly disposable.  Under memory pressure the OOM
+# killer should take them out first; ManagedOOM probes reclaim
+# aggressively.  (OOMScoreAdjust=+500 is applied via the per-task drop-in
+# since slices don't directly expose that key.)
+ManagedOOMSwap=kill
+ManagedOOMMemoryPressure=kill
+ManagedOOMMemoryPressureLimit=50%
+
+[Install]
+WantedBy=multi-user.target

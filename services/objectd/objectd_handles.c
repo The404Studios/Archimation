@@ -22,6 +22,26 @@
 
 static handle_entry_t g_handles[MAX_HANDLES];
 static volatile int   g_handle_inited = 0;  /* Atomic via __atomic builtins */
+/*
+ * Lock choice rationale: pthread_mutex_t, not pthread_spinlock_t.
+ *
+ * objectd is a single-threaded epoll daemon at the protocol level, but
+ * the handle table is also consulted from registry.c helpers that may
+ * run under short-lived worker threads in future expansions.  The
+ * critical section here (array scan up to MAX_HANDLES, or index + copy)
+ * is bounded and USUALLY sub-microsecond -- on paper a spinlock wins.
+ *
+ * HOWEVER: handle_cleanup_stale() walks the full 16384-slot table and
+ * calls close(2) per stale entry.  close(2) can block on devices that
+ * aren't prompt to free (sockets awaiting linger, named-pipe peers,
+ * etc.), which blows up spinlock latency to milliseconds.  A mutex
+ * parks waiters on a futex instead of burning CPU.
+ *
+ * For the fast alloc/lookup paths on uncontended CPUs glibc's mutex
+ * stays almost entirely in userspace (single cmpxchg) so the extra
+ * cost vs. a spinlock is one cache-line load at most.  Net: keep the
+ * mutex; it's the safer default for a cleanup path that can sleep.
+ */
 static pthread_mutex_t g_handle_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Handle values start at 0x100 to avoid conflicts with predefined HKEYs */

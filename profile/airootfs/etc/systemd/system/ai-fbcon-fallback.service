@@ -1,0 +1,45 @@
+[Unit]
+Description=AI Arch framebuffer fallback shell (X died too many times)
+Documentation=file:///usr/lib/ai-arch/fbcon-fallback.sh
+# This unit is conditionally started by the OnFailure= / StartLimit policies
+# on lightdm.service (see /etc/systemd/system/lightdm.service.d/fallback.conf).
+#
+# Ordering: we want fbcon fallback to be the LAST thing to come up if the
+# graphical stack has given up.  It runs on tty2 so it never races with
+# plymouth / X / getty on tty1.
+After=getty@tty2.service plymouth-quit-wait.service
+# Prevent collision with the default autovt getty on tty2.
+Conflicts=getty@tty2.service
+# Only relevant in graphical boots; don't bother in multi-user target.
+ConditionPathExists=/usr/lib/ai-arch/fbcon-fallback.sh
+# Don't trigger on live ISO (no installed state to recover to)
+ConditionPathExists=!/run/archiso
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/ai-arch/fbcon-fallback.sh run
+# Bind to the target VT so the shell opens there rather than inheriting
+# the unit's stderr -- critical for interactive use.
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty2
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+# Never restart on its own; user unblocks manually via:
+#   /usr/lib/ai-arch/fbcon-fallback.sh unblock
+Restart=no
+# Emergency shell runs as root so we can inspect /var/log/lightdm etc.
+User=root
+# No sandboxing -- the whole point is to let the user debug freely.
+ProtectSystem=no
+ProtectHome=no
+PrivateTmp=no
+# Generous timeout: user may stay in the shell for minutes.
+TimeoutStartSec=infinity
+
+[Install]
+# Not WantedBy= anything; triggered only by lightdm OnFailure=.
+# But we keep graphical.target wants for manual `systemctl start` use.
+WantedBy=graphical.target

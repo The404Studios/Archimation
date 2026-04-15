@@ -45,24 +45,29 @@ typedef int (*pa_simple_write_fn)(pa_simple *, const void *, size_t, int *);
 typedef int (*pa_simple_drain_fn)(pa_simple *, int *);
 
 static void *g_pa_lib = NULL;
-static int g_pa_tried = 0;
+static pthread_once_t g_pa_once = PTHREAD_ONCE_INIT;
+static int g_pa_load_ok = 0;
 static pa_simple_new_fn   p_new;
 static pa_simple_free_fn  p_free;
 static pa_simple_write_fn p_write;
 static pa_simple_drain_fn p_drain;
 
-static int pa_load(void)
+static void pa_load_impl(void)
 {
-    if (g_pa_tried) return g_pa_lib ? 0 : -1;
-    g_pa_tried = 1;
     g_pa_lib = dlopen("libpulse-simple.so.0", RTLD_NOW);
     if (!g_pa_lib) g_pa_lib = dlopen("libpulse-simple.so", RTLD_NOW);
-    if (!g_pa_lib) return -1;
+    if (!g_pa_lib) return;
     p_new   = (pa_simple_new_fn)dlsym(g_pa_lib, "pa_simple_new");
     p_free  = (pa_simple_free_fn)dlsym(g_pa_lib, "pa_simple_free");
     p_write = (pa_simple_write_fn)dlsym(g_pa_lib, "pa_simple_write");
     p_drain = (pa_simple_drain_fn)dlsym(g_pa_lib, "pa_simple_drain");
-    return (p_new && p_write) ? 0 : -1;
+    g_pa_load_ok = (p_new && p_write) ? 1 : 0;
+}
+
+static int pa_load(void)
+{
+    pthread_once(&g_pa_once, pa_load_impl);
+    return g_pa_load_ok ? 0 : -1;
 }
 
 /* ================================================================== */
@@ -149,14 +154,25 @@ static void *source_voice_thread(void *arg)
             sv->buf_head = buf->next;
             if (!sv->buf_head) sv->buf_tail = NULL;
         }
+        /* Snapshot stream+playing under lock to close the same TOCTOU
+         * covered in dsound_audio.c. */
+        pa_simple *stream_snap = sv->stream;
+        int playing_snap = sv->playing;
         pthread_mutex_unlock(&sv->lock);
 
-        if (buf && sv->stream && sv->playing) {
-            int err = 0;
-            p_write(sv->stream, buf->data, buf->size, &err);
+        if (buf) {
+            if (stream_snap && playing_snap && p_write) {
+                int err = 0;
+                p_write(stream_snap, buf->data, buf->size, &err);
+            }
+            /* Always free the buffer — previously leaked when the stream was
+             * paused (playing_snap == 0): we'd skip the write but also skip
+             * the free, accumulating queue entries silently. */
             free(buf->data);
             free(buf);
-        } else if (!buf) {
+        } else {
+            /* No work: sleep ~5ms. Keeps the thread responsive without burning
+             * CPU. XAudio2 on Windows submits buffers every 10-40ms typically. */
             usleep(5000);
         }
     }
@@ -277,18 +293,25 @@ static __attribute__((ms_abi)) HRESULT sv_ExitLoop(IXAudio2SourceVoice *s, uint3
 static __attribute__((ms_abi)) void sv_GetState(IXAudio2SourceVoice *s, void *state, uint32_t flags)
 {
     (void)flags;
-    /* XAUDIO2_VOICE_STATE: { pCurrentBufferContext, BuffersQueued, SamplesPlayed } */
-    if (state) {
-        uint64_t *st = (uint64_t *)state;
-        st[0] = 0; /* pCurrentBufferContext */
-        pthread_mutex_lock(&s->lock);
-        uint32_t count = 0;
-        buf_entry_t *b = s->buf_head;
-        while (b) { count++; b = b->next; }
-        pthread_mutex_unlock(&s->lock);
-        ((uint32_t *)state)[2] = count; /* BuffersQueued */
-        st[1] = 0; /* SamplesPlayed */
-    }
+    /* XAUDIO2_VOICE_STATE layout (Windows packed, 24 bytes):
+     *   void     *pCurrentBufferContext; offset 0  (8 bytes)
+     *   UINT32   BuffersQueued;          offset 8  (4 bytes)
+     *   UINT64   SamplesPlayed;          offset 16 (8 bytes, 8-byte aligned)
+     * The old code miscalculated offsets — it double-overwrote BuffersQueued
+     * with SamplesPlayed because it treated the struct as two uint64s. */
+    if (!state) return;
+    uint8_t *p = (uint8_t *)state;
+
+    pthread_mutex_lock(&s->lock);
+    uint32_t count = 0;
+    buf_entry_t *b = s->buf_head;
+    while (b) { count++; b = b->next; }
+    pthread_mutex_unlock(&s->lock);
+
+    *(void **)(p + 0)      = NULL;   /* pCurrentBufferContext */
+    *(uint32_t *)(p + 8)   = count;  /* BuffersQueued */
+    /* p + 12..15 is padding in the MSVC-packed struct. */
+    *(uint64_t *)(p + 16)  = 0;      /* SamplesPlayed */
 }
 
 static __attribute__((ms_abi)) HRESULT sv_SetFrequencyRatio(IXAudio2SourceVoice *s, float r, uint32_t o)

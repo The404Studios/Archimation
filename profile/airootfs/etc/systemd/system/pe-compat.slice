@@ -26,5 +26,43 @@ MemoryAccounting=yes
 IOAccounting=yes
 TasksAccounting=yes
 
+# --- CPU ------------------------------------------------------------------
+# 900 = 9x default weight.  PE apps (games, productivity tools) are the
+# primary reason this system exists, so they get the bulk of the box.
+# Trust (1000) still wins on its rare runnable moments; everything else
+# loses to PE under contention.  game.slice (a child scope) boosts this
+# further to 10000 for the foreground game.
+CPUWeight=900
+
+# --- Memory ---------------------------------------------------------------
+# PE apps include games that legitimately want 4-8 GiB of RAM.  We do
+# NOT set MemoryHigh here at the slice level -- individual per-app
+# scopes can carry their own limits if needed.  slice-apply.sh on NEW
+# HW writes MemoryHigh=80% of total to this file at runtime; on OLD HW
+# (1 GiB P4) it writes MemoryHigh=512M to prevent single-app OOM.
+MemoryMin=128M
+MemoryLow=256M
+# Allow some swap -- games have cold menu/settings code paths that can
+# be safely swapped without FPS impact.
+MemorySwapMax=2G
+
+# --- IO -------------------------------------------------------------------
+# 800 = 8x default.  Games stream assets; IDE runs compiler.  All of
+# these beat observer/background work but bow to trust if trust ever
+# needs disk (rare).
+IOWeight=800
+
+# --- Process limits -------------------------------------------------------
+# 8192: modern games + DXVK compile threads + anti-cheat sandboxes.
+TasksMax=8192
+
+# --- ManagedOOM ----------------------------------------------------------
+# Memory pressure here is tolerable; we prefer to kill observer.slice
+# first.  Threshold set higher than observer/ai-daemon so those get
+# reaped before PE apps.
+ManagedOOMSwap=auto
+ManagedOOMMemoryPressure=auto
+ManagedOOMMemoryPressureLimit=85%
+
 [Install]
 WantedBy=multi-user.target

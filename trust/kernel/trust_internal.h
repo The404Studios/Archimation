@@ -14,6 +14,7 @@
 #include <linux/time64.h>
 #include <linux/wait.h>
 #include <linux/mutex.h>
+#include <linux/cache.h>    /* ____cacheline_aligned_in_smp / SMP_CACHE_BYTES */
 #include "../include/trust_types.h"
 
 /* Forward declaration for TMS region tags (full definition in trust_memory.h) */
@@ -23,17 +24,48 @@ enum tms_region_tag;
 #define TRUST_TLB_SETS  1024
 #define TRUST_TLB_WAYS  4
 
+/*
+ * Per-set struct is ~2 KB (4 subject copies + valid_mask + lru + spinlock).
+ * Adjacent sets are operated on by DIFFERENT CPUs (subject_id → hash →
+ * set index).  Without ____cacheline_aligned_in_smp the tail of one set
+ * (spinlock/lru bytes) can share a line with the first subject of the
+ * next set, so a softirq touching one set invalidates the lock line of
+ * an unrelated set on another CPU.  Align to cacheline so each set is
+ * isolated on SMP kernels.  On UP this is a no-op.
+ */
 typedef struct {
     trust_subject_t entries[TRUST_TLB_WAYS];
     u32             valid_mask;     /* Bitmask: which ways are valid */
     u32             lru;            /* LRU tracking (2 bits per way) */
     spinlock_t      lock;
-} trust_tlb_set_t;
+} ____cacheline_aligned_in_smp trust_tlb_set_t;
 
+/*
+ * trust_tlb_t layout rationale (false-sharing mitigation):
+ *
+ *  - `sets` is read on EVERY lookup/insert/invalidate/modify from every
+ *    CPU.  Keep it in its own read-mostly cacheline so hot-path readers
+ *    never see it invalidated.
+ *  - `hit_count` and `miss_count` are incremented (atomic_inc) on the
+ *    lookup hot path.  EVERY CPU dirties them.  If they share a line
+ *    with `sets`, every lookup invalidates the cacheline that every
+ *    other CPU's next lookup needs for the `sets` pointer → classic
+ *    false-sharing ping-pong.  Split each onto its own cacheline.
+ *  - The two counters are also split from EACH OTHER because typical
+ *    workloads see hits and misses from different CPUs at the same
+ *    instant (hits from long-running subjects on one CPU, misses from
+ *    newly-created subjects on another); a shared line between the
+ *    two counters thrashes just as badly.
+ *
+ * Cost: adds 2 * 64B = 128B to the BSS footprint of this struct. Trivial
+ * compared to the vmalloc'd sets[] array (~2 MB).
+ */
 typedef struct {
     trust_tlb_set_t *sets;  /* vmalloc'd, TRUST_TLB_SETS entries */
-    atomic_t        hit_count;
-    atomic_t        miss_count;
+    /* hit_count: written by every CPU on cache-hit path (trust_tlb_lookup). */
+    atomic_t        hit_count  ____cacheline_aligned_in_smp;
+    /* miss_count: written by every CPU on cache-miss path (trust_tlb_lookup). */
+    atomic_t        miss_count ____cacheline_aligned_in_smp;
 } trust_tlb_t;
 
 /* --- Policy Table --- */
@@ -45,12 +77,21 @@ typedef struct {
     spinlock_t          lock;
 } trust_policy_table_t;
 
-/* --- Audit Ring Buffer --- */
+/* --- Audit Ring Buffer ---
+ *
+ * head/tail are written by EVERY audit call on whatever CPU records the
+ * audit event.  entries[] is read by userspace dumpers on another CPU.
+ * Since head/tail sit RIGHT AFTER the entries[] array, a writer on CPU A
+ * bouncing head forward can invalidate the cacheline containing the
+ * last few bytes of entries[] that a reader on CPU B is scanning.
+ * Push head/tail + lock onto their own cacheline to avoid that.
+ */
 #define TRUST_AUDIT_SIZE 4096
 
 typedef struct {
     trust_audit_entry_t entries[TRUST_AUDIT_SIZE];
-    u32                 head;
+    /* head/tail/lock form the write-hot control block; isolate from entries[]. */
+    u32                 head                           ____cacheline_aligned_in_smp;
     u32                 tail;
     spinlock_t          lock;
 } trust_audit_ring_t;
@@ -185,6 +226,41 @@ int32_t trust_risc_record_action(u32 subject_id, u32 action, u32 result);
 int     trust_risc_threshold_check(u32 subject_id, u32 action);
 void    trust_risc_decay_tick(void);
 u32     trust_risc_translate_cap(u32 cap, u16 from_domain, u16 to_domain);
+
+/* --- Predicated dispatch helper (trust_risc.c) ---
+ *
+ * Session 31 extended ISA: top bit of the 32-bit instruction word
+ * gates execution on the per-CPU predicate flag register.  Returns
+ * 1 if the instruction should execute, 0 if it should be skipped.
+ * Unpredicated instructions (bit 31 = 0) always return 1, preserving
+ * current behavior for legacy programs.
+ */
+int trust_risc_eval_predicated(u32 instr);
+
+/*
+ * Per-CPU predicate flag register accessors.  Updated by ALU-style
+ * primitives (record_action, threshold_check, VEC_*_count).  Top
+ * level dispatchers should call trust_isa_pred_reset() on entry so
+ * stale state does not leak between unrelated submits.
+ */
+void    trust_isa_pred_reset(void);
+void    trust_isa_pred_set(int64_t result);
+int64_t trust_isa_pred_get(void);
+
+/* --- VEC family (trust_vector.c) and FUSED family (trust_fused.c) ---
+ *
+ * Both return >= 0 on success (count/bitmap-hits) or -errno.  Neither
+ * updates the predicate register directly — that's the caller's job
+ * after interpreting the return value.  Backward-compat: legacy
+ * dispatcher code that never invokes these paths is unaffected.
+ */
+int trust_isa_exec_vec(u32 op, const u32 *subjects, u32 count,
+                       u64 param, u64 *out, u32 out_len);
+int trust_isa_exec_fused(u32 op, u64 op0, u64 op1, u64 op2,
+                         u16 imm, u64 *out_val);
+int trust_isa_decode_batch(const void *buf, u32 buf_len,
+                           u32 *subjects, u32 max_count,
+                           u32 *op_out, u64 *param_out);
 
 /* --- FBC operations (trust_fbc.c) --- */
 int  trust_fbc_policy_eval(u32 subject_id, u32 action, u32 *matching_rule_idx);

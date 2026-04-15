@@ -22,6 +22,20 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+# io_uring batch /proc reader -- gated by config, see daemon/config.py.
+# Import is safe on non-Linux (module returns available() == False).
+try:
+    from iouring import IOUring, batch_read_proc_files
+    _IOURING_IMPORT_OK = True
+except Exception:
+    try:
+        from daemon.iouring import IOUring, batch_read_proc_files  # type: ignore
+        _IOURING_IMPORT_OK = True
+    except Exception:
+        IOUring = None  # type: ignore[assignment]
+        batch_read_proc_files = None  # type: ignore[assignment]
+        _IOURING_IMPORT_OK = False
+
 logger = logging.getLogger("ai-control.syscall_monitor")
 
 # ---------------------------------------------------------------------------
@@ -334,7 +348,11 @@ class SyscallMonitor:
 
     def __init__(self, poll_interval: float = SIMULATION_POLL_INTERVAL,
                  process_ttl: float = PROCESS_TTL,
-                 max_processes: int = MAX_TRACKED_PROCESSES):
+                 max_processes: int = MAX_TRACKED_PROCESSES,
+                 use_iouring: bool = False,
+                 iouring_sqpoll: bool = False,
+                 iouring_sq_cpu: Optional[int] = None,
+                 iouring_depth: int = 32):
         self._profiles: dict[int, ProcessSyscallProfile] = {}
         self._poll_interval = poll_interval
         self._process_ttl = process_ttl
@@ -344,6 +362,14 @@ class SyscallMonitor:
         self._task: Optional[asyncio.Task] = None
         self._nl_sock: Optional[socket.socket] = None
         # Translation delegated to module-level functions wrapping syscall_translator
+        # io_uring feature flag (R32).  Gated by config.py so old-HW
+        # boxes stay on /proc text reads.  _iouring_disabled flips to
+        # True if a call fails at runtime, preventing log spam.
+        self._use_iouring = bool(use_iouring and _IOURING_IMPORT_OK)
+        self._iouring_sqpoll = bool(iouring_sqpoll)
+        self._iouring_sq_cpu = iouring_sq_cpu
+        self._iouring_depth = max(8, int(iouring_depth))
+        self._iouring_disabled: bool = False
 
     # --- Lifecycle ---
 
@@ -509,9 +535,20 @@ class SyscallMonitor:
             await asyncio.sleep(self._poll_interval)
 
     async def _poll_pe_processes(self) -> None:
-        """Find PE processes and poll their current syscall state."""
-        # Offload the blocking /proc walk to an executor to avoid stalling
-        # the event loop for the (potentially hundreds of) filesystem calls.
+        """Find PE processes and poll their current syscall state.
+
+        With io_uring enabled (R32) we:
+
+        1. Walk /proc once to collect PE-PID candidates (cheap dirent).
+        2. Submit one batch ``read()`` per PID's ``/proc/<pid>/syscall``
+           via io_uring.  N PIDs -> 1 submit + 1 drain, instead of N
+           blocking syscalls on the main thread.
+
+        On old HW / kernels <5.1 we fall through to the classic
+        per-PID loop.  The PE-detection step (``_is_pe_process``) still
+        does one readlink + small /proc read per candidate; optimising
+        that is Round 33 territory (needs an io_uring OPENAT, 5.6+).
+        """
         loop = asyncio.get_event_loop()
         try:
             pids = await loop.run_in_executor(
@@ -521,56 +558,107 @@ class SyscallMonitor:
         except OSError:
             return
 
-        for pid in pids:
-            if not self._is_pe_process(pid):
-                continue
+        # Filter to PE-loader processes + already-tracked ones.
+        pe_pids = [pid for pid in pids if self._is_pe_process(pid)]
+        if not pe_pids:
+            return
 
-            # Read current syscall from /proc/PID/syscall
+        # Fast path: batch-read /proc/<pid>/syscall via io_uring.
+        use_uring = (
+            self._use_iouring
+            and not self._iouring_disabled
+            and batch_read_proc_files is not None
+        )
+        if use_uring:
+            syscall_paths = [f"/proc/{pid}/syscall" for pid in pe_pids]
+            depth = min(max(len(pe_pids), 8), self._iouring_depth)
+
+            def _do_batch():
+                try:
+                    return batch_read_proc_files(
+                        syscall_paths,
+                        buf_size=512,      # /proc/PID/syscall is ~80 bytes
+                        depth=depth,
+                        sqpoll=self._iouring_sqpoll,
+                        sq_cpu=self._iouring_sq_cpu,
+                    )
+                except OSError as exc:
+                    logger.warning(
+                        "syscall_monitor: io_uring batch failed (%s); "
+                        "disabling for this daemon", exc,
+                    )
+                    return None
+
+            batch = await loop.run_in_executor(None, _do_batch)
+            if batch is None:
+                self._iouring_disabled = True
+                # Degrade to per-PID sync reads below.
+            else:
+                for pid, path in zip(pe_pids, syscall_paths):
+                    raw = batch.get(path)
+                    if raw is None:
+                        continue
+                    try:
+                        line = raw.decode("ascii", errors="replace").strip()
+                    except Exception:
+                        continue
+                    self._record_syscall_line(pid, line)
+                return
+
+        # Classic fallback path.
+        for pid in pe_pids:
             try:
                 with open(f"/proc/{pid}/syscall", "r") as f:
                     line = f.read().strip()
             except (OSError, PermissionError):
                 continue
+            self._record_syscall_line(pid, line)
 
-            if line == "running" or line == "-1":
-                continue
+    def _record_syscall_line(self, pid: int, line: str) -> None:
+        """Parse one ``/proc/<pid>/syscall`` line and log the event.
 
-            parts = line.split()
-            if len(parts) < 7:
-                continue
+        Split out of :meth:`_poll_pe_processes` so both the io_uring
+        batch path and the fallback sync path share the bookkeeping.
+        """
+        if line == "running" or line == "-1":
+            return
 
-            try:
-                syscall_nr = int(parts[0])
-                arg0 = int(parts[1], 16) if len(parts) > 1 else 0
-                arg1 = int(parts[2], 16) if len(parts) > 2 else 0
-                arg2 = int(parts[3], 16) if len(parts) > 3 else 0
-            except (ValueError, IndexError):
-                continue
+        parts = line.split()
+        if len(parts) < 7:
+            return
 
-            linux_name = SYSCALL_NAMES.get(syscall_nr, f"syscall_{syscall_nr}")
-            win_api, win_cat = _translate_syscall(syscall_nr)
+        try:
+            syscall_nr = int(parts[0])
+            arg0 = int(parts[1], 16) if len(parts) > 1 else 0
+            arg1 = int(parts[2], 16) if len(parts) > 2 else 0
+            arg2 = int(parts[3], 16) if len(parts) > 3 else 0
+        except (ValueError, IndexError):
+            return
 
-            event = SyscallEvent(
-                timestamp=time.time(),
-                pid=pid,
-                subject_id=0,  # No trust subject in simulation mode
-                syscall_nr=syscall_nr,
-                linux_name=linux_name,
-                windows_api=win_api,
-                category=win_cat,
-                arg0=arg0,
-                arg1=arg1,
-                arg2=arg2,
-                return_value=0,  # Can't capture in simulation mode
-            )
+        linux_name = SYSCALL_NAMES.get(syscall_nr, f"syscall_{syscall_nr}")
+        win_api, win_cat = _translate_syscall(syscall_nr)
 
-            if syscall_nr == 16:
-                event.details = f"DeviceIoControl cmd={_translate_ioctl(arg1)}"
-            elif syscall_nr == 41:
-                event.details = _translate_socket(arg0, arg1)
+        event = SyscallEvent(
+            timestamp=time.time(),
+            pid=pid,
+            subject_id=0,
+            syscall_nr=syscall_nr,
+            linux_name=linux_name,
+            windows_api=win_api,
+            category=win_cat,
+            arg0=arg0,
+            arg1=arg1,
+            arg2=arg2,
+            return_value=0,
+        )
 
-            profile = self._get_or_create_profile(pid, 0)
-            profile.add_event(event)
+        if syscall_nr == 16:
+            event.details = f"DeviceIoControl cmd={_translate_ioctl(arg1)}"
+        elif syscall_nr == 41:
+            event.details = _translate_socket(arg0, arg1)
+
+        profile = self._get_or_create_profile(pid, 0)
+        profile.add_event(event)
 
     def _is_pe_process(self, pid: int) -> bool:
         """Check if a PID is a PE process (running under pe-loader)."""
@@ -730,6 +818,10 @@ class SyscallMonitor:
             "total_events": total_events,
             "max_processes": self._max_processes,
             "poll_interval": self._poll_interval,
+            "iouring_enabled": bool(
+                self._use_iouring and not self._iouring_disabled
+            ),
+            "iouring_sqpoll": bool(self._iouring_sqpoll),
         }
 
     # --- Manual tracking ---

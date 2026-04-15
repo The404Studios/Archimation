@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import logging
+import threading
 import time
 from typing import Optional
 
@@ -26,30 +27,56 @@ _COMPOSITOR_TTL = 30.0
 # cost on slow disks. These binaries don't come and go at runtime.
 _which_cache: dict[str, Optional[str]] = {}
 
+# Serialize cache reads/writes across uvicorn thread-pool workers.
+#
+# Without this lock a cache-miss storm (TTL just expired, N concurrent
+# requests on N worker threads) launches N parallel subprocess forks
+# (hyprctl / wmctrl / xdotool) and each updates the cache.  On old HW
+# that's a 50-300 ms CPU burn per extra fork and measurable load.
+#
+# RLock chosen so future callers that hold the lock while re-entering
+# (e.g. _invalidate_window_caches inside a mutating op that was
+# itself gated on the cache) don't deadlock.
+_cache_lock = threading.RLock()
+
 
 def _detect_compositor() -> str:
     """Detect whether we're running Hyprland, X11, or neither."""
     global _compositor_cache
     now = time.monotonic()
-    if _compositor_cache is not None and (now - _compositor_cache[1]) < _COMPOSITOR_TTL:
-        return _compositor_cache[0]
-    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
-        result = "hyprland"
-    elif os.environ.get("DISPLAY"):
-        result = "x11"
-    else:
-        result = "none"
-    _compositor_cache = (result, now)
-    return result
+    # Fast path: lockless read of the tuple; tuple assignment is atomic
+    # under the GIL so readers always see a coherent (value, timestamp) pair.
+    cached = _compositor_cache
+    if cached is not None and (now - cached[1]) < _COMPOSITOR_TTL:
+        return cached[0]
+    # Slow path: serialize the refill to avoid a thundering-herd of env lookups.
+    with _cache_lock:
+        cached = _compositor_cache
+        if cached is not None and (now - cached[1]) < _COMPOSITOR_TTL:
+            return cached[0]
+        if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            result = "hyprland"
+        elif os.environ.get("DISPLAY"):
+            result = "x11"
+        else:
+            result = "none"
+        _compositor_cache = (result, now)
+        return result
 
 
 def _which_cached(binary: str) -> Optional[str]:
     """Cached `shutil.which` — avoids PATH walks on hot paths."""
+    # dict.__contains__ / __getitem__ are atomic under GIL but two
+    # threads that both miss would both call shutil.which() and both
+    # write the dict.  Serialize PATH walks to prevent duplicate forks.
     if binary in _which_cache:
         return _which_cache[binary]
-    path = shutil.which(binary)
-    _which_cache[binary] = path
-    return path
+    with _cache_lock:
+        if binary in _which_cache:
+            return _which_cache[binary]
+        path = shutil.which(binary)
+        _which_cache[binary] = path
+        return path
 
 
 _hypr_sock_cache: tuple[str, str] | None = None  # (sig, resolved_path)
@@ -142,96 +169,118 @@ def get_windows() -> list:
     """Get list of open windows. Cached for _WINDOW_LIST_TTL seconds."""
     global _windows_cache
     now = time.monotonic()
-    if _windows_cache is not None and (now - _windows_cache[1]) < _WINDOW_LIST_TTL:
-        return _windows_cache[0]
+    # Fast lockless read: coherent tuple under GIL.
+    cached = _windows_cache
+    if cached is not None and (now - cached[1]) < _WINDOW_LIST_TTL:
+        return cached[0]
 
-    compositor = _detect_compositor()
-    result: list = []
+    # Serialize the expensive subprocess call so N concurrent cache
+    # misses still launch ONE hyprctl/wmctrl fork, not N.
+    with _cache_lock:
+        cached = _windows_cache
+        if cached is not None and (now - cached[1]) < _WINDOW_LIST_TTL:
+            return cached[0]
 
-    if compositor == "hyprland":
-        try:
-            data = _hyprctl("clients")
-            result = json.loads(data) if data else []
-        except json.JSONDecodeError:
-            result = []
+        compositor = _detect_compositor()
+        result: list = []
 
-    elif compositor == "x11":
-        if not _which_cached("wmctrl"):
-            logger.debug("wmctrl not found on PATH; cannot list X11 windows")
-            _windows_cache = ([], now)
-            return []
-        try:
-            sub_result = subprocess.run(
-                ["wmctrl", "-l", "-p"], capture_output=True, text=True, timeout=5
-            )
-            for line in sub_result.stdout.strip().split("\n"):
-                if not line:
-                    continue
-                parts = line.split(None, 4)
-                if len(parts) >= 5:
-                    result.append({
-                        "id": parts[0],
-                        "desktop": parts[1],
-                        "pid": parts[2],
-                        "host": parts[3],
-                        "title": parts[4],
-                    })
-                elif len(parts) == 4:
-                    result.append({
-                        "id": parts[0],
-                        "desktop": parts[1],
-                        "pid": parts[2],
-                        "host": parts[3],
-                        "title": "",
-                    })
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            logger.debug("wmctrl failed: %s", e)
+        if compositor == "hyprland":
+            try:
+                data = _hyprctl("clients")
+                result = json.loads(data) if data else []
+            except json.JSONDecodeError:
+                result = []
 
-    _windows_cache = (result, now)
-    return result
+        elif compositor == "x11":
+            if not _which_cached("wmctrl"):
+                logger.debug("wmctrl not found on PATH; cannot list X11 windows")
+                _windows_cache = ([], now)
+                return []
+            try:
+                sub_result = subprocess.run(
+                    ["wmctrl", "-l", "-p"], capture_output=True, text=True, timeout=5
+                )
+                for line in sub_result.stdout.strip().split("\n"):
+                    if not line:
+                        continue
+                    parts = line.split(None, 4)
+                    if len(parts) >= 5:
+                        result.append({
+                            "id": parts[0],
+                            "desktop": parts[1],
+                            "pid": parts[2],
+                            "host": parts[3],
+                            "title": parts[4],
+                        })
+                    elif len(parts) == 4:
+                        result.append({
+                            "id": parts[0],
+                            "desktop": parts[1],
+                            "pid": parts[2],
+                            "host": parts[3],
+                            "title": "",
+                        })
+            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+                logger.debug("wmctrl failed: %s", e)
+
+        _windows_cache = (result, now)
+        return result
 
 
 def get_active_window() -> Optional[dict]:
     """Get the currently focused window. Cached for _WINDOW_LIST_TTL seconds."""
     global _active_window_cache
     now = time.monotonic()
-    if _active_window_cache is not None and (now - _active_window_cache[1]) < _WINDOW_LIST_TTL:
-        return _active_window_cache[0]
+    cached = _active_window_cache
+    if cached is not None and (now - cached[1]) < _WINDOW_LIST_TTL:
+        return cached[0]
 
-    compositor = _detect_compositor()
-    result: Optional[dict] = None
+    # Serialize cache refill to prevent duplicate hyprctl/xdotool forks
+    # across concurrent API requests.
+    with _cache_lock:
+        cached = _active_window_cache
+        if cached is not None and (now - cached[1]) < _WINDOW_LIST_TTL:
+            return cached[0]
 
-    if compositor == "hyprland":
-        try:
-            data = _hyprctl("activewindow")
-            result = json.loads(data) if data else None
-        except json.JSONDecodeError:
-            result = None
+        compositor = _detect_compositor()
+        result: Optional[dict] = None
 
-    elif compositor == "x11":
-        if not _which_cached("xdotool"):
-            logger.debug("xdotool not found on PATH; cannot get active window")
-            _active_window_cache = (None, now)
-            return None
-        try:
-            sub_result = subprocess.run(
-                ["xdotool", "getactivewindow", "getwindowname"],
-                capture_output=True, text=True, timeout=5
-            )
-            result = {"title": sub_result.stdout.strip()} if sub_result.returncode == 0 else None
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            logger.debug("xdotool failed: %s", e)
+        if compositor == "hyprland":
+            try:
+                data = _hyprctl("activewindow")
+                result = json.loads(data) if data else None
+            except json.JSONDecodeError:
+                result = None
 
-    _active_window_cache = (result, now)
-    return result
+        elif compositor == "x11":
+            if not _which_cached("xdotool"):
+                logger.debug("xdotool not found on PATH; cannot get active window")
+                _active_window_cache = (None, now)
+                return None
+            try:
+                sub_result = subprocess.run(
+                    ["xdotool", "getactivewindow", "getwindowname"],
+                    capture_output=True, text=True, timeout=5
+                )
+                result = {"title": sub_result.stdout.strip()} if sub_result.returncode == 0 else None
+            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+                logger.debug("xdotool failed: %s", e)
+
+        _active_window_cache = (result, now)
+        return result
 
 
 def _invalidate_window_caches() -> None:
     """Drop window/active/workspace caches after a mutating op."""
     global _windows_cache, _active_window_cache, _workspaces_cache
-    _windows_cache = None
-    _active_window_cache = None
-    _workspaces_cache = None
+    # Pointer reassignments are atomic under GIL; no lock strictly needed,
+    # but taking the lock makes the invalidation visible to any thread
+    # mid-refill (RLock allows the same thread to re-enter if the caller
+    # already holds the lock).
+    with _cache_lock:
+        _windows_cache = None
+        _active_window_cache = None
+        _workspaces_cache = None
 
 
 def focus_window(identifier: str) -> bool:
@@ -298,48 +347,55 @@ def get_workspaces() -> list:
     """Get workspace/desktop list. Cached for _WINDOW_LIST_TTL seconds."""
     global _workspaces_cache
     now = time.monotonic()
-    if _workspaces_cache is not None and (now - _workspaces_cache[1]) < _WINDOW_LIST_TTL:
-        return _workspaces_cache[0]
+    cached = _workspaces_cache
+    if cached is not None and (now - cached[1]) < _WINDOW_LIST_TTL:
+        return cached[0]
 
-    compositor = _detect_compositor()
-    desktops: list = []
+    # Serialize cache refill to prevent duplicate hyprctl/wmctrl forks.
+    with _cache_lock:
+        cached = _workspaces_cache
+        if cached is not None and (now - cached[1]) < _WINDOW_LIST_TTL:
+            return cached[0]
 
-    if compositor == "hyprland":
-        try:
-            data = _hyprctl("workspaces")
-            desktops = json.loads(data) if data else []
-        except json.JSONDecodeError:
-            desktops = []
-    elif compositor == "x11":
-        if not _which_cached("wmctrl"):
-            logger.debug("wmctrl not found on PATH; cannot list workspaces")
-            _workspaces_cache = ([], now)
-            return []
-        try:
-            result = subprocess.run(
-                ["wmctrl", "-d"], capture_output=True, text=True, timeout=5
-            )
-            for line in result.stdout.strip().split("\n"):
-                if not line:
-                    continue
-                parts = line.split(None, 8)
-                if len(parts) >= 9:
-                    desktops.append({
-                        "id": parts[0],
-                        "active": parts[1] == "*",
-                        "name": parts[8],
-                    })
-                elif len(parts) >= 2:
-                    desktops.append({
-                        "id": parts[0],
-                        "active": parts[1] == "*",
-                        "name": f"Desktop {parts[0]}",
-                    })
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            logger.debug("wmctrl -d failed: %s", e)
+        compositor = _detect_compositor()
+        desktops: list = []
 
-    _workspaces_cache = (desktops, now)
-    return desktops
+        if compositor == "hyprland":
+            try:
+                data = _hyprctl("workspaces")
+                desktops = json.loads(data) if data else []
+            except json.JSONDecodeError:
+                desktops = []
+        elif compositor == "x11":
+            if not _which_cached("wmctrl"):
+                logger.debug("wmctrl not found on PATH; cannot list workspaces")
+                _workspaces_cache = ([], now)
+                return []
+            try:
+                result = subprocess.run(
+                    ["wmctrl", "-d"], capture_output=True, text=True, timeout=5
+                )
+                for line in result.stdout.strip().split("\n"):
+                    if not line:
+                        continue
+                    parts = line.split(None, 8)
+                    if len(parts) >= 9:
+                        desktops.append({
+                            "id": parts[0],
+                            "active": parts[1] == "*",
+                            "name": parts[8],
+                        })
+                    elif len(parts) >= 2:
+                        desktops.append({
+                            "id": parts[0],
+                            "active": parts[1] == "*",
+                            "name": f"Desktop {parts[0]}",
+                        })
+            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+                logger.debug("wmctrl -d failed: %s", e)
+
+        _workspaces_cache = (desktops, now)
+        return desktops
 
 
 def get_info() -> dict:

@@ -1,0 +1,51 @@
+# /etc/environment -- session-wide variables read by PAM (pam_env.so).
+#
+# Loaded before /etc/profile and BEFORE any profile.d script.  Values here
+# apply to every login session including GDM/LightDM auto-login, SSH, and
+# non-interactive systemd user units.  Keep HARDWARE-INDEPENDENT values
+# here; HW-specific tuning lives in /run/ai-arch/gpu-env.sh (written at
+# boot by /usr/lib/ai-arch/gpu-profile.sh).
+#
+# FORMAT: KEY=VALUE   (no `export`, no shell constructs -- pam_env syntax).
+
+# --- Mesa universal ----------------------------------------------------
+# glthread: defers driver calls off the render thread; 5-15% FPS on legacy
+# GL games with zero downsides (driver skips fast-path if unsafe).
+mesa_glthread=true
+
+# LIBGL_ALWAYS_INDIRECT: force direct rendering even if GLX is remote.
+LIBGL_ALWAYS_INDIRECT=0
+# LIBGL_DRI3_DISABLE: keep DRI3 on (required for Vulkan/Xorg interop).
+LIBGL_DRI3_DISABLE=0
+
+# --- DXVK universal ----------------------------------------------------
+DXVK_LOG_LEVEL=none
+DXVK_HUD=
+DXVK_FRAME_RATE=0
+
+# --- VKD3D universal ---------------------------------------------------
+VKD3D_DEBUG=none
+
+# --- NVIDIA universal --------------------------------------------------
+# Threaded optimisations are a free win on NVIDIA (proprietary + nouveau).
+__GL_THREADED_OPTIMIZATIONS=1
+__GL_SHADER_DISK_CACHE=1
+
+# --- Shader cache directories ------------------------------------------
+# Per-user paths; gpu-profile.sh can override on live ISO to tmpfs.
+# Using XDG_CACHE_HOME is resolved by pam_env at session start.
+# (These variables are consumed by DXVK/Mesa/VKD3D when the per-vendor
+# profile.d files don't override them.)
+
+# --- Intel / ANV -------------------------------------------------------
+ANV_ENABLE_PIPELINE_CACHE=true
+
+# --- AMD ---------------------------------------------------------------
+# Prefer RADV over amdvlk globally; amdvlk has limited DXVK support and
+# adds ~200 MB of GPU RAM overhead on pipeline cache.
+AMD_VULKAN_ICD=RADV
+
+# --- PE loader defaults ------------------------------------------------
+# WINEPREFIX-compatible path for PE apps that consult HOME-based caches.
+# The pe-launch-wrapper.sh points individual games at this tree.
+PE_DATA_HOME=/var/lib/pe-compat

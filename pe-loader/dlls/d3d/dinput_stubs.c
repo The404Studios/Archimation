@@ -11,6 +11,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #include <linux/input.h>
 
@@ -112,7 +113,13 @@ struct IDirectInputDevice8 {
     volatile int ref_count;
     DWORD dev_type;
     int acquired;
-    int evdev_fd;
+    int evdev_fd;   /* keyboard: persistent fd so GetDeviceState at 1000Hz
+                     * doesn't do open()/close() syscalls per poll */
+    int evdev_fd_tried;  /* 1 once we've attempted to open — caches negative
+                          * results so we don't rescan /dev/input on every
+                          * GetDeviceState when no keyboard is present */
+    pthread_mutex_t fd_lock;  /* protects evdev_fd updates between Release and
+                               * concurrent getdevstate */
 };
 
 /* IUnknown GUID {00000000-0000-0000-C000-000000000046} */
@@ -139,7 +146,10 @@ static __attribute__((ms_abi)) uint32_t did8_release(IDirectInputDevice8 *self)
 {
     int ref = __sync_sub_and_fetch(&self->ref_count, 1);
     if (ref <= 0) {
-        if (self->evdev_fd >= 0) close(self->evdev_fd);
+        pthread_mutex_lock(&self->fd_lock);
+        if (self->evdev_fd >= 0) { close(self->evdev_fd); self->evdev_fd = -1; }
+        pthread_mutex_unlock(&self->fd_lock);
+        pthread_mutex_destroy(&self->fd_lock);
         free(self);
         return 0;
     }
@@ -158,25 +168,73 @@ static __attribute__((ms_abi)) HRESULT did8_acquire(IDirectInputDevice8 *self)
 static __attribute__((ms_abi)) HRESULT did8_unacquire(IDirectInputDevice8 *self)
 { self->acquired = 0; return DI_OK; }
 
+/* Open a persistent keyboard fd on first use. Returns fd (or -1). Games poll
+ * GetDeviceState at 125-1000Hz; the previous code did open(O_RDONLY) +
+ * close() every call, which is ~two syscalls per poll = wasted CPU + VFS
+ * pressure. Now we open once, keep the fd for the device lifetime, and
+ * close on Release. */
+static int did8_get_kbd_fd(IDirectInputDevice8 *self)
+{
+    if (self->evdev_fd >= 0) return self->evdev_fd;
+    if (self->evdev_fd_tried) return -1;  /* cached negative result */
+    pthread_mutex_lock(&self->fd_lock);
+    if (self->evdev_fd < 0 && !self->evdev_fd_tried) {
+        /* Scan /dev/input for the first connected keyboard (has EV_KEY with
+         * KEY_SPACE/KEY_ESC in its capability set). Falls back to event0 if
+         * scan fails. We do this once, cached for the device's lifetime. */
+        int found = -1;
+        DIR *dir = opendir("/dev/input");
+        if (dir) {
+            struct dirent *ent;
+            while ((ent = readdir(dir)) != NULL) {
+                if (strncmp(ent->d_name, "event", 5) != 0) continue;
+                char path[64];
+                snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
+                int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+                if (fd < 0) continue;
+                /* Check for keyboard capability: has KEY_ESC (1) */
+                unsigned long keybits[(KEY_MAX + 8 * sizeof(unsigned long) - 1) / (8 * sizeof(unsigned long))];
+                memset(keybits, 0, sizeof(keybits));
+                if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits) >= 0 &&
+                    (keybits[1 / (8 * sizeof(unsigned long))] & (1UL << (1 % (8 * sizeof(unsigned long)))))) {
+                    found = fd;
+                    break;
+                }
+                close(fd);
+            }
+            closedir(dir);
+        }
+        if (found < 0) {
+            found = open("/dev/input/event0", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        }
+        self->evdev_fd = found;
+        self->evdev_fd_tried = 1;  /* cache: don't rescan even if -1 */
+    }
+    int fd = self->evdev_fd;
+    pthread_mutex_unlock(&self->fd_lock);
+    return fd;
+}
+
 static __attribute__((ms_abi)) HRESULT did8_getdevstate(IDirectInputDevice8 *self, DWORD size, void *data)
 {
     if (!data) return E_POINTER;
     memset(data, 0, size);
 
-    /* Try to read keyboard state from evdev */
+    /* Try to read keyboard state from evdev. Persistent fd keeps the hot
+     * polling loop at a single ioctl per call (~1us) instead of open+ioctl+close. */
     if (self->dev_type == DI8DEVTYPE_KEYBOARD && size >= 256) {
-        int fd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
+        int fd = did8_get_kbd_fd(self);
         if (fd >= 0) {
             unsigned char keys[KEY_MAX/8 + 1];
             memset(keys, 0, sizeof(keys));
             if (ioctl(fd, EVIOCGKEY(sizeof(keys)), keys) >= 0) {
                 /* Map evdev keycodes to DirectInput scan codes */
+                uint8_t *out = (uint8_t *)data;
                 for (int i = 0; i < 256 && i < KEY_MAX; i++) {
                     if (keys[i/8] & (1 << (i%8)))
-                        ((uint8_t *)data)[i] = 0x80;  /* Key pressed */
+                        out[i] = 0x80;  /* Key pressed */
                 }
             }
-            close(fd);
         }
     }
     return DI_OK;
@@ -265,6 +323,7 @@ static IDirectInputDevice8 *create_dinput_device(DWORD dev_type)
     dev->ref_count = 1;
     dev->dev_type = dev_type;
     dev->evdev_fd = -1;
+    pthread_mutex_init(&dev->fd_lock, NULL);
     return dev;
 }
 

@@ -33,4 +33,10 @@ file_permissions=(
   ["/usr/lib/ai-arch/hw-detect.sh"]="0:0:755"
   ["/usr/lib/ai-arch/low-ram-services.sh"]="0:0:755"
   ["/usr/lib/ai-arch/fstab-optimize.sh"]="0:0:755"
+  ["/usr/lib/ai-arch/gpu-profile.sh"]="0:0:755"
+  ["/usr/lib/ai-arch/pe-launch-wrapper.sh"]="0:0:755"
+  ["/etc/profile.d/gpu-tuning.sh"]="0:0:644"
+  ["/etc/profile.d/mesa.sh"]="0:0:644"
+  ["/etc/profile.d/dxvk.sh"]="0:0:644"
+  ["/etc/profile.d/vkd3d.sh"]="0:0:644"
 )

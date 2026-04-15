@@ -31,6 +31,7 @@
 #include "compat/env_setup.h"
 #include "compat/objectd_client.h"
 #include "windrv_manager.h"
+#include "pe_patch.h"
 
 /* Event bus - lock-free event emission to AI Cortex */
 #include "eventbus/pe_event.h"
@@ -428,6 +429,50 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Step 5a1: Patch common CRT function bodies in the IAT with our
+     * SSE2/AVX2 optimized versions.  Must run BEFORE section protections
+     * are restored so IAT pages are still writable. */
+    {
+        /* Build a short SHA-256-like hex key from the existing image
+         * hash helper below.  A stronger hash would be ideal but the
+         * Rolling FNV already used here is stable per-binary and good
+         * enough as a cache key.  We format it into a hex-ish string
+         * so the cache naming scheme matches the on-disk contract. */
+        char patch_key[65] = {0};
+        uint32_t key_hash = 0;
+        FILE *kf = fopen(exe_path, "rb");
+        if (kf) {
+            uint8_t buf[4096];
+            size_t n;
+            uint64_t size_sum = 0;
+            while ((n = fread(buf, 1, sizeof(buf), kf)) > 0) {
+                for (size_t i = 0; i < n; i++)
+                    key_hash = (key_hash * 31u) + buf[i];
+                size_sum += n;
+            }
+            fclose(kf);
+            /* 16 hex chars for hash + 16 hex chars for size -> 32 chars
+             * + the binary's basename-hash gives enough uniqueness
+             * across typical install sets. */
+            snprintf(patch_key, sizeof(patch_key),
+                     "%08x%08x%016llx%08x",
+                     key_hash, (uint32_t)size_sum,
+                     (unsigned long long)image.image_base,
+                     (uint32_t)image.size_of_image);
+            /* Pad out to 64 chars so the cache file name is uniform. */
+            size_t klen = strlen(patch_key);
+            while (klen < 64 && klen < sizeof(patch_key) - 1) {
+                patch_key[klen++] = '0';
+            }
+            patch_key[64] = '\0';
+        }
+        pe_patch_init();
+        int n_applied = pe_patch_apply(&image,
+                                       patch_key[0] ? patch_key : NULL);
+        if (verbose && n_applied > 0)
+            printf("[peloader] pe_patch: %d CRT bodies patched\n", n_applied);
+    }
+
     /* Step 5b: Restore per-section memory protections (relocation made everything RWX) */
     if (verbose)
         printf("[peloader] Step 5b: Restoring section protections...\n");
@@ -663,6 +708,7 @@ int main(int argc, char **argv)
     trust_gate_shutdown();
     objectd_disconnect();
     pe_import_cleanup();
+    pe_patch_shutdown();
     pe_image_free(&image);
     return exit_code;
 }

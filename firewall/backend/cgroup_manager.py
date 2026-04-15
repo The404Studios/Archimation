@@ -46,11 +46,28 @@ CGROUP_ROOT = "/sys/fs/cgroup"
 CGROUP_CONTROLLERS = "/sys/fs/cgroup/cgroup.controllers"
 DEFAULT_SLICE = "pe-compat.slice"
 
-# Controllers we would like enabled in the slice's subtree.  "pids" and
-# "memory" are sufficient for our predicate to work (cgroup membership
-# is enough for nft matching -- we don't actually need cpu/io controllers
-# just to match sockets by cgroup path).
-_DESIRED_CONTROLLERS = ("pids",)
+# Round 32: sibling slices whose names are reserved by the resource
+# orchestration layer.  We never place firewall app-scopes under these
+# (they're owned by the daemon / observer / trust subsystems), so a
+# caller asking for slice_name="trust.slice" is very likely a bug and
+# we reject it to keep the firewall footprint honest.
+_KNOWN_SIBLING_SLICES = frozenset({
+    "trust.slice",
+    "ai-daemon.slice",
+    "observer.slice",
+    "game.slice",  # game.slice is allowed as a promotion target but
+                    # NOT as a firewall app-scope parent -- transient
+                    # promotions don't need per-app firewall rules.
+})
+
+# Controllers we would like enabled in the slice's subtree.  "pids" is
+# the minimum needed for nft cgroupv2 predicates to match.  Round 32 adds
+# memory / cpu / io because pe-compat.slice now carries MemoryHigh /
+# CPUWeight / IOWeight overrides that propagate to children ONLY if the
+# corresponding controller is enabled in the slice's subtree_control.
+# Without this, firewall-created scopes would bypass the resource budget
+# entirely on kernels that otherwise have v2 unified mode.
+_DESIRED_CONTROLLERS = ("pids", "memory", "cpu", "io")
 
 # PIDs we refuse to move even if asked.  PID 1 is systemd, PID 2 is
 # kthreadd and kernel threads cannot be moved at all -- writing them
@@ -183,6 +200,19 @@ class CgroupManager:
     def __init__(self, slice_name: str = DEFAULT_SLICE) -> None:
         # Slice constant -- callers should not change this at runtime
         # because the nft rules are compiled with the default value.
+        #
+        # Round 32: reject sibling resource slices (trust, ai-daemon,
+        # observer, game) outright -- putting firewall app-scopes there
+        # would inherit the wrong CPU/memory budget.  Callers that want
+        # a non-default slice must pick a NEW dedicated slice, not
+        # hijack one we already manage for resource orchestration.
+        if slice_name in _KNOWN_SIBLING_SLICES:
+            logger.warning(
+                "CgroupManager: slice_name=%r is reserved for resource "
+                "orchestration; firewall app-scopes forced back to %s",
+                slice_name, DEFAULT_SLICE,
+            )
+            slice_name = DEFAULT_SLICE
         self._slice_name = slice_name
         self._available: Optional[bool] = None
         self._slice_ready: bool = False

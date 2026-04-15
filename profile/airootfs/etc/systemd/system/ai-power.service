@@ -1,0 +1,52 @@
+[Unit]
+Description=AI Arch Power Profile Initializer
+Documentation=file:///usr/lib/ai-arch/power-profile.sh
+# Run after hw-detect populates /run/ai-arch-hw-profile so we know whether
+# to initialize with ondemand (OLD) or schedutil (NEW).  Run after
+# systemd-modules-load so /dev/cpu/*/msr is available for the AI daemon.
+After=ai-hw-detect.service systemd-modules-load.service
+Wants=ai-hw-detect.service
+# Must land before the AI daemon because ai-control reads the governor on
+# startup to remember the baseline.
+Before=ai-control.service display-manager.service lightdm.service
+
+# Only meaningful on systems that actually have cpufreq sysfs entries.
+# If the kernel lacks cpufreq support (very unusual) we silently skip.
+ConditionPathExists=/sys/devices/system/cpu/cpu0/cpufreq
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Load the msr kernel module (no-op if already loaded or unavailable) so
+# the AI daemon can pread() IA32_THERM_STATUS for precise per-core temps.
+ExecStartPre=-/usr/bin/modprobe msr
+# Apply the governor recommended by hw-detect.  Script is idempotent and
+# failsafe: any error short-circuits to a no-op, boot continues.
+ExecStart=/usr/lib/ai-arch/power-profile.sh init
+# On shutdown, restore the kernel default.  Not strictly necessary but keeps
+# the system clean when the service is stopped by an operator.
+ExecStop=-/usr/lib/ai-arch/power-profile.sh restore
+
+# Fast: a 10-second ceiling prevents a hung MSR probe from blocking boot.
+TimeoutStartSec=10
+SuccessExitStatus=0 1 2
+
+# Root is required to write /sys/.../scaling_governor and to load msr.ko.
+User=root
+Group=root
+
+# Lightweight sandbox — we need /sys writes but nothing else.
+ProtectSystem=strict
+ReadWritePaths=/sys/devices/system/cpu /run /dev/cpu
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=no
+# CapabilityBoundingSet CAP_SYS_ADMIN is required for modprobe; the
+# scaling_governor write only needs CAP_DAC_OVERRIDE + CAP_SYS_ADMIN.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_SYS_MODULE
+
+# Nice / io: this is boot-critical tuning, give it priority.
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target graphical.target

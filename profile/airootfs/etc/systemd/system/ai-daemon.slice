@@ -1,0 +1,60 @@
+[Unit]
+Description=AI Arch Control Daemon Slice (L4 cortex + ai-control)
+Documentation=https://github.com/ai-arch-linux
+# L4 (AI Cortex + ai-control-daemon) sits on top of the stack.  It's the
+# decision maker but NOT on any hot path -- it observes and issues
+# commands, rarely handling more than a few requests/sec.  We cap it
+# fairly tightly so a runaway LLM inference loop or leaking websocket
+# handler doesn't eat the system out from under a game.
+#
+# Key invariant: when a game is running, ai-daemon.slice gets demoted
+# below pe-compat.slice.  CPUWeight=200 is 2x default but 4.5x below
+# pe-compat's 900.
+DefaultDependencies=no
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+TasksAccounting=yes
+
+# --- CPU ------------------------------------------------------------------
+# 200 = 2x default weight.  Trust is 1000, pe-compat is 900, observer is
+# 10, default is 100.  ai-daemon at 200 means "slightly prioritized over
+# stock system services but ALWAYS loses to a running game".
+CPUWeight=200
+
+# --- Memory ---------------------------------------------------------------
+# The daemon currently sits around 90-140 MB RSS (FastAPI + Pillow +
+# evdev + optional llama-cpp-python).  512 MiB soft cap lets a small
+# local LLM fit with room to spare; MemoryMax=1G is a hard stop so a
+# runaway context-window bug can't bring the box down.
+MemoryHigh=512M
+MemoryMax=1G
+# Allow swap: the daemon is long-lived and most of its working set is
+# cold (API routes that get hit rarely).  Swapping cold pages keeps RAM
+# free for whatever game/app the user is actually running.
+MemorySwapMax=512M
+
+# --- IO -------------------------------------------------------------------
+# 100 = default weight.  The daemon writes audit logs and reads
+# /proc/*/status constantly but none of it is latency-critical.
+IOWeight=100
+
+# --- Process limits -------------------------------------------------------
+# 1024 tasks: FastAPI uvicorn workers + asyncio background tasks
+# (trust_observer, memory_observer, pattern_scanner, syscall_monitor) +
+# any subprocess.Popen children we haven't moved to their own slice.
+TasksMax=1024
+
+# --- Pressure-based demotion ---------------------------------------------
+# If memory pressure climbs, the kernel will aggressively evict cold
+# pages from this slice before touching trust.slice.
+ManagedOOMSwap=auto
+ManagedOOMMemoryPressure=auto
+ManagedOOMMemoryPressureLimit=70%
+
+[Install]
+WantedBy=multi-user.target

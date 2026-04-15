@@ -1,0 +1,83 @@
+[Unit]
+Description=AI Arch Foreground Game Slice (transient boost)
+Documentation=https://github.com/ai-arch-linux
+# Sub-slice of pe-compat.slice used ONLY when the user launches a game
+# through pe-run-game or the /contusion/launch API.  ai-control/daemon/
+# cgroup.py drives the transition:
+#
+#   idle        --> games launched via systemd-run into pe-compat.slice/*.scope
+#   game active --> the foreground .scope is promoted: systemd-run
+#                   --slice=game.slice which inherits pe-compat.slice
+#                   through this unit
+#
+# game.slice carries aggressive boosts that are unsafe for random .exe
+# launches (e.g. IDE, installer) but essential for a playable frame rate:
+# priority inversion avoidance, realtime scheduling quota, and minimum
+# memory reservation.
+#
+# Critically: this file sets generic safe values for the OLD profile.
+# slice-apply.sh overwrites it at runtime on NEW-tier hardware with
+# higher CPUWeight and higher memory reserves.
+DefaultDependencies=no
+Before=shutdown.target
+Conflicts=shutdown.target
+
+# Sub-slice of pe-compat.slice -- inherits its Delegate=yes, so nft
+# rules with "level 2" cgroup matches continue to hit.
+# systemd computes slice nesting from the name prefix up to the last
+# dash before .slice; "pe-compat-game.slice" would nest under
+# pe-compat.slice automatically.  We keep "game.slice" as a top-level
+# name for cleaner paths and let cgroup.py handle placement explicitly.
+
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+TasksAccounting=yes
+
+# --- CPU ------------------------------------------------------------------
+# CPUWeight=10000: 100x default, 10x trust.  This is extreme because
+# the game slice is only populated while a game is actively running;
+# when empty the weight is meaningless.  The high value guarantees the
+# game wins every CPU arbitration against background tasks.
+CPUWeight=10000
+# NO CPUQuota -- a game should be allowed to use 100% of every core if
+# it wants to.  cpu.max stays "max" (the default).
+
+# --- Memory ---------------------------------------------------------------
+# MemoryMin: reserve 256 MiB that the kernel won't reclaim.  This keeps
+# code pages and texture atlases resident across alt-tab.  On NEW HW
+# slice-apply.sh bumps this to 2G.
+MemoryMin=256M
+MemoryLow=512M
+# No MemoryHigh -- don't throttle a legitimate game.  If something goes
+# wrong, ManagedOOM below will step in before the hard limit.
+MemoryMax=infinity
+# Games should NEVER swap -- every page fault is a frame drop.  Swap=0
+# is the single most impactful setting here after MemoryMin.
+MemorySwapMax=0
+MemoryZSwapMax=0
+
+# --- IO -------------------------------------------------------------------
+# Highest IO weight.  Matters for games that stream assets (large open-world
+# titles) -- disk reads should always win against observer backups.
+IOWeight=1000
+
+# --- Process limits -------------------------------------------------------
+# Big: modern games spawn 100+ worker threads (job system, audio pipeline,
+# anti-cheat sandbox).  8192 is 2x the kernel default but still well
+# under the PID ceiling.
+TasksMax=8192
+
+# --- Delegate so per-game nft scopes can still live beneath this slice ---
+# Without Delegate, systemd reclaims subtree_control on every transient
+# scope creation and the firewall's cgroupv2 predicates stop matching.
+Delegate=pids memory cpu io
+
+# --- ManagedOOM is permissive on this slice ---
+# If memory pressure hits here, the kill target should be a BACKGROUND
+# process, not the game.  So we keep ManagedOOMSwap=auto (default) and
+# let observer.slice / ai-daemon.slice absorb the pressure first.
+
+[Install]
+WantedBy=multi-user.target

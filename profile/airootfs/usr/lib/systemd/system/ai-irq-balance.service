@@ -1,0 +1,42 @@
+[Unit]
+Description=AI Arch IRQ Balancer (move device IRQs off game-reserved CPUs)
+Documentation=file:///usr/lib/ai-arch/irq-balancer.sh
+# Must run AFTER ai-hw-detect (writes /run/ai-arch-hw-profile and invokes
+# slice-apply.sh -> /run/ai-arch-numa). Also after local-fs so the coherence
+# output dir (/var/run/coherence, on tmpfs) is writable.
+After=ai-hw-detect.service local-fs.target
+# Needs the NUMA sidecar file that slice-apply.sh creates.
+Requires=ai-hw-detect.service
+# Before display-manager + ai-control so first game launch lands on already-
+# balanced IRQs. Non-fatal: if we're late the coherence daemon can SIGHUP us.
+Before=ai-control.service display-manager.service lightdm.service
+
+[Service]
+Type=oneshot
+# RemainAfterExit so systemctl reload actually calls ExecReload instead of
+# restarting (which would snapshot twice and flush /var/run/coherence).
+RemainAfterExit=yes
+ExecStart=/usr/lib/ai-arch/irq-balancer.sh apply
+ExecReload=/usr/lib/ai-arch/irq-balancer.sh reload
+# Never block boot. If IRQ rebalance fails we still want login.
+TimeoutStartSec=15
+SuccessExitStatus=0 1 2
+# Need CAP_SYS_ADMIN to write /proc/irq/N/smp_affinity. Keep other privs
+# dropped.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+NoNewPrivileges=yes
+# ProtectSystem=strict conflicts with writing /etc/irqbalance; allow
+# that path via ReadWritePaths.
+ProtectSystem=strict
+ReadWritePaths=/etc/irqbalance /var/run/coherence /run/systemd/system /proc/irq
+ProtectHome=yes
+ProtectKernelLogs=yes
+# We DO need to probe /proc/interrupts and /proc/irq; these are NOT under
+# ProtectProc's default.
+PrivateTmp=yes
+# Give it some nice so we don't delay more critical services.
+Nice=0
+
+[Install]
+WantedBy=multi-user.target graphical.target

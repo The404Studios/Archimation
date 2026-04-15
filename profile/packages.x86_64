@@ -66,6 +66,8 @@ egl-wayland
 steam
 gamemode
 # lib32-gamemode  # AUR-only, not in official repos
+# gamescope: compositor bypass for PE launch (Session 33 Agent 8) — nested
+# compositor owns present loop, forces MAILBOX/IMMEDIATE end-to-end.
 gamescope
 mangohud
 # lib32-mangohud  # AUR-only, not in official repos

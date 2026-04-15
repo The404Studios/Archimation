@@ -16,6 +16,7 @@
 #include <pthread.h>
 
 #include "common/dll_common.h"
+#include "dxgi_format_cache.h"
 
 #define LOG_PREFIX "[dxgi] "
 
@@ -393,12 +394,33 @@ static __attribute__((ms_abi)) BOOL output_supports_overlays(IDXGIOutput *s)
 
 /* IDXGIOutput3 */
 static __attribute__((ms_abi)) long output_check_overlay(IDXGIOutput *s, DXGI_FORMAT f, void *d, UINT *fl)
-{ (void)s; (void)f; (void)d; if (fl) *fl = 0; return S_OK; }
+{
+    (void)s; (void)d;
+    /* Route the format through the cache: a known-convertible format returns
+     * a non-zero VkFormat, so we report "overlay-capable" (0 here means the
+     * app must composite itself — DXGI_OVERLAY_SUPPORT_FLAG_DIRECT = 0x1 /
+     * SCALING = 0x2). We leave flags=0 to stay conservative but prime the
+     * cache for subsequent CreateTexture2D / ResizeBuffers.
+     * Colorspace 0 = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 (sRGB default). */
+    uint32_t vk_cs = 0;
+    (void)dx_format_cache_lookup((uint32_t)f, 0u, 0u, &vk_cs);
+    if (fl) *fl = 0;
+    return S_OK;
+}
 
 /* IDXGIOutput4 */
 static __attribute__((ms_abi)) long output_check_overlay_cs(IDXGIOutput *s, DXGI_FORMAT f,
     DXGI_COLOR_SPACE_TYPE cs, void *d, UINT *fl)
-{ (void)s; (void)f; (void)cs; (void)d; if (fl) *fl = 0; return S_OK; }
+{
+    (void)s; (void)d;
+    /* Same reasoning as output_check_overlay but the caller has specified
+     * the target colorspace; the triplet (format, 0, cs) lands in a
+     * distinct cache bucket from the sRGB default above. */
+    uint32_t vk_cs = 0;
+    (void)dx_format_cache_lookup((uint32_t)f, 0u, (uint32_t)cs, &vk_cs);
+    if (fl) *fl = 0;
+    return S_OK;
+}
 
 /* IDXGIOutput5 */
 static __attribute__((ms_abi)) long output_dup_output1(IDXGIOutput *s, void *d, UINT u, UINT n,
@@ -1043,3 +1065,17 @@ WINAPI_EXPORT long CreateDXGIFactory2(UINT Flags, const GUID *riid, void **ppFac
  * live in DXVK's dxgi.so. Closing the handle at exit would unmap those pages
  * before final Release() calls unwind, causing SIGSEGV. OS reclaims it anyway.
  */
+
+/*
+ * pe_dxgi_format_to_vk - Public helper exported to sibling TUs (dxvk_bridge,
+ * d3d9_device, d3d_stubs, d3dx_stubs) so they share a single conversion
+ * table and a single per-thread cache.
+ *
+ * Not a Windows API (no WINAPI_EXPORT ms_abi attribute). Internal SysV ABI
+ * is correct because all callers are Linux-compiled TUs in our own DLL.
+ */
+uint32_t pe_dxgi_format_to_vk(uint32_t dxgi_format, uint32_t usage,
+                              uint32_t colorspace, uint32_t *out_vk_color_space)
+{
+    return dx_format_cache_lookup(dxgi_format, usage, colorspace, out_vk_color_space);
+}

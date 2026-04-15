@@ -351,6 +351,7 @@ dlls/libpe_comdlg32.so: $(COMDLG32_OBJS) $(COMMON_OBJS)
 D3D_SRCS = dlls/d3d/d3d_stubs.c \
            dlls/d3d/d3d9_device.c \
            dlls/d3d/dxgi_factory.c \
+           dlls/d3d/dxgi_format_cache.c \
            dlls/d3d/d3dcompiler_stubs.c \
            dlls/d3d/dxvk_bridge.c \
            dlls/d3d/d3dx_stubs.c \

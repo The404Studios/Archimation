@@ -72,7 +72,27 @@ TasksMax=8192
 # --- Delegate so per-game nft scopes can still live beneath this slice ---
 # Without Delegate, systemd reclaims subtree_control on every transient
 # scope creation and the firewall's cgroupv2 predicates stop matching.
-Delegate=pids memory cpu io
+Delegate=pids memory cpu io cpuset
+
+# --- CPU / memory topology (SAFE DEFAULTS) --------------------------------
+# AllowedCPUs and AllowedMemoryNodes are rewritten on every boot by
+# /usr/lib/ai-arch/slice-apply.sh in the drop-in /run/systemd/system/
+# game.slice.d/10-numa.conf based on NUMA detection and HW tier.
+#
+# The baseline below is intentionally permissive: "all CPUs, any memory
+# node". On a 16-core workstation this is wrong (we want cores 2-15
+# reserved for the game), but the drop-in will overwrite it at T+1s
+# after boot. In the tiny window before slice-apply runs, launching a
+# game would land on cpuset=all which is safe if less optimal.
+#
+# Do NOT set AllowedCPUs= here to the empty string: that DENIES every
+# CPU and breaks anything that lands in this slice early. Leaving the
+# line out keeps the kernel default (inherit from parent) which is the
+# correct pre-tuning behaviour.
+#
+# The drop-in from slice-apply.sh contains the real AllowedCPUs= and
+# AllowedMemoryNodes= directives — see 10-numa.conf comment block for
+# what gets written per HW tier.
 
 # --- ManagedOOM is permissive on this slice ---
 # If memory pressure hits here, the kill target should be a BACKGROUND

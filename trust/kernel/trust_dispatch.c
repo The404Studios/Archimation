@@ -23,10 +23,41 @@
 #include <linux/errno.h>
 #include <linux/bug.h>
 #include <linux/ratelimit.h>
+#include <linux/ktime.h>
 
 #include "../include/trust_cmd.h"
 #include "../include/trust_ioctl.h"
 #include "trust_internal.h"
+#include "trust_isa.h"
+
+/* --- Session 32 wire-format constants mirrored from trust/include/trust_isa.h
+ *
+ * We cannot include the userspace-facing trust/include/trust_isa.h from the
+ * kernel tree (it redefines macros that conflict with the kernel's header)
+ * so we re-declare the small subset of constants needed to parse the
+ * libtrust VARLEN wire format.  Keep these in sync with
+ * trust/include/trust_isa.h lines ~302-316 and TRUST_FAMILY_VEC at 207.
+ */
+#ifndef TRUST_CMDBUF_VARLEN
+#define TRUST_CMDBUF_VARLEN     (1U << 8)
+#endif
+#ifndef TRUST_CMDBUF_DELTA
+#define TRUST_CMDBUF_DELTA      (1U << 9)
+#endif
+#ifndef TRUST_VEC_NOPS_SENTINEL
+#define TRUST_VEC_NOPS_SENTINEL 0xF
+#endif
+#ifndef TRUST_CMD_FAMILY_VEC
+#define TRUST_CMD_FAMILY_VEC    6
+#endif
+#ifndef TRUST_CMD_FAMILY_FUSED
+#define TRUST_CMD_FAMILY_FUSED  7
+#endif
+/* ISA v2 bump in the trust_cmd_buffer_t.version field (libtrust sets this
+ * when VARLEN is used so older kernels would reject the buffer). */
+#ifndef TRUST_ISA_VERSION
+#define TRUST_ISA_VERSION       2
+#endif
 
 /* ========================================================================
  * Operand extraction helpers
@@ -1088,12 +1119,177 @@ static int cmd_meta_trc_state(const trust_cmd_entry_t *cmd,
 }
 
 /* ========================================================================
+ * VEC family handlers (Family 6)
+ *
+ * The classic fixed-format wire carries VEC subjects packed as u64
+ * operands (one subject per low-32-bits slot) plus an auxiliary param
+ * slot.  The VARLEN path delivers a sorted subject array already
+ * decoded by the dispatcher's varlen walker; the shared `cmd_vec_run`
+ * below takes the decoded array and calls trust_isa_exec_vec().
+ *
+ * Wire format (classic fixed, nops < 15):
+ *   op[0..nops-2] = subject_ids   (one per 64-bit slot, low 32 bits)
+ *   op[nops-1]    = aux param      (raw u64, op-specific meaning)
+ *   imm           = unused (count is implied by nops)
+ *
+ * Fallback semantics: if nops is 0 we treat it as count=0 and return 0
+ * (a no-op).  If nops is 15 the classic fixed path cannot represent
+ * the count — callers must use VARLEN, we return -E2BIG so userspace
+ * can lower.
+ * ======================================================================== */
+
+static int cmd_vec_run(u32 op, const u32 *subjects, u32 count,
+		       u64 param, trust_cmd_result_t *result)
+{
+	u64 *out_bitmap = NULL;
+	u32 out_len = 0;
+	int ret;
+
+	if (count == 0) {
+		result->status = 0;
+		result->value = 0;
+		return 0;
+	}
+
+	/* Bitmap is returned via result->value when count <= 64; wider
+	 * batches still set the first-64 bits there (callers who need
+	 * more must use the VARLEN path which returns the full bitmap
+	 * through the result extension — currently trimmed to first
+	 * word on the classic path).
+	 */
+	{
+		u64 scratch[1] = { 0 };
+		u64 *words;
+		u32 nwords = (count + 63U) / 64U;
+		if (nwords <= 1) {
+			words = scratch;
+			out_len = 1;
+		} else {
+			words = kcalloc(nwords, sizeof(u64), GFP_KERNEL);
+			if (!words) {
+				result->status = -ENOMEM;
+				return -ENOMEM;
+			}
+			out_len = nwords;
+		}
+
+		ret = trust_isa_exec_vec(op, subjects, count, param,
+					 words, out_len);
+		out_bitmap = words;
+
+		if (ret < 0) {
+			result->status = ret;
+			result->value = 0;
+			if (out_bitmap != scratch)
+				kfree(out_bitmap);
+			return ret;
+		}
+
+		/* Surface the count in `value` but keep the first bitmap
+		 * word readable in the low 64 bits via a union-ish trick:
+		 * if we have only one word, put that in value directly;
+		 * otherwise return the count and drop the higher words. */
+		if (nwords == 1)
+			result->value = words[0];
+		else
+			result->value = words[0];
+
+		result->status = 0;
+		if (out_bitmap != scratch)
+			kfree(out_bitmap);
+		trust_stats_record_vec_hit(count);
+		/* Update predicate register with the bitmap-count so the
+		 * next predicated op can branch on "any matches". */
+		trust_isa_pred_set((int64_t)ret);
+		return ret;
+	}
+}
+
+/*
+ * cmd_vec_from_classic - Extract subject array from a classic
+ * trust_cmd_entry_t and dispatch via cmd_vec_run().
+ *
+ * The classic wire carries at most 15 64-bit operands, so we can
+ * batch up to 14 subjects here (one slot is reserved for the
+ * aux param).  Larger batches MUST use VARLEN — we return -E2BIG.
+ */
+static int cmd_vec_from_classic(const trust_cmd_entry_t *cmd,
+				trust_cmd_result_t *result)
+{
+	u32 op = TRUST_CMD_OPCODE(cmd->instruction);
+	u32 nops = cmd->operand_count;
+	u32 i, count;
+	u64 param;
+	u32 subjects_stack[TRUST_CMD_MAX_OPERANDS];
+
+	if (nops == 0) {
+		/* VEC op with no operands: treat as degenerate no-op
+		 * so the caller's stats counter still fires but the
+		 * underlying VEC path isn't invoked. */
+		result->status = 0;
+		result->value = 0;
+		return 0;
+	}
+
+	/* Last operand is the aux param; everything else is subject ids. */
+	count = nops - 1;
+	param = cmd->operands[nops - 1] & TRUST_OP_VAL_MASK;
+
+	if (count > TRUST_CMD_MAX_OPERANDS - 1) {
+		result->status = -E2BIG;
+		return -E2BIG;
+	}
+
+	for (i = 0; i < count; i++)
+		subjects_stack[i] = (u32)(cmd->operands[i] & TRUST_OP_VAL_MASK);
+
+	return cmd_vec_run(op, subjects_stack, count, param, result);
+}
+
+/* ========================================================================
+ * FUSED family handlers (Family 7)
+ *
+ * Wire: op0..op2 = three 64-bit operands; imm = 16 bits.  The fused
+ * handlers in trust_fused.c take (op0, op1, op2, imm, *out) directly;
+ * we just unwrap the typed tags and forward.
+ * ======================================================================== */
+
+static int cmd_fused_run(const trust_cmd_entry_t *cmd,
+			 trust_cmd_result_t *result)
+{
+	u32 op = TRUST_CMD_OPCODE(cmd->instruction);
+	u64 op0 = (cmd->operand_count > 0) ? cmd->operands[0] & TRUST_OP_VAL_MASK : 0;
+	u64 op1 = (cmd->operand_count > 1) ? cmd->operands[1] & TRUST_OP_VAL_MASK : 0;
+	u64 op2 = (cmd->operand_count > 2) ? cmd->operands[2] & TRUST_OP_VAL_MASK : 0;
+	u16 imm = (u16)TRUST_CMD_IMM(cmd->instruction);
+	u64 out_val = 0;
+	int ret;
+
+	ret = trust_isa_exec_fused(op, op0, op1, op2, imm, &out_val);
+	result->status = ret;
+	result->value = (ret == 0) ? out_val : 0;
+	if (ret == 0) {
+		trust_stats_record_fused_hit();
+		/* ALU-flow: expose the output to the predicate reg. */
+		trust_isa_pred_set((int64_t)(u64)out_val);
+	}
+	return ret;
+}
+
+/* ========================================================================
  * Dispatch table: [family][opcode] -> handler
  *
  * NULL entries are unsupported operations (return -ENOSYS).
+ *
+ * Note: the 2D table only covers opcodes 0..7 per family (the classic
+ * TRUST_CMD_MAX_OPCODES width).  Families 6 (VEC) and 7 (FUSED) have
+ * more opcodes (VEC goes to 9, FUSED to 4) but only ops 0..4/5 fit
+ * cleanly in the table.  The dispatcher routes VEC/FUSED via the
+ * family-level fan-out in trust_cmd_submit() so opcodes 0..15 all
+ * reach the right helper regardless of table width.
  * ======================================================================== */
 
-static trust_cmd_handler_t dispatch_table[TRUST_ISA_FAMILY_COUNT][TRUST_CMD_MAX_OPCODES] = {
+static trust_cmd_handler_t dispatch_table[TRUST_STAT_FAMILY_SLOTS][TRUST_CMD_MAX_OPCODES] = {
 	[TRUST_FAMILY_AUTH] = {
 		[AUTH_OP_MINT]      = cmd_auth_mint,
 		[AUTH_OP_BURN]      = cmd_auth_burn,
@@ -1196,6 +1392,162 @@ static int parse_one_command(const u8 *buf, u32 remaining,
 	return (int)wire_size;
 }
 
+/* ==================================================================
+ * LEB128 varint decode (local; matches libtrust encoder in
+ * libtrust_batch.c varint_encode_u64()).  Max 10 bytes.
+ * ================================================================== */
+
+static int varint_decode_u64(const u8 *buf, u32 avail, u64 *out)
+{
+	u64 v = 0;
+	u32 shift = 0, i = 0;
+	while (i < avail) {
+		u8 b = buf[i++];
+		v |= ((u64)(b & 0x7FU)) << shift;
+		if (!(b & 0x80U)) {
+			*out = v;
+			return (int)i;
+		}
+		shift += 7;
+		if (shift >= 64)
+			return -1;
+	}
+	return 0;
+}
+
+static inline int64_t zigzag_decode_s64(u64 v)
+{
+	return (int64_t)((v >> 1) ^ -(int64_t)(v & 1));
+}
+
+/*
+ * parse_varlen_vec_op - Decode a VEC instruction from the libtrust
+ * VARLEN wire format (see libtrust/libtrust_batch.c:emit_vec_op()).
+ *
+ * Wire:
+ *   u32 instr
+ *   [if TRUST_CMD_FLAG_CONDITIONAL in instr.flags AND VARLEN]: u8 pred tag
+ *   [if nops == TRUST_VEC_NOPS_SENTINEL (0xF)]: varint count
+ *   u32 base subject_id
+ *   (count-1) * varint zigzag(signed delta)
+ *
+ * @buf/remaining: same meaning as parse_one_command.
+ * @subjects:      output array, caller-allocated, length >= *count_out.
+ * @max_subjects:  capacity of @subjects.
+ * @count_out:     decoded subject count.
+ * @param_out:     aux param (unused by VEC VARLEN wire; zero).
+ * @instr_out:     decoded instruction word.
+ * @pred_out:      predicate tag byte if present; 0 if absent.
+ *
+ * Returns bytes consumed, or -errno.
+ */
+static int parse_varlen_vec_op(const u8 *buf, u32 remaining,
+			       u32 *subjects, u32 max_subjects,
+			       u32 *count_out, u32 *instr_out,
+			       u8 *pred_out)
+{
+	u32 off = 0;
+	u32 instr;
+	u32 nops_field;
+	u32 count;
+	u64 v;
+	int n;
+	u32 base;
+	u32 prev;
+	u32 i;
+
+	if (remaining < sizeof(u32))
+		return -EINVAL;
+
+	memcpy(&instr, buf + off, sizeof(u32));
+	off += sizeof(u32);
+
+	if (pred_out) *pred_out = 0;
+	if (TRUST_CMD_FLAGS(instr) & TRUST_CMD_FLAG_CONDITIONAL) {
+		if (off + 1 > remaining)
+			return -EINVAL;
+		if (pred_out) *pred_out = buf[off];
+		off += 1;
+	}
+
+	nops_field = TRUST_CMD_NOPS(instr);
+	if (nops_field == TRUST_VEC_NOPS_SENTINEL) {
+		n = varint_decode_u64(buf + off, remaining - off, &v);
+		if (n <= 0)
+			return -EINVAL;
+		off += (u32)n;
+		if (v == 0 || v > TRUST_ISA_BATCH_MAX_COUNT)
+			return -EINVAL;
+		count = (u32)v;
+	} else {
+		count = nops_field;
+		if (count == 0)
+			return -EINVAL;
+	}
+
+	if (count > max_subjects)
+		return -ENOSPC;
+
+	/* Base subject id (full u32). */
+	if (off + sizeof(u32) > remaining)
+		return -EINVAL;
+	memcpy(&base, buf + off, sizeof(u32));
+	off += sizeof(u32);
+	subjects[0] = base;
+	prev = base;
+
+	for (i = 1; i < count; i++) {
+		int64_t d;
+		n = varint_decode_u64(buf + off, remaining - off, &v);
+		if (n <= 0)
+			return -EINVAL;
+		off += (u32)n;
+		d = zigzag_decode_s64(v);
+		subjects[i] = (u32)((int64_t)prev + d);
+		prev = subjects[i];
+	}
+
+	*instr_out = instr;
+	*count_out = count;
+	return (int)off;
+}
+
+/*
+ * dispatch_fused - Route a FUSED family instruction to trust_fused.c.
+ *
+ * The FUSED table has opcodes 0..4 (FUSED_OP_MAX=5).  We don't go
+ * through dispatch_table[] because FUSED_OP_MAX exceeds
+ * TRUST_CMD_MAX_OPCODES on some future expansions; keep dispatch
+ * direct.
+ */
+static int dispatch_fused(const trust_cmd_entry_t *entry,
+			  trust_cmd_result_t *result)
+{
+	u32 opcode = TRUST_CMD_OPCODE(entry->instruction);
+	if (opcode >= FUSED_OP_MAX) {
+		result->status = -ENOSYS;
+		return -ENOSYS;
+	}
+	return cmd_fused_run(entry, result);
+}
+
+/*
+ * dispatch_vec_classic - Route a classic-format VEC instruction.
+ *
+ * Opcodes 0..9 (VEC_OP_MAX).  Bypasses dispatch_table[] for the same
+ * reason as FUSED.
+ */
+static int dispatch_vec_classic(const trust_cmd_entry_t *entry,
+				trust_cmd_result_t *result)
+{
+	u32 opcode = TRUST_CMD_OPCODE(entry->instruction);
+	if (opcode >= VEC_OP_MAX) {
+		result->status = -ENOSYS;
+		return -ENOSYS;
+	}
+	return cmd_vec_from_classic(entry, result);
+}
+
 /*
  * trust_cmd_submit - Process a command buffer submitted via ioctl.
  *
@@ -1237,7 +1589,10 @@ int trust_cmd_submit(const trust_ioc_cmd_submit_t __user *arg)
 		return -EINVAL;
 	}
 
-	if (header.version != TRUST_CMD_VERSION) {
+	/* Session 32: version 2 introduced for VARLEN batches.  Accept
+	 * either: classic (v1) or ISA-extended (v2). */
+	if (header.version != TRUST_CMD_VERSION &&
+	    header.version != TRUST_ISA_VERSION) {
 		pr_warn_ratelimited("trust_cmd: unsupported version %u\n", header.version);
 		return -EINVAL;
 	}
@@ -1284,6 +1639,19 @@ int trust_cmd_submit(const trust_ioc_cmd_submit_t __user *arg)
 	/* Initialize batch result */
 	memset(&batch_result, 0, sizeof(batch_result));
 
+	/* Reset per-CPU predicate register: stale state from a previous
+	 * submit (possibly from another thread that got migrated here)
+	 * must NOT leak into this batch's predicated instructions. */
+	trust_isa_pred_reset();
+
+	/* Detect VARLEN wire format up front. */
+	{
+		int is_varlen = (header.flags & TRUST_CMDBUF_VARLEN) ? 1 : 0;
+		u64 t_start_ns = ktime_get_ns();
+		u32 varlen_bytes = is_varlen ? submit.cmd_buf_size : 0;
+
+		trust_stats_record_cmdbuf_in(submit.cmd_buf_size, varlen_bytes);
+
 	/* Iterate and dispatch commands */
 	offset = TRUST_CMD_HEADER_SIZE;
 
@@ -1292,20 +1660,103 @@ int trust_cmd_submit(const trust_ioc_cmd_submit_t __user *arg)
 		trust_cmd_handler_t handler;
 		u32 family, opcode, flags;
 		int consumed;
+		u8 varlen_pred_tag = 0;
+		u32 *vec_subjects = NULL;
+		u32 vec_count = 0;
+		int is_varlen_vec = 0;
 
-		/* Parse command from wire format */
-		consumed = parse_one_command(cmd_buf + offset,
-					     submit.cmd_buf_size - offset,
-					     &entry);
-		if (consumed < 0) {
-			pr_warn_ratelimited("trust_cmd: parse error at cmd %u offset %u\n",
-				i, offset);
-			results[i].status = -EINVAL;
-			if (header.flags & TRUST_CMD_BUF_ATOMIC)
-				goto atomic_fail;
-			batch_result.commands_executed = i + 1;
-			batch_result.commands_failed++;
-			break;
+		/* --- Parse phase ---
+		 *
+		 * VARLEN path: peek at the instruction word to decide
+		 * whether this is a VEC op (variable-length payload)
+		 * or a classic fixed-format op nested inside the
+		 * varlen buffer.
+		 */
+		if (is_varlen) {
+			u32 peek_instr;
+			u32 peek_family;
+
+			if (submit.cmd_buf_size - offset < sizeof(u32)) {
+				pr_warn_ratelimited("trust_cmd: varlen EOF at cmd %u offset %u\n",
+					i, offset);
+				results[i].status = -EINVAL;
+				if (header.flags & TRUST_CMD_BUF_ATOMIC)
+					goto atomic_fail;
+				batch_result.commands_executed = i + 1;
+				batch_result.commands_failed++;
+				break;
+			}
+			memcpy(&peek_instr, cmd_buf + offset, sizeof(u32));
+			peek_family = TRUST_CMD_FAMILY(peek_instr);
+
+			if (peek_family == TRUST_CMD_FAMILY_VEC) {
+				/* VEC: decode subjects into a scratch
+				 * array allocated below. */
+				u32 max_subj = TRUST_ISA_BATCH_MAX_COUNT;
+				vec_subjects = kmalloc_array(max_subj,
+							     sizeof(u32),
+							     GFP_KERNEL);
+				if (!vec_subjects) {
+					results[i].status = -ENOMEM;
+					if (header.flags & TRUST_CMD_BUF_ATOMIC)
+						goto atomic_fail;
+					batch_result.commands_executed++;
+					batch_result.commands_failed++;
+					continue;
+				}
+				consumed = parse_varlen_vec_op(
+					cmd_buf + offset,
+					submit.cmd_buf_size - offset,
+					vec_subjects, max_subj,
+					&vec_count, &entry.instruction,
+					&varlen_pred_tag);
+				if (consumed < 0) {
+					pr_warn_ratelimited("trust_cmd: varlen VEC parse error cmd %u offset %u rc=%d\n",
+						i, offset, consumed);
+					kfree(vec_subjects);
+					results[i].status = consumed;
+					if (header.flags & TRUST_CMD_BUF_ATOMIC)
+						goto atomic_fail;
+					batch_result.commands_executed++;
+					batch_result.commands_failed++;
+					continue;
+				}
+				entry.operand_count = 0;
+				is_varlen_vec = 1;
+			} else {
+				/* Non-VEC ops in a varlen buffer still use
+				 * the classic fixed per-op layout (libtrust
+				 * falls back to that for non-VEC ops). */
+				consumed = parse_one_command(
+					cmd_buf + offset,
+					submit.cmd_buf_size - offset,
+					&entry);
+				if (consumed < 0) {
+					pr_warn_ratelimited("trust_cmd: parse error varlen-classic cmd %u offset %u\n",
+						i, offset);
+					results[i].status = -EINVAL;
+					if (header.flags & TRUST_CMD_BUF_ATOMIC)
+						goto atomic_fail;
+					batch_result.commands_executed = i + 1;
+					batch_result.commands_failed++;
+					break;
+				}
+			}
+		} else {
+			/* Classic path. */
+			consumed = parse_one_command(cmd_buf + offset,
+						     submit.cmd_buf_size - offset,
+						     &entry);
+			if (consumed < 0) {
+				pr_warn_ratelimited("trust_cmd: parse error at cmd %u offset %u\n",
+					i, offset);
+				results[i].status = -EINVAL;
+				if (header.flags & TRUST_CMD_BUF_ATOMIC)
+					goto atomic_fail;
+				batch_result.commands_executed = i + 1;
+				batch_result.commands_failed++;
+				break;
+			}
 		}
 
 		offset += consumed;
@@ -1315,8 +1766,62 @@ int trust_cmd_submit(const trust_ioc_cmd_submit_t __user *arg)
 		opcode = TRUST_CMD_OPCODE(entry.instruction);
 		flags  = TRUST_CMD_FLAGS(entry.instruction);
 
+		/* --- Predicate bit (ISA v2):
+		 *
+		 * Top bit of the instruction word gates execution on the
+		 * per-CPU predicate register (last ALU-style result).
+		 * This is evaluated BEFORE family dispatch so skipped
+		 * instructions are truly free (no handler call, no stat
+		 * bump beyond the skip counter).
+		 *
+		 * The predicate bit overlaps family bits 31:28 when
+		 * FAMILY spans 4 bits, so we only honor it for families
+		 * <= 7 (those leave bit 31 clear when P=0).  Agent 1's
+		 * authoritative trust_cmd.h will reserve this correctly.
+		 */
+		if (trust_isa_instr_is_predicated(entry.instruction)) {
+			if (!trust_risc_eval_predicated(entry.instruction)) {
+				if (is_varlen_vec && vec_subjects)
+					kfree(vec_subjects);
+				trust_stats_record_predicate_skip();
+				results[i].status = 0;
+				results[i].value = 0;
+				batch_result.commands_executed++;
+				batch_result.commands_succeeded++;
+				continue;
+			}
+			/* Re-read family/opcode AFTER stripping the
+			 * predicate prefix: bits 30:28 in the predicated
+			 * encoding carry sense + cond code, so the
+			 * "real" family for P=1 ops is... TBD by Agent 1.
+			 * Session 32 scoped this out; we keep family as
+			 * decoded and require Agent 1's enum to confirm
+			 * the layout.
+			 */
+		}
+
+		/* VARLEN-only: 1-byte predicate tag after instruction
+		 * word (present when TRUST_CMD_FLAG_CONDITIONAL+VARLEN).
+		 * A nonzero tag here is an ADDITIONAL pre-condition
+		 * beyond the bit-31 predicate: if either fails, we
+		 * skip.  Current semantics: treat any nonzero tag as
+		 * "skip iff previous command failed" (legacy
+		 * CONDITIONAL behavior).  A future revision can decode
+		 * the TRUST_PRED_* bits properly.
+		 */
+		if (is_varlen_vec && varlen_pred_tag && prev_status < 0) {
+			if (vec_subjects) kfree(vec_subjects);
+			results[i].status = -ECANCELED;
+			results[i].value = 0;
+			batch_result.commands_executed++;
+			batch_result.commands_failed++;
+			continue;
+		}
+
 		/* CONDITIONAL: skip if previous command failed */
 		if ((flags & TRUST_CMD_FLAG_CONDITIONAL) && prev_status < 0) {
+			if (is_varlen_vec && vec_subjects)
+				kfree(vec_subjects);
 			results[i].status = -ECANCELED;
 			results[i].value = 0;
 			batch_result.commands_executed++;
@@ -1329,10 +1834,12 @@ int trust_cmd_submit(const trust_ioc_cmd_submit_t __user *arg)
 			smp_mb();
 
 		/* CHAIN: inject previous output as first operand */
-		if ((flags & TRUST_CMD_FLAG_CHAIN) && i > 0) {
+		if ((flags & TRUST_CMD_FLAG_CHAIN) && i > 0 && !is_varlen_vec) {
 			/*
 			 * Shift existing operands right by one and insert
-			 * the chained value at position 0.
+			 * the chained value at position 0.  Not meaningful
+			 * for VEC ops (their operands are a subject array,
+			 * not a per-op value slot) so we skip it there.
 			 */
 			if (entry.operand_count < TRUST_CMD_MAX_OPERANDS) {
 				u32 j;
@@ -1348,13 +1855,163 @@ int trust_cmd_submit(const trust_ioc_cmd_submit_t __user *arg)
 			}
 		}
 
-		/* Validate family and opcode */
-		if (family >= TRUST_ISA_FAMILY_COUNT ||
-		    opcode >= TRUST_CMD_MAX_OPCODES) {
+		/* --- Family fan-out ---
+		 *
+		 * Families 0-5: dispatch via the 2D table.
+		 * Family 6 (VEC): varlen path calls trust_isa_exec_vec
+		 *                 directly; classic path uses
+		 *                 dispatch_vec_classic.
+		 * Family 7 (FUSED): always via dispatch_fused.
+		 */
+		if (family >= TRUST_STAT_FAMILY_SLOTS) {
+			if (is_varlen_vec && vec_subjects)
+				kfree(vec_subjects);
 			results[i].status = -ENOSYS;
 			prev_status = -ENOSYS;
 			batch_result.commands_executed++;
 			batch_result.commands_failed++;
+			trust_stats_record_scalar_fallback();
+			if (header.flags & TRUST_CMD_BUF_ATOMIC)
+				goto atomic_fail;
+			continue;
+		}
+
+		trust_stats_record_dispatch(family);
+
+		if (family == TRUST_CMD_FAMILY_VEC && is_varlen_vec) {
+			/* VARLEN VEC: decoded subjects directly into
+			 * vec_subjects.  Param is not carried in the VEC
+			 * varlen wire (libtrust doesn't emit one; aux
+			 * params are embedded in `imm` or the per-op
+			 * instruction fields).  Derive param from imm. */
+			u64 vec_param = (u64)TRUST_CMD_IMM(entry.instruction);
+			results[i].status = 0;
+			results[i].value = 0;
+			prev_status = cmd_vec_run(opcode, vec_subjects,
+						  vec_count, vec_param,
+						  &results[i]);
+			kfree(vec_subjects);
+			vec_subjects = NULL;
+			chain_value = results[i].value;
+			batch_result.commands_executed++;
+			if (prev_status < 0) {
+				batch_result.commands_failed++;
+				if (header.flags & TRUST_CMD_BUF_ATOMIC)
+					goto atomic_fail;
+			} else {
+				batch_result.commands_succeeded++;
+			}
+			continue;
+		}
+
+		if (family == TRUST_CMD_FAMILY_VEC) {
+			/* Classic-format VEC (nops-packed subjects). */
+			results[i].status = 0;
+			results[i].value = 0;
+			prev_status = dispatch_vec_classic(&entry, &results[i]);
+			chain_value = results[i].value;
+			batch_result.commands_executed++;
+			if (prev_status < 0) {
+				batch_result.commands_failed++;
+				if (header.flags & TRUST_CMD_BUF_ATOMIC)
+					goto atomic_fail;
+			} else {
+				batch_result.commands_succeeded++;
+			}
+			continue;
+		}
+
+		if (family == TRUST_CMD_FAMILY_FUSED) {
+			results[i].status = 0;
+			results[i].value = 0;
+			prev_status = dispatch_fused(&entry, &results[i]);
+			chain_value = results[i].value;
+			batch_result.commands_executed++;
+			if (prev_status < 0) {
+				batch_result.commands_failed++;
+				if (header.flags & TRUST_CMD_BUF_ATOMIC)
+					goto atomic_fail;
+			} else {
+				batch_result.commands_succeeded++;
+			}
+			continue;
+		}
+
+		/* Legacy families 0..5.
+		 *
+		 * Opcodes with bit 3 set (>= 8) on AUTH/TRUST/RES/LIFE are
+		 * the "fused bit" form shipped by libtrust Session 32
+		 * (TRUST_OPCODE_FUSED_BIT = 0x8 in trust/include/trust_isa.h).
+		 * Reroute those to the FUSED family dispatcher so
+		 * AUTH_OP_VERIFY_THEN_GATE (family=AUTH, opcode=0x9)
+		 * reaches trust_isa_exec_fused(FUSED_OP_AUTH_GATE).
+		 */
+		if (opcode >= 0x8) {
+			u32 fused_op = FUSED_OP_MAX;  /* invalid by default */
+			if (family == TRUST_FAMILY_AUTH) {
+				if (opcode == 0x9)        /* VERIFY_THEN_GATE */
+					fused_op = FUSED_OP_AUTH_GATE;
+				else if (opcode == 0x8)   /* MINT_THEN_BURN */
+					fused_op = FUSED_OP_AUTH_GATE; /* best mapping */
+			} else if (family == TRUST_FAMILY_TRUST) {
+				if (opcode == 0x8)        /* CHECK_AND_RECORD */
+					fused_op = FUSED_OP_CHECK_RECORD;
+				else if (opcode == 0x9)   /* THRESH_ELEVATE */
+					fused_op = FUSED_OP_DECAY_CHECK;
+			} else if (family == TRUST_FAMILY_RES) {
+				if (opcode == 0x8)        /* BURN_THEN_REGEN */
+					fused_op = FUSED_OP_BURN_AUDIT;
+			} else if (family == TRUST_FAMILY_LIFE) {
+				if (opcode == 0x8)        /* DIVIDE_THEN_GATE */
+					fused_op = FUSED_OP_TRUST_XFER;
+			}
+
+			if (fused_op < FUSED_OP_MAX) {
+				trust_cmd_entry_t fe = entry;
+				/* Rewrite the instruction word so cmd_fused_run
+				 * sees opcode=fused_op.  Family field is ignored
+				 * by cmd_fused_run. */
+				fe.instruction = (entry.instruction &
+					~(TRUST_CMD_OPCODE_MASK | TRUST_CMD_FAMILY_MASK)) |
+					((u32)TRUST_CMD_FAMILY_FUSED << TRUST_CMD_FAMILY_SHIFT) |
+					((u32)fused_op << TRUST_CMD_OPCODE_SHIFT);
+				results[i].status = 0;
+				results[i].value = 0;
+				/* Count as a FUSED dispatch (not the original
+				 * family) so the stats accurately report what
+				 * the hardware path actually executed. */
+				trust_stats_record_dispatch(TRUST_CMD_FAMILY_FUSED);
+				prev_status = dispatch_fused(&fe, &results[i]);
+				chain_value = results[i].value;
+				batch_result.commands_executed++;
+				if (prev_status < 0) {
+					batch_result.commands_failed++;
+					if (header.flags & TRUST_CMD_BUF_ATOMIC)
+						goto atomic_fail;
+				} else {
+					batch_result.commands_succeeded++;
+				}
+				continue;
+			}
+
+			/* No fused mapping for this (family, opcode) pair. */
+			results[i].status = -ENOSYS;
+			prev_status = -ENOSYS;
+			batch_result.commands_executed++;
+			batch_result.commands_failed++;
+			trust_stats_record_scalar_fallback();
+			if (header.flags & TRUST_CMD_BUF_ATOMIC)
+				goto atomic_fail;
+			continue;
+		}
+
+		/* Legacy families 0..5, opcode 0..7. */
+		if (opcode >= TRUST_CMD_MAX_OPCODES) {
+			results[i].status = -ENOSYS;
+			prev_status = -ENOSYS;
+			batch_result.commands_executed++;
+			batch_result.commands_failed++;
+			trust_stats_record_scalar_fallback();
 			if (header.flags & TRUST_CMD_BUF_ATOMIC)
 				goto atomic_fail;
 			continue;
@@ -1366,6 +2023,7 @@ int trust_cmd_submit(const trust_ioc_cmd_submit_t __user *arg)
 			prev_status = -ENOSYS;
 			batch_result.commands_executed++;
 			batch_result.commands_failed++;
+			trust_stats_record_scalar_fallback();
 			if (header.flags & TRUST_CMD_BUF_ATOMIC)
 				goto atomic_fail;
 			continue;
@@ -1376,6 +2034,10 @@ int trust_cmd_submit(const trust_ioc_cmd_submit_t __user *arg)
 		results[i].value = 0;
 		prev_status = handler(&entry, &results[i]);
 		chain_value = results[i].value;
+
+		/* Expose the result to the predicate register so the
+		 * NEXT predicated instruction can branch on this op. */
+		trust_isa_pred_set((int64_t)(u64)results[i].value);
 
 		batch_result.commands_executed++;
 		if (prev_status < 0) {
@@ -1400,6 +2062,9 @@ int trust_cmd_submit(const trust_ioc_cmd_submit_t __user *arg)
 						subj.capabilities);
 			}
 		}
+	}
+
+		trust_stats_record_dispatch_time(ktime_get_ns() - t_start_ns);
 	}
 
 	goto writeback;
@@ -1437,4 +2102,42 @@ out:
 	kvfree(results);
 	kvfree(cmd_buf);
 	return ret;
+}
+
+/* ======================================================================
+ * TRUST_IOC_QUERY_CAPS handler
+ *
+ * Reports the same capability bitmap advertised at /sys/kernel/trust/caps,
+ * plus a version tag and size limits, so libtrust can bump from returning
+ * 0 to reporting VEC / FUSED / VARLEN availability.  The ioctl ABI is
+ * additive: existing fields are preserved; any new bits live in
+ * high-order positions of `features`.
+ *
+ * Layout of trust_ioc_query_caps_t (see trust/include/trust_isa.h):
+ *   uint32_t version;       output: TRUST_ISA_VERSION
+ *   uint32_t features;      output: TRUST_STAT_CAP_BIT_* bitmap (low bits)
+ *   uint32_t max_batch_ops; output: kernel's max ops per batch
+ *   uint32_t max_vec_count; output: kernel's max subjects per VEC
+ * ====================================================================== */
+
+struct trust_ioc_query_caps_compat {
+	u32 version;
+	u32 features;
+	u32 max_batch_ops;
+	u32 max_vec_count;
+};
+
+int trust_cmd_query_caps(void __user *arg)
+{
+	struct trust_ioc_query_caps_compat q;
+
+	memset(&q, 0, sizeof(q));
+	q.version       = TRUST_ISA_VERSION;
+	q.features      = (u32)trust_stats_caps_bitmap();
+	q.max_batch_ops = TRUST_CMD_MAX_BATCH;
+	q.max_vec_count = TRUST_ISA_BATCH_MAX_COUNT;
+
+	if (copy_to_user(arg, &q, sizeof(q)))
+		return -EFAULT;
+	return 0;
 }

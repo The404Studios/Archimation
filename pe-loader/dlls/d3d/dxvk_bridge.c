@@ -10,8 +10,10 @@
 #include <string.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <stdint.h>
 
 #include "common/dll_common.h"
+#include "dxgi_format_cache.h"
 
 /* X11 types */
 typedef unsigned long XID;
@@ -251,6 +253,36 @@ int dxvk_get_window_size(void *hwnd, int *width, int *height)
     if (width) *width = 800;
     if (height) *height = 600;
     return -1;
+}
+
+/*
+ * dxvk_bridge_format_lookup - Route a DXGI format query through the per-thread
+ * cache before DXVK sees it.
+ *
+ * DXVK's own DxgiAdapter::LookupFormat in native dxgi.so is reasonably fast
+ * (an unordered_map lookup) but it's called from the render thread and
+ * contends with device-creation threads on the DXVK side. Our lock-free
+ * thread-local cache avoids the contention entirely for the ~20 formats a
+ * typical frame uses.
+ *
+ * Returned value is a VkFormat (uint32_t). 0 == VK_FORMAT_UNDEFINED; caller
+ * should then fall back to the DXVK resolver (or just pass the DXGI format
+ * through since DXVK has a richer table for obscure video formats).
+ */
+uint32_t dxvk_bridge_format_lookup(uint32_t dxgi_format, uint32_t usage,
+                                   uint32_t colorspace, uint32_t *out_vk_cs)
+{
+    return dx_format_cache_lookup(dxgi_format, usage, colorspace, out_vk_cs);
+}
+
+/*
+ * dxvk_bridge_cache_stats - Fetch cache counters for the current thread.
+ * Intended for diag endpoints (pe_diag.c) that want to print format hit/miss
+ * statistics when a render thread is stalled.
+ */
+void dxvk_bridge_cache_stats(uint64_t *out_hits, uint64_t *out_misses)
+{
+    dx_format_cache_stats(out_hits, out_misses);
 }
 
 /*

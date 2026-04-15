@@ -188,6 +188,58 @@ mkdir -p "$LOG_DIR" 2>/dev/null
     echo "  compositor=${COMPOSITOR_TYPE:-none}"
 } >> "$LOG_DIR/pe-launch.log" 2>/dev/null
 
+# --- Gamescope routing (Session 33 compositor bypass) -----------------
+# Default: launch through gamescope for guaranteed compositor bypass.
+# gamescope gives us an isolated nested compositor whose present mode is
+# fully controlled; combined with the coherence Vulkan layer this forces
+# MAILBOX/IMMEDIATE end-to-end.
+#
+# HW tier gating:
+#   NEW / MID / DEFAULT : route through gamescope-launch.sh
+#   OLD / legacy        : keep existing xfconf-compositor path (gamescope
+#                         requires Vulkan 1.2+ which some legacy ICDs lack)
+#
+# User override: COHERENCE_NO_GAMESCOPE=1 skips gamescope entirely.
+GAMESCOPE_LAUNCH=/usr/lib/ai-arch/gamescope-launch.sh
+HW_PROFILE_FILE=/run/ai-arch-hw-profile
+HW_PROFILE=""
+if [ -r "$HW_PROFILE_FILE" ]; then
+    # Same file format used by hw-detect.sh (`PROFILE=NEW|OLD|DEFAULT`).
+    HW_PROFILE=$(awk -F= '/^PROFILE=/{gsub(/"/,"",$2); print $2; exit}' \
+                  "$HW_PROFILE_FILE" 2>/dev/null)
+fi
+
+use_gamescope=0
+case "$HW_PROFILE" in
+    NEW|DEFAULT|MID) use_gamescope=1 ;;
+    OLD)             use_gamescope=0 ;;
+    *)
+        # Unknown profile: fall back by GPU tier (software -> no gamescope).
+        if [ "${GPU_TIER:-}" = "software" ] || [ "${GPU_TIER:-}" = "legacy" ]; then
+            use_gamescope=0
+        else
+            use_gamescope=1
+        fi
+        ;;
+esac
+[ "${COHERENCE_NO_GAMESCOPE:-0}" = "1" ] && use_gamescope=0
+[ -x "$GAMESCOPE_LAUNCH" ] || use_gamescope=0
+command -v gamescope >/dev/null 2>&1 || use_gamescope=0
+
+if [ "$use_gamescope" = "1" ]; then
+    {
+        echo "  gamescope=yes (profile=$HW_PROFILE)"
+    } >> "$LOG_DIR/pe-launch.log" 2>/dev/null
+    # gamescope owns the outer present loop; our xfconf/hyprctl tweaks
+    # are redundant (but already installed via trap for restore on exit).
+    exec "$GAMESCOPE_LAUNCH" "$TARGET_EXE" "$@"
+fi
+
+# --- OLD-tier fallback: stay on xfconf-compositor path ----------------
+{
+    echo "  gamescope=no (profile=$HW_PROFILE) — xfconf-compositor fallback"
+} >> "$LOG_DIR/pe-launch.log" 2>/dev/null
+
 # Prefer peloader in /usr/bin; fall back to PATH lookup.
 PELOADER=/usr/bin/peloader
 [ -x "$PELOADER" ] || PELOADER=$(command -v peloader 2>/dev/null || echo /usr/bin/peloader)

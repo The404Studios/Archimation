@@ -1,0 +1,120 @@
+[Unit]
+Description=Coherence Control Daemon (multi-rate arbiter)
+Documentation=file:///etc/coherence/coherence.conf
+Documentation=file:///usr/share/doc/coherence/design.md
+
+# We need hardware profile populated (gives us thermal caps, CPU topology,
+# NUMA info) before we compute any actuation plan. ai-hw-detect drops
+# /run/ai-arch-hw-profile.
+After=ai-hw-detect.service systemd-modules-load.service
+Wants=ai-hw-detect.service
+
+# Land before any graphical session starts so the arbiter is already
+# steering cpufreq + IRQ affinity when the compositor spins up.
+Before=graphical.target display-manager.service lightdm.service
+
+# Degrade gracefully on minimal kernels. If the cpufreq sysfs is absent
+# the actuation stage will ENOENT its writes and the loop still runs in
+# observe mode — but we skip starting at all when literally nothing is
+# available.
+ConditionPathExists=/sys/devices/system/cpu
+
+# Back off if we crash-loop — coherence is not critical for basic boot.
+# (StartLimit* keys must live in [Unit], not [Service].)
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+Slice=system.slice
+ExecStart=/usr/bin/coherenced --config=/etc/coherence/coherence.conf
+
+# Reload applies the config at the next frame boundary; the daemon uses
+# SIGHUP for this.
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=always
+RestartSec=2s
+
+# Latency matters. Give us CPU priority and real-time I/O so sampling
+# + actuation writes are not blocked by background cgroups.
+CPUWeight=1000
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+Nice=-5
+
+# Allow the process to run with SCHED_FIFO if we ever need to (Agent 9
+# may decide; we don't assume it here).
+LimitRTPRIO=50
+LimitNICE=-20
+
+# --- Security + sandboxing -------------------------------------------------
+#
+# Rationale:
+#   - We need to write sysfs (cpufreq, thermal, IRQ affinity), cgroup v2
+#     (game + system slices) and procfs (/proc/irq/*/smp_affinity_list).
+#   - We do NOT need network, home dirs, or ability to exec new binaries.
+#   - CAP_SYS_NICE covers sched_setscheduler + migration hints; CAP_SYS_ADMIN
+#     is required for cgroup hierarchy writes and some IRQ affinity sysfs.
+#
+User=root
+Group=root
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_NICE
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_NICE
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# PrivateDevices=no — we need /dev/cpu/*/msr for thermal reads.
+PrivateDevices=no
+# ProtectKernelTunables=no — we write /sys/devices/system/cpu/...
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+# ProtectControlGroups=no — we steer cgroup v2 cpusets.
+ProtectControlGroups=no
+ProtectHostname=yes
+ProtectClock=yes
+ProtectProc=invisible
+ProcSubset=all
+RestrictNamespaces=yes
+# RestrictRealtime=no — Agent 9 may schedule SCHED_FIFO threads.
+RestrictRealtime=no
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+ReadWritePaths=/sys/devices/system/cpu
+ReadWritePaths=/sys/class/thermal
+ReadWritePaths=/sys/class/powercap
+ReadWritePaths=/sys/fs/cgroup
+ReadWritePaths=/proc/irq
+ReadWritePaths=/proc/sys/kernel/sched_migration_cost_ns
+ReadWritePaths=/var/run/coherence
+ReadWritePaths=/run/coherence
+ReadWritePaths=/dev/cpu
+
+# io_uring sqpoll pin + Vulkan present-mode override are both userspace
+# hints — no extra caps needed.
+
+# Resource ceiling: the daemon should never blow past a few MB RSS.
+MemoryMax=128M
+TasksMax=32
+
+# Journal: tag us cleanly so operators can `journalctl -u coherence` and
+# see just our JSON stream.
+SyslogIdentifier=coherenced
+StandardOutput=journal
+StandardError=journal
+
+# Timeout: we answer SIGTERM immediately by design; 5 s ceiling.
+TimeoutStopSec=5s
+
+[Install]
+WantedBy=multi-user.target graphical.target

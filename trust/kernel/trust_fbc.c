@@ -17,12 +17,64 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/wait.h>
+#include <linux/mutex.h>
+#include <linux/rcupdate.h>
+#include <linux/lockdep.h>
 #include "trust_internal.h"
 
 trust_policy_table_t g_trust_policy;
 trust_audit_ring_t   g_trust_audit;
 trust_dep_graph_t    g_trust_deps;
 trust_escalation_queue_t g_trust_escalations;
+
+/*
+ * Session 33: RCU-published snapshot of the policy table.  Readers
+ * take rcu_read_lock / rcu_dereference, writers publish via
+ * rcu_assign_pointer under g_trust_policy_write_lock and kfree_rcu
+ * the old snapshot after a grace period.  The snapshot's rules_ref
+ * aliases g_trust_policy.rules (an append-only array that is never
+ * reallocated) so the only thing the snapshot owns exclusively is
+ * the (rule_count, rcu_head) pair.
+ */
+trust_policy_snapshot_t __rcu *g_trust_policy_rcu;
+DEFINE_MUTEX(g_trust_policy_write_lock);
+
+/*
+ * Publish helper.  Caller MUST hold g_trust_policy_write_lock.
+ * Allocates a new snapshot, stamps it with the current rule count,
+ * publishes via rcu_assign_pointer, and schedules the old snapshot
+ * for release via kfree_rcu (no synchronous stall; readers that
+ * already hold the old pointer drain naturally under the next RCU
+ * grace period).
+ */
+static int _trust_policy_publish_snapshot(int rule_count)
+{
+    trust_policy_snapshot_t *new_snap, *old_snap;
+
+    lockdep_assert_held(&g_trust_policy_write_lock);
+
+    new_snap = kzalloc(sizeof(*new_snap), GFP_KERNEL);
+    if (!new_snap)
+        return -ENOMEM;
+
+    new_snap->rule_count = rule_count;
+    new_snap->rules_ref  = g_trust_policy.rules;
+
+    /*
+     * rcu_dereference_protected tells lockdep we hold the writer
+     * lock, so it won't warn about a raw pointer fetch outside
+     * rcu_read_lock.
+     */
+    old_snap = rcu_dereference_protected(g_trust_policy_rcu,
+                lockdep_is_held(&g_trust_policy_write_lock));
+
+    rcu_assign_pointer(g_trust_policy_rcu, new_snap);
+
+    if (old_snap)
+        kfree_rcu(old_snap, rcu);
+
+    return 0;
+}
 
 /* --- Policy Initialization --- */
 
@@ -55,14 +107,17 @@ void trust_policy_init_defaults(void)
     };
 
     int i;
+    int final_count;
     /*
-     * Policy rules are append-only from this point on, and readers
-     * snapshot count via READ_ONCE() without taking the lock (see
-     * _record_action_cb / trust_risc_threshold_check).  We publish
-     * each new rule's bytes BEFORE incrementing count, with a
-     * smp_wmb() fence, so any reader that sees the new count is
-     * guaranteed to see the rule's fully-written contents.
+     * Policy rules are append-only from this point on.  Legacy
+     * readers (trust_risc.c, not editable) snapshot count via
+     * READ_ONCE() with an smp_rmb fence — that path still works.
+     * RCU readers (trust_fbc.c) use rcu_dereference(g_trust_policy_rcu)
+     * and see the published snapshot.  Writer takes BOTH the
+     * outer mutex (for lockdep-checked RCU publish) and the legacy
+     * spinlock (for the array append).
      */
+    mutex_lock(&g_trust_policy_write_lock);
     spin_lock(&g_trust_policy.lock);
     for (i = 0; i < (int)(sizeof(defaults) / sizeof(defaults[0])); i++) {
         int slot = g_trust_policy.count;
@@ -72,24 +127,43 @@ void trust_policy_init_defaults(void)
             WRITE_ONCE(g_trust_policy.count, slot + 1);
         }
     }
+    final_count = g_trust_policy.count;
     spin_unlock(&g_trust_policy.lock);
+
+    /* One RCU publish covers all default rules.  Ignore -ENOMEM here:
+     * the fallback (rcu pointer still NULL) just means RCU readers see
+     * no rules, which is still safe (default DENY).  Callers of
+     * trust_policy_add_rule later will retry publishing. */
+    (void)_trust_policy_publish_snapshot(final_count);
+    mutex_unlock(&g_trust_policy_write_lock);
 }
 
 int trust_policy_add_rule(const trust_policy_rule_t *rule)
 {
     int ret = -1;
-    int slot;
+    int slot, final_count;
+    mutex_lock(&g_trust_policy_write_lock);
     spin_lock(&g_trust_policy.lock);
     slot = g_trust_policy.count;
     if (slot < TRUST_MAX_POLICIES) {
         g_trust_policy.rules[slot] = *rule;
         /* Publish the rule bytes before the count bump so lockless
-         * readers never observe a partially-initialized rule. */
+         * legacy readers never observe a partially-initialized rule. */
         smp_wmb();
         WRITE_ONCE(g_trust_policy.count, slot + 1);
         ret = 0;
     }
+    final_count = g_trust_policy.count;
     spin_unlock(&g_trust_policy.lock);
+
+    /*
+     * Republish the RCU snapshot so rcu_dereference readers pick up
+     * the new rule count.  Old snapshot is freed after grace period
+     * via kfree_rcu — no synchronous stall on the publisher.
+     */
+    if (ret == 0)
+        (void)_trust_policy_publish_snapshot(final_count);
+    mutex_unlock(&g_trust_policy_write_lock);
     return ret;
 }
 
@@ -99,6 +173,9 @@ int trust_fbc_policy_eval(u32 subject_id, u32 action, u32 *matching_rule_idx)
     trust_subject_t subj;
     int i;
     int result = TRUST_RESULT_DENY;
+    const trust_policy_snapshot_t *snap;
+    const trust_policy_rule_t *rules;
+    int count;
 
     if (trust_tlb_lookup(subject_id, &subj) < 0) {
         if (matching_rule_idx) *matching_rule_idx = 0xFFFFFFFF;
@@ -116,57 +193,76 @@ int trust_fbc_policy_eval(u32 subject_id, u32 action, u32 *matching_rule_idx)
         return TRUST_RESULT_DENY;
     }
 
-    /* Lock-free read: rules are append-only; count is monotonic. */
-    {
-        int count = READ_ONCE(g_trust_policy.count);
-        if (count > TRUST_MAX_POLICIES)
-            count = TRUST_MAX_POLICIES;
-        smp_rmb();
+    /*
+     * Session 33: full RCU read section.  rcu_dereference pairs with
+     * rcu_assign_pointer on the publish side; the read-side critical
+     * section ensures the snapshot and the rules[] it aliases are
+     * kept alive for the duration of the loop.
+     *
+     * Fallback: if no snapshot has been published yet (pre-init or
+     * -ENOMEM on publish) treat the policy as empty and fall through
+     * to the default DENY.
+     */
+    rcu_read_lock();
+    /* Lockdep hook: confirm we're actually inside an RCU reader. */
+    RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
+                     "trust_fbc_policy_eval called without rcu_read_lock");
 
-        for (i = 0; i < count; i++) {
-            const trust_policy_rule_t *rule = &g_trust_policy.rules[i];
+    snap = rcu_dereference(g_trust_policy_rcu);
+    if (!snap) {
+        rcu_read_unlock();
+        return TRUST_RESULT_DENY;
+    }
 
-            /* Check domain match (0xFFFFFFFF = all domains) */
-            if (rule->domain != 0xFFFFFFFF && rule->domain != subj.domain)
-                continue;
+    count = snap->rule_count;
+    rules = snap->rules_ref;
+    if (count > TRUST_MAX_POLICIES)
+        count = TRUST_MAX_POLICIES;
 
-            /* Check action match */
-            if (READ_ONCE(rule->action_type) != action)
-                continue;
+    for (i = 0; i < count; i++) {
+        const trust_policy_rule_t *rule = &rules[i];
 
-            /* Found matching rule */
-            if (matching_rule_idx) *matching_rule_idx = (u32)i;
+        /* Check domain match (0xFFFFFFFF = all domains) */
+        if (rule->domain != 0xFFFFFFFF && rule->domain != subj.domain)
+            continue;
 
-            /* TRC Integration: apply threshold bias to min_trust */
-            {
-                /* Clamp threshold_bias to prevent overflow from flipping the comparison */
-                int32_t bias = subj.trc.threshold_bias;
-                int32_t biased_min;
-                if (bias > 50) bias = 50;
-                if (bias < -50) bias = -50;
-                biased_min = rule->min_trust + bias;
-                /* Clamp result to valid trust range [0, 100] */
-                if (biased_min < 0) biased_min = 0;
-                if (biased_min > 100) biased_min = 100;
+        /* Check action match */
+        if (READ_ONCE(rule->action_type) != action)
+            continue;
 
-                if (subj.trust_score < biased_min) {
-                    result = TRUST_RESULT_DENY;
-                    break;
-                }
-            }
+        /* Found matching rule */
+        if (matching_rule_idx) *matching_rule_idx = (u32)i;
 
-            /* Check required capabilities */
-            if (rule->required_caps &&
-                (subj.capabilities & rule->required_caps) != rule->required_caps) {
-                /* Missing capabilities: might need escalation */
-                result = TRUST_RESULT_ESCALATE;
+        /* TRC Integration: apply threshold bias to min_trust */
+        {
+            /* Clamp threshold_bias to prevent overflow from flipping the comparison */
+            int32_t bias = subj.trc.threshold_bias;
+            int32_t biased_min;
+            if (bias > 50) bias = 50;
+            if (bias < -50) bias = -50;
+            biased_min = rule->min_trust + bias;
+            /* Clamp result to valid trust range [0, 100] */
+            if (biased_min < 0) biased_min = 0;
+            if (biased_min > 100) biased_min = 100;
+
+            if (subj.trust_score < biased_min) {
+                result = TRUST_RESULT_DENY;
                 break;
             }
+        }
 
-            result = TRUST_RESULT_ALLOW;
+        /* Check required capabilities */
+        if (rule->required_caps &&
+            (subj.capabilities & rule->required_caps) != rule->required_caps) {
+            /* Missing capabilities: might need escalation */
+            result = TRUST_RESULT_ESCALATE;
             break;
         }
+
+        result = TRUST_RESULT_ALLOW;
+        break;
     }
+    rcu_read_unlock();
 
     return result;
 }

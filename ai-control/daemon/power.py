@@ -1,12 +1,21 @@
 """
-Power orchestration: governor switching + thermal throttling of observers.
+Power orchestration: EPP biasing + thermal throttling of observers.
 
 Responsibilities
 ----------------
-1. **Governor auto-boost on PE launch.** When a PE process enters
-   ``pe-compat.slice`` the governor flips from ``ondemand`` →
-   ``performance``. When the last PE exits we restore the saved baseline
-   governor so we don't burn battery forever.
+1. **EPP boost on PE launch.** When a PE process enters
+   ``pe-compat.slice`` we nudge the CPUs into the ``performance``
+   energy-performance-preference and raise ``min_perf_pct`` to a
+   floor.  This keeps schedutil in charge of the actual frequency
+   selection but biases it strongly toward high turbo.  When the last
+   PE exits we restore the saved EPP + min_perf_pct baseline captured
+   at daemon start.
+
+   This supersedes the old ``governor=performance`` approach, which
+   tended to oscillate under thermal pressure because the
+   performance governor ignores thermal hints and fights the
+   pstate driver until it hits an emergency shutdown. EPP + min_perf
+   nudge schedutil rather than preempting it.
 
 2. **Throttle observers on thermal pressure.** When the CPU/GPU max temp
    crosses into the ``hot`` band (>= 80 °C) or ``critical`` (>= 90 °C) we
@@ -14,10 +23,15 @@ Responsibilities
    ``CPUQuota`` limit to their cgroup. When temps recover we restore them.
 
 3. **Mediate root access.** The AI daemon runs as root (see
-   ``ai-control.service``) so it *can* write ``scaling_governor``
+   ``ai-control.service``) so it *can* write cpufreq sysfs knobs
    directly; we still prefer the ``/usr/lib/ai-arch/power-profile.sh``
    helper because the shell script is the single source of truth for
    policy and is auditable independently of the Python module.
+
+4. **Fallback path.** On very old CPUs with neither ``intel_pstate``
+   nor ``amd_pstate`` present, no EPP control is exposed — we fall
+   back to the legacy ``governor=performance`` switch and log
+   loudly that we're running in legacy mode.
 
 Non-goals
 ---------
@@ -55,6 +69,31 @@ _DEFAULT_BASELINE = {"old": "ondemand", "mid": "schedutil", "new": "schedutil"}
 
 _GOVERNOR_HELPER = "/usr/lib/ai-arch/power-profile.sh"
 _PE_SLICE_CGROUP = "/sys/fs/cgroup/pe-compat.slice"
+
+# EPP (Energy Performance Preference) — intel_pstate/amd_pstate common
+# knob exposed at /sys/devices/system/cpu/cpuN/cpufreq/energy_performance_preference
+# Accepted values depend on the driver; "performance", "balance_performance",
+# "balance_power", "power" and "default" are commonly supported.
+VALID_EPP = {
+    "performance", "balance_performance", "default",
+    "balance_power", "power",
+}
+
+# pstate driver sysfs roots used for min_perf_pct.  At most one of these
+# two exists on a given machine; whichever is present is the active
+# driver.
+_INTEL_PSTATE_ROOT = "/sys/devices/system/cpu/intel_pstate"
+_AMD_PSTATE_ROOT   = "/sys/devices/system/cpu/amd_pstate"
+
+# Floor percentage applied while a PE is running.  Any number in
+# [1, 100]; we use 60 which is "take me out of the deep C-states
+# but leave thermal headroom for bursty workloads".
+_PE_MIN_PERF_FLOOR = 60
+
+# EPP boost target while PE is running.  ``performance`` tells the
+# pstate driver to weight frequency decisions toward the top of the
+# range; schedutil still makes the final call.
+_PE_EPP_BOOST = "performance"
 
 # Observer cgroup path -- we put the daemon's observer threads under
 # ai-control.slice/throttle.scope when thermal pressure kicks in.
@@ -147,6 +186,99 @@ async def _run_helper(*args: str, timeout: float = 10.0) -> tuple[int, str]:
     out = stdout.decode(errors="replace").strip()
     err = stderr.decode(errors="replace").strip()
     return proc.returncode or 0, (err or out)
+
+
+# ---------------------------------------------------------------------------
+# EPP (Energy Performance Preference) + min_perf_pct helpers
+# ---------------------------------------------------------------------------
+def _list_epp_files() -> list[str]:
+    """Every CPU's EPP sysfs file, sorted by cpu index."""
+    if not _IS_LINUX:
+        return []
+    return sorted(glob.glob(
+        "/sys/devices/system/cpu/cpu[0-9]*/cpufreq/energy_performance_preference"
+    ))
+
+
+def _detect_pstate_driver() -> Optional[str]:
+    """Return "intel", "amd", or None depending on which pstate driver
+    is loaded.  Used to pick the right min_perf_pct sysfs path and to
+    decide whether to use the EPP path or fall back to governor flips.
+    """
+    if not _IS_LINUX:
+        return None
+    if os.path.isdir(_INTEL_PSTATE_ROOT):
+        return "intel"
+    if os.path.isdir(_AMD_PSTATE_ROOT):
+        return "amd"
+    return None
+
+
+def _read_current_epp() -> Optional[str]:
+    """Read cpu0's EPP. Returns None if EPP isn't exposed."""
+    if not _IS_LINUX:
+        return None
+    files = _list_epp_files()
+    if not files:
+        return None
+    try:
+        with open(files[0], "r") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def _read_current_min_perf_pct(driver: Optional[str]) -> Optional[int]:
+    """Read min_perf_pct for the active pstate driver."""
+    if not _IS_LINUX or not driver:
+        return None
+    root = _INTEL_PSTATE_ROOT if driver == "intel" else _AMD_PSTATE_ROOT
+    try:
+        with open(os.path.join(root, "min_perf_pct"), "r") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+async def _write_epp_direct(value: str) -> int:
+    """Write EPP to every CPU.  Returns CPU count successfully written."""
+    if not _IS_LINUX:
+        return 0
+
+    def _sync() -> int:
+        count = 0
+        for path in _list_epp_files():
+            try:
+                with open(path, "w") as f:
+                    f.write(value)
+                count += 1
+            except (OSError, PermissionError):
+                continue
+        return count
+
+    return await asyncio.to_thread(_sync)
+
+
+async def _write_min_perf_pct_direct(pct: int, driver: Optional[str]) -> bool:
+    """Write min_perf_pct for the active pstate driver."""
+    if not _IS_LINUX or not driver:
+        return False
+    if pct < 0:
+        pct = 0
+    if pct > 100:
+        pct = 100
+    root = _INTEL_PSTATE_ROOT if driver == "intel" else _AMD_PSTATE_ROOT
+    path = os.path.join(root, "min_perf_pct")
+
+    def _sync() -> bool:
+        try:
+            with open(path, "w") as f:
+                f.write(str(pct))
+            return True
+        except (OSError, PermissionError):
+            return False
+
+    return await asyncio.to_thread(_sync)
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +426,9 @@ class _ObserverThrottler:
 class PowerOrchestrator:
     """High-level power policy controller.
 
-    * Boosts governor to ``performance`` when any PE process is running.
+    * Biases EPP toward ``performance`` + raises ``min_perf_pct`` to a
+      floor when any PE process is running.  Falls back to
+      ``governor=performance`` on very old CPUs without pstate driver.
     * Throttles observers when ``ThermalOrchestrator`` reports hot/critical.
     * Exposes a snapshot dict for ``/power/current``.
 
@@ -322,6 +456,14 @@ class PowerOrchestrator:
         self._pe_boost_active: bool = False
         self._pe_count_last: int = 0
 
+        # Session 33: pstate driver + EPP baseline captured at start().
+        self._pstate_driver: Optional[str] = _detect_pstate_driver()
+        self._baseline_epp: Optional[str] = None
+        self._baseline_min_perf_pct: Optional[int] = None
+        # When pstate is unavailable we fall back to the classic
+        # governor flip.  Logged once at start() and on every boost.
+        self._legacy_fallback: bool = self._pstate_driver is None
+
         self._throttler = _ObserverThrottler()
 
         self._watch_task: Optional[asyncio.Task] = None
@@ -333,16 +475,31 @@ class PowerOrchestrator:
             return
         self._running = True
         # Remember whatever governor the hw-detect / user had configured
-        # at startup so we can restore on shutdown.
+        # at startup so we can restore on shutdown (legacy fallback).
         self._baseline_gov = (
             self._current_gov
             or _DEFAULT_BASELINE.get(self._hw, "ondemand")
         )
-        logger.info(
-            "PowerOrchestrator started (hw=%s, baseline_gov=%s, avail=%s)",
-            self._hw, self._baseline_gov,
-            sorted(self._available) if self._available else "unknown",
-        )
+        # Capture EPP + min_perf baseline so the exit path can restore it.
+        self._baseline_epp = _read_current_epp()
+        self._baseline_min_perf_pct = _read_current_min_perf_pct(self._pstate_driver)
+
+        if self._legacy_fallback:
+            logger.warning(
+                "PowerOrchestrator LEGACY MODE: no intel_pstate / amd_pstate driver "
+                "detected — falling back to governor-switching. "
+                "hw=%s baseline_gov=%s",
+                self._hw, self._baseline_gov,
+            )
+        else:
+            logger.info(
+                "PowerOrchestrator started (hw=%s, pstate=%s, baseline_epp=%s, "
+                "baseline_min_perf_pct=%s, baseline_gov=%s, avail=%s)",
+                self._hw, self._pstate_driver,
+                self._baseline_epp, self._baseline_min_perf_pct,
+                self._baseline_gov,
+                sorted(self._available) if self._available else "unknown",
+            )
         # Hook thermal state transitions (if an orchestrator is attached).
         if self._thermal is not None:
             try:
@@ -365,19 +522,24 @@ class PowerOrchestrator:
             self._watch_task = None
         # Revert any runtime changes so we don't leave the system in a
         # weird state when the daemon exits.
-        if self._pe_boost_active and self._baseline_gov:
-            await self.set_governor(self._baseline_gov, reason="shutdown")
+        if self._pe_boost_active:
+            await self._apply_pe_exit_restore()
             self._pe_boost_active = False
         self._throttler.revert(self._memory_observer, self._scanner)
         logger.info("PowerOrchestrator stopped")
 
-    # ── Governor control ──
+    # ── Governor control (legacy fallback path only) ──
     async def set_governor(self, gov: str, reason: str = "manual") -> dict[str, Any]:
-        """Public API: switch all CPUs to ``gov``.
+        """Public API: switch all CPUs to ``gov`` (legacy fallback).
 
         Tries the shell helper first (single source of truth, can be
         audited by systemd) and falls back to a direct sysfs write if
         the helper is absent (e.g. in a minimal test rootfs).
+
+        Note: Session 33 replaces the primary PE-boost path with EPP +
+        min_perf_pct.  ``set_governor`` is retained for backwards
+        compatibility with callers that want an explicit governor flip
+        and for the legacy fallback on pre-pstate CPUs.
         """
         if gov not in VALID_GOVERNORS:
             return {"success": False, "error": f"invalid governor: {gov}"}
@@ -404,6 +566,95 @@ class PowerOrchestrator:
             "direct_cpus_written": cpus,
         }
 
+    # ── EPP / min_perf control (primary Session 33 path) ──
+    async def set_epp(self, value: str, reason: str = "manual") -> dict[str, Any]:
+        """Public API: write ``value`` to every CPU's EPP knob.
+
+        Tries the shell helper first, falls back to direct sysfs
+        writes.  Returns a dict suitable for a JSON REST response.
+        """
+        if value not in VALID_EPP:
+            return {"success": False, "error": f"invalid epp: {value}"}
+        if not _list_epp_files():
+            return {"success": False, "error": "EPP not exposed on this CPU"}
+        rc, msg = await _run_helper("epp", "set", value)
+        cpus = 0
+        if rc != 0:
+            cpus = await _write_epp_direct(value)
+        now = _read_current_epp()
+        logger.info(
+            "set_epp(%s) reason=%s helper_rc=%s direct_cpus=%d now=%s",
+            value, reason, rc, cpus, now,
+        )
+        return {
+            "success": now == value,
+            "epp": now,
+            "helper_rc": rc,
+            "helper_msg": msg,
+            "direct_cpus_written": cpus,
+        }
+
+    async def set_min_perf_pct(self, pct: int, reason: str = "manual") -> dict[str, Any]:
+        """Public API: write ``pct`` to the active pstate driver's
+        min_perf_pct.  No-op (with success=False) if neither
+        intel_pstate nor amd_pstate is loaded.
+        """
+        if self._pstate_driver is None:
+            return {"success": False, "error": "no pstate driver loaded"}
+        if pct < 0 or pct > 100:
+            return {"success": False, "error": f"min_perf_pct out of range: {pct}"}
+        rc, msg = await _run_helper("minperf", "set", str(pct))
+        ok_direct = False
+        if rc != 0:
+            ok_direct = await _write_min_perf_pct_direct(pct, self._pstate_driver)
+        now = _read_current_min_perf_pct(self._pstate_driver)
+        logger.info(
+            "set_min_perf_pct(%d) driver=%s reason=%s helper_rc=%s direct_ok=%s now=%s",
+            pct, self._pstate_driver, reason, rc, ok_direct, now,
+        )
+        return {
+            "success": now == pct,
+            "min_perf_pct": now,
+            "driver": self._pstate_driver,
+            "helper_rc": rc,
+            "helper_msg": msg,
+            "direct_ok": ok_direct,
+        }
+
+    # ── PE boost compound helpers ──
+    async def _apply_pe_boost(self, reason: str) -> None:
+        """Apply the PE-launch boost: EPP=performance + min_perf_pct=floor.
+        Falls back to governor=performance on very old CPUs.
+        """
+        if self._legacy_fallback:
+            await self.set_governor("performance", reason=reason)
+            return
+        await self.set_epp(_PE_EPP_BOOST, reason=reason)
+        await self.set_min_perf_pct(_PE_MIN_PERF_FLOOR, reason=reason)
+
+    async def _apply_pe_exit_restore(self) -> None:
+        """Restore the baseline captured at ``start()``.
+
+        In legacy mode this writes the saved governor; in normal mode
+        it writes back the saved EPP + min_perf_pct.  If either value
+        is missing we write a sane default.
+        """
+        if self._legacy_fallback:
+            if self._baseline_gov:
+                await self.set_governor(self._baseline_gov, reason="pe_exit")
+            return
+        if self._baseline_epp:
+            await self.set_epp(self._baseline_epp, reason="pe_exit")
+        else:
+            # Safe default: ``default`` asks the driver for its own
+            # idea of neutral, which is equivalent to pre-boost
+            # behavior on both intel and amd pstate.
+            await self.set_epp("default", reason="pe_exit_default")
+        if self._baseline_min_perf_pct is not None:
+            await self.set_min_perf_pct(
+                self._baseline_min_perf_pct, reason="pe_exit",
+            )
+
     # ── PE watch loop ──
     async def _pe_watch_loop(self):
         try:
@@ -412,12 +663,11 @@ class PowerOrchestrator:
                     count = _count_pe_scopes()
                     if count > 0 and not self._pe_boost_active:
                         # At least one PE process appeared — boost.
-                        await self.set_governor("performance", reason=f"pe_launch({count})")
+                        await self._apply_pe_boost(reason=f"pe_launch({count})")
                         self._pe_boost_active = True
                     elif count == 0 and self._pe_boost_active:
                         # All PE processes exited — restore baseline.
-                        if self._baseline_gov:
-                            await self.set_governor(self._baseline_gov, reason="pe_exit")
+                        await self._apply_pe_exit_restore()
                         self._pe_boost_active = False
                     self._pe_count_last = count
                 except Exception as exc:
@@ -457,6 +707,14 @@ class PowerOrchestrator:
                 "available": sorted(self._available) if self._available else [],
                 "pe_boost_active": self._pe_boost_active,
                 "pe_process_count": self._pe_count_last,
+            },
+            "epp": {
+                "current": _read_current_epp(),
+                "baseline": self._baseline_epp,
+                "driver": self._pstate_driver,
+                "legacy_fallback": self._legacy_fallback,
+                "min_perf_pct": _read_current_min_perf_pct(self._pstate_driver),
+                "baseline_min_perf_pct": self._baseline_min_perf_pct,
             },
             "cpu": {
                 "temp": cpu.get("temp"),

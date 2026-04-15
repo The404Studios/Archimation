@@ -12,6 +12,8 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/string.h>
+#include <linux/percpu_counter.h>
+#include <linux/gfp.h>
 #include "trust_internal.h"
 
 trust_tlb_t g_trust_tlb;
@@ -36,15 +38,35 @@ static inline u32 tlb_hash(u32 subject_id)
 
 int trust_tlb_init(void)
 {
-    int i;
+    int i, ret;
 
-    atomic_set(&g_trust_tlb.hit_count, 0);
-    atomic_set(&g_trust_tlb.miss_count, 0);
+    /*
+     * Session 33: percpu_counter replaces atomic_t.  Per-CPU shards
+     * eliminate atomic RMW traffic on the hot path; aggregation only
+     * happens on diagnostic reads (trust_tlb_get_hits/misses).
+     *
+     * GFP_KERNEL is fine here: module init runs in process context
+     * and may block.  Leaked on the miss-init rollback path (hit
+     * counter freed before returning).
+     */
+    ret = percpu_counter_init(&g_trust_tlb.hit_count, 0, GFP_KERNEL);
+    if (ret) {
+        pr_err("trust: percpu_counter_init(hit_count) failed: %d\n", ret);
+        return ret;
+    }
+    ret = percpu_counter_init(&g_trust_tlb.miss_count, 0, GFP_KERNEL);
+    if (ret) {
+        pr_err("trust: percpu_counter_init(miss_count) failed: %d\n", ret);
+        percpu_counter_destroy(&g_trust_tlb.hit_count);
+        return ret;
+    }
 
     g_trust_tlb.sets = vzalloc(TRUST_TLB_SETS * sizeof(trust_tlb_set_t));
     if (!g_trust_tlb.sets) {
         pr_err("trust: failed to vmalloc TLB sets (%zu bytes)\n",
                (size_t)(TRUST_TLB_SETS * sizeof(trust_tlb_set_t)));
+        percpu_counter_destroy(&g_trust_tlb.miss_count);
+        percpu_counter_destroy(&g_trust_tlb.hit_count);
         return -ENOMEM;
     }
 
@@ -58,6 +80,14 @@ void trust_tlb_cleanup(void)
 {
     vfree(g_trust_tlb.sets);
     g_trust_tlb.sets = NULL;
+    /*
+     * Destroy order matches reverse-of-init: sets[] first (so any
+     * in-flight readers are drained by module unload rcu grace),
+     * then counters.  percpu_counter_destroy releases the per-CPU
+     * allocations.
+     */
+    percpu_counter_destroy(&g_trust_tlb.miss_count);
+    percpu_counter_destroy(&g_trust_tlb.hit_count);
 }
 
 int trust_tlb_lookup(u32 subject_id, trust_subject_t *out)
@@ -85,7 +115,15 @@ int trust_tlb_lookup(u32 subject_id, trust_subject_t *out)
             set->entries[i].subject_id == subject_id) {
             /* Hit: update LRU and copy under lock */
             set->lru = (set->lru & ~(3U << (i * 2))) | ((u32)3 << (i * 2));
-            atomic_inc(&g_trust_tlb.hit_count);
+            /*
+             * Session 33: per-CPU increment — lockless relative to
+             * other CPUs; the global aggregate is only touched when
+             * the local batch (32 by default) overflows.  Preempt is
+             * already disabled by spin_lock_irqsave so the raw
+             * __percpu_counter_add path is safe, but we use the
+             * wrapper for portability.
+             */
+            percpu_counter_inc(&g_trust_tlb.hit_count);
             if (out)
                 *out = set->entries[i];
             spin_unlock_irqrestore(&set->lock, flags);
@@ -93,7 +131,7 @@ int trust_tlb_lookup(u32 subject_id, trust_subject_t *out)
         }
     }
 
-    atomic_inc(&g_trust_tlb.miss_count);
+    percpu_counter_inc(&g_trust_tlb.miss_count);
     spin_unlock_irqrestore(&set->lock, flags);
     return -1;
 }
@@ -208,8 +246,13 @@ void trust_tlb_flush(void)
         spin_unlock_irqrestore(&set->lock, flags);
     }
 
-    atomic_set(&g_trust_tlb.hit_count, 0);
-    atomic_set(&g_trust_tlb.miss_count, 0);
+    /*
+     * percpu_counter_set walks every CPU's shard and zeroes it, so
+     * readers will see a clean count after the next grace period
+     * rather than a torn value from a concurrent sum_positive.
+     */
+    percpu_counter_set(&g_trust_tlb.hit_count, 0);
+    percpu_counter_set(&g_trust_tlb.miss_count, 0);
 }
 
 /*

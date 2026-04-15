@@ -1,0 +1,48 @@
+# drm-direct-allowlist.txt -- GPUs validated to work with gamescope
+# --drm-backend (direct scan-out, lowest-latency path).
+#
+# Format: one rule per line, whitespace-separated:
+#   <vendor_id>  <device_id>   # comment
+# vendor/device are the PCI IDs as printed by:
+#   cat /sys/class/drm/card*/device/{vendor,device}
+# and are matched case-insensitively without the 0x prefix.
+#
+# Lines starting with '#' and blank lines are ignored.
+#
+# Vendor IDs:
+#   0x1002 = AMD/ATI     (amdgpu)
+#   0x10de = NVIDIA      (nouveau / nvidia-drm)
+#   0x8086 = Intel       (i915 / xe)
+#
+# MAINTENANCE: add an entry ONLY after running gamescope with
+# --drm-backend on real hardware for >=60 seconds and verifying no
+# flip errors, no dropped frames, and mode set survives VT switch.
+
+# AMD RDNA2 (validated on 6.6 kernel with amdgpu DC)
+0x1002  0x73bf  # Navi 21  (RX 6800 XT)
+0x1002  0x73df  # Navi 22  (RX 6700 XT)
+0x1002  0x73ff  # Navi 23  (RX 6600)
+0x1002  0x7480  # Navi 24  (RX 6500 XT)
+
+# AMD RDNA3 (validated 6.8+)
+0x1002  0x744c  # Navi 31  (RX 7900 XTX)
+0x1002  0x7550  # Navi 33  (RX 7600)
+
+# NVIDIA Ampere (via nvidia-drm.modeset=1; requires nvidia-open-dkms >=525)
+0x10de  0x2484  # GA104   (RTX 3070)
+0x10de  0x2204  # GA102   (RTX 3090)
+0x10de  0x2487  # GA104   (RTX 3060 Ti)
+
+# NVIDIA Ada (validated 545+)
+0x10de  0x2684  # AD102   (RTX 4090)
+0x10de  0x2704  # AD103   (RTX 4080)
+
+# Intel Arc (xe driver, 6.8+)
+0x8086  0x56a0  # DG2-G10 (Arc A770)
+0x8086  0x56a1  # DG2-G10 (Arc A750)
+
+# NOTE on GT218 / Kepler / pre-Maxwell NVIDIA:
+#   Nouveau's DRM backend works for mode-set but can't reliably flip at
+#   gamescope's cadence on hardware where the PFIFO engine is unreliable.
+#   Explicitly NOT allowlisted; gamescope-launch.sh will fall through to
+#   the nested-Wayland path for these.

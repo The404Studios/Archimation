@@ -53,6 +53,11 @@ from typing import Optional
 
 logger = logging.getLogger("ai-control.cgroup")
 
+# Path constants for NUMA detection (Linux only — on Windows these simply
+# don't exist and the detector returns the single-node fallback).
+NUMA_SYS_PATH = "/sys/devices/system/node"
+NUMA_RUN_SIDECAR = "/run/ai-arch-numa"
+
 # ---------------------------------------------------------------------------
 # Slice name constants
 # ---------------------------------------------------------------------------
@@ -178,6 +183,216 @@ def available() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# NUMA topology detection (Session 33)
+# ---------------------------------------------------------------------------
+# Reads /sys/devices/system/node/nodeN/cpulist to learn which CPUs belong to
+# which NUMA node. The daemon uses this to pass --property=AllowedCPUs= /
+# AllowedMemoryNodes= to systemd-run when spawning PE scopes, so a game
+# process lands on the game-reserved cores without waiting for cgroup.py's
+# promote-to-game-slice step.
+#
+# Cached per-process: NUMA topology can't change without reboot.
+# Returns the SAME shape on Linux, Windows, and NUMA-less systems (a single
+# node with all logical CPUs, recommended_system_cpus="").
+
+
+def _parse_cpulist(text: str) -> list[int]:
+    """Expand a Linux cpulist string (e.g. "0-3,5,7-9") into [0,1,2,3,5,7,8,9].
+
+    Malformed tokens are silently skipped — this function never raises.
+    """
+    out: list[int] = []
+    if not text:
+        return out
+    for tok in text.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "-" in tok:
+            lo_s, _, hi_s = tok.partition("-")
+            try:
+                lo, hi = int(lo_s), int(hi_s)
+            except ValueError:
+                continue
+            if lo > hi:
+                lo, hi = hi, lo
+            out.extend(range(lo, hi + 1))
+        else:
+            try:
+                out.append(int(tok))
+            except ValueError:
+                continue
+    return out
+
+
+def _compact_cpulist(cpus: list[int]) -> str:
+    """Render [0,1,2,3,5,7,8,9] as "0-3,5,7-9" (kernel cpulist format)."""
+    if not cpus:
+        return ""
+    cpus = sorted(set(cpus))
+    parts: list[str] = []
+    start = cpus[0]
+    prev = start
+    for c in cpus[1:]:
+        if c == prev + 1:
+            prev = c
+            continue
+        parts.append(f"{start}-{prev}" if start != prev else str(start))
+        start = c
+        prev = c
+    parts.append(f"{start}-{prev}" if start != prev else str(start))
+    return ",".join(parts)
+
+
+# Cached result of detect_numa_topology(). Reset only on daemon restart.
+_numa_cache: Optional[dict] = None
+
+
+def detect_numa_topology() -> dict:
+    """Return a snapshot of the NUMA topology and a recommended CPU split.
+
+    Structure::
+
+        {
+            'nodes': [
+                {'id': 0, 'cpus': [0, 1, 2, ..., 15]},
+                {'id': 1, 'cpus': [16, 17, ..., 31]},
+            ],
+            'recommended_game_node':  0,
+            'recommended_game_cpus':  '2-15',
+            'recommended_system_cpus': '0-1',
+            'cpu_total': 32,
+            'source': 'sysfs',   # or 'sidecar' | 'fallback' | 'cached'
+        }
+
+    Precedence:
+      1. ``/run/ai-arch-numa`` (written by slice-apply.sh) — authoritative,
+         cross-consistent with the irq-balancer.
+      2. ``/sys/devices/system/node/nodeN/cpulist`` — direct probe.
+      3. ``os.cpu_count()`` fallback — "everything is node 0".
+
+    Never raises. Degrades gracefully on Windows / non-NUMA kernels.
+    """
+    global _numa_cache
+    if _numa_cache is not None:
+        cached = dict(_numa_cache)
+        cached["source"] = "cached"
+        return cached
+
+    # --- Attempt 1: sidecar file from slice-apply.sh --------------------
+    sidecar_vals: dict[str, str] = {}
+    try:
+        if os.path.isfile(NUMA_RUN_SIDECAR):
+            with open(NUMA_RUN_SIDECAR, "r") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, val = line.partition("=")
+                    val = val.strip()
+                    if val.startswith('"') and val.endswith('"') and len(val) >= 2:
+                        val = val[1:-1]
+                    sidecar_vals[key.strip()] = val
+    except OSError:
+        sidecar_vals = {}
+
+    # --- Attempt 2: read /sys/devices/system/node ----------------------
+    nodes: list[dict] = []
+    try:
+        if os.path.isdir(NUMA_SYS_PATH):
+            for entry in sorted(os.listdir(NUMA_SYS_PATH)):
+                if not entry.startswith("node"):
+                    continue
+                nid_s = entry[4:]
+                if not nid_s.isdigit():
+                    continue
+                cpulist_path = os.path.join(NUMA_SYS_PATH, entry, "cpulist")
+                try:
+                    with open(cpulist_path, "r") as fh:
+                        cpulist_txt = fh.read().strip()
+                except OSError:
+                    continue
+                cpus = _parse_cpulist(cpulist_txt)
+                if not cpus:
+                    continue
+                nodes.append({"id": int(nid_s), "cpus": cpus})
+    except OSError:
+        nodes = []
+
+    # Fallback: synthesise a single node from os.cpu_count()
+    cpu_count = os.cpu_count() or 1
+    if not nodes:
+        nodes = [{"id": 0, "cpus": list(range(cpu_count))}]
+        source = "fallback"
+    else:
+        source = "sysfs"
+
+    # Pick the node with the most CPUs (single-socket systems: always node 0)
+    game_node = max(nodes, key=lambda n: len(n["cpus"]))
+    node_cpus = sorted(game_node["cpus"])
+    total_in_node = len(node_cpus)
+
+    # Reservation policy mirrors slice-apply.sh
+    if total_in_node <= 2:
+        reserved_n = 0
+    elif total_in_node >= 8:
+        reserved_n = 2
+    else:
+        reserved_n = 1
+    if reserved_n >= total_in_node:
+        reserved_n = 0
+
+    if reserved_n == 0:
+        reserved_cpus: list[int] = []
+        game_cpus_list = node_cpus
+    else:
+        reserved_cpus = node_cpus[:reserved_n]
+        game_cpus_list = node_cpus[reserved_n:]
+
+    # Prefer sidecar values over our own derivation — they're guaranteed to
+    # match whatever systemd actually has written in the drop-in right now.
+    # Check validity by attempting to parse the cpulist strings.
+    if sidecar_vals:
+        side_game = sidecar_vals.get("GAME_CPUS", "")
+        side_reserved = sidecar_vals.get("RESERVED_CPUS", "")
+        side_node_str = sidecar_vals.get("GAME_NODE", "")
+        side_game_cpus = _parse_cpulist(side_game)
+        if side_game_cpus:
+            game_cpus_list = side_game_cpus
+            reserved_cpus = _parse_cpulist(side_reserved)
+            try:
+                game_node_id = int(side_node_str) if side_node_str else game_node["id"]
+            except ValueError:
+                game_node_id = game_node["id"]
+            source = "sidecar"
+        else:
+            game_node_id = game_node["id"]
+    else:
+        game_node_id = game_node["id"]
+
+    result = {
+        "nodes": nodes,
+        "recommended_game_node": game_node_id,
+        "recommended_game_cpus": _compact_cpulist(game_cpus_list),
+        "recommended_system_cpus": _compact_cpulist(reserved_cpus),
+        "cpu_total": cpu_count,
+        "source": source,
+    }
+    _numa_cache = dict(result)
+    return result
+
+
+def reset_numa_cache() -> None:
+    """Drop the cached NUMA topology (forces a re-probe on next call).
+
+    Called by the coherence daemon after it rewrites /run/ai-arch-numa and
+    SIGHUPs ai-irq-balance. Cheap; the re-probe reads four small files.
+    """
+    global _numa_cache
+    _numa_cache = None
+
+
+# ---------------------------------------------------------------------------
 # 1. Launch PE exe directly into pe-compat.slice/<app>.scope
 # ---------------------------------------------------------------------------
 
@@ -252,6 +467,24 @@ def launch_pe_exe(
         # journal via the API.
         "--quiet",
     ]
+
+    # NUMA pinning for game-slice launches. We set AllowedCPUs at the SCOPE
+    # level (not just inherit from the slice) because some games fork a
+    # helper that would otherwise be free to land on reserved CPUs before
+    # cgroup.procs migration catches up. For non-game slices this is a
+    # no-op (the slice's own AllowedCPUs already covers the scope).
+    if slice_name == SLICE_GAME:
+        try:
+            topo = detect_numa_topology()
+            game_cpus = topo.get("recommended_game_cpus") or ""
+            game_node = topo.get("recommended_game_node")
+            if game_cpus:
+                argv.append(f"--property=AllowedCPUs={game_cpus}")
+            if isinstance(game_node, int):
+                argv.append(f"--property=AllowedMemoryNodes={game_node}")
+        except Exception as exc:  # pragma: no cover -- defensive
+            logger.debug("launch_pe_exe: NUMA detection failed (%s); "
+                         "systemd will use slice defaults", exc)
     # --working-directory must come before the -- separator, not after.
     if cwd:
         argv.append(f"--working-directory={cwd}")

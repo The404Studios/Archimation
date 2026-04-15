@@ -222,6 +222,18 @@ static long trust_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     (void)file;
 
+    /* TRUST_IOC_QUERY_CAPS (T, 110): match by _IOC nr so we stay
+     * ABI-compatible with whichever header version libtrust was built
+     * against.  The struct definition lives in userspace headers
+     * (trust/include/trust_isa.h); we don't need to redefine it
+     * kernel-side — just copy out 16 bytes of fixed layout.
+     * Allowed for any caller that can open /dev/trust. */
+    if (_IOC_TYPE(cmd) == 'T' && _IOC_NR(cmd) == 110 &&
+        _IOC_DIR(cmd) == _IOC_READ &&
+        _IOC_SIZE(cmd) == 16 /* sizeof(trust_ioc_query_caps_t) */) {
+        return trust_cmd_query_caps((void __user *)arg);
+    }
+
     /* Require CAP_SYS_ADMIN for privileged (write) operations.
      * Read-only queries (GET_SCORE, GET_SUBJECT, etc.) are allowed
      * for any process that can open /dev/trust. */
@@ -923,6 +935,12 @@ static int __init trust_init(void)
     mod_timer(&trust_decay_timer,
               jiffies + msecs_to_jiffies(TRUST_DECAY_INTERVAL_MS));
 
+    /* Register /sys/kernel/trust/{stats,caps}.  Non-fatal on failure:
+     * the module stays functional (dispatcher still runs) but the
+     * observability surface is hidden.  Logged once for admins. */
+    if (trust_stats_register() < 0)
+        pr_warn("trust: stats sysfs registration failed; /sys/kernel/trust/{stats,caps} will be absent\n");
+
     pr_info("trust: Root of Authority module loaded - /dev/trust created\n");
     pr_info("trust: Architecture: Dynamic Hyperlation with Self-Consuming Proof Chain\n");
     pr_info("trust: TLB: %d sets x %d ways = %d entries\n",
@@ -954,6 +972,7 @@ static int __init trust_init(void)
 static void __exit trust_exit(void)
 {
     timer_shutdown_sync(&trust_decay_timer);
+    trust_stats_unregister();
     tsc_cleanup();
     tms_cleanup();
     device_destroy(trust_class, trust_dev);

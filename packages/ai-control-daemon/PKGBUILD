@@ -22,10 +22,12 @@ depends=(
     'nftables'
 )
 optdepends=(
-    'python-sdnotify: systemd READY=1 notification'
     'windows-services: Windows SCM service management'
     'llama-cpp-python: local LLM inference support'
 )
+# python-sdnotify removed: AUR-only. We now use a stdlib-only
+# sd_notify implementation in main.py that talks directly to
+# NOTIFY_SOCKET (AF_UNIX datagram). No external dep required.
 provides=('ai-control-daemon')
 backup=(
     'etc/ai-control-daemon/config.toml'

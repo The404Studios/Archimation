@@ -31,6 +31,37 @@ from api_server import create_app, start_server
 logger = logging.getLogger("ai-control")
 
 
+def _notify_systemd(state: str) -> bool:
+    """Send one datagram to systemd's NOTIFY_SOCKET (libsystemd sd_notify(3)
+    protocol). Returns True on success, False when not running under
+    Type=notify (NOTIFY_SOCKET unset) or if the send fails.
+
+    Uses only stdlib (socket + os). Avoids the python-sdnotify dependency
+    which is AUR-only — not available on a minimal Arch pacstrap.
+
+    Supports both filesystem sockets (unix:/path) and abstract namespace
+    sockets (@name → NUL-prefixed). Both forms are documented in
+    systemd.exec(5) NOTIFY_SOCKET.
+    """
+    sock_path = os.environ.get("NOTIFY_SOCKET")
+    if not sock_path:
+        return False
+    addr = "\x00" + sock_path[1:] if sock_path.startswith("@") else sock_path
+    try:
+        # SOCK_CLOEXEC avoids leaking the fd to any future exec()
+        sock = socket.socket(socket.AF_UNIX,
+                             socket.SOCK_DGRAM | socket.SOCK_CLOEXEC)
+        try:
+            sock.connect(addr)
+            sock.sendall(state.encode("utf-8"))
+            return True
+        finally:
+            sock.close()
+    except OSError as e:
+        logger.warning("sd_notify(%r) failed: %s", state, e)
+        return False
+
+
 def _install_sigchld_reaper():
     """Install SIGCHLD = SIG_IGN to auto-reap orphaned children.
 
@@ -289,15 +320,31 @@ async def main():
 
     logger.info(f"Starting API server on {host}:{port} (session={session})")
 
-    server_task = asyncio.create_task(start_server(app, host, port))
+    # Event set by start_server() once uvicorn has bound + lifespan.startup
+    # has completed. Gates systemd READY=1 so the Type=notify contract
+    # reflects real HTTP-accepting state, not just "python is running".
+    uvicorn_ready = asyncio.Event()
+    server_task = asyncio.create_task(start_server(app, host, port, ready_event=uvicorn_ready))
 
-    # Notify systemd we're ready (if running under systemd)
+    # Wait (bounded) for uvicorn to actually start accepting connections
+    # before notifying systemd. On cold boot this is typically <1s;
+    # 60s timeout accommodates slow I/O (QEMU TCG, 1GB Pentium 4).
     try:
-        import sdnotify
-        n = sdnotify.SystemdNotifier()
-        n.notify("READY=1")
-    except ImportError:
-        pass
+        await asyncio.wait_for(uvicorn_ready.wait(), timeout=60.0)
+    except asyncio.TimeoutError:
+        logger.critical("uvicorn did not signal startup within 60s — aborting")
+        server_task.cancel()
+        sys.exit(1)
+
+    # Notify systemd we're ready (if running under systemd with Type=notify).
+    # Uses the native NOTIFY_SOCKET protocol directly — same as libsystemd's
+    # sd_notify(3). We don't depend on python-sdnotify (AUR-only; not in
+    # Arch core/extra) so this works on a minimal pacstrap.
+    _sent = _notify_systemd("READY=1")
+    if _sent:
+        logger.info("Sent READY=1 to systemd (Type=notify)")
+    else:
+        logger.debug("NOTIFY_SOCKET not set; not running under systemd Type=notify")
 
     logger.info("AI Control Daemon ready - full system access enabled")
 

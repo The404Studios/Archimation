@@ -4060,7 +4060,7 @@ def create_app(config: dict):
     return app
 
 
-async def start_server(app, host: str, port: int):
+async def start_server(app, host: str, port: int, ready_event=None):
     """Start the uvicorn server.
 
     access_log is intentionally disabled: every request already gets audit-
@@ -4068,6 +4068,12 @@ async def start_server(app, host: str, port: int):
     uvicorn access log was a redundant second write + format pass per
     request — ~5-10% of CPU on tiny endpoints like /health under load.
     Pick httptools + uvloop where available for additional throughput.
+
+    If `ready_event` is provided, it is set() once uvicorn has finished
+    startup (lifespan.startup complete + socket bound). Callers use this
+    to gate systemd `READY=1` notification so the service unit's
+    `Type=notify` contract reflects real HTTP readiness, not just the
+    Python process being alive.
     """
     import uvicorn
 
@@ -4092,4 +4098,15 @@ async def start_server(app, host: str, port: int):
         pass
     config = uvicorn.Config(**kwargs)
     server = uvicorn.Server(config)
+
+    if ready_event is not None:
+        async def _signal_when_started():
+            # uvicorn.Server.started flips to True after lifespan.startup
+            # completes AND the socket is accepting. Poll at 50 ms; typical
+            # wait is <1 s on warm disk.
+            while not server.started:
+                await asyncio.sleep(0.05)
+            ready_event.set()
+        asyncio.create_task(_signal_when_started())
+
     await server.serve()

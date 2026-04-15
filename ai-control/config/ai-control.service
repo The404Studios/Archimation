@@ -9,7 +9,14 @@ After=network.target
 After=local-fs.target
 
 [Service]
-Type=simple
+# Type=notify: the daemon calls sd_notify(0, "READY=1") AFTER uvicorn has
+# finished its lifespan.startup AND is accepting connections on port 8420.
+# Downstream units with After=ai-control.service can rely on /health being
+# live the moment systemd reports us "active". Prior Type=simple reported
+# active as soon as Python forked, which caused a readiness race (SSH up
+# but /health 404 / connection-refused).
+Type=notify
+NotifyAccess=main
 ExecStart=/usr/bin/ai-control-daemon
 StandardOutput=journal
 StandardError=journal
@@ -32,8 +39,11 @@ Restart=on-failure
 RestartSec=3
 StartLimitIntervalSec=60
 StartLimitBurst=5
-# Fail fast if the daemon can't start within 30s (missing deps, port in use)
-TimeoutStartSec=30
+# Bumped from 30s → 90s to accommodate the cold-start path:
+# Python module imports, FastAPI app construction, cortex/pattern-scanner
+# lazy init, uvloop import, and uvicorn socket bind. On TCG-emulated QEMU
+# this is consistently ~30-45s; 90s gives headroom for 1GB Pentium 4.
+TimeoutStartSec=90
 # No restrictions - AI has full access
 ProtectSystem=false
 ProtectHome=false

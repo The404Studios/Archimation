@@ -262,11 +262,35 @@ get_auth_token() {
         | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
 }
 
-# Test 2: AI Control Daemon status
+# Test 2: AI Control Daemon status.
+# With Type=notify, systemctl reports "activating" until the daemon sends
+# sd_notify(READY=1) after uvicorn binds. That can take 15-45s under TCG.
+# Poll (bounded 90s) for "active"; accept "activating" as in-progress.
+# Separately, fix the "activatingunknown" bug: $(cmd || echo unknown)
+# concatenates both when cmd exits non-zero while printing output.
+get_daemon_status() {
+    local raw
+    raw=$($SSH_ACTIVE "systemctl is-active ai-control 2>/dev/null" 2>/dev/null | tr -d '\r\n' || true)
+    if [ -z "$raw" ]; then raw="unknown"; fi
+    printf '%s' "$raw"
+}
 echo -n "  [2] AI Daemon running: "
 if [ -n "$SSH_USER" ]; then
-    DAEMON_STATUS=$($SSH_ACTIVE "systemctl is-active ai-control 2>/dev/null" 2>/dev/null || echo "unknown")
-    DAEMON_STATUS=$(echo "$DAEMON_STATUS" | tr -d '\r\n')
+    DAEMON_STATUS=$(get_daemon_status)
+    if [ "$DAEMON_STATUS" != "active" ]; then
+        # Not yet active — poll for up to 90s
+        echo ""
+        echo "    Initial status: $DAEMON_STATUS. Polling for active (max 90s)..."
+        for i in $(seq 1 90); do
+            DAEMON_STATUS=$(get_daemon_status)
+            if [ "$DAEMON_STATUS" = "active" ]; then
+                echo "    became active after ${i}s"
+                break
+            fi
+            sleep 1
+        done
+        echo -n "    [2] AI Daemon running: "
+    fi
     if [ "$DAEMON_STATUS" = "active" ]; then
         echo "PASS (active)"
         PASS=$((PASS + 1))
@@ -283,21 +307,44 @@ else
 fi
 
 # Test 3: AI Daemon /health endpoint
+# Poll port 8420 first. With ai-control.service as Type=notify the service
+# is only reported "active" AFTER uvicorn binds — but the test ran before
+# that change landed and still fails fast under TCG if the daemon is mid-
+# startup. Bounded poll matches the pattern used for sshd above.
 echo -n "  [3] AI Daemon /health: "
 if [ -n "$SSH_USER" ]; then
+    echo ""
+    echo "    Polling port 8420 (max 90s) ..."
+    PORT_READY=0
+    for i in $(seq 1 90); do
+        if $SSH_ACTIVE "bash -c 'echo > /dev/tcp/127.0.0.1/8420' 2>/dev/null" 2>/dev/null; then
+            echo "    port 8420 accepting connections after ${i}s"
+            PORT_READY=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$PORT_READY" = "0" ]; then
+        echo "    port 8420 never bound within 90s"
+    fi
+
     SSH_HEALTH=$($SSH_ACTIVE "curl -s --connect-timeout 5 http://localhost:8420/health" 2>/dev/null || echo "")
     if echo "$SSH_HEALTH" | grep -q '"status"' 2>/dev/null; then
-        echo "PASS ($SSH_HEALTH)"
+        echo "    [3] AI Daemon /health: PASS ($SSH_HEALTH)"
         PASS=$((PASS + 1))
     else
-        echo "FAIL (response: '$SSH_HEALTH')"
+        echo "    [3] AI Daemon /health: FAIL (response: '$SSH_HEALTH')"
         FAIL=$((FAIL + 1))
         # Check if port is bound
-        echo "  Checking port 8420..."
-        $SSH_ACTIVE "ss -tlnp 2>/dev/null | grep 8420" 2>/dev/null || echo "  Port 8420 not bound"
+        echo "    Checking port 8420..."
+        $SSH_ACTIVE "ss -tlnp 2>/dev/null | grep 8420" 2>/dev/null || echo "    Port 8420 not bound"
         # Check processes
-        echo "  Python processes:"
-        $SSH_ACTIVE "ps aux 2>/dev/null | grep -i python | grep -v grep" 2>/dev/null || echo "  No python processes"
+        echo "    Python processes:"
+        $SSH_ACTIVE "ps aux 2>/dev/null | grep -i python | grep -v grep" 2>/dev/null || echo "    No python processes"
+        # Journal tail for diagnosis
+        echo "    --- ai-control journal (last 20) ---"
+        $SSH_ACTIVE "journalctl -u ai-control --no-pager -n 20 2>/dev/null" 2>/dev/null || echo "    (no journal)"
+        echo "    --- end journal ---"
     fi
 else
     echo "SKIP (no SSH)"
@@ -306,7 +353,7 @@ fi
 # Test 4: System info endpoint (requires auth token)
 echo -n "  [4] System info /system/info: "
 if [ -n "$SSH_USER" ]; then
-    AUTH_TOKEN=$(get_auth_token)
+    AUTH_TOKEN=$(get_auth_token || true)
     if [ -n "$AUTH_TOKEN" ]; then
         SYS_INFO=$($SSH_ACTIVE "curl -s --connect-timeout 5 -H 'Authorization: Bearer ${AUTH_TOKEN}' http://localhost:8420/system/info" 2>/dev/null || echo "")
         if echo "$SYS_INFO" | grep -q "hostname" 2>/dev/null; then

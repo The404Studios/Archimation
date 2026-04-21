@@ -1,0 +1,283 @@
+{
+  "schema_version": 1,
+  "counts": {
+    "ok": 10,
+    "exempt": 0,
+    "no_emit": 21,
+    "no_consumer": 11,
+    "orphaned": 17,
+    "total": 59
+  },
+  "known_violations": {
+    "PE_EVT_EXCEPTION": {
+      "status": "no_emit",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 47,
+      "source": "pe_event_bus"
+    },
+    "PE_EVT_TRUST_DENY": {
+      "status": "no_emit",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 49,
+      "source": "pe_event_bus"
+    },
+    "PE_EVT_TRUST_ESCALATE": {
+      "status": "orphaned",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 50,
+      "source": "pe_event_bus"
+    },
+    "PE_EVT_DRIVER_LOAD": {
+      "status": "orphaned",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 51,
+      "source": "pe_event_bus"
+    },
+    "PE_EVT_DEVICE_CREATE": {
+      "status": "orphaned",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 52,
+      "source": "pe_event_bus"
+    },
+    "OBJ_EVT_CREATE": {
+      "status": "orphaned",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 55,
+      "source": "pe_event_bus"
+    },
+    "OBJ_EVT_DESTROY": {
+      "status": "orphaned",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 56,
+      "source": "pe_event_bus"
+    },
+    "OBJ_EVT_CONTENTION": {
+      "status": "orphaned",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 57,
+      "source": "pe_event_bus"
+    },
+    "OBJ_EVT_REGISTRY_WRITE": {
+      "status": "orphaned",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 58,
+      "source": "pe_event_bus"
+    },
+    "OBJ_EVT_REGISTRY_DELETE": {
+      "status": "orphaned",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 59,
+      "source": "pe_event_bus"
+    },
+    "OBJ_EVT_DEVICE_ARRIVE": {
+      "status": "orphaned",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 60,
+      "source": "pe_event_bus"
+    },
+    "OBJ_EVT_DEVICE_REMOVE": {
+      "status": "orphaned",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 61,
+      "source": "pe_event_bus"
+    },
+    "SVC_EVT_INSTALL": {
+      "status": "no_consumer",
+      "file": "services/scm/scm_event.h",
+      "line": 18,
+      "source": "pe_event_bus"
+    },
+    "SVC_EVT_START": {
+      "status": "no_consumer",
+      "file": "services/scm/scm_event.h",
+      "line": 19,
+      "source": "pe_event_bus"
+    },
+    "SVC_EVT_STOP": {
+      "status": "no_consumer",
+      "file": "services/scm/scm_event.h",
+      "line": 20,
+      "source": "pe_event_bus"
+    },
+    "SVC_EVT_RESTART": {
+      "status": "no_consumer",
+      "file": "services/scm/scm_event.h",
+      "line": 22,
+      "source": "pe_event_bus"
+    },
+    "TRUST_EVT_SCORE_CHANGE": {
+      "status": "no_emit",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 72,
+      "source": "pe_event_bus"
+    },
+    "TRUST_EVT_TOKEN_STARVE": {
+      "status": "no_emit",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 73,
+      "source": "pe_event_bus"
+    },
+    "TRUST_EVT_IMMUNE_ALERT": {
+      "status": "no_emit",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 74,
+      "source": "pe_event_bus"
+    },
+    "TRUST_EVT_QUARANTINE": {
+      "status": "no_emit",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 75,
+      "source": "pe_event_bus"
+    },
+    "TRUST_EVT_APOPTOSIS": {
+      "status": "orphaned",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 76,
+      "source": "pe_event_bus"
+    },
+    "TRUST_EVT_TRC_CHANGE": {
+      "status": "orphaned",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 77,
+      "source": "pe_event_bus"
+    },
+    "CORTEX_EVT_DECISION": {
+      "status": "orphaned",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 80,
+      "source": "pe_event_bus"
+    },
+    "CORTEX_EVT_AUTONOMY": {
+      "status": "orphaned",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 81,
+      "source": "pe_event_bus"
+    },
+    "CORTEX_EVT_OVERRIDE": {
+      "status": "orphaned",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 82,
+      "source": "pe_event_bus"
+    },
+    "CORTEX_EVT_POLICY": {
+      "status": "orphaned",
+      "file": "pe-loader/include/eventbus/pe_event.h",
+      "line": 83,
+      "source": "pe_event_bus"
+    },
+    "SVC_EVT_HEALTH_OK": {
+      "status": "orphaned",
+      "file": "services/scm/scm_event.h",
+      "line": 24,
+      "source": "pe_event_bus"
+    },
+    "TRUST_ALG_POOL_EXHAUSTION": {
+      "status": "no_emit",
+      "file": "trust/include/trust_algedonic.h",
+      "line": 33,
+      "source": "trust_algedonic_reason"
+    },
+    "TRUST_ALG_APE_EXHAUSTION": {
+      "status": "no_emit",
+      "file": "trust/include/trust_algedonic.h",
+      "line": 34,
+      "source": "trust_algedonic_reason"
+    },
+    "TRUST_ALG_CASCADE_APOPTOSIS": {
+      "status": "no_emit",
+      "file": "trust/include/trust_algedonic.h",
+      "line": 35,
+      "source": "trust_algedonic_reason"
+    },
+    "TRUST_ALG_QUORUM_DISPUTED_REPEATEDLY": {
+      "status": "no_emit",
+      "file": "trust/include/trust_algedonic.h",
+      "line": 36,
+      "source": "trust_algedonic_reason"
+    },
+    "TRUST_ALG_MORPHOGEN_HOT_SPOT": {
+      "status": "no_emit",
+      "file": "trust/include/trust_algedonic.h",
+      "line": 37,
+      "source": "trust_algedonic_reason"
+    },
+    "TRUST_ALG_CANCER_DETECTED": {
+      "status": "no_emit",
+      "file": "trust/include/trust_algedonic.h",
+      "line": 38,
+      "source": "trust_algedonic_reason"
+    },
+    "TRUST_ALG_TPM_DRIFT": {
+      "status": "no_emit",
+      "file": "trust/include/trust_algedonic.h",
+      "line": 39,
+      "source": "trust_algedonic_reason"
+    },
+    "TRUST_ALG_PROOF_CHAIN_BREAK": {
+      "status": "no_emit",
+      "file": "trust/include/trust_algedonic.h",
+      "line": 40,
+      "source": "trust_algedonic_reason"
+    },
+    "TRUST_ALG_TOKEN_STARVATION_STORM": {
+      "status": "no_emit",
+      "file": "trust/include/trust_algedonic.h",
+      "line": 41,
+      "source": "trust_algedonic_reason"
+    },
+    "TRUST_MORPHOGEN_EVENT_MITOSIS": {
+      "status": "no_emit",
+      "file": "trust/kernel/trust_morphogen.h",
+      "line": 60,
+      "source": "trust_morphogen_event"
+    },
+    "TRUST_MORPHOGEN_EVENT_APOPTOSIS": {
+      "status": "no_emit",
+      "file": "trust/kernel/trust_morphogen.h",
+      "line": 61,
+      "source": "trust_morphogen_event"
+    },
+    "TRUST_MORPHOGEN_EVENT_CANCER": {
+      "status": "no_emit",
+      "file": "trust/kernel/trust_morphogen.h",
+      "line": 62,
+      "source": "trust_morphogen_event"
+    },
+    "TRUST_MORPHOGEN_EVENT_QUARANTINE": {
+      "status": "no_emit",
+      "file": "trust/kernel/trust_morphogen.h",
+      "line": 63,
+      "source": "trust_morphogen_event"
+    },
+    "TRUST_MORPHOGEN_EVENT_PROOF_BREAK": {
+      "status": "no_emit",
+      "file": "trust/kernel/trust_morphogen.h",
+      "line": 64,
+      "source": "trust_morphogen_event"
+    },
+    "TRUST_MORPHOGEN_EVENT_GENERIC": {
+      "status": "no_emit",
+      "file": "trust/kernel/trust_morphogen.h",
+      "line": 65,
+      "source": "trust_morphogen_event"
+    },
+    "TRUST_QUORUM_MAJORITY": {
+      "status": "no_consumer",
+      "file": "trust/include/trust_quorum.h",
+      "line": 29,
+      "source": "trust_quorum_verdict"
+    },
+    "TRUST_QUORUM_DISPUTED": {
+      "status": "no_consumer",
+      "file": "trust/include/trust_quorum.h",
+      "line": 30,
+      "source": "trust_quorum_verdict"
+    },
+    "TRUST_QUORUM_APOPTOSIS_CANDIDATE": {
+      "status": "no_consumer",
+      "file": "trust/include/trust_quorum.h",
+      "line": 31,
+      "source": "trust_quorum_verdict"
+    }
+  }
+}

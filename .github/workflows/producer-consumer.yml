@@ -1,0 +1,21 @@
+name: producer-consumer-gate
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+jobs:
+  producer-consumer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Run I-6 producer/consumer lint
+        run: python3 scripts/lint_producer_consumer.py --ci --baseline scripts/producer_consumer_baseline.json --out /tmp/producer-consumer-report.json
+      - name: Show report on failure
+        if: failure()
+        run: cat /tmp/producer-consumer-report.json || true
+      - name: Annotate
+        if: failure()
+        run: echo "::error file=producer-consumer-gate::I-6 invariant violated -- producer declared without consumer. See scripts/lint_producer_consumer.py and docs/architecture-invariants.md §6."

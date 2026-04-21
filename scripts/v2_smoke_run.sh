@@ -18,6 +18,11 @@ mkdir -p "$EXTRACT"
 cd "$EXTRACT" || exit 1
 bsdtar xf "$ISO" arch/boot/x86_64/vmlinuz-linux arch/boot/x86_64/initramfs-linux.img 2>/dev/null
 
+# S74-V: Truncate serial log — QEMU opens file:$SERIAL in O_WRONLY|O_CREAT
+# (no O_TRUNC), so leftover boot text from a prior run causes wait_for_boot
+# to false-match before the new QEMU has written anything.
+: > "$SERIAL"
+
 qemu-system-x86_64 -m 4096 -smp 2 \
     -drive file="$ISO",media=cdrom,if=ide,index=1 \
     -kernel "$EXTRACT/arch/boot/x86_64/vmlinuz-linux" \
@@ -51,12 +56,22 @@ wait_for_boot "$SERIAL" 300
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p $SSH_PORT)
 SSH_USER=""
-if sshpass -p root ssh "${SSH_OPTS[@]}" root@127.0.0.1 "echo SSHOK" 2>/dev/null | grep -q SSHOK; then
-    SSH_USER=root; SSH_PASS=root
-elif sshpass -p arch ssh "${SSH_OPTS[@]}" arch@127.0.0.1 "echo SSHOK" 2>/dev/null | grep -q SSHOK; then
-    SSH_USER=arch; SSH_PASS=arch
-else
-    echo "SSH FAILED"; kill $QEMU 2>/dev/null; exit 1
+# S74-V: Retry SSH for up to 90s — wait_for_boot can match banner text
+# BEFORE sshd binds. Match set_smoke_run.sh's retry pattern.
+for i in $(seq 1 18); do
+    if sshpass -p root ssh "${SSH_OPTS[@]}" root@127.0.0.1 "echo SSHOK" 2>/dev/null | grep -q SSHOK; then
+        SSH_USER=root; SSH_PASS=root
+        echo "  SSH ready after ${i} attempts"
+        break
+    elif sshpass -p arch ssh "${SSH_OPTS[@]}" arch@127.0.0.1 "echo SSHOK" 2>/dev/null | grep -q SSHOK; then
+        SSH_USER=arch; SSH_PASS=arch
+        echo "  SSH ready after ${i} attempts"
+        break
+    fi
+    sleep 5
+done
+if [ -z "$SSH_USER" ]; then
+    echo "SSH FAILED after 90s retry"; kill $QEMU 2>/dev/null; exit 1
 fi
 echo "SSH_USER=$SSH_USER"
 

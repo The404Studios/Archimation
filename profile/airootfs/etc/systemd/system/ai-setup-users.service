@@ -1,0 +1,29 @@
+[Unit]
+## ai-setup-users.service -- first-boot idempotent user/group reconciliation
+##
+## Session 69 (Agent R).  Ensures the default non-root user is a member of
+## trust + pe-compat + wheel/audio/video/input on EVERY boot (oneshot, but
+## idempotent so repeated runs are cheap).  This is the installed-to-disk
+## counterpart to customize_airootfs.sh's compile-time group assignment.
+##
+## Ordering: before ai-control.service so the daemon sees the final group
+## layout when it chgrp's /run/pe-compat/events.sock.
+
+Description=ARCHWINDOWS first-boot user/group reconciliation
+Documentation=file:///usr/share/doc/ARCHWINDOWS/permissions.md
+DefaultDependencies=yes
+After=systemd-sysusers.service local-fs.target
+Before=ai-control.service display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/root/setup-users.sh
+StandardOutput=journal
+StandardError=journal
+RemainAfterExit=yes
+# The script checks-then-creates; failure of one step doesn't abort the
+# rest.  If the script itself is missing, fail silently (non-fatal).
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=multi-user.target

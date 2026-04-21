@@ -276,22 +276,36 @@ static int registry_validate_name(const char *name)
     return 0;
 }
 
+/* Mask off high 32 bits from an HKEY pseudo-handle.
+ *
+ * MinGW PE binaries pass HKEY as a signed LONG (HKEY in <winreg.h> is a typedef
+ * of HANDLE which is a void*, but many apps cast through long). Sign extension
+ * turns 0x80000001 into 0xFFFFFFFF80000001 on 64-bit, which then misses our
+ * range check and switch statements. Apply this mask everywhere we compare an
+ * HKEY to a 0x80000000-series constant. Session 68 audit restored this fix
+ * after it drifted out of tree (S67 memory claimed it was applied; it wasn't).
+ */
+static inline uint32_t hkey_low32(HKEY hKey)
+{
+    return (uint32_t)((uintptr_t)hKey & 0xFFFFFFFFu);
+}
+
 /* Predefined HKEY? */
 static int is_predefined_hkey(HKEY hKey)
 {
-    uintptr_t v = (uintptr_t)hKey;
-    return (v >= 0x80000000 && v <= 0x80000005);
+    uint32_t v = hkey_low32(hKey);
+    return (v >= 0x80000000u && v <= 0x80000005u);
 }
 
 static const char *hkey_to_prefix(HKEY hKey)
 {
-    switch ((uintptr_t)hKey) {
-    case 0x80000000: return "HKCR";
-    case 0x80000001: return "HKCU";
-    case 0x80000002: return "HKLM";
-    case 0x80000003: return "HKU";
-    case 0x80000005: return "HKCC";
-    default:         return NULL;
+    switch (hkey_low32(hKey)) {
+    case 0x80000000u: return "HKCR";
+    case 0x80000001u: return "HKCU";
+    case 0x80000002u: return "HKLM";
+    case 0x80000003u: return "HKU";
+    case 0x80000005u: return "HKCC";
+    default:          return NULL;
     }
 }
 
@@ -752,12 +766,12 @@ static void ensure_init(void)
 static reg_node_t *resolve_hkey(HKEY hk)
 {
     if (!is_predefined_hkey(hk)) return NULL;
-    switch ((uintptr_t)hk) {
-    case 0x80000000: return g_hive_hkcr;
-    case 0x80000001: return g_hive_hkcu;
-    case 0x80000002: return g_hive_hklm;
-    case 0x80000003: return g_hive_hku;
-    case 0x80000005: return g_hive_hkcc;
+    switch (hkey_low32(hk)) {
+    case 0x80000000u: return g_hive_hkcr;
+    case 0x80000001u: return g_hive_hkcu;
+    case 0x80000002u: return g_hive_hklm;
+    case 0x80000003u: return g_hive_hku;
+    case 0x80000005u: return g_hive_hkcc;
     }
     return NULL;
 }
@@ -984,7 +998,7 @@ static reg_node_t *hkey_to_node_locked(HKEY hk, const char *subkey, int create)
 {
     if (is_predefined_hkey(hk)) {
         /* HKCR -> merge resolver */
-        if ((uintptr_t)hk == 0x80000000) {
+        if (hkey_low32(hk) == 0x80000000u) {
             return resolve_hkcr(subkey, create);
         }
         reg_node_t *root = resolve_hkey(hk);
@@ -1013,7 +1027,7 @@ static reg_node_t *hkey_to_node_locked(HKEY hk, const char *subkey, int create)
 static reg_node_t *hkey_to_node_ro(HKEY hk, const char *subkey)
 {
     if (is_predefined_hkey(hk)) {
-        if ((uintptr_t)hk == 0x80000000) {
+        if (hkey_low32(hk) == 0x80000000u) {
             /* HKCR merge: try HKCU, HKLM, legacy in RO mode */
             char classes_sub[PATH_BUF_MAX];
             if (subkey && *subkey)
@@ -1173,7 +1187,7 @@ LONG registry_set_value(HKEY hKey, const char *name, DWORD type,
     if (is_predefined_hkey(hKey)) {
         /* Writing directly on a predefined root (rare) goes to that root
          * (for HKCR we use the write-biased merge resolver). */
-        if ((uintptr_t)hKey == 0x80000000) {
+        if (hkey_low32(hKey) == 0x80000000u) {
             node = resolve_hkcr(NULL, 1);
         } else {
             node = resolve_hkey(hKey);
@@ -1240,7 +1254,7 @@ LONG registry_get_value(HKEY hKey, const char *subkey, const char *name,
 
     /* HKCR fallback - if we resolved on HKCU side but value is only on
      * HKLM (merge semantics).  Only applies when hKey==HKCR root. */
-    if (!v && is_predefined_hkey(hKey) && (uintptr_t)hKey == 0x80000000) {
+    if (!v && is_predefined_hkey(hKey) && hkey_low32(hKey) == 0x80000000u) {
         char classes_sub[PATH_BUF_MAX];
         if (subkey && *subkey)
             snprintf(classes_sub, sizeof(classes_sub),
@@ -1298,7 +1312,7 @@ LONG registry_delete_value(HKEY hKey, const char *name)
     pthread_rwlock_wrlock(&g_reg_rwlock);
     reg_node_t *node = NULL;
     if (is_predefined_hkey(hKey)) {
-        if ((uintptr_t)hKey == 0x80000000) node = resolve_hkcr(NULL, 1);
+        if (hkey_low32(hKey) == 0x80000000u) node = resolve_hkcr(NULL, 1);
         else node = resolve_hkey(hKey);
     } else {
         handle_entry_t *entry = handle_lookup(hKey);
@@ -1437,7 +1451,7 @@ LONG registry_enum_key(HKEY hKey, DWORD index, char *name, DWORD *name_size)
     pthread_rwlock_rdlock(&g_reg_rwlock);
 
     /* HKCR merge enumeration */
-    if (is_predefined_hkey(hKey) && (uintptr_t)hKey == 0x80000000) {
+    if (is_predefined_hkey(hKey) && hkey_low32(hKey) == 0x80000000u) {
         enum { MAX_HKCR_ENTRIES = 4096 };
         static char merged[MAX_HKCR_ENTRIES][KEY_NAME_MAX];
         DWORD count = 0;

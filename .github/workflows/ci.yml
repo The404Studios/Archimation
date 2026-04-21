@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+# Give GitHub the hint that a re-pushed commit supersedes the previous run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Arch build + validate
+    runs-on: ubuntu-latest
+    # GitHub-hosted runners cap free jobs at 360 min; keep well under that.
+    timeout-minutes: 55
+    # Run inside an actual Arch container — we need pacman, makepkg, and
+    # (optionally) mkarchiso. --privileged would allow the full ISO build
+    # but the free-tier runner disallows it. We skip ISO/QEMU via CI_QUICK.
+    container:
+      image: archlinux:latest
+      options: --user root
+
+    env:
+      # Free-tier runners can't nest VMs and mkarchiso needs root + loop
+      # devices that GitHub Actions doesn't reliably provide. Skip by default.
+      CI_QUICK: "1"
+
+    steps:
+      - name: Install base toolchain
+        run: |
+          set -euxo pipefail
+          # Avoid the -Syu full-system upgrade in CI — image is rebuilt daily upstream.
+          # -Sy + targeted install keeps the step under ~60s.
+          pacman -Sy --noconfirm --needed \
+            base-devel \
+            git \
+            python \
+            make \
+            gcc \
+            sudo
+          # Create an unprivileged build user — makepkg refuses to run as root.
+          useradd -m -G wheel builder || true
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' >/etc/sudoers.d/builder
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so scripts/reproducible-build.sh can read commit time.
+          fetch-depth: 0
+
+      - name: Fix repository ownership (for builder user)
+        run: |
+          # Arch container runs as root; checkout is owned by root but we
+          # want the builder user to read/write. Also mark the dir as safe
+          # for git inside the container.
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # Cache the pacman package cache — rebuilding the same PKGBUILDs
+      # re-downloads every dependency otherwise, at ~500MB per run.
+      - name: Cache pacman packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/pacman/pkg
+          key: pacman-${{ runner.os }}-${{ hashFiles('packages/**/PKGBUILD') }}
+          restore-keys: |
+            pacman-${{ runner.os }}-
+
+      - name: Run CI pipeline
+        shell: bash
+        run: |
+          set -uo pipefail
+          chmod +x scripts/ci.sh scripts/reproducible-build.sh || true
+          # makepkg must not run as root — drop to builder for the whole pipeline.
+          sudo -u builder -E bash scripts/ci.sh
+        env:
+          CI_QUICK: ${{ env.CI_QUICK }}
+
+      - name: Upload CI logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 14
+          if-no-files-found: warn

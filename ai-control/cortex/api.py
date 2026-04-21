@@ -493,4 +493,279 @@ def create_cortex_api(
 
         return analysis
 
+    # -- Markov chain introspection ------------------------------------------
+    #
+    # Three read-only endpoints surface the Markov models that drive NL
+    # routing, behavioral anomaly detection, trust-band forecasting, and
+    # decision-engine prediction. They follow the same "no auth dep" pattern
+    # as every other endpoint in this file (cortex api.py has no trust-gate
+    # dependency -- gating lives at the ai-control-daemon layer). Each
+    # sub-section wraps in try/except so a missing module degrades to a
+    # {"status": "unavailable", "reason": str} stanza rather than a 500.
+
+    def _markov_behavioral_snapshot() -> dict:
+        try:
+            try:
+                from ..daemon.behavioral_markov import get_model as _get_behav
+            except Exception:
+                from behavioral_markov import get_model as _get_behav  # type: ignore
+        except Exception as e:
+            return {"status": "unavailable", "reason": str(e)}
+        try:
+            model = _get_behav()
+            pids = model.tracked_pids()
+            per_pid = []
+            total_obs = 0
+            total_ngrams = 0
+            for pid in pids[:32]:  # cap output
+                try:
+                    summary = model.export(pid)
+                except Exception as exc:
+                    summary = {"pid": pid, "error": str(exc)}
+                per_pid.append(summary)
+                total_obs += int(summary.get("total_observations", 0) or 0)
+                total_ngrams += int(summary.get("unique_ngrams", 0) or 0)
+            return {
+                "status": "ok",
+                "n": model.n,
+                "tracked_pids": len(pids),
+                "pids_sampled": len(per_pid),
+                "total_observations": total_obs,
+                "total_unique_ngrams": total_ngrams,
+                "per_pid": per_pid,
+            }
+        except Exception as e:
+            return {"status": "error", "reason": str(e)}
+
+    def _markov_trust_snapshot() -> dict:
+        try:
+            try:
+                from ..daemon import trust_markov as _tm
+            except Exception:
+                import trust_markov as _tm  # type: ignore
+        except Exception as e:
+            return {"status": "unavailable", "reason": str(e)}
+        try:
+            with _tm._chains_lock:
+                subject_ids = list(_tm._chains.keys())
+            total_obs = 0
+            for sid in subject_ids:
+                try:
+                    total_obs += _tm.get_chain(sid).n_observations
+                except Exception:
+                    pass
+            return {
+                "status": "ok",
+                "states": _tm.BAND_NAMES,
+                "state_count": _tm.N_STATES,
+                "absorbing_state": _tm.BAND_NAMES[_tm.ABSORBING_STATE],
+                "tracked_subjects": len(subject_ids),
+                "total_observations": total_obs,
+                "subject_ids": subject_ids[:64],  # cap output
+            }
+        except Exception as e:
+            return {"status": "error", "reason": str(e)}
+
+    def _markov_decision_snapshot() -> dict:
+        # DecisionMarkovModel is documented in cortex.decision_engine -- soft
+        # import so a hypothetical future removal degrades to "unavailable"
+        # instead of crashing. Prefer get_default_model() (same pattern the
+        # behavioral/trust/NL snapshots use) so a live decision stream is
+        # observed. Fall back to a freshly-instantiated model purely so
+        # callers still see the API shape.
+        try:
+            from .decision_engine import (  # type: ignore
+                DecisionMarkovModel, get_default_model,
+            )
+        except Exception as e:
+            try:
+                from .decision_engine import DecisionMarkovModel  # type: ignore
+                get_default_model = None  # type: ignore[assignment]
+                missing_reason = None
+            except Exception as e2:
+                return {
+                    "status": "unavailable",
+                    "reason": f"DecisionMarkovModel not importable: {e2}",
+                }
+        else:
+            missing_reason = None
+
+        # Source-of-truth preference:
+        #   1. decision_engine.markov attribute (explicit engine-owned model)
+        #   2. process-wide singleton via get_default_model()
+        #   3. fresh DecisionMarkovModel()  -- empty, API-shape only
+        try:
+            model = getattr(decision_engine, "markov", None) if decision_engine else None
+            if model is None and get_default_model is not None:
+                try:
+                    model = get_default_model()
+                except Exception:
+                    model = None
+            if model is None:
+                model = DecisionMarkovModel()
+            snap: dict = {"status": "ok"}
+            # Prefer the model's full snapshot() if it exposes one -- gives
+            # us transitions + state_counts + states + total_observations in
+            # a single lock-free-after-capture read.
+            snap_fn = getattr(model, "snapshot", None)
+            if callable(snap_fn):
+                try:
+                    full = snap_fn()
+                    if isinstance(full, dict):
+                        snap.update(full)
+                except Exception as exc:
+                    snap["snapshot_error"] = str(exc)
+            # Duck-type fill-in of commonly-exposed attributes (harmless if
+            # snapshot() already provided them; we only set when missing).
+            for attr in ("state_count", "transition_count", "last_action",
+                         "last_timestamp", "observations"):
+                if attr in snap:
+                    continue
+                if hasattr(model, attr):
+                    try:
+                        snap[attr] = getattr(model, attr)
+                    except Exception:
+                        pass
+            # Top-K transitions -- if snapshot() didn't already supply it.
+            if "top_transitions" not in snap:
+                topk_fn = getattr(model, "top_transitions", None)
+                if callable(topk_fn):
+                    try:
+                        snap["top_transitions"] = topk_fn(k=10)
+                    except Exception as exc:
+                        snap["top_transitions_error"] = str(exc)
+            return snap
+        except Exception as e:
+            return {"status": "error", "reason": str(e)}
+
+    def _markov_nl_snapshot() -> dict:
+        try:
+            try:
+                from ..daemon.markov_nlp import get_default_model as _get_nlp
+            except Exception:
+                from markov_nlp import get_default_model as _get_nlp  # type: ignore
+        except Exception as e:
+            return {"status": "unavailable", "reason": str(e)}
+        try:
+            m = _get_nlp()
+            return {
+                "status": "ok",
+                "trained_pairs": int(getattr(m, "trained_pairs", 0)),
+                "handler_count": len(getattr(m, "handler_totals", {}) or {}),
+                "bigram_emissions": len(getattr(m, "handler_emissions", {}) or {}),
+                "vocab_size": len(getattr(m, "vocab", set()) or set()),
+            }
+        except Exception as e:
+            return {"status": "error", "reason": str(e)}
+
+    # -- GET /cortex/markov/system -------------------------------------------
+
+    @app.get("/cortex/markov/system")
+    async def markov_system():
+        """Aggregated snapshot of every Markov chain the cortex sees.
+
+        Soft-imports each sub-module so a missing component becomes
+        {"status": "unavailable"} rather than a 500. Useful for
+        /status dashboards and on-box diagnostics.
+        """
+        return {
+            "behavioral": _markov_behavioral_snapshot(),
+            "trust_bands": _markov_trust_snapshot(),
+            "decisions": _markov_decision_snapshot(),
+            "nl_routing": _markov_nl_snapshot(),
+            "uptime_seconds": round(time.time() - _start_time, 1),
+        }
+
+    # -- GET /cortex/markov/subject/{subject_id} -----------------------------
+
+    @app.get("/cortex/markov/subject/{subject_id}")
+    async def markov_subject(subject_id: int):
+        """Trust-band Markov chain for a single subject.
+
+        Returns the forecast envelope (current band, transition matrix,
+        expected hitting time to APOPTOSIS, stationary distribution).
+        404 if the subject has no recorded transitions.
+        """
+        try:
+            try:
+                from ..daemon import trust_markov as _tm
+            except Exception:
+                import trust_markov as _tm  # type: ignore
+        except Exception as e:
+            raise HTTPException(
+                status_code=503,
+                detail=f"trust_markov module unavailable: {e}",
+            )
+
+        # Existence check before get_chain creates-on-demand (we don't want
+        # /cortex/markov/subject/99999 to spawn ghost chains).
+        with _tm._chains_lock:
+            if subject_id not in _tm._chains:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"no markov chain for subject_id={subject_id}",
+                )
+
+        try:
+            chain = _tm.get_chain(subject_id)
+            # Call transition_matrix() for the raw matrix snapshot.
+            P = chain.transition_matrix()
+            band_names = _tm.BAND_NAMES
+            # hitting time from every non-APOPTOSIS band
+            hitting = {}
+            for idx in range(1, _tm.N_STATES):
+                try:
+                    eta = chain.expected_time_to_apoptosis(idx)
+                    hitting[band_names[idx]] = (
+                        None if eta == float("inf") else eta
+                    )
+                except Exception:
+                    hitting[band_names[idx]] = None
+            return {
+                "subject_id": subject_id,
+                "states": band_names,
+                "n_observations": chain.n_observations,
+                "transition_matrix": P,
+                "expected_time_to_apoptosis_by_band": hitting,
+                "historical_band_likelihood": {
+                    band_names[i]: chain.likelihood_in_band(i)
+                    for i in range(_tm.N_STATES)
+                },
+                "stationary_distribution": {
+                    band_names[i]: v
+                    for i, v in enumerate(chain.stationary())
+                },
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"markov subject lookup failed: {e}",
+            )
+
+    # -- GET /cortex/markov/decisions ----------------------------------------
+
+    @app.get("/cortex/markov/decisions")
+    async def markov_decisions():
+        """Decision engine bigram Markov snapshot.
+
+        Degrades cleanly if DecisionMarkovModel is not yet wired into the
+        decision engine: returns {"status": "unavailable"} rather than 500.
+        """
+        snap = _markov_decision_snapshot()
+        # Include the underlying decision-engine verdict counts too so the
+        # caller can cross-reference empirical counts against the bigram.
+        if decision_engine is not None:
+            try:
+                snap["verdict_counts"] = dict(decision_engine.stats.get(
+                    "verdict_counts", {}
+                ))
+                snap["total_evaluations"] = int(decision_engine.stats.get(
+                    "evaluations", 0
+                ))
+            except Exception as e:
+                snap["verdict_counts_error"] = str(e)
+        return snap
+
     return app

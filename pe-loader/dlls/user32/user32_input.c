@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "common/dll_common.h"
 #include "../../graphics/gfx_backend.h"
@@ -473,14 +474,25 @@ WINAPI_EXPORT BOOL SetProcessDPIAware(void)
     return TRUE;
 }
 
+/* S68: shcore exports these when libpe_shcore.so is loaded. Declared weak
+ * so user32 links cleanly in headless/unit-test builds where shcore isn't
+ * pulled in. At runtime the dynamic loader resolves them as soon as
+ * libpe_shcore.so is dlopen'd (all DLL stubs are loaded up front). */
+extern UINT shcore_get_dpi_for_hwnd(HWND hwnd) __attribute__((weak));
+extern int  pe_dpi_get_for_xwindow(unsigned long xw, uint32_t *dpiX, uint32_t *dpiY)
+    __attribute__((weak));
+
 WINAPI_EXPORT UINT GetDpiForWindow(HWND hwnd)
 {
-    (void)hwnd;
-    return 96;  /* Standard DPI */
+    if (shcore_get_dpi_for_hwnd)
+        return shcore_get_dpi_for_hwnd(hwnd);
+    return 96;  /* Headless fallback */
 }
 
 WINAPI_EXPORT UINT GetDpiForSystem(void)
 {
+    if (shcore_get_dpi_for_hwnd)
+        return shcore_get_dpi_for_hwnd(NULL);
     return 96;
 }
 

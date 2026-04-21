@@ -329,7 +329,19 @@ dlls/libpe_setupapi.so: $(SETUPAPI_OBJS) $(COMMON_OBJS)
 	$(CC) -shared -o $@ $^ $(LDFLAGS)
 
 # comctl32.dll stub (Common Controls)
-COMCTL32_SRCS = dlls/comctl32/comctl32_controls.c
+# S68: previously only comctl32_controls.c was linked — recent widget work
+# (listview/treeview/button/tab/toolbar/progress/status/runtime) existed on
+# disk but didn't reach libpe_comctl32.so, so the S67/S68 notify + WS_VSCROLL
+# + OOB + lParam fixes weren't actually in the shipped binary.
+COMCTL32_SRCS = dlls/comctl32/comctl32_controls.c \
+                dlls/comctl32/comctl32_listview.c \
+                dlls/comctl32/comctl32_treeview.c \
+                dlls/comctl32/comctl32_button.c \
+                dlls/comctl32/comctl32_tab.c \
+                dlls/comctl32/comctl32_toolbar.c \
+                dlls/comctl32/comctl32_progress.c \
+                dlls/comctl32/comctl32_status.c \
+                dlls/comctl32/comctl_runtime.c
 COMCTL32_OBJS = $(COMCTL32_SRCS:.c=.o)
 
 dlls/comctl32/%.o: dlls/comctl32/%.c
@@ -348,7 +360,8 @@ dlls/comdlg32/%.o: dlls/comdlg32/%.c
 dlls/libpe_comdlg32.so: $(COMDLG32_OBJS) $(COMMON_OBJS)
 	$(CC) -shared -o $@ $^ $(LDFLAGS)
 
-# d3d stubs (DirectX/Direct3D/XInput/D3D12/DirectInput/D3DX)
+# d3d stubs (DirectX/Direct3D/D3D12/DirectInput/D3DX)
+# XInput moved to its own DLL (dlls/xinput/); see target below.
 D3D_SRCS = dlls/d3d/d3d_stubs.c \
            dlls/d3d/d3d9_device.c \
            dlls/d3d/dxgi_factory.c \
@@ -364,6 +377,28 @@ dlls/d3d/%.o: dlls/d3d/%.c
 
 dlls/libpe_d3d.so: $(D3D_OBJS) $(COMMON_OBJS)
 	$(CC) -shared -o $@ $^ $(LDFLAGS) -lm
+
+# xinput1_4.dll (plus xinput1_3 / xinput9_1_0 symlinks) - real evdev backend
+# Just libc + pthread; no libevdev/libudev dependency (brief: keep it lean).
+# Games import xinput1_4.dll / xinput1_3.dll / xinput9_1_0.dll; the import
+# resolver maps all five names to libpe_xinput1_4.so, and the symlinks let
+# dlopen("libpe_xinput1_3.so") also succeed during PE-import fallback paths.
+XINPUT_SRCS = dlls/xinput/xinput_evdev.c
+XINPUT_OBJS = $(XINPUT_SRCS:.c=.o)
+
+dlls/xinput/%.o: dlls/xinput/%.c
+	$(CC) $(DLL_CFLAGS) -c -o $@ $<
+
+dlls/libpe_xinput1_4.so: $(XINPUT_OBJS) $(COMMON_OBJS)
+	$(CC) -shared -o $@ $^ $(LDFLAGS)
+
+# Symlinks: xinput1_3 and xinput9_1_0 both resolve to the same .so.
+# Phony-ish: rebuilt any time libpe_xinput1_4.so changes.
+dlls/libpe_xinput1_3.so: dlls/libpe_xinput1_4.so
+	ln -sf libpe_xinput1_4.so $@
+
+dlls/libpe_xinput9_1_0.so: dlls/libpe_xinput1_4.so
+	ln -sf libpe_xinput1_4.so $@
 
 # ntoskrnl.exe stub (Windows kernel API)
 NTOSKRNL_SRCS = dlls/ntoskrnl/ntoskrnl_io.c \
@@ -585,6 +620,7 @@ dlls: dlls/libpe_kernel32.so dlls/libpe_ntdll.so dlls/libpe_msvcrt.so \
       dlls/libpe_version.so dlls/libpe_shlwapi.so dlls/libpe_crypt32.so \
       dlls/libpe_winmm.so dlls/libpe_iphlpapi.so dlls/libpe_winhttp.so \
       dlls/libpe_setupapi.so dlls/libpe_comctl32.so dlls/libpe_comdlg32.so dlls/libpe_d3d.so \
+      dlls/libpe_xinput1_4.so dlls/libpe_xinput1_3.so dlls/libpe_xinput9_1_0.so \
       dlls/libpe_ntoskrnl.so dlls/libpe_hal.so dlls/libpe_ndis.so \
       dlls/libpe_mscoree.so \
       dlls/libpe_oleaut32.so dlls/libpe_bcrypt.so dlls/libpe_psapi.so \

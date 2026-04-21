@@ -69,11 +69,14 @@ drivers/userspace/devcon: drivers/userspace/devcon.c $(DRIVER_USER_OBJS) $(DRIVE
 	$(CC) $(CFLAGS) -I drivers/stubs -o $@ $^ $(LDFLAGS)
 
 # Anti-cheat compatibility
+# NOTE: vanguard_shim has been moved to research/anticheat/ -- Riot Vanguard is
+# a kernel anti-cheat and loading its shim is an explicit opt-in ban-risk
+# surface. It is NOT built here. See research/anticheat/README.md and the
+# ai-control handler game.enable_anticheat_shim (i_understand_bans=true).
 ANTICHEAT_SRCS = anticheat/ac_compat.c \
                  anticheat/eac_shim.c \
                  anticheat/battleye_shim.c \
                  anticheat/blackshield_shim.c \
-                 anticheat/vanguard_shim.c \
                  anticheat/anticheat_guard.c \
                  anticheat/process_integrity.c \
                  anticheat/kernel_callbacks.c

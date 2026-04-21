@@ -163,6 +163,9 @@ class DecisionEngine:
         # the full timing deque on every /status API call.
         self._stats_cache: Optional[dict] = None
         self._stats_cache_eval_count: int = -1
+        # Last verdict emitted, used to feed the bigram DecisionMarkovModel.
+        # None until the first decision is finalized.
+        self._last_verdict_name: Optional[str] = None
 
         self._load_default_policies()
 
@@ -291,13 +294,28 @@ class DecisionEngine:
         return result
 
     def _finalize(self, result: EvalResult, start: float) -> None:
-        """Record timing and verdict statistics."""
+        """Record timing and verdict statistics.
+
+        Also feeds the process-wide ``DecisionMarkovModel`` singleton so
+        the /cortex/markov/decisions endpoint sees real bigram data. Wrap
+        in try/except so a singleton failure never poisons decision flow.
+        """
         elapsed = time.monotonic() - start
         self._eval_times.append(elapsed)
 
-        self._verdict_counts[result.verdict.name] = (
-            self._verdict_counts.get(result.verdict.name, 0) + 1
+        verdict_name = result.verdict.name
+        self._verdict_counts[verdict_name] = (
+            self._verdict_counts.get(verdict_name, 0) + 1
         )
+
+        # Feed the decision-bigram chain. Always pass through
+        # observe_decision() so the model's internal stream stays
+        # consistent (single source of truth for the (prev, next) pair).
+        try:
+            get_default_model().observe_decision(verdict_name)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("DecisionMarkovModel observe failed: %s", exc)
+        self._last_verdict_name = verdict_name
 
     # -- Tier 1: Policy rules --
 
@@ -650,3 +668,268 @@ class DecisionEngine:
             }
             for r in self._policy_rules
         ]
+
+
+# ---------------------------------------------------------------------------
+# DecisionMarkovModel -- bigram Markov chain over decision verdicts.
+#
+# Session 68 (Agent F): operationalizes the "Decisions" row of the eight-chain
+# table in docs/markov-chains.md. States are the existing `Verdict` enum
+# names (ALLOW / DENY / QUARANTINE / ESCALATE / MODIFY) -- we do NOT invent
+# new verdict tokens; the model only accepts strings that round-trip through
+# the enum.
+#
+# Design constraints:
+#   * Bounded memory: collections.deque(maxlen=1024) for the full observation
+#     stream; transition count matrix is O(|Verdict|^2) = 25 entries max.
+#   * Thread-safe: one Lock protecting every mutation and every derived-read
+#     that walks the counts dict.
+#   * Duck-typed API for cortex/api.py::_markov_decision_snapshot:
+#       state_count / transition_count / last_action / last_timestamp /
+#       observations / top_transitions(k) / snapshot() / next_decision_distribution()
+#   * Test-compat API (tests/integration/test_markov_chains.py:293):
+#       observe_decision(action) -- single-arg append-to-stream variant that
+#         derives the (prev, next) transition from the previous observation.
+#       predict_next(after_action, k) -- returns a sorted list of
+#         (action, prob) tuples; empty list for unknown origin.
+#
+# Hook: DecisionEngine._finalize() now calls into the module-level singleton
+# via get_default_model().observe(prev_verdict_name, result.verdict.name) so
+# that the live decision stream populates the chain without callers needing
+# to know it exists. The wiring is isolated to one line and tolerant of
+# singleton-init failure (wrapped in try/except at call site).
+# ---------------------------------------------------------------------------
+
+
+class DecisionMarkovModel:
+    """Bigram Markov chain over decision verdicts (stateful stream observer).
+
+    States are the names of the ``Verdict`` enum; any other state label is
+    accepted but recorded literally (for forward-compat if the enum grows).
+    The model counts (prev, next) transitions rather than raw emissions so
+    that predict_next() can answer "given I just saw X, what's most likely
+    to come next?" -- which is the question both the test suite and the
+    /cortex/markov/decisions endpoint want answered.
+
+    Memory is bounded in two ways:
+      * ``_observations`` is a bounded deque (maxlen=1024) of the full
+        observation stream, so memory is O(1024) regardless of uptime.
+      * ``_transitions`` is dense-keyed by (prev, next) string tuples.
+        With |Verdict|=5 and the small set of externally-injected labels
+        we'll ever see, the dict has at most a few dozen entries.
+
+    Thread-safety: a single ``threading.Lock`` guards every mutation and
+    every derived-read that walks the internal dicts. Readers of simple
+    attributes (``state_count``, ``observations``) do not take the lock;
+    they rely on the GIL for atomic int/len reads.
+    """
+
+    __slots__ = (
+        "_lock", "_transitions", "_state_counts", "_stream",
+        "_last_action", "_last_timestamp", "_total_observations",
+    )
+
+    # Canonical state set. We expose Verdict names rather than ints so the
+    # snapshot JSON is self-describing.
+    STATES: List[str] = [v.name for v in Verdict]
+
+    # Max length of the observation stream (the prompt calls for 1024).
+    _MAX_OBSERVATIONS: int = 1024
+
+    def __init__(self) -> None:
+        import threading as _threading
+        self._lock = _threading.Lock()
+        # (prev_state, next_state) -> count
+        self._transitions: Dict[tuple, int] = {}
+        # per-state visit counts (counts BOTH prev and next endpoints)
+        self._state_counts: Dict[str, int] = {}
+        # bounded stream of raw actions for observe_decision() chaining
+        self._stream: Deque[str] = deque(maxlen=self._MAX_OBSERVATIONS)
+        self._last_action: Optional[str] = None
+        self._last_timestamp: Optional[float] = None
+        self._total_observations: int = 0
+
+    # --- Observation API (two variants: pair + single) ---------------------
+
+    def observe(self, prev_decision: str, next_decision: str) -> None:
+        """Increment the (prev -> next) transition count.
+
+        Either argument may be any hashable string; we do not reject
+        unknown state names (forward-compat), but known names are matched
+        against ``Verdict`` for the state-count tally.
+        """
+        if not isinstance(prev_decision, str) or not isinstance(next_decision, str):
+            return
+        with self._lock:
+            key = (prev_decision, next_decision)
+            self._transitions[key] = self._transitions.get(key, 0) + 1
+            self._state_counts[prev_decision] = self._state_counts.get(prev_decision, 0) + 1
+            self._state_counts[next_decision] = self._state_counts.get(next_decision, 0) + 1
+            self._last_action = next_decision
+            self._last_timestamp = time.time()
+            self._total_observations += 1
+
+    def observe_decision(self, action: str) -> None:
+        """Append ``action`` to the stream; derive (prev, action) if stream non-empty.
+
+        This matches the test-suite contract -- feeding a sequence of raw
+        actions produces the bigram chain implicitly. First call is a
+        no-op for transitions (no predecessor) but still records the state
+        for state_counts tracking.
+        """
+        if not isinstance(action, str):
+            return
+        prev: Optional[str]
+        with self._lock:
+            prev = self._stream[-1] if self._stream else None
+            self._stream.append(action)
+        if prev is None:
+            # First observation: just record the state visit.
+            with self._lock:
+                self._state_counts[action] = self._state_counts.get(action, 0) + 1
+                self._last_action = action
+                self._last_timestamp = time.time()
+                self._total_observations += 1
+            return
+        self.observe(prev, action)
+
+    # --- Read-only derived quantities --------------------------------------
+
+    def next_decision_distribution(self, current: str) -> Dict[str, float]:
+        """Normalized P(next | current) over observed transitions out of ``current``.
+
+        Returns an empty dict if ``current`` has never been observed as a
+        predecessor. Probabilities sum to 1.0 modulo float error when the
+        dict is non-empty.
+        """
+        with self._lock:
+            out_counts: Dict[str, int] = {}
+            for (prev, nxt), c in self._transitions.items():
+                if prev == current and c > 0:
+                    out_counts[nxt] = out_counts.get(nxt, 0) + c
+        total = sum(out_counts.values())
+        if total == 0:
+            return {}
+        return {k: v / total for k, v in out_counts.items()}
+
+    def predict_next(self, after_action: str, k: int = 3) -> List[tuple]:
+        """Top-k (next_state, probability) tuples sorted by descending probability.
+
+        Empty list for unknown origin (matches the defensive contract in
+        test_decision_markov_observation_records).
+        """
+        dist = self.next_decision_distribution(after_action)
+        if not dist:
+            return []
+        ranked = sorted(dist.items(), key=lambda kv: kv[1], reverse=True)
+        return ranked[: max(1, int(k))]
+
+    def top_transitions(self, k: int = 10) -> List[dict]:
+        """Top-k highest-count (prev -> next) transitions, for telemetry.
+
+        Returns a list of dicts shaped for JSON so the /cortex/markov/decisions
+        endpoint can emit them directly.
+        """
+        with self._lock:
+            items = sorted(
+                self._transitions.items(),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )[: max(1, int(k))]
+        return [
+            {"from": prev, "to": nxt, "count": c}
+            for (prev, nxt), c in items
+        ]
+
+    def snapshot(self) -> dict:
+        """JSON-safe telemetry snapshot.
+
+        Keys documented for /cortex/markov/decisions callers:
+          * states:              full Verdict name list (stable enumeration)
+          * state_counts:        state -> visit count
+          * transitions:         "prev->next" -> count
+          * top_transitions:     top-10 list of {from, to, count}
+          * total_observations:  integer, monotonically increasing
+        """
+        with self._lock:
+            transitions_str = {
+                f"{prev}->{nxt}": c
+                for (prev, nxt), c in self._transitions.items()
+            }
+            state_counts = dict(self._state_counts)
+            total = self._total_observations
+            last_action = self._last_action
+            last_ts = self._last_timestamp
+        return {
+            "states": list(self.STATES),
+            "state_counts": state_counts,
+            "transitions": transitions_str,
+            "top_transitions": self.top_transitions(k=10),
+            "total_observations": total,
+            "last_action": last_action,
+            "last_timestamp": last_ts,
+        }
+
+    # --- Duck-typed attributes for cortex/api.py snapshot ------------------
+
+    @property
+    def state_count(self) -> int:
+        """Number of distinct states observed (INCLUDING non-Verdict strings)."""
+        return len(self._state_counts)
+
+    @property
+    def transition_count(self) -> int:
+        """Number of distinct (prev, next) transitions observed."""
+        return len(self._transitions)
+
+    @property
+    def last_action(self) -> Optional[str]:
+        return self._last_action
+
+    @property
+    def last_timestamp(self) -> Optional[float]:
+        return self._last_timestamp
+
+    @property
+    def observations(self) -> int:
+        """Total number of observe()/observe_decision() calls that recorded state."""
+        return self._total_observations
+
+    def reset(self) -> None:
+        """Drop all observations. Test-only; safe in production."""
+        with self._lock:
+            self._transitions.clear()
+            self._state_counts.clear()
+            self._stream.clear()
+            self._last_action = None
+            self._last_timestamp = None
+            self._total_observations = 0
+
+
+# Module-level lazy singleton -- mirrors markov_nlp.get_default_model() pattern.
+_default_decision_model: Optional[DecisionMarkovModel] = None
+_default_decision_lock = None  # lazily created to avoid import-time threading cost
+
+
+def get_default_model() -> DecisionMarkovModel:
+    """Return the process-wide DecisionMarkovModel singleton (lazy-init).
+
+    The same pattern markov_nlp / behavioral_markov / trust_markov use. The
+    singleton can be reset via reset_default_model() for deterministic tests.
+    """
+    global _default_decision_model, _default_decision_lock
+    if _default_decision_model is not None:
+        return _default_decision_model
+    if _default_decision_lock is None:
+        import threading as _threading
+        _default_decision_lock = _threading.Lock()
+    with _default_decision_lock:
+        if _default_decision_model is None:
+            _default_decision_model = DecisionMarkovModel()
+    return _default_decision_model
+
+
+def reset_default_model() -> None:
+    """Drop the process-wide singleton (test helper)."""
+    global _default_decision_model
+    _default_decision_model = None

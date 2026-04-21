@@ -1,0 +1,52 @@
+# bootc/trust-keys/.gitignore
+#
+# ABSOLUTELY NO PRIVATE KEY MATERIAL IS TRACKED IN THIS REPO.
+# The project MOK private key lives in CI secrets (GHCR / GitHub Actions
+# secret store). Dev machines generate their own ephemeral keys here;
+# neither the private nor the public key ever hits git.
+#
+# Tracked: this .gitignore, README.md (lifecycle docs), and any
+# *.example / *.template sample files that show FORMAT only.
+#
+# Ignored: everything that could be a real key.
+
+# Private keys — PEM, DER, PKCS#8, OpenSSH, sshd, GPG
+*.pem
+*.key
+*.priv
+*.pkcs8
+*.pkcs12
+*.p12
+*.pfx
+
+# DER certs get split into pub/priv; ignore all .der except *.example.der
+*.der
+!*.example.der
+
+# sign-file / module signing intermediates
+*.x509
+signing_key.*
+module_signing_key.*
+
+# sbctl / shim MOK artifacts
+mok.*
+MOK.*
+*.der.priv
+
+# systemd-cryptenroll TPM policy artifacts that reference keys
+*.pcrlock
+*.pcrlock.sig
+
+# scratch output from CI build runs
+dist/
+build/
+out/
+tmp/
+*.asc
+*.gpg
+
+# But DO keep:
+!README.md
+!.gitignore
+!*.example
+!*.template

@@ -3,7 +3,7 @@
 
 pkgname=ai-control-daemon
 pkgver=0.1.0
-pkgrel=1
+pkgrel=23
 pkgdesc="AI control daemon providing full system access via REST API (screen, keyboard, mouse, filesystem, processes)"
 arch=('any')
 url="https://github.com/ai-arch-linux/ai-control-daemon"
@@ -24,6 +24,7 @@ depends=(
 optdepends=(
     'windows-services: Windows SCM service management'
     'llama-cpp-python: local LLM inference support'
+    'mono: run .NET 4.x PE binaries via mscoree bridge (CLR runtime + mcs compiler)'
 )
 # python-sdnotify removed: AUR-only. We now use a stdlib-only
 # sd_notify implementation in main.py that talks directly to
@@ -78,6 +79,33 @@ package() {
 exec /usr/bin/python3 /usr/lib/ai-control-daemon/main.py \
     --config /etc/ai-control-daemon/config.toml "$@"
 LAUNCHER
+
+    # Session 68 (Agent G): ship the PowerShell first-boot installer so the
+    # ai-install-pwsh.service oneshot has something to exec.  pwsh is
+    # AUR-only (powershell-bin) and the MS tarball installer avoids adding
+    # an AUR dep to pacstrap; we pull it over the network on first boot only.
+    if [ -f "${startdir}/../../scripts/install-pwsh.sh" ]; then
+        install -Dm755 "${startdir}/../../scripts/install-pwsh.sh" \
+            "$pkgdir/usr/share/ai-control/scripts/install-pwsh.sh"
+    fi
+
+    # Session 68: compile and ship the dictionary_v2 template artifact
+    # (~8000 NL phrases → typed handler_type).  contusion.py's Stage-1
+    # routing probes /var/cache/ai-control/dictionary_v2.pkl.zst first;
+    # without this file the v2 fast-path degrades silently to stage-2
+    # regex routing, which was the 0/33 set_smoke regression in pkg-17.
+    # Compile here so the artifact ships in the package even when the
+    # build host has no ai-control-daemon service running.
+    if python3 daemon/dictionary_v2.py --build \
+        "$pkgdir/var/cache/ai-control/dictionary_v2.pkl.zst" 2>&1 | tail -3; then
+        # Strip world-writable perms — _validate_pickle_source() refuses to
+        # load a pickle whose parent dir or file is o+w (pickle-injection
+        # hardening from S63).
+        chmod 755 "$pkgdir/var/cache/ai-control" 2>/dev/null || true
+        chmod 644 "$pkgdir/var/cache/ai-control/dictionary_v2.pkl.zst" 2>/dev/null || true
+    else
+        echo "WARNING: dictionary_v2 build failed -- v2 fast-path will be unavailable on the live ISO" >&2
+    fi
 
     # AI Cortex (the brain)
     install -dm755 "$pkgdir/usr/lib/ai-control-daemon/cortex"

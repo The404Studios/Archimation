@@ -32,6 +32,7 @@
 #include <crypto/hash.h>
 #include <crypto/sha2.h>
 #include "trust_internal.h"
+#include "trust_ape.h"    /* trust_ape_markov_validator() prototype */
 
 /* Global APE state */
 trust_ape_t g_trust_ape;
@@ -253,6 +254,14 @@ void trust_ape_init(void)
     for (i = 0; i < APE_INDEX_SIZE; i++)
         g_ape_index[i] = APE_INDEX_EMPTY;
     pr_info("trust_ape: Authority Proof Engine initialized (software emulation)\n");
+
+    /*
+     * Session 68 wiring (was "Session 59 handoff" per trust_ape.h:165-175):
+     * run the Theorem 3 (Reconfiguration Unpredictability) chi-square
+     * witness at module load. Result is logged to dmesg; never fails
+     * module load.
+     */
+    trust_ape_markov_validator();
 }
 
 /*

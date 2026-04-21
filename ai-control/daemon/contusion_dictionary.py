@@ -2759,6 +2759,15 @@ class Action:
     security: str = "safe"
     trust: int = 100
     confirm: bool = False       # Requires user confirmation before execution
+    # S68: optional routing discriminator used by contusion.py to dispatch the
+    # action to the right handler. When set (common value: "legacy.shell_exec"),
+    # the /contusion/context response carries it through so downstream callers
+    # can see which code path handled the instruction. Prior to this session
+    # 28 call sites already passed handler_type=... via keyword-arg, but the
+    # dataclass lacked the field — every one of them crashed at construction
+    # with TypeError (uncovered by set_smoke on pkg-17). Making it Optional
+    # keeps all existing code working.
+    handler_type: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -3013,6 +3022,7 @@ class ContextEngine:
                 type="type", value=text,
                 description=f"Type text: {text[:40]}",
                 security="safe", trust=100,
+                handler_type="legacy.shell_exec",
             )]
 
         # "press <key>" -> Action(press, "<key>")
@@ -3023,6 +3033,7 @@ class ContextEngine:
                 type="press", value=key,
                 description=f"Press key: {key}",
                 security="safe", trust=100,
+                handler_type="legacy.shell_exec",
             )]
 
         # "click <x>,<y>" -> Action(click, "x,y")
@@ -3033,6 +3044,7 @@ class ContextEngine:
                 value=f"{click_match.group(1)},{click_match.group(2)}",
                 description=f"Click at ({click_match.group(1)}, {click_match.group(2)})",
                 security="safe", trust=100,
+                handler_type="legacy.shell_exec",
             )]
 
         # "screenshot" / "take a screenshot" / "take screenshot" / "capture screen"
@@ -3044,6 +3056,7 @@ class ContextEngine:
                 type="screenshot", value="",
                 description="Capture a screenshot",
                 security="safe", trust=100,
+                handler_type="legacy.shell_exec",
             )]
 
         # "close window" / "close active window"
@@ -3052,6 +3065,7 @@ class ContextEngine:
                 type="press", value="alt+F4",
                 description="Close active window",
                 security="safe", trust=100,
+                handler_type="legacy.shell_exec",
             )]
 
         # "minimize window"
@@ -3060,6 +3074,7 @@ class ContextEngine:
                 type="run", value="xdotool getactivewindow windowminimize",
                 description="Minimize active window",
                 security="safe", trust=100,
+                handler_type="legacy.shell_exec",
             )]
 
         # "maximize window"
@@ -3068,6 +3083,7 @@ class ContextEngine:
                 type="run", value="xdotool key --clearmodifiers super+Up",
                 description="Maximize active window",
                 security="safe", trust=100,
+                handler_type="legacy.shell_exec",
             )]
 
         # --- Time / date queries --------------------------------------
@@ -3077,6 +3093,7 @@ class ContextEngine:
                 type="run", value="date +'%H:%M:%S %Z (%A, %B %d %Y)'",
                 description="Show current time",
                 security="safe", trust=100,
+                handler_type="legacy.shell_exec",
             )]
 
         if re.search(r'\b(?:what\s+(?:is\s+)?(?:the\s+)?)?date\b', part) and \
@@ -3085,6 +3102,7 @@ class ContextEngine:
                 type="run", value="date +'%A, %B %d %Y'",
                 description="Show today's date",
                 security="safe", trust=100,
+                handler_type="legacy.shell_exec",
             )]
 
         # --- App launch detection ---
@@ -3121,6 +3139,7 @@ class ContextEngine:
                         description=f"Open {profile.name} with {url}",
                         security="safe",
                         trust=100,
+                        handler_type="legacy.shell_exec",
                     ))
                 elif url_words:
                     target = url_words.group(1)
@@ -3136,12 +3155,14 @@ class ContextEngine:
                         description=f"Open {profile.name} to {target}",
                         security="safe",
                         trust=100,
+                        handler_type="legacy.shell_exec",
                     ))
                     # Type URL and press enter for browsers
                     if any(c in profile.categories for c in ["browser"]):
                         actions.append(Action(
                             type="wait", value="2",
                             description="Wait for browser to open",
+                            handler_type="legacy.shell_exec",
                         ))
                 else:
                     actions.append(Action(
@@ -3150,6 +3171,7 @@ class ContextEngine:
                         description=f"Launch {profile.name}",
                         security="safe",
                         trust=100,
+                        handler_type="legacy.shell_exec",
                     ))
                 return actions
             # Check if it is an .exe
@@ -3164,6 +3186,7 @@ class ContextEngine:
                     description=f"Run Windows executable {exe_path}",
                     security="moderate",
                     trust=300,
+                    handler_type="legacy.shell_exec",
                 ))
                 return actions
 
@@ -3180,6 +3203,7 @@ class ContextEngine:
                     description=f"Launch {first_word} (not in app library)",
                     security="moderate",
                     trust=300,
+                    handler_type="legacy.shell_exec",
                 ))
                 return actions
 
@@ -3204,6 +3228,7 @@ class ContextEngine:
                 description=entry["desc"] + f": {pkg}",
                 security=entry["security"],
                 trust=entry["trust"],
+                handler_type="legacy.shell_exec",
             ))
             return actions
 
@@ -3224,6 +3249,7 @@ class ContextEngine:
                     description=f"{verb.title()} service {service}",
                     security=entry["security"],
                     trust=entry["trust"],
+                    handler_type="legacy.shell_exec",
                 ))
                 return actions
 
@@ -3239,6 +3265,7 @@ class ContextEngine:
                 description=f"Show largest items in {path}",
                 security="safe",
                 trust=100,
+                handler_type="legacy.shell_exec",
             ))
             return actions
 
@@ -3248,6 +3275,7 @@ class ContextEngine:
                 type="run", value="df -h",
                 description="Show disk space usage",
                 security="safe", trust=100,
+                handler_type="legacy.shell_exec",
             ))
             return actions
 
@@ -3257,6 +3285,7 @@ class ContextEngine:
                 type="run", value="neofetch",
                 description="Show system information",
                 security="safe", trust=100,
+                handler_type="legacy.shell_exec",
             ))
             return actions
 
@@ -3266,6 +3295,7 @@ class ContextEngine:
                 type="run", value="ip addr show",
                 description="Show network interfaces",
                 security="safe", trust=100,
+                handler_type="legacy.shell_exec",
             ))
             return actions
 
@@ -3275,6 +3305,7 @@ class ContextEngine:
                 type="run", value="ps aux --sort=-%cpu | head -20",
                 description="List top processes by CPU",
                 security="safe", trust=100,
+                handler_type="legacy.shell_exec",
             ))
             return actions
 
@@ -3287,6 +3318,7 @@ class ContextEngine:
                     type="run", value=f"kill {target}",
                     description=f"Send SIGTERM to PID {target}",
                     security="moderate", trust=300,
+                    handler_type="legacy.shell_exec",
                 ))
             else:
                 actions.append(Action(
@@ -3295,6 +3327,7 @@ class ContextEngine:
                     description=f"Kill processes matching '{target}'",
                     security="dangerous", trust=600,
                     confirm=True,
+                    handler_type="legacy.shell_exec",
                 ))
             return actions
 
@@ -3311,6 +3344,7 @@ class ContextEngine:
                 value=f"grep -rn {shlex.quote(pattern)} {shlex.quote(path)}",
                 description=f"Search for '{pattern}' in {path}",
                 security="safe", trust=100,
+                handler_type="legacy.shell_exec",
             ))
             return actions
 
@@ -3351,6 +3385,7 @@ class ContextEngine:
                     security=entry.get("security", "safe"),
                     trust=entry.get("trust", 100),
                     confirm=entry.get("confirm", False),
+                    handler_type="legacy.shell_exec",
                 ))
                 return actions
 
@@ -3367,6 +3402,7 @@ class ContextEngine:
                 description="Execute as raw command",
                 security="moderate",
                 trust=300,
+                handler_type="legacy.shell_exec",
             )
         # Otherwise suggest a search
         return Action(
@@ -3375,6 +3411,7 @@ class ContextEngine:
             description=f"Could not parse request; try searching: {text}",
             security="safe",
             trust=100,
+            handler_type="legacy.shell_exec",
         )
 
 

@@ -34,6 +34,7 @@
 #include "trust_internal.h"
 #include "trust_memory.h"
 #include "trust_syscall.h"
+#include "trust_attest.h"
 
 #define DEVICE_NAME "trust"
 #define CLASS_NAME  "trust"
@@ -855,6 +856,25 @@ static int __init trust_init(void)
 
     pr_info("trust: Root of Authority module loading...\n");
 
+    /*
+     * Boot attestation MUST run first.  If the PCR 11 measurement
+     * does not match the value provisioned by the bootc image build,
+     * we refuse to create /dev/trust — authority operations silently
+     * disable.  On hardware without a TPM 2.0 chip (or with explicit
+     * trust.attest=skip), we degrade to SOFTWARE mode and continue,
+     * but with a prominent dmesg warning that userspace can see.
+     * See trust/kernel/trust_attest.c and docs/research/s72_gamma_tpm2_attest.md.
+     */
+    ret = trust_attest_init();
+    if (ret != 0) {
+        pr_err("trust: attestation FAILED — module refusing to initialize (rc=%d)\n",
+               ret);
+        trust_attest_cleanup();
+        return -EACCES;
+    }
+    pr_info("trust: attestation mode = %s\n",
+            trust_attest_mode_name(trust_attest_mode()));
+
     /* Initialize all subsystems */
     ret = trust_tlb_init();
     if (ret < 0) {
@@ -986,6 +1006,7 @@ static void __exit trust_exit(void)
      * torn down (no more ioctl paths will call into policy). */
     trust_policy_cleanup();
     trust_tlb_cleanup();
+    trust_attest_cleanup();
     pr_info("trust: Root of Authority module unloaded\n");
 }
 

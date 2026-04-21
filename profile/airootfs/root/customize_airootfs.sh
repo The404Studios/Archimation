@@ -15,14 +15,27 @@ if ! getent group autologin &>/dev/null; then
     echo "Created group 'autologin'"
 fi
 
+# --- Session 69 (Agent R): trust + pe-compat groups for non-root daemon access ---
+# trust    -- /dev/trust read-ioctl access (MODE=0660,GROUP=trust in 70-trust.rules)
+# pe-compat-- /run/pe-compat/events.sock subscribe access (0660,GROUP=pe-compat)
+# trust-system's sysusers.d/trust.conf also creates these on installed-to-disk
+# systems; this block handles the live-ISO chroot path where systemd-sysusers
+# hasn't run yet.
+for g in trust pe-compat; do
+    if ! getent group "$g" &>/dev/null; then
+        groupadd -r "$g"
+        echo "Created group '$g'"
+    fi
+done
+
 # --- Create the 'arch' user for autologin ---
 if ! id "arch" &>/dev/null; then
-    useradd -m -G wheel,video,audio,input,network,storage,games,users,autologin -s /bin/bash arch
+    useradd -m -G wheel,video,audio,input,network,storage,games,users,autologin,trust,pe-compat -s /bin/bash arch
     echo "arch:arch" | chpasswd
     echo "Created user 'arch'"
 else
     # Ensure existing user is in all required groups (including autologin + users for polkit)
-    usermod -aG wheel,video,audio,input,network,storage,games,users,autologin arch
+    usermod -aG wheel,video,audio,input,network,storage,games,users,autologin,trust,pe-compat arch
     echo "User 'arch' already exists, updated groups"
 fi
 
@@ -616,6 +629,21 @@ for dir in /etc/skel/Desktop /home/arch/Desktop; do
             [ -f "$f" ] && chmod +x "$f"
         done
     fi
+done
+
+# --- Session 68/69: profile/airootfs/usr/bin/ scripts lose the execute bit
+# when the source tree lives on NTFS (/mnt/c/...), so mkarchiso bakes them in
+# as 644 and users hitting `ai-health` or `ai-install-to-disk` get Permission
+# denied. Restore +x on shell scripts in /usr/bin and generators so they
+# actually run on the live ISO and the installed system.
+for f in \
+    /usr/bin/ai-health \
+    /usr/bin/ai-install-to-disk \
+    /usr/bin/ai-control-daemon \
+    /usr/bin/ai-cortex \
+    /usr/bin/pe-status \
+    /usr/lib/systemd/system-generators/ai-safe-mode-generator; do
+    [ -f "$f" ] && chmod 755 "$f"
 done
 
 # --- Create .xprofile for arch user (ensures session environment) ---

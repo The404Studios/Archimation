@@ -91,7 +91,24 @@ int scm_start_service(const char *name)
             name, svc->type, svc->binary_path);
 
     if (svc->type == SERVICE_KERNEL_DRIVER || svc->type == SERVICE_FILE_SYSTEM_DRIVER) {
-        /* Kernel drivers: handled by the WDM host module */
+        /* Kernel drivers require the WDM host kernel module (wdm_host.ko) to
+         * be loaded; it owns the kernel-side PE IAT walker and trust gate. If
+         * /dev/wdm_host is not present we MUST NOT lie about SERVICE_RUNNING
+         * -- Session 65 moved from fake-RUNNING to honest refusal because
+         * lying breaks dependency graphs and hides real missing-driver bugs.
+         * See services/drivers/kernel/wdm_host.* and trust_ape TRUST_ACTION_LOAD_KERNEL_BINARY. */
+        if (access("/dev/wdm_host", F_OK) != 0) {
+            fprintf(stderr, "[scm_api] Kernel driver refused: /dev/wdm_host unavailable "
+                    "(wdm_host.ko not loaded) for service '%s' (binary='%s'): %s\n",
+                    name, svc->binary_path, strerror(errno));
+            svc->state = SERVICE_STOPPED;
+            svc->pid = 0;
+            write_status_file(name, SERVICE_STOPPED, 0);
+            return -1;
+        }
+        /* WDM host present -- proceed with kernel-driver registration via the
+         * wdm_host IOCTL path. The actual load is issued by the wdm_host
+         * consumer; SCM records the RUNNING state once the driver binds. */
         fprintf(stderr, "[scm_api] Kernel driver - registering with WDM host\n");
         svc->state = SERVICE_RUNNING;
         svc->pid = 0;

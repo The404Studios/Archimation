@@ -1,0 +1,7 @@
+# Per-user config for the `ai` CLI.
+# See /usr/share/doc/ai-control/ai-cli.md for the full surface.
+daemon_url = "http://127.0.0.1:8420"
+auth_token = ""              # leave empty for localhost-bootstrap
+auto_confirm_threshold = 0.85
+verbosity = "normal"         # "quiet" | "normal" | "verbose"
+editor = ""                  # empty = use $EDITOR or vi

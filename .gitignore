@@ -84,3 +84,9 @@ Thumbs.db
 
 # Claude Code runtime state
 .claude/scheduled_tasks.lock
+
+# Local session artifacts (transcripts, CI log dumps, scratch probes)
+/info/
+/logs/
+/tmp_*.py
+/tmp_*.sh

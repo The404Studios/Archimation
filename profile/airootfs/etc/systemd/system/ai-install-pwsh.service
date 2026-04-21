@@ -1,0 +1,28 @@
+[Unit]
+Description=One-shot Microsoft PowerShell installation (first boot only)
+Documentation=file:///usr/share/ai-control/scripts/install-pwsh.sh
+# Session 68 (Agent G): pwsh is AUR-only on Arch, so we pacstrap nothing and
+# pull the official MS tarball on first boot instead.  Gated on the binary
+# being absent so subsequent boots are no-ops (RemainAfterExit keeps systemd
+# happy either way).
+ConditionPathExists=!/usr/bin/pwsh
+ConditionPathExists=/usr/share/ai-control/scripts/install-pwsh.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# install-pwsh.sh self-checks for curl+tar and exits cleanly on no-network;
+# we wrap it in a short timeout so a network stall doesn't hang the unit
+# forever.  On failure we still mark the unit "activated" via ExecStartPost
+# logging so systemd doesn't retry forever — user can re-run manually.
+ExecStart=/bin/bash -c 'timeout 120 /usr/share/ai-control/scripts/install-pwsh.sh || { echo "install-pwsh: failed (network/tarball); retry manually via sudo /usr/share/ai-control/scripts/install-pwsh.sh" >&2; exit 0; }'
+StandardOutput=journal
+StandardError=journal
+# Runs as root — needs write access to /opt/microsoft and /usr/local/bin.
+User=root
+# Network-bound one-shot; don't care about CPU/mem isolation.
+
+[Install]
+WantedBy=multi-user.target

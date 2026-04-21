@@ -1,0 +1,27 @@
+#!/bin/sh
+# ~/.xprofile - sourced by LightDM Xsession wrapper before the session starts.
+# Use for user-level X environment setup. Must NOT block or fork long-running
+# processes here (autostart .desktop entries handle those).
+
+# Ensure XDG runtime dir exists (belt-and-suspenders; Xsession also sets this).
+if [ -z "$XDG_RUNTIME_DIR" ]; then
+    export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+fi
+
+# Ensure PATH includes common user locations.
+case ":$PATH:" in
+    *:"$HOME/.local/bin":*) ;;
+    *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+
+# XDG data dirs — make sure system-wide .desktop files are visible.
+if [ -z "$XDG_DATA_DIRS" ]; then
+    export XDG_DATA_DIRS="/usr/local/share:/usr/share"
+fi
+
+# XFCE expects these to be set for sessions to behave correctly.
+export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-XFCE}"
+export DESKTOP_SESSION="${DESKTOP_SESSION:-xfce}"
+
+# Do NOT exec anything here. Control returns to /etc/lightdm/Xsession which
+# exec's the session command (startxfce4).

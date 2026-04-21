@@ -3,7 +3,7 @@
 
 pkgname=trust-dkms
 pkgver=0.1.0
-pkgrel=1
+pkgrel=7
 pkgdesc="Root of Authority trust kernel module (DKMS) - dynamic trust enforcement at kernel level"
 arch=('x86_64')
 url="https://github.com/ai-arch-linux/trust-system"
@@ -28,25 +28,36 @@ package() {
     install -d "$_dkms_dir/include"
 
     # ── Kernel source files ───────────────────────────────────────────
-    # Must match all .o targets in Kbuild: trust_core, trust_tlb, trust_risc,
-    # trust_fbc, trust_dna_gate, trust_ape, trust_chromosome, trust_token,
-    # trust_lifecycle, trust_dispatch, trust_memory, trust_syscall
+    # Every .c listed here MUST match a .o target in trust/kernel/Kbuild.
+    # Drift is caught at build time by verify_trust_dkms_manifest()
+    # in scripts/build-packages.sh (S68 manifest guard).
     for src in \
         trust_core.c trust_tlb.c trust_risc.c trust_fbc.c \
         trust_dna_gate.c trust_ape.c trust_chromosome.c \
         trust_token.c trust_lifecycle.c trust_dispatch.c \
-        trust_memory.c trust_memory.h trust_internal.h \
-        trust_syscall.c trust_syscall.h; do
+        trust_dispatch_tables.c trust_memory.c trust_syscall.c \
+        trust_vector.c trust_fused.c trust_stats.c \
+        trust_subject_pool.c trust_ape_markov.c trust_authz.c \
+        trust_compat.c trust_invariants.c trust_meiosis.c; do
         install -Dm644 "$_srcdir/kernel/$src" "$_dkms_dir/$src"
+    done
+
+    # Kernel-side headers (private to the module, included by the .c files)
+    for hdr in \
+        trust_ape.h trust_authz.h trust_compat.h trust_internal.h \
+        trust_isa.h trust_lifecycle.h trust_meiosis.h \
+        trust_memory.h trust_syscall.h; do
+        install -Dm644 "$_srcdir/kernel/$hdr" "$_dkms_dir/$hdr"
     done
 
     # Kbuild (module build rules)
     install -Dm644 "$_srcdir/kernel/Kbuild" "$_dkms_dir/Kbuild"
 
-    # Headers that Kbuild references via -I$(src)/../include
+    # Public headers that Kbuild references via -I$(src)/../include
     install -Dm644 "$_srcdir/include/trust_types.h"  "$_dkms_dir/include/trust_types.h"
     install -Dm644 "$_srcdir/include/trust_ioctl.h"  "$_dkms_dir/include/trust_ioctl.h"
     install -Dm644 "$_srcdir/include/trust_uapi.h"   "$_dkms_dir/include/trust_uapi.h"
+    install -Dm644 "$_srcdir/include/trust_chromosome.h" "$_dkms_dir/include/trust_chromosome.h"
 
     # ── DKMS configuration ────────────────────────────────────────────
     install -Dm644 /dev/stdin "$_dkms_dir/dkms.conf" <<DKMS

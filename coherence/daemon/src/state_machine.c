@@ -20,6 +20,7 @@
  */
 
 #include "state_machine.h"
+#include "coh_markov.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -52,6 +53,10 @@ static void coh_enter_state(coh_arbiter_t *arb,
 	arb->transitions_total++;
 	arb->transitions_last_window++;
 
+	/* Feed the empirical Markov chain. Out-of-range states (e.g.,
+	 * GAME_FOREGROUND) are silently dropped inside coh_markov_observe. */
+	coh_markov_observe(old, new_state);
+
 	/* Reset dwell counters — every new state starts fresh. */
 	scratch->lat_enter_dwell_ms = 0;
 	scratch->lat_exit_dwell_ms = 0;
@@ -77,6 +82,8 @@ void coh_sm_init(coh_arbiter_t *arb, coh_sm_scratch_t *scratch, uint64_t now_ms)
 	arb->state_enter_t_ms = now_ms;
 	arb->lockout_until_t_ms = 0;        /* no lockout at boot */
 	scratch->last_eval_t_ms = now_ms;
+	/* Arm the Markov chain observer — idempotent, safe to call repeatedly. */
+	coh_markov_init();
 }
 
 const char *coh_sm_state_name(coh_state_t s)

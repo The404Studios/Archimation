@@ -1,0 +1,14 @@
+# Fetched binaries are never committed to the tree.
+# See ../../../scripts/fetch-real-pe-binaries.sh for source URLs and
+# ../real-binaries/SHA256SUMS for expected checksums.
+*.exe
+*.zip
+*.tar
+*.tar.gz
+*.tar.bz2
+*.7z
+# Keep SHA256SUMS, this .gitignore, the LICENSE notes, and any README here.
+!SHA256SUMS
+!.gitignore
+!LICENSE.txt
+!README.md

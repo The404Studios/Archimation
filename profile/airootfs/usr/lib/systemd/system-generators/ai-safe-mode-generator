@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# ai-safe-mode-generator -- invoked by systemd early in boot.
+#
+# If the kernel was booted with "ai.mode=safe" on /proc/cmdline, this
+# generator masks ai-control.service and ai-cortex.service by creating
+# symlinks to /dev/null in the normal generator output directory.  On a
+# normal boot (no ai.mode=safe) this script is a no-op.
+#
+# systemd invokes generators very early with three positional arguments:
+#   $1  normal-dir  (where to drop unit files / mask symlinks)
+#   $2  early-dir   (we don't need this)
+#   $3  late-dir    (we don't need this)
+#
+# Generators must be fast and must not touch the network.  Any failure is
+# logged to the journal but never aborts the boot.
+set -euo pipefail
+
+normal_dir="${1:-/run/systemd/generator}"
+
+# Only act on a real cmdline.  In some chroots /proc/cmdline may be absent;
+# that's fine, we just do nothing.
+[ -r /proc/cmdline ] || exit 0
+
+# Match whitespace-delimited token "ai.mode=safe".  Be tolerant of trailing
+# whitespace on the cmdline.
+if ! grep -qE '(^| )ai\.mode=safe( |$)' /proc/cmdline; then
+    exit 0
+fi
+
+mkdir -p "$normal_dir"
+
+# Mask both AI services by pointing the unit name at /dev/null.  This is the
+# systemd-sanctioned way to force a unit off for a single boot without
+# writing to disk.
+for unit in ai-control.service ai-cortex.service; do
+    ln -sf /dev/null "$normal_dir/$unit"
+done
+
+# Leave a breadcrumb in the journal so the user can see why their daemon
+# isn't running.  `logger` may not be available this early, so write to
+# /run instead.
+mkdir -p /run/ai-control
+printf 'ai.mode=safe detected on kernel cmdline at %s -- masked ai-control.service + ai-cortex.service\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)" \
+    > /run/ai-control/safe-mode.stamp 2>/dev/null || true
+
+exit 0

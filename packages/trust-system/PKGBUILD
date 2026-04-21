@@ -3,7 +3,7 @@
 
 pkgname=trust-system
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc="Root of Trust kernel module and libtrust userspace library"
 arch=('x86_64')
 url="https://github.com/ai-arch-linux/trust-system"
@@ -40,6 +40,34 @@ package() {
     install -Dm644 include/trust_types.h "$pkgdir/usr/include/trust/trust_types.h"
     install -Dm644 include/trust_ioctl.h "$pkgdir/usr/include/trust/trust_ioctl.h"
     install -Dm644 include/trust_uapi.h "$pkgdir/usr/include/trust/trust_uapi.h"
+
+    # Session 69 (Agent R): ship the /dev/trust udev rule in the installed-to-disk
+    # path as well as the live ISO.  The airootfs overlay already ships the file
+    # under profile/airootfs/etc/udev/rules.d/70-trust.rules for the live session;
+    # this package body puts it under /usr/lib/udev/rules.d/ so an ai-install-to-disk
+    # target (Agent O) gets the same MODE=0660,GROUP=trust semantics without needing
+    # to copy the rule out of archiso.  70- sort order beats trust-dkms's 99- default.
+    install -Dm644 /dev/stdin "$pkgdir/usr/lib/udev/rules.d/70-trust.rules" <<'RULE'
+# /dev/trust -- Root of Authority kernel module device node.
+#
+# MODE=0660 + GROUP=trust restricts TRUST_IOC_QUARANTINE (and every other
+# trust ioctl) to processes whose real or supplementary GID is in the
+# "trust" group.  Write-side ioctls are additionally capability-gated
+# inside trust.ko, so group membership grants read-only diagnostics to
+# non-root callers without opening the quarantine surface.
+KERNEL=="trust", MODE="0660", GROUP="trust"
+RULE
+
+    # Session 69 (Agent R): sysusers.d so the "trust" + "pe-compat" system
+    # groups exist on first boot even if no one runs groupadd(8).  systemd
+    # processes /usr/lib/sysusers.d/*.conf via systemd-sysusers.service.
+    install -Dm644 /dev/stdin "$pkgdir/usr/lib/sysusers.d/trust.conf" <<'SYSUSERS'
+# Group for /dev/trust access (read-only diagnostics for non-root callers).
+# Write-side ioctls remain capability-gated inside trust.ko.
+g trust - -
+# Group for /run/pe-compat/events.sock subscribers (PE runtime event bus).
+g pe-compat - -
+SYSUSERS
 
     # Kernel source and DKMS integration is handled by the trust-dkms package.
     # trust-system provides only the userspace library and headers.

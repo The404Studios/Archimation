@@ -1,0 +1,493 @@
+#!/bin/bash
+# ai-install-to-disk — One-command installer for ArchWindows (AI Arch Linux).
+#
+# Turns a live-ISO session into a persisted install on a disk:
+#   GPT → 512M EFI (FAT32) + ext4 root → pacstrap base + custom pkgs →
+#   fstab (UUID) → chroot locale/hostname/user/sudoers/grub → enable ai-control.
+#
+# Interactive by default; `--yes` with all flags set enables automation.  A
+# destructive-op triple-confirm (must TYPE the device name) guards against
+# clobbering the wrong disk.
+#
+# Exit codes:
+#   0  — install completed; reboot to use
+#   1  — installer aborted (user cancel, verification fail)
+#   2  — environment error (not root, not live ISO, missing tool)
+#
+# See scripts/test-install-to-disk.sh for the end-to-end QEMU validator that
+# drives this (well, its headless-runner twin) under TCG.
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# MODE DISPATCHER  (Session 72 / Agent δ)
+# ----------------------------------------------------------------------------
+# This script is the entry point for BOTH install paths:
+#   --mode bootc    (default if `bootc` is present; delegates to ai-install-bootc)
+#   --mode archiso  (legacy pacstrap path, this script's original behavior)
+#
+# Auto-detection: if `bootc` is in $PATH and the user didn't pass --mode,
+# we default to bootc (atomic upgrades / rollback).  Otherwise archiso.
+#
+# We strip --mode out of $@ before falling through to the flag parser below
+# so existing callers (test harness, wizard button) remain unchanged.
+INSTALL_MODE=""
+_remaining_args=()
+for _a in "$@"; do
+    _remaining_args+=("$_a")
+done
+
+# Peek for --mode so we can dispatch before the main parser spins up.
+i=0
+while [ $i -lt ${#_remaining_args[@]} ]; do
+    case "${_remaining_args[$i]}" in
+        --mode)
+            if [ $((i+1)) -lt ${#_remaining_args[@]} ]; then
+                INSTALL_MODE="${_remaining_args[$((i+1))]}"
+                # Splice --mode + value out of the array
+                unset '_remaining_args[i]'
+                unset '_remaining_args[i+1]'
+                _remaining_args=("${_remaining_args[@]}")
+                continue
+            fi
+            ;;
+    esac
+    i=$((i+1))
+done
+
+# Auto-detect mode if not specified.
+if [ -z "$INSTALL_MODE" ]; then
+    if command -v bootc >/dev/null 2>&1 && [ -x /usr/bin/ai-install-bootc ]; then
+        INSTALL_MODE="bootc"
+    else
+        INSTALL_MODE="archiso"
+    fi
+fi
+
+case "$INSTALL_MODE" in
+    bootc)
+        if [ ! -x /usr/bin/ai-install-bootc ]; then
+            echo "[ai-install] FATAL: --mode bootc but /usr/bin/ai-install-bootc is missing" >&2
+            echo "             (fall back with: sudo ai-install-to-disk --mode archiso)" >&2
+            exit 2
+        fi
+        exec /usr/bin/ai-install-bootc "${_remaining_args[@]}"
+        ;;
+    archiso)
+        # Fall through to the original archiso/pacstrap path below.
+        set -- "${_remaining_args[@]}"
+        ;;
+    *)
+        echo "[ai-install] FATAL: unknown --mode '$INSTALL_MODE' (expected bootc|archiso)" >&2
+        exit 1
+        ;;
+esac
+
+# ----------------------------------------------------------------------------
+# Defaults (overridden by flags or prompts)
+# ----------------------------------------------------------------------------
+TARGET=""
+HOSTNAME_DEF="archwindows"
+USERNAME_DEF="archw"
+LOCALE_DEF="en_US.UTF-8"
+KEYMAP_DEF="us"
+TIMEZONE_DEF=""
+BOOTLOADER="grub"           # grub | systemd-boot — brief specifies GRUB
+SWAPFILE_GB=4
+PRESET="full"               # full installs desktop; minimal is headless
+ASSUME_YES=0
+PASSWORD=""                 # never defaulted; prompted or env AI_INSTALL_PASSWORD
+
+MOUNT="/mnt"
+LOG="/var/log/ai-install-to-disk.log"
+
+# ----------------------------------------------------------------------------
+# Logging helpers
+# ----------------------------------------------------------------------------
+log()   { printf '[ai-install] %s\n' "$*" | tee -a "$LOG" >&2; }
+die()   { printf '[ai-install] FATAL: %s\n' "$*" | tee -a "$LOG" >&2; exit 1; }
+warn()  { printf '[ai-install] WARN:  %s\n' "$*" | tee -a "$LOG" >&2; }
+hr()    { printf -- '----------------------------------------\n'; }
+
+# ----------------------------------------------------------------------------
+# Usage
+# ----------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+Usage: ai-install-to-disk [OPTIONS]
+
+Install ArchWindows onto a disk from the live ISO.
+
+Install modes (auto-selected; bootc preferred when available):
+  --mode bootc         Atomic OCI-image deploy via 'bootc install to-filesystem'
+                       (delegates to /usr/bin/ai-install-bootc).  Gives you
+                       'bootc upgrade' / 'bootc rollback' on the target.
+  --mode archiso       Legacy pacstrap deploy (this script's default flow).
+                       Use on systems where bootc isn't viable.
+
+Options:
+  --target <dev>       Target disk device (e.g. /dev/sda, /dev/nvme0n1)
+  --hostname <name>    Hostname            (default: ${HOSTNAME_DEF})
+  --user <name>        Primary username    (default: ${USERNAME_DEF})
+  --locale <locale>    Locale              (default: ${LOCALE_DEF})
+  --keymap <map>       Console keymap      (default: ${KEYMAP_DEF})
+  --timezone <tz>      Timezone            (default: auto-detect or UTC)
+  --bootloader <b>     grub | systemd-boot (default: ${BOOTLOADER})
+  --swap-gb <n>        Swapfile size in GB (default: ${SWAPFILE_GB}; 0 = none)
+  --preset <p>         minimal | full      (default: ${PRESET})
+  --yes                Non-interactive; requires --target and \$AI_INSTALL_PASSWORD
+  --help               Show this help
+
+Environment:
+  AI_INSTALL_PASSWORD  Pre-set password for the new user (avoids prompt).
+
+Examples:
+  sudo ai-install-to-disk
+  sudo ai-install-to-disk --target /dev/sda --user me --yes
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Parse flags
+# ----------------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --target)     TARGET="${2:-}";     shift 2 ;;
+        --hostname)   HOSTNAME_DEF="${2:-}";     shift 2 ;;
+        --user)       USERNAME_DEF="${2:-}";     shift 2 ;;
+        --locale)     LOCALE_DEF="${2:-}";       shift 2 ;;
+        --keymap)     KEYMAP_DEF="${2:-}";       shift 2 ;;
+        --timezone)   TIMEZONE_DEF="${2:-}";     shift 2 ;;
+        --bootloader) BOOTLOADER="${2:-}";       shift 2 ;;
+        --swap-gb)    SWAPFILE_GB="${2:-0}";     shift 2 ;;
+        --preset)     PRESET="${2:-}";           shift 2 ;;
+        --yes|-y)     ASSUME_YES=1;              shift   ;;
+        --help|-h)    usage; exit 0 ;;
+        *) die "unknown flag: $1 (try --help)" ;;
+    esac
+done
+
+# ----------------------------------------------------------------------------
+# Pre-flight
+# ----------------------------------------------------------------------------
+touch "$LOG" 2>/dev/null || LOG="/tmp/ai-install-to-disk.log"
+log "=== ArchWindows Installer ==="
+
+# 1) root?
+if [ "$(id -u)" -ne 0 ]; then
+    die "must run as root (try: sudo ai-install-to-disk)"
+fi
+
+# 2) live ISO?
+if [ ! -d /run/archiso ] && ! grep -q 'archisolabel' /proc/cmdline 2>/dev/null; then
+    warn "this doesn't look like a live ISO boot (/run/archiso missing)"
+    warn "continuing anyway — if you're running from an installed system,"
+    warn "destructive operations on --target will still proceed"
+fi
+
+# 3) required tools
+for bin in sgdisk wipefs mkfs.fat mkfs.ext4 pacstrap genfstab arch-chroot lsblk blkid; do
+    command -v "$bin" >/dev/null 2>&1 || die "missing required tool: $bin"
+done
+
+# 4) detect timezone if not provided
+if [ -z "$TIMEZONE_DEF" ]; then
+    TIMEZONE_DEF="$(timedatectl show -p Timezone --value 2>/dev/null || echo UTC)"
+    [ -n "$TIMEZONE_DEF" ] || TIMEZONE_DEF="UTC"
+fi
+
+# 5) validate bootloader
+case "$BOOTLOADER" in
+    grub|systemd-boot) ;;
+    *) die "bootloader must be 'grub' or 'systemd-boot' (got: $BOOTLOADER)" ;;
+esac
+
+# ----------------------------------------------------------------------------
+# Prompts (skipped entirely when --yes)
+# ----------------------------------------------------------------------------
+list_disks() {
+    lsblk -dn -o NAME,SIZE,TYPE,MODEL | awk '$3=="disk"{printf "  /dev/%-10s %8s   %s\n", $1, $2, substr($0, index($0,$4))}'
+}
+
+prompt_target() {
+    hr
+    echo "Available disks:"
+    list_disks
+    hr
+    local ans
+    read -r -p "Target disk (e.g. /dev/sda): " ans
+    TARGET="$ans"
+}
+
+prompt_or_default() {
+    local varname="$1" prompt="$2" cur="$3" ans
+    read -r -p "$prompt [$cur]: " ans
+    [ -n "$ans" ] && printf -v "$varname" '%s' "$ans" || printf -v "$varname" '%s' "$cur"
+}
+
+if [ "$ASSUME_YES" -eq 0 ]; then
+    [ -n "$TARGET" ] || prompt_target
+    prompt_or_default HOSTNAME_DEF "Hostname"    "$HOSTNAME_DEF"
+    prompt_or_default USERNAME_DEF "Username"    "$USERNAME_DEF"
+    prompt_or_default LOCALE_DEF   "Locale"      "$LOCALE_DEF"
+    prompt_or_default KEYMAP_DEF   "Keymap"      "$KEYMAP_DEF"
+    prompt_or_default TIMEZONE_DEF "Timezone"    "$TIMEZONE_DEF"
+    prompt_or_default BOOTLOADER   "Bootloader"  "$BOOTLOADER"
+    prompt_or_default SWAPFILE_GB  "Swapfile GB (0=none)" "$SWAPFILE_GB"
+    prompt_or_default PRESET       "Preset (minimal|full)" "$PRESET"
+fi
+
+# ----------------------------------------------------------------------------
+# Validate target
+# ----------------------------------------------------------------------------
+[ -n "$TARGET" ] || die "--target required (no disk selected)"
+[ -b "$TARGET" ] || die "target is not a block device: $TARGET"
+
+# Refuse mounted disks
+if mount | awk '{print $1}' | grep -q "^${TARGET}"; then
+    die "refusing: $TARGET has mounted partitions — unmount first"
+fi
+
+# Determine partition suffix (nvme/mmcblk/loop use 'p', sata/vd don't — except vd* which is plain)
+case "$TARGET" in
+    /dev/nvme*|/dev/mmcblk*|/dev/loop*) PART_PREFIX="${TARGET}p" ;;
+    *)                                  PART_PREFIX="${TARGET}"  ;;
+esac
+EFI_PART="${PART_PREFIX}1"
+ROOT_PART="${PART_PREFIX}2"
+
+# ----------------------------------------------------------------------------
+# Password
+# ----------------------------------------------------------------------------
+if [ -n "${AI_INSTALL_PASSWORD:-}" ]; then
+    PASSWORD="$AI_INSTALL_PASSWORD"
+elif [ "$ASSUME_YES" -eq 1 ]; then
+    die "--yes requires \$AI_INSTALL_PASSWORD (refusing to ship a default password)"
+else
+    while :; do
+        read -r -s -p "Password for '$USERNAME_DEF': " PASSWORD; echo
+        [ -n "$PASSWORD" ] || { echo "  password cannot be empty"; continue; }
+        read -r -s -p "Re-enter password: " p2; echo
+        [ "$PASSWORD" = "$p2" ] && break
+        echo "  passwords did not match — try again"
+    done
+fi
+
+# ----------------------------------------------------------------------------
+# Triple-confirmation before we wipe anything
+# ----------------------------------------------------------------------------
+hr
+echo "About to install ArchWindows with these settings:"
+cat <<EOF
+  Target disk:  $TARGET
+  Hostname:     $HOSTNAME_DEF
+  Username:     $USERNAME_DEF
+  Locale:       $LOCALE_DEF
+  Keymap:       $KEYMAP_DEF
+  Timezone:     $TIMEZONE_DEF
+  Bootloader:   $BOOTLOADER
+  Swapfile:     ${SWAPFILE_GB}G
+  Preset:       $PRESET
+EOF
+hr
+echo "Partition layout:"
+echo "  $EFI_PART   512M  EFI System Partition (FAT32, /boot/efi)"
+echo "  $ROOT_PART   rest  ext4 root (/)"
+hr
+echo "Current state of $TARGET:"
+lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT "$TARGET" 2>/dev/null || true
+hr
+echo "ALL DATA on $TARGET will be PERMANENTLY ERASED."
+if [ "$ASSUME_YES" -eq 1 ]; then
+    echo "(--yes set — but you must still type the device name)"
+fi
+echo
+read -r -p "Type the device name exactly (e.g. $TARGET) to confirm: " confirm
+if [ "$confirm" != "$TARGET" ]; then
+    die "confirmation did not match ('$confirm' != '$TARGET') — aborted"
+fi
+read -r -p "Final check — continue? [yes/NO]: " final
+case "$final" in
+    yes|YES|Yes) ;;
+    *) die "aborted by user" ;;
+esac
+
+# ----------------------------------------------------------------------------
+# PARTITION
+# ----------------------------------------------------------------------------
+log "Wiping and partitioning $TARGET"
+wipefs -af "$TARGET"
+sgdisk -Z "$TARGET"
+sgdisk -o "$TARGET"
+sgdisk -n 1:0:+512MiB -t 1:ef00 -c 1:EFI   "$TARGET"
+sgdisk -n 2:0:0       -t 2:8300 -c 2:rootfs "$TARGET"
+command -v partprobe >/dev/null 2>&1 && partprobe "$TARGET" || true
+sleep 2
+
+# ----------------------------------------------------------------------------
+# FORMAT + MOUNT
+# ----------------------------------------------------------------------------
+log "Creating filesystems"
+mkfs.fat  -F32 -n EFI        "$EFI_PART"
+mkfs.ext4 -F   -L ArchWindows -m 1 "$ROOT_PART"
+
+log "Mounting filesystems under $MOUNT"
+mountpoint -q "$MOUNT" && umount -R "$MOUNT" 2>/dev/null || true
+mount "$ROOT_PART" "$MOUNT"
+mkdir -p "$MOUNT/boot/efi"
+mount "$EFI_PART" "$MOUNT/boot/efi"
+
+# ----------------------------------------------------------------------------
+# PACSTRAP
+# ----------------------------------------------------------------------------
+# Use the live ISO's pacman.conf (Agent N owns content) — it should already
+# point at whichever repo the built ISO was shipped with (file:// or URL).
+PACMAN_CONF="/etc/pacman.conf"
+
+BASE_PKGS="base base-devel linux linux-firmware vim sudo networkmanager openssh efibootmgr"
+if [ "$BOOTLOADER" = "grub" ]; then
+    BASE_PKGS="$BASE_PKGS grub"
+fi
+if [ "$PRESET" = "full" ]; then
+    BASE_PKGS="$BASE_PKGS xfce4 xfce4-goodies lightdm lightdm-gtk-greeter xorg-server mesa vulkan-icd-loader"
+fi
+
+log "pacstrap — base system (${PRESET})"
+pacstrap -K --noconfirm --config "$PACMAN_CONF" "$MOUNT" $BASE_PKGS
+
+# Custom AI Arch packages per BUILD_ORDER in scripts/build-packages.sh.
+# If the repo isn't reachable (developer builds without the live URL up yet),
+# soft-fail with a warning — the core system is still bootable.
+CUSTOM_PKGS="pe-loader trust-system trust-dkms windows-services ai-firewall ai-control-daemon ai-desktop-config ai-first-boot-wizard"
+log "pacstrap — ArchWindows packages"
+if ! pacstrap --noconfirm --config "$PACMAN_CONF" "$MOUNT" $CUSTOM_PKGS; then
+    warn "some ArchWindows packages failed to install (repo reachable? network?)"
+    warn "you can retry post-boot with: sudo pacman -S $CUSTOM_PKGS"
+fi
+
+# ----------------------------------------------------------------------------
+# FSTAB (UUID-based)
+# ----------------------------------------------------------------------------
+log "Generating fstab"
+genfstab -U "$MOUNT" > "$MOUNT/etc/fstab"
+
+# Swapfile
+if [ "${SWAPFILE_GB:-0}" -gt 0 ]; then
+    log "Creating ${SWAPFILE_GB}G swapfile"
+    arch-chroot "$MOUNT" bash -c "
+        fallocate -l ${SWAPFILE_GB}G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=\$((${SWAPFILE_GB}*1024)) status=progress
+        chmod 600 /swapfile
+        mkswap /swapfile
+    "
+    echo "/swapfile none swap defaults 0 0" >> "$MOUNT/etc/fstab"
+fi
+
+# ----------------------------------------------------------------------------
+# CHROOT CONFIGURATION
+# ----------------------------------------------------------------------------
+log "Configuring system in chroot"
+
+# Hostname + hosts
+echo "$HOSTNAME_DEF" > "$MOUNT/etc/hostname"
+cat > "$MOUNT/etc/hosts" <<EOF
+127.0.0.1  localhost
+::1        localhost
+127.0.1.1  ${HOSTNAME_DEF}.localdomain ${HOSTNAME_DEF}
+EOF
+
+# Copy the live ISO's pacman.conf into the target (Agent N owns the content —
+# we just propagate it so the installed system uses the same repos).
+cp /etc/pacman.conf "$MOUNT/etc/pacman.conf"
+
+# Timezone
+arch-chroot "$MOUNT" ln -sf "/usr/share/zoneinfo/$TIMEZONE_DEF" /etc/localtime
+arch-chroot "$MOUNT" hwclock --systohc 2>/dev/null || true
+
+# Locale
+sed -i "s/^#\s*\(${LOCALE_DEF}\s\+UTF-8\)/\1/" "$MOUNT/etc/locale.gen" 2>/dev/null || \
+    echo "${LOCALE_DEF} UTF-8" >> "$MOUNT/etc/locale.gen"
+arch-chroot "$MOUNT" locale-gen
+echo "LANG=${LOCALE_DEF}"    > "$MOUNT/etc/locale.conf"
+echo "KEYMAP=${KEYMAP_DEF}"  > "$MOUNT/etc/vconsole.conf"
+
+# User + sudoers
+arch-chroot "$MOUNT" bash -c "
+    id '$USERNAME_DEF' >/dev/null 2>&1 || useradd -m -G wheel,audio,video,storage,input -s /bin/bash '$USERNAME_DEF'
+    # Add to 'trust' group only if it exists on the system
+    getent group trust >/dev/null && usermod -aG trust '$USERNAME_DEF' || true
+"
+# Set passwords via chpasswd (stdin → no command-line leakage via ps)
+arch-chroot "$MOUNT" chpasswd <<EOF
+${USERNAME_DEF}:${PASSWORD}
+root:${PASSWORD}
+EOF
+# %wheel sudo (uncomment if commented; otherwise leave existing policy alone)
+sed -i 's/^# *\(%wheel ALL=(ALL\(:ALL\)\?) ALL\)/\1/' "$MOUNT/etc/sudoers" 2>/dev/null || true
+
+# Initramfs
+arch-chroot "$MOUNT" mkinitcpio -P 2>/dev/null || warn "mkinitcpio -P had warnings (non-fatal)"
+
+# Bootloader
+if [ "$BOOTLOADER" = "grub" ]; then
+    log "Installing GRUB (UEFI)"
+    arch-chroot "$MOUNT" grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ArchWindows --removable
+    arch-chroot "$MOUNT" grub-mkconfig -o /boot/grub/grub.cfg
+else
+    log "Installing systemd-boot"
+    arch-chroot "$MOUNT" bootctl --path=/boot/efi install
+    ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+    mkdir -p "$MOUNT/boot/efi/loader/entries"
+    cat > "$MOUNT/boot/efi/loader/loader.conf" <<EOF
+default archwindows
+timeout 3
+console-mode max
+EOF
+    cat > "$MOUNT/boot/efi/loader/entries/archwindows.conf" <<EOF
+title   ArchWindows
+linux   /vmlinuz-linux
+initrd  /initramfs-linux.img
+options root=UUID=${ROOT_UUID} rw
+EOF
+    # Copy kernel/initrd into the ESP
+    cp "$MOUNT/boot/vmlinuz-linux"         "$MOUNT/boot/efi/" 2>/dev/null || true
+    cp "$MOUNT/boot/initramfs-linux.img"   "$MOUNT/boot/efi/" 2>/dev/null || true
+fi
+
+# Enable services (skip-on-missing so absence of a unit doesn't abort)
+log "Enabling services"
+for svc in NetworkManager sshd ai-control ai-cortex lightdm; do
+    arch-chroot "$MOUNT" systemctl enable "$svc" 2>/dev/null && log "  enabled $svc" || log "  skipped $svc (not present)"
+done
+
+# Marker + log
+mkdir -p "$MOUNT/var/log" "$MOUNT/var/lib/ai-arch"
+cat > "$MOUNT/var/log/ai-install.log" <<EOF
+installed_at=$(date -Iseconds)
+target=$TARGET
+hostname=$HOSTNAME_DEF
+user=$USERNAME_DEF
+bootloader=$BOOTLOADER
+preset=$PRESET
+swap_gb=$SWAPFILE_GB
+EOF
+
+# ----------------------------------------------------------------------------
+# FINISH
+# ----------------------------------------------------------------------------
+sync
+log "Unmounting"
+umount -R "$MOUNT" 2>/dev/null || true
+
+hr
+echo
+echo "  ArchWindows installed successfully."
+echo
+echo "  Target:    $TARGET"
+echo "  Hostname:  $HOSTNAME_DEF"
+echo "  User:      $USERNAME_DEF (password as entered)"
+echo "  AI daemon: port 8420 (starts at boot if package installed)"
+echo
+echo "  Reboot with:  sudo reboot"
+echo
+hr
+exit 0

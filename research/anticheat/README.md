@@ -1,0 +1,1 @@
+Vanguard shim -- research-only. NOT built into services by default. Loading implies opt-in ban risk. See docs/anti-cheat.md or ai-control handler `game.enable_anticheat_shim` with `i_understand_bans=true`.

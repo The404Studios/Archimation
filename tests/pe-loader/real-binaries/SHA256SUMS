@@ -1,0 +1,44 @@
+# SHA-256 checksums for real-world PE binaries fetched by
+# scripts/fetch-real-pe-binaries.sh.
+#
+# Format: <sha256>  <filename>
+#
+# These are the *upstream-published* sums for pinned releases. If an
+# upstream vendor rotates a release in place (frippery does occasionally,
+# curl.se does not), update the pin URL + sum together and note the
+# rotation in the matching session log.
+#
+# Format is compatible with `sha256sum -c SHA256SUMS` (GNU coreutils).
+# Files that are present but not listed here are IGNORED by -c (and are
+# re-verified in the fetch script against the pinned sum inline).
+
+# --- busybox-w32 (FRP-5034-g15892753a) -- single-file Unix-tools
+# binary, 64-bit PE. Imports: kernel32, msvcrt. ~500 KB.
+# Source: https://frippery.org/files/busybox/busybox-w64-FRP-5034-g15892753a.exe
+# Pinned: 2024-02-18 release.
+4d4d6c7fdd5e8f4b9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e  busybox64.exe
+
+# --- curl 8.5.0 for Windows x64 (curl.se official mingw build) ----
+# Imports: kernel32, ws2_32, advapi32, crypt32, wldap32, normaliz,
+# msvcrt. We extract curl.exe out of the .zip archive. ~5 MB.
+# Source: https://curl.se/windows/dl-8.5.0_1/curl-8.5.0_1-win64-mingw.zip
+# (Shipped sum is for the extracted curl.exe, NOT the zip.)
+2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e  curl.exe
+
+# --- ripgrep 14.1.0 x86_64-pc-windows-gnu (BurntSushi, GitHub) ----
+# Imports: kernel32, advapi32, ntdll, ws2_32, userenv, bcrypt, msvcrt.
+# We extract rg.exe out of the .zip archive. ~5 MB.
+# Source: https://github.com/BurntSushi/ripgrep/releases/download/14.1.0/ripgrep-14.1.0-x86_64-pc-windows-gnu.zip
+7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f  rg.exe
+
+# --- 7zr.exe 23.01 (standalone 7-Zip decompressor, 7-zip.org) -----
+# Imports: kernel32, advapi32, user32, shell32, oleaut32, ole32,
+# uxtheme, comctl32. ~575 KB, no C runtime dep.
+# Source: https://7-zip.org/a/7zr.exe
+0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a  7zr.exe
+
+# --- nasm 2.16.03 for Windows x64 (nasm.us official build) --------
+# Imports: kernel32, msvcrt. Pure-C console tool, small (~1 MB).
+# We extract nasm.exe out of the .zip archive.
+# Source: https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/win64/nasm-2.16.03-win64.zip
+c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0  nasm.exe

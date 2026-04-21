@@ -1,8 +1,31 @@
 #!/bin/bash
-# trust-dkms.install — DKMS lifecycle hooks for the trust kernel module
+# trust-dkms.install — DKMS lifecycle hooks for the trust kernel module.
+#
+# S72 / Agent β: signing is now a first-class concern, but this script has to
+# stay backward-compatible with the archiso path (first-boot dkms build). Three
+# signing sources are tried in order:
+#   1. /etc/ai-control/signing.conf — site override; full path control
+#   2. /var/lib/ai-control/trust-{priv.pem,pub.der} — project default, placed
+#      by bootc image build or by install-time enrollment
+#   3. per-install MOK at /var/lib/dkms/mok.{key,pub} — generated lazily here
+# If none of the above exists we emit an UNSIGNED module and print a loud
+# warning. Under lockdown=integrity or Secure Boot + MOK that module will
+# REFUSE TO LOAD; the user has two options: disable lockdown, or enroll a key.
+#
+# In bootc mode this whole file is effectively dead code — the module is
+# pre-built + pre-signed at image construction time by bootc/build-trust-module.sh
+# and placed directly at /usr/lib/modules/<kver>/extra/trust.ko. The trust-dkms
+# package is still installed as a fallback for users who kernel-override via
+# rpm-ostree-style layering or boot an out-of-band kernel. If the pre-built
+# module is already present and matches the running kernel, we skip DKMS
+# entirely (see _have_prebuilt_signed_module).
 
 _mod=trust
 _ver=0.1.0
+
+# ─── utility ─────────────────────────────────────────────────────────────────
+_log() { printf '>>> trust-dkms.install: %s\n' "$*"; }
+_warn() { printf '!!! trust-dkms.install: WARN: %s\n' "$*" >&2; }
 
 # Arch Linux linux-headers omits include/generated/autoconf.h.
 # Generate it from include/config/auto.conf so DKMS can compile.
@@ -13,7 +36,7 @@ _gen_autoconf() {
         local auto_conf="$kbuild/include/config/auto.conf"
         [ -f "$auto_conf" ] || continue
         [ -f "$autoconf" ] && continue
-        echo ">>> Generating $autoconf from auto.conf..."
+        _log "Generating $autoconf from auto.conf..."
         mkdir -p "$kbuild/include/generated"
         awk '
             /^[[:space:]]*#/ { next }
@@ -37,31 +60,184 @@ _gen_autoconf() {
     done
 }
 
+# Detect a pre-built signed module already shipped by bootc image build.
+# If present AND matches the running kernel we short-circuit DKMS entirely.
+_have_prebuilt_signed_module() {
+    local kver="${1:-$(uname -r)}"
+    local ko="/usr/lib/modules/${kver}/extra/trust.ko"
+    [ -f "$ko" ] || return 1
+    # Signature sentinel is the 28-byte tail "~Module signature appended~\n".
+    # grep -q needs binary-safe match; tail -c is the simplest approach.
+    if tail -c 28 "$ko" 2>/dev/null | grep -q 'Module signature appended'; then
+        return 0
+    fi
+    return 1
+}
+
+# Resolve signing key/cert using the precedence documented in the header.
+# Populates the bash globals TRUST_KEY and TRUST_CERT if found; returns 0 on
+# success, 1 when no key is available at all.
+_resolve_signing_keys() {
+    TRUST_KEY=""
+    TRUST_CERT=""
+
+    # (1) site override — /etc/ai-control/signing.conf
+    if [ -r /etc/ai-control/signing.conf ]; then
+        # Config file is plain shell key=value; variables allowed:
+        #   TRUST_SIGN_KEY=/path/to/priv.pem
+        #   TRUST_SIGN_CERT=/path/to/pub.der
+        # shellcheck disable=SC1091
+        . /etc/ai-control/signing.conf 2>/dev/null || true
+        if [ -n "${TRUST_SIGN_KEY:-}" ] && [ -r "${TRUST_SIGN_KEY}" ] \
+        && [ -n "${TRUST_SIGN_CERT:-}" ] && [ -r "${TRUST_SIGN_CERT}" ]; then
+            TRUST_KEY="$TRUST_SIGN_KEY"
+            TRUST_CERT="$TRUST_SIGN_CERT"
+            _log "signing keys: site-override ($TRUST_KEY + $TRUST_CERT)"
+            return 0
+        fi
+    fi
+
+    # (2) project default — /var/lib/ai-control/trust-*.{pem,der}
+    if [ -r /var/lib/ai-control/trust-priv.pem ] \
+    && [ -r /var/lib/ai-control/trust-pub.der ]; then
+        TRUST_KEY=/var/lib/ai-control/trust-priv.pem
+        TRUST_CERT=/var/lib/ai-control/trust-pub.der
+        _log "signing keys: project default ($TRUST_KEY + $TRUST_CERT)"
+        return 0
+    fi
+
+    # (3) per-install MOK at /var/lib/dkms/mok.{key,pub}
+    if [ -r /var/lib/dkms/mok.key ] && [ -r /var/lib/dkms/mok.pub ]; then
+        TRUST_KEY=/var/lib/dkms/mok.key
+        TRUST_CERT=/var/lib/dkms/mok.pub
+        _log "signing keys: per-install MOK ($TRUST_KEY + $TRUST_CERT)"
+        return 0
+    fi
+
+    return 1
+}
+
+# Lazily generate a per-install MOK if no key source exists AND the user did
+# not forbid it (/etc/ai-control/no-auto-mok exists). This keeps archiso
+# first-boots self-healing under lockdown.
+_maybe_generate_install_mok() {
+    if [ -e /etc/ai-control/no-auto-mok ]; then
+        _log "per-install MOK generation disabled by /etc/ai-control/no-auto-mok"
+        return 1
+    fi
+    if ! command -v openssl >/dev/null 2>&1; then
+        _warn "openssl not found — cannot generate per-install MOK"
+        return 1
+    fi
+    mkdir -p /var/lib/dkms
+    if [ -f /var/lib/dkms/mok.key ]; then
+        return 0  # already there
+    fi
+    _log "generating per-install MOK at /var/lib/dkms/mok.{key,pub}"
+    openssl req -new -x509 -nodes \
+        -newkey rsa:4096 -sha256 -days 3650 \
+        -subj "/CN=ARCHWINDOWS trust-dkms per-install MOK/O=ARCHWINDOWS/" \
+        -keyout /var/lib/dkms/mok.key \
+        -outform DER -out /var/lib/dkms/mok.pub \
+        2>/dev/null || { _warn "openssl req failed; continuing unsigned"; return 1; }
+    chmod 600 /var/lib/dkms/mok.key
+    _log "MOK generated — enroll with: mokutil --import /var/lib/dkms/mok.pub"
+    return 0
+}
+
+# Sign a freshly-built .ko using whichever key source _resolve_signing_keys
+# found. On failure we print a visible warning but do NOT abort installation.
+_sign_module() {
+    local ko="$1"
+    [ -f "$ko" ] || return 1
+    local kver
+    kver="$(uname -r)"
+    local sign_file="/usr/lib/modules/${kver}/build/scripts/sign-file"
+    if [ ! -x "$sign_file" ]; then
+        _warn "sign-file not at $sign_file — module left unsigned"
+        _warn "install linux-headers OR use bootc image with pre-built signed module"
+        return 1
+    fi
+    if ! _resolve_signing_keys; then
+        _maybe_generate_install_mok && _resolve_signing_keys
+    fi
+    if [ -z "$TRUST_KEY" ] || [ -z "$TRUST_CERT" ]; then
+        _warn "no signing keys resolved — trust.ko left UNSIGNED"
+        _warn "under lockdown=integrity this module will REFUSE TO LOAD."
+        _warn "remedies: (a) boot with kernel param lockdown=none; or"
+        _warn "         (b) create /etc/ai-control/signing.conf with key/cert paths; or"
+        _warn "         (c) let DKMS auto-generate per-install MOK (do not create"
+        _warn "             /etc/ai-control/no-auto-mok), then run"
+        _warn "             mokutil --import /var/lib/dkms/mok.pub and reboot."
+        return 1
+    fi
+    if "$sign_file" sha256 "$TRUST_KEY" "$TRUST_CERT" "$ko" 2>/dev/null; then
+        _log "signed $ko with $TRUST_CERT"
+        return 0
+    fi
+    _warn "sign-file failed on $ko — module left unsigned"
+    return 1
+}
+
+# After dkms install, walk the module output path for every kernel version and
+# sign anything matching our module name. DKMS installs to
+# /usr/lib/modules/<kver>/extra/trust.ko (per DEST_MODULE_LOCATION).
+_sign_all_dkms_outputs() {
+    local any_signed=0
+    for kver in $(ls /usr/lib/modules/ 2>/dev/null); do
+        local ko="/usr/lib/modules/${kver}/extra/${_mod}.ko"
+        [ -f "$ko" ] || continue
+        # Already signed by bootc build? Leave it alone.
+        if tail -c 28 "$ko" 2>/dev/null | grep -q 'Module signature appended'; then
+            _log "skipping signed module $ko"
+            any_signed=1
+            continue
+        fi
+        if _sign_module "$ko"; then
+            any_signed=1
+        fi
+    done
+    return $((1 - any_signed))
+}
+
 post_install() {
     _gen_autoconf
 
-    echo ">>> Registering ${_mod}/${_ver} with DKMS..."
+    # Fast path: if bootc built + signed the module at image time, DKMS work
+    # is redundant. Just run depmod to wire it up.
+    if _have_prebuilt_signed_module; then
+        _log "pre-built signed trust.ko detected at /usr/lib/modules/$(uname -r)/extra/"
+        _log "skipping DKMS add/build/install — bootc image path"
+        depmod -a 2>/dev/null || true
+        _log "load with: modprobe trust"
+        return 0
+    fi
+
+    _log "registering ${_mod}/${_ver} with DKMS..."
     dkms add "${_mod}/${_ver}" --no-depmod 2>/dev/null || true
 
-    echo ">>> Building ${_mod}/${_ver} for running kernel..."
+    _log "building ${_mod}/${_ver} for running kernel..."
     if dkms build "${_mod}/${_ver}" --no-depmod; then
         dkms install "${_mod}/${_ver}" --no-depmod
+        # Sign immediately after DKMS lays the module down.
+        _sign_all_dkms_outputs || \
+            _warn "one or more trust.ko copies left unsigned (see earlier warnings)"
         depmod -a
-        echo ">>> trust.ko installed — load with: modprobe trust"
+        _log "trust.ko installed — load with: modprobe trust"
     else
-        echo ">>> Build failed (no kernel headers?). Module will be built on next kernel install."
+        _warn "build failed (no kernel headers?). Module will be built on next kernel install."
     fi
 }
 
 post_upgrade() {
     local _old_ver="$1"
-    echo ">>> Removing old ${_mod}/${_old_ver} from DKMS..."
+    _log "removing old ${_mod}/${_old_ver} from DKMS..."
     dkms remove "${_mod}/${_old_ver}" --all 2>/dev/null || true
 
     post_install
 }
 
 pre_remove() {
-    echo ">>> Removing ${_mod}/${_ver} from DKMS..."
+    _log "removing ${_mod}/${_ver} from DKMS..."
     dkms remove "${_mod}/${_ver}" --all 2>/dev/null || true
 }

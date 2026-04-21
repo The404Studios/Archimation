@@ -91,6 +91,25 @@ for unit in trust.slice ai-daemon.slice observer.slice game.slice; do
     fi
 done
 
+# Session 68 (Agent G): PowerShell Core first-boot installer.  Gated on
+# !/usr/bin/pwsh via ConditionPathExists in the unit, so this is a no-op
+# once pwsh is on disk.  Required to flip tests/pe-loader/run_corpus.sh's
+# powershell_hello.ps1 from SKIP → PASS on live ISO without baking an
+# AUR dependency into pacstrap.
+if [ -f /etc/systemd/system/ai-install-pwsh.service ]; then
+    ln -sf /etc/systemd/system/ai-install-pwsh.service \
+        "$WANTS_DIR/ai-install-pwsh.service"
+fi
+
+# Session 69 (Agent R): first-boot user/group reconciliation.  Idempotent
+# oneshot that adds the default non-root user to trust + pe-compat + wheel
+# + audio/video/input.  Ordered Before=ai-control.service so the daemon
+# sees the final group layout when it chgrp's /run/pe-compat/events.sock.
+if [ -f /etc/systemd/system/ai-setup-users.service ]; then
+    ln -sf /etc/systemd/system/ai-setup-users.service \
+        "$WANTS_DIR/ai-setup-users.service"
+fi
+
 # PE-compat firewall - Windows-style firewall layer
 # After= pe-compat.slice so the slice directory exists before the firewall
 # daemon starts moving PIDs into it.

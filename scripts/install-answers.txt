@@ -1,0 +1,44 @@
+# scripts/install-answers.txt — pre-baked installer answers for automated QEMU validation.
+# Consumed by scripts/test-install-to-disk.sh → guest-side run-installer-headless.py.
+#
+# Format: KEY=VALUE, one per line.  Lines beginning with '#' are comments.
+# Unknown keys are silently ignored by the runner, so new fields can be added
+# without breaking older runners that don't know about them.
+
+# --- Target disk ---------------------------------------------------------
+# The blank qcow2 attached via virtio appears as /dev/vda in the guest.
+disk=/dev/vda
+
+# --- Partitioning -------------------------------------------------------
+# 512M EFI (FAT32) + root (ext4).  Optional swap size (0 = disabled).
+efi_size_mb=512
+use_swap=0
+swap_size_gb=0
+
+# --- Identity ------------------------------------------------------------
+hostname=archtest
+username=arch
+password=arch
+# Display name only affects /etc/passwd GECOS — not login credentials.
+display_name=AI Arch Test
+
+# --- Locale / keyboard / time -------------------------------------------
+timezone=UTC
+locale=en_US.UTF-8
+keymap=us
+
+# --- Boot loader --------------------------------------------------------
+# Values: systemd-boot | grub
+bootloader=systemd-boot
+
+# --- AI subsystem defaults ---------------------------------------------
+# Autonomy level matches the first-boot wizard:
+#   0=Observer 1=Advisor 2=Act&Report 3=Autonomous 4=Sovereign
+enable_ai=1
+autonomy_level=2
+
+# --- Preset --------------------------------------------------------------
+# 'minimal' installs only base + ai-control; 'full' adds the desktop stack
+# (XFCE, Firefox, gaming packages).  Minimal keeps the test ~8 min faster
+# and the post-install disk image under 6 GB.
+preset=minimal

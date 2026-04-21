@@ -126,6 +126,19 @@ extern gfx_window_t *hwnd_to_gfx(HWND hwnd);
 extern HWND gfx_to_hwnd(gfx_window_t *win);
 extern WNDPROC hwnd_get_wndproc(HWND hwnd);
 
+/* Session 68: WM_DPICHANGED hook lives in libpe_shcore.so.
+ *
+ * Declared weak so libpe_user32.so links cleanly even when shcore is
+ * not yet available at link time (user32's link line does not pull in
+ * shcore on purpose -- shcore sits logically *above* user32).
+ *
+ * At runtime the loader dlopens every stub DLL early, so by the time a
+ * ConfigureNotify reaches the message pump the weak reference has been
+ * satisfied and the call fires. If shcore is absent (headless tests),
+ * the pointer is NULL and we silently skip. */
+extern int shcore_notify_window_rect_change(HWND hwnd, int x, int y, int w, int h)
+    __attribute__((weak));
+
 /* --------------------------------------------------------------------------
  * Message queue (simple linked list per-thread)
  * -------------------------------------------------------------------------- */
@@ -307,6 +320,18 @@ static int translate_gfx_event_to_msg(const gfx_event_t *event, MSG *msg)
         return 1;
 
     case GFX_EVENT_RESIZE:
+        /* S68: window may have crossed a DPI boundary -- check and post
+         * WM_DPICHANGED if needed. The WM_SIZE we build below is emitted
+         * as before; WM_DPICHANGED is queued separately via PostMessage
+         * from within shcore_notify_window_rect_change. */
+        if (shcore_notify_window_rect_change && event->window) {
+            shcore_notify_window_rect_change(
+                msg->hwnd,
+                event->window->x,
+                event->window->y,
+                event->width,
+                event->height);
+        }
         msg->message = WM_SIZE;
         msg->wParam = 0;  /* SIZE_RESTORED */
         msg->lParam = ((LPARAM)(event->height & 0xFFFF) << 16) |
@@ -314,6 +339,15 @@ static int translate_gfx_event_to_msg(const gfx_event_t *event, MSG *msg)
         return 1;
 
     case GFX_EVENT_MOVE:
+        /* S68: same WM_DPICHANGED check on move. */
+        if (shcore_notify_window_rect_change && event->window) {
+            shcore_notify_window_rect_change(
+                msg->hwnd,
+                event->x,
+                event->y,
+                event->window->width,
+                event->window->height);
+        }
         msg->message = WM_MOVE;
         msg->wParam = 0;
         msg->lParam = ((LPARAM)(event->y & 0xFFFF) << 16) |

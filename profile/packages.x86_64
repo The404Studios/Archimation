@@ -94,6 +94,13 @@ wine-gecko
 # lib32-gst-plugins-good  # AUR-only (does not exist in multilib)
 winetricks
 
+# Mono CLR — runs native .NET 4.x PE binaries via mscoree bridge (Session 65 A2).
+# Ships `mcs` (C# compiler) + `mono` (CLR runtime). Required by PE corpus's
+# dotnet_hello.exe and by the AI daemon's claude_installer when .NET tooling
+# is requested. extra/mono provides monodoc; depends: zlib, libgdiplus, sh,
+# python, ca-certificates (already in base).
+mono
+
 # Network
 networkmanager
 network-manager-applet

@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""ai -- natural-language CLI for the AI Control daemon.
+
+Stdlib-only.  Talks to the daemon's /contusion/ai endpoint, presents the
+proposed plan, asks the operator to confirm, then dispatches via
+/contusion/confirm + /contusion/execute.  Never subprocesses anything
+itself -- every action is mediated by the daemon.
+
+Daemon URL is resolved with this precedence (highest -> lowest):
+  1. ``--daemon-url URL`` CLI flag
+  2. ``$AI_DAEMON_URL`` environment variable
+  3. ``~/.ai/config.toml::daemon_url``
+  4. ``http://127.0.0.1:8420`` default
+
+Auth token uses the same chain but with ``--token``, ``$AI_DAEMON_TOKEN``,
+and ``~/.ai/config.toml::auth_token``.
+
+Stdin handling: when stdin is not a TTY (pipe/redirect), the y/N/edit
+prompt reads one line and accepts ``y``/``yes`` (case-insensitive) as
+confirm; anything else (including EOF or empty) declines.  This makes
+``echo y | ai install firefox`` work in pipelines.  ``--yes`` still
+bypasses the prompt entirely on high-confidence plans.
+
+Exit codes:
+  0  success
+  1  user declined
+  2  LLM low confidence
+  3  execute failed
+  4  daemon unreachable
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+try:
+    import tomllib  # type: ignore[attr-defined]  # Python 3.11+
+    _HAS_TOMLLIB = True
+except ImportError:  # pragma: no cover - older interpreters
+    tomllib = None  # type: ignore[assignment]
+    _HAS_TOMLLIB = False
+
+
+__version__ = "0.1.0"
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "daemon_url": "http://127.0.0.1:8420",
+    "auth_token": "",
+    "auto_confirm_threshold": 0.85,
+    "verbosity": "normal",
+    "editor": "",
+}
+
+CONFIG_PATH = Path.home() / ".ai" / "config.toml"
+
+# ---------------------------------------------------------------------------
+# ANSI helpers
+# ---------------------------------------------------------------------------
+
+class C:
+    """Tiny ANSI color holder.  All attributes become empty strings when
+    --no-color is in effect or the output is not a TTY."""
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GRN = "\033[32m"
+    YLW = "\033[33m"
+    BLU = "\033[34m"
+    MAG = "\033[35m"
+    CYN = "\033[36m"
+
+    @classmethod
+    def disable(cls) -> None:
+        for k in list(vars(cls)):
+            if k.isupper() and isinstance(getattr(cls, k), str):
+                setattr(cls, k, "")
+
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+def _parse_ini_fallback(text: str) -> Dict[str, Any]:
+    """Tiny key=value parser used when tomllib is unavailable.  Only
+    understands top-level scalar lines; good enough for our tiny config."""
+    out: Dict[str, Any] = {}
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        v = v.strip()
+        if v.startswith('"') and v.endswith('"'):
+            v = v[1:-1]
+        elif v.startswith("'") and v.endswith("'"):
+            v = v[1:-1]
+        else:
+            try:
+                if "." in v:
+                    v = float(v)
+                else:
+                    v = int(v)
+            except ValueError:
+                pass
+        out[k] = v
+    return out
+
+
+def load_config(path: Path = CONFIG_PATH) -> Dict[str, Any]:
+    cfg = dict(DEFAULT_CONFIG)
+    if not path.is_file():
+        return cfg
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return cfg
+    parsed: Dict[str, Any] = {}
+    if _HAS_TOMLLIB:
+        try:
+            parsed = tomllib.loads(raw.decode("utf-8"))  # type: ignore[union-attr]
+        except Exception:
+            parsed = _parse_ini_fallback(raw.decode("utf-8", "replace"))
+    else:
+        parsed = _parse_ini_fallback(raw.decode("utf-8", "replace"))
+    for k, v in parsed.items():
+        if k in DEFAULT_CONFIG:
+            cfg[k] = v
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# HTTP client
+# ---------------------------------------------------------------------------
+
+class DaemonClient:
+    def __init__(self, base: str, token: str = "", timeout: float = 30.0):
+        self.base = base.rstrip("/")
+        self.token = token or ""
+        self.timeout = timeout
+
+    def _post(self, path: str, payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        url = self.base + path
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "application/json")
+        if self.token:
+            req.add_header("Authorization", f"Bearer {self.token}")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read()
+                code = resp.getcode()
+        except urllib.error.HTTPError as e:
+            raw = e.read() if hasattr(e, "read") else b"{}"
+            code = e.code
+        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+            raise DaemonUnreachable(str(e)) from e
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except Exception:
+            data = {"raw": raw.decode("utf-8", "replace")}
+        return code, data
+
+
+class DaemonUnreachable(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Plan rendering
+# ---------------------------------------------------------------------------
+
+def _confidence_color(conf: float) -> str:
+    if conf >= 0.85:
+        return C.GRN
+    if conf >= 0.6:
+        return C.YLW
+    return C.RED
+
+
+def _extract_plan(resp: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalise the /contusion/ai response into a uniform plan dict.
+
+    Tolerates three reasonable shapes the daemon may emit:
+      (a) {"plan": {handler_type, args, confidence, rationale, ...}}
+      (b) {"handler_type": ..., "args": ..., "confidence": ..., "rationale": ...}
+      (c) {"proposal": {"success": True, "results": [{"action": ht,
+            "handler_type": ht, "args": ..., "confidence": ..., "rationale": ...}]}}
+            -- the live daemon shape from contusion._route_via_llm via
+            the /contusion/ai endpoint. We pluck results[0].
+    """
+    # Shape (c) — daemon's actual production envelope (S53 fix)
+    proposal = resp.get("proposal")
+    if isinstance(proposal, dict):
+        results = proposal.get("results")
+        if isinstance(results, list) and results and isinstance(results[0], dict):
+            first = results[0]
+            plan = {}
+            for k in ("handler_type", "args", "confidence", "rationale",
+                      "action", "source"):
+                if k in first:
+                    plan[k] = first[k]
+            # action and handler_type are aliases in the daemon payload
+            if "handler_type" not in plan and "action" in plan:
+                plan["handler_type"] = plan["action"]
+        else:
+            # proposal exists but no results -- treat outer as plan dict
+            plan = dict(proposal)
+    elif isinstance(resp.get("plan"), dict):
+        plan = dict(resp["plan"])
+    else:
+        plan = {}
+        for k in ("handler_type", "args", "confidence", "rationale",
+                  "action", "command", "value", "description",
+                  "clarifying_question", "suggestion"):
+            if k in resp:
+                plan[k] = resp[k]
+    plan.setdefault("handler_type", resp.get("action") or "unknown")
+    plan.setdefault("args", resp.get("args") or {})
+    try:
+        plan["confidence"] = float(plan.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        plan["confidence"] = 0.0
+    plan.setdefault("rationale", resp.get("rationale", ""))
+    # Bubble up daemon-side error / clarification fields so the CLI's low-conf
+    # path can show the user something useful instead of "unknown".
+    for surface in ("clarifying_question", "suggestion", "needs_clarification",
+                    "error", "llm_suggestion"):
+        if surface in resp and surface not in plan:
+            plan[surface] = resp[surface]
+    return plan
+
+
+def render_plan(plan: Dict[str, Any], verbose: bool = False) -> None:
+    handler = plan.get("handler_type", "unknown")
+    args = plan.get("args", {})
+    conf = float(plan.get("confidence", 0.0))
+    rationale = plan.get("rationale", "")
+
+    cc = _confidence_color(conf)
+    try:
+        args_disp = json.dumps(args, indent=2 if verbose else None,
+                               ensure_ascii=False)
+    except Exception:
+        args_disp = repr(args)
+
+    print(f"{C.BOLD}Proposed action:{C.RESET} {C.CYN}{handler}{C.RESET}({args_disp})")
+    print(f"{C.BOLD}Confidence:{C.RESET}      {cc}{conf:.2f}{C.RESET}")
+    if rationale:
+        if verbose:
+            print(f"{C.BOLD}Rationale:{C.RESET}")
+            for line in str(rationale).splitlines() or [""]:
+                print(f"  {C.DIM}{line}{C.RESET}")
+        else:
+            short = str(rationale).strip().splitlines()[0][:160]
+            print(f"{C.BOLD}Rationale:{C.RESET}       {C.DIM}{short}{C.RESET}")
+
+
+# ---------------------------------------------------------------------------
+# Edit-in-editor flow
+# ---------------------------------------------------------------------------
+
+def edit_plan_args(plan: Dict[str, Any], editor_pref: str) -> Dict[str, Any]:
+    editor = editor_pref or os.environ.get("EDITOR") or "vi"
+    payload = {
+        "handler_type": plan.get("handler_type"),
+        "args": plan.get("args", {}),
+    }
+    blob = json.dumps(payload, indent=2, ensure_ascii=False)
+    fd, name = tempfile.mkstemp(prefix="ai-plan-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(blob)
+        # subprocess is allowed here only to invoke the user's editor on a
+        # local temp file.  This is not a system action -- it's the same as
+        # `git commit` opening $EDITOR on COMMIT_EDITMSG.
+        import subprocess  # local import keeps the no-system-side-effects rule visible
+        rc = subprocess.call([editor, name])
+        if rc != 0:
+            print(f"{C.YLW}Editor exited non-zero ({rc}); aborting edit.{C.RESET}",
+                  file=sys.stderr)
+            return plan
+        with open(name, "r", encoding="utf-8") as f:
+            edited = json.load(f)
+        new_plan = dict(plan)
+        new_plan["handler_type"] = edited.get("handler_type", plan.get("handler_type"))
+        new_plan["args"] = edited.get("args", plan.get("args", {}))
+        return new_plan
+    finally:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Confirmation flow
+# ---------------------------------------------------------------------------
+
+def _prompt_confirm() -> str:
+    """Prompt the operator to confirm the proposed plan.
+
+    Behaviour matrix:
+      * stdin is a TTY -> interactive prompt "Confirm? [y/N/edit]".
+      * stdin is NOT a TTY (piped/redirected) -> read ONE line from stdin and
+        accept ``y|yes`` (case-insensitive) as confirm; anything else
+        (including empty, whitespace, or EOF) is treated as decline.
+        Pipelines like ``echo y | ai install firefox`` therefore work as
+        the operator expects.
+    """
+    if not sys.stdin.isatty():
+        try:
+            line = sys.stdin.readline()
+        except (KeyboardInterrupt, OSError):
+            return "n"
+        ans = (line or "").strip().lower()
+        if ans in ("y", "yes"):
+            return "y"
+        return "n"
+    try:
+        ans = input(f"{C.BOLD}Confirm? [y/N/edit]{C.RESET} ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return "n"
+    return ans or "n"
+
+
+def _action_value_from_plan(plan: Dict[str, Any]) -> str:
+    """Pick a string suitable for /contusion/confirm's `value` field.
+    The daemon accepts either `command` or `value`; we pass both."""
+    args = plan.get("args") or {}
+    if isinstance(args, dict):
+        for k in ("command", "value", "target", "package", "app"):
+            v = args.get(k)
+            if isinstance(v, str) and v:
+                return v
+    handler = plan.get("handler_type", "")
+    if isinstance(args, dict) and args:
+        try:
+            return f"{handler}:{json.dumps(args, ensure_ascii=False)}"
+        except Exception:
+            return handler
+    return handler
+
+
+# ---------------------------------------------------------------------------
+# Result rendering
+# ---------------------------------------------------------------------------
+
+def render_result(resp: Dict[str, Any], verbose: bool = False) -> int:
+    status = resp.get("status", "")
+    success = bool(resp.get("success", status == "ok"))
+    summary = resp.get("summary") or resp.get("result") or ""
+    if isinstance(summary, dict):
+        summary = json.dumps(summary, indent=2)
+    color = C.GRN if success else C.RED
+    tag = "OK" if success else "FAIL"
+    print(f"{color}[{tag}]{C.RESET} {summary}")
+    if verbose:
+        try:
+            print(f"{C.DIM}{json.dumps(resp, indent=2, ensure_ascii=False)}{C.RESET}")
+        except Exception:
+            pass
+    return 0 if success else 3
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="ai",
+        description="Natural-language CLI for the AI Control daemon. "
+                    "Phrase a task in English and the daemon plans + executes it.",
+        epilog="Examples:\n"
+               "  ai install firefox\n"
+               "  ai launch steam in big picture mode\n"
+               "  ai close all chrome windows and lock the screen\n"
+               "  echo y | ai install firefox          # accept piped 'y'\n"
+               "  ai --daemon-url http://10.0.0.5:8420 status disks\n"
+               "\n"
+               "Daemon URL precedence (highest -> lowest):\n"
+               "  1. --daemon-url URL\n"
+               "  2. $AI_DAEMON_URL\n"
+               "  3. ~/.ai/config.toml::daemon_url\n"
+               "  4. http://127.0.0.1:8420 (default)\n"
+               "\n"
+               "Auth token precedence (highest -> lowest):\n"
+               "  1. --token TOKEN\n"
+               "  2. $AI_DAEMON_TOKEN\n"
+               "  3. ~/.ai/config.toml::auth_token\n"
+               "  4. (no token sent)\n"
+               "\n"
+               "Stdin handling:\n"
+               "  When stdin is not a TTY (piped/redirected), one line is read\n"
+               "  for the confirmation prompt. 'y' or 'yes' confirms, anything\n"
+               "  else (including EOF) declines. Use --yes to bypass the prompt\n"
+               "  entirely on high-confidence plans.\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("task", nargs=argparse.REMAINDER,
+                   help="The task in natural language (any number of words).")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="Auto-confirm if the LLM's confidence meets the threshold.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Show the plan but don't execute it.")
+    p.add_argument("--no-color", action="store_true",
+                   help="Strip ANSI color codes from output.")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="Show the full LLM rationale and the daemon audit trail.")
+    p.add_argument("--daemon-url", dest="daemon_url", default=None, metavar="URL",
+                   help="Override the daemon base URL "
+                        "(beats $AI_DAEMON_URL and ~/.ai/config.toml). "
+                        "Default: http://127.0.0.1:8420.")
+    p.add_argument("--token", default=None, metavar="TOKEN",
+                   help="Override the auth token "
+                        "(beats $AI_DAEMON_TOKEN and ~/.ai/config.toml).")
+    p.add_argument("--config", dest="config", default=None, metavar="FILE",
+                   help="Override the config file path. Useful for CI / "
+                        "test fixtures (defaults to ~/.ai/config.toml). "
+                        "Beats $AI_CONFIG_FILE; CLI flag wins.")
+    p.add_argument("--version", action="version", version=f"ai {__version__}")
+    return p
+
+
+def _normalise_argv(argv: list) -> list:
+    """Strip the leading 'task' subcommand alias if present."""
+    if argv and argv[0] == "task":
+        return argv[1:]
+    return argv
+
+
+def main(argv: Optional[list] = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    argv = _normalise_argv(argv)
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # --no-color or non-tty stdout disables colors
+    if args.no_color or not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+        C.disable()
+
+    task_words = list(args.task or [])
+    if not task_words:
+        parser.print_help()
+        return 0
+    instruction = " ".join(task_words).strip()
+
+    # Resolve config path: --config flag > $AI_CONFIG_FILE env > default
+    if args.config is not None:
+        cfg_path = Path(args.config).expanduser()
+    elif os.environ.get("AI_CONFIG_FILE"):
+        cfg_path = Path(os.environ["AI_CONFIG_FILE"]).expanduser()
+    else:
+        cfg_path = CONFIG_PATH
+    cfg = load_config(cfg_path)
+    # Precedence (highest first): CLI flag > env var > config file > default.
+    if args.daemon_url is not None:
+        base = args.daemon_url
+    elif os.environ.get("AI_DAEMON_URL"):
+        base = os.environ["AI_DAEMON_URL"]
+    else:
+        base = str(cfg.get("daemon_url", "http://127.0.0.1:8420"))
+    if args.token is not None:
+        token = args.token
+    elif os.environ.get("AI_DAEMON_TOKEN"):
+        token = os.environ["AI_DAEMON_TOKEN"]
+    else:
+        token = str(cfg.get("auth_token", ""))
+    threshold = float(cfg.get("auto_confirm_threshold", 0.85))
+    editor_pref = str(cfg.get("editor", ""))
+    verbose = args.verbose or str(cfg.get("verbosity", "")).lower() == "verbose"
+
+    client = DaemonClient(base, token=token)
+
+    # ---- Phase 1: ask the daemon for a plan -------------------------------
+    try:
+        code, resp = client._post("/contusion/ai",
+                                  {"instruction": instruction,
+                                   "auto_confirm": False})
+    except DaemonUnreachable as e:
+        print(f"{C.RED}error:{C.RESET} cannot reach AI daemon at {base}",
+              file=sys.stderr)
+        print(f"  {C.DIM}{e}{C.RESET}", file=sys.stderr)
+        print(f"  {C.YLW}hint:{C.RESET} run "
+              f"`systemctl status ai-control` to check the service.",
+              file=sys.stderr)
+        return 4
+
+    if code in (401, 403):
+        print(f"{C.RED}error:{C.RESET} daemon rejected request "
+              f"({code}). Token misconfigured?", file=sys.stderr)
+        return 4
+    if code >= 500:
+        print(f"{C.RED}error:{C.RESET} daemon returned {code}", file=sys.stderr)
+        if verbose:
+            print(json.dumps(resp, indent=2), file=sys.stderr)
+        return 3
+
+    plan = _extract_plan(resp)
+
+    # ---- Phase 2: handle low-confidence -----------------------------------
+    if plan["confidence"] < 0.30:
+        print(f"{C.YLW}Low confidence ({plan['confidence']:.2f}) "
+              f"-- the daemon is not sure what you mean.{C.RESET}",
+              file=sys.stderr)
+        sug = (resp.get("suggestion") or plan.get("suggestion")
+               or plan.get("rationale") or "")
+        clar = resp.get("clarifying_question") or plan.get("clarifying_question")
+        if sug:
+            print(f"  {C.DIM}suggestion:{C.RESET} {sug}", file=sys.stderr)
+        if clar:
+            print(f"  {C.BOLD}{clar}{C.RESET}", file=sys.stderr)
+        return 2
+
+    # ---- Phase 3: render plan ---------------------------------------------
+    print()
+    render_plan(plan, verbose=verbose)
+    print()
+
+    if args.dry_run:
+        print(f"{C.DIM}[dry-run] not executing.{C.RESET}")
+        return 0
+
+    # ---- Phase 4: confirm --------------------------------------------------
+    if args.yes and plan["confidence"] >= threshold:
+        decision = "y"
+        print(f"{C.DIM}--yes auto-confirm "
+              f"(confidence >= {threshold}){C.RESET}")
+    else:
+        decision = _prompt_confirm()
+
+    if decision in ("n", "no"):
+        print(f"{C.YLW}Declined.{C.RESET}")
+        return 1
+
+    if decision in ("e", "edit"):
+        plan = edit_plan_args(plan, editor_pref)
+        print()
+        print(f"{C.BOLD}Edited plan:{C.RESET}")
+        render_plan(plan, verbose=verbose)
+        # After edit we go straight to execute (no second confirm prompt).
+
+    # ---- Phase 5: execute --------------------------------------------------
+    action_value = _action_value_from_plan(plan)
+    try:
+        if decision in ("y", "yes"):
+            # Two-step: confirm -> execute.  The daemon uses /contusion/confirm
+            # to clear the dangerous-action gate, then /contusion/execute to
+            # actually run.  We pass the plan's value to both so the daemon
+            # can re-resolve the same action after confirmation.
+            ccode, cresp = client._post(
+                "/contusion/confirm",
+                {"command": action_value, "value": action_value},
+            )
+            if ccode >= 400:
+                print(f"{C.RED}confirm failed ({ccode}){C.RESET}",
+                      file=sys.stderr)
+                if verbose:
+                    print(json.dumps(cresp, indent=2), file=sys.stderr)
+                return 3
+
+        ecode, eresp = client._post(
+            "/contusion/execute",
+            {"instruction": instruction,
+             "action": plan.get("handler_type"),
+             "args": plan.get("args", {})},
+        )
+    except DaemonUnreachable as e:
+        print(f"{C.RED}error:{C.RESET} daemon disappeared mid-execute: {e}",
+              file=sys.stderr)
+        return 4
+
+    if ecode >= 400:
+        print(f"{C.RED}execute failed ({ecode}){C.RESET}", file=sys.stderr)
+        if verbose:
+            print(json.dumps(eresp, indent=2), file=sys.stderr)
+        return 3
+
+    return render_result(eresp, verbose=verbose)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print()
+        sys.exit(1)

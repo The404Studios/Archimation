@@ -1,0 +1,730 @@
+#!/bin/bash
+# ai-install-bootc — bootc-mode installer for ArchWindows (AI Arch Linux).
+#
+# Session 72 / Agent δ.  Parallel to `ai-install-to-disk` (the archiso/pacstrap
+# path).  Deploys the ArchWindows OCI image via `bootc install to-filesystem`.
+#
+# What this does (top-to-bottom):
+#   1. Pre-flight: root + live-ISO + bootc CLI present.
+#   2. Capability detection: EFI vs BIOS, TPM 2.0, disk size, network.
+#      Prints an UNMISSABLE capability matrix with red warnings when degrading.
+#   3. Prompts / flags: target disk, image ref, hostname, user, fs, password.
+#   4. Triple-confirm destructive op (must TYPE device name).
+#   5. Partition:  GPT (EFI) / MBR (BIOS) + 512 MiB EFI/boot + rest for root.
+#   6. Format:     FAT32 on ESP + btrfs (default) with @ @home @var subvols.
+#                  xfs + ext4 on request.  Refuse disks < 16 GiB.
+#   7. Mount under /mnt.
+#   8. `bootc install to-filesystem --source-imgref <...> /mnt` does the deploy.
+#   9. Chroot-ish post-install: create user, hostname, timezone, enroll MOK if
+#      Agent β's key exists, write expected-PCR-11 if TPM is present.
+#  10. Finish: unmount + reboot hint.
+#
+# Exit codes:
+#   0 — install completed (reboot to use).
+#   1 — aborted (user cancel, validation fail).
+#   2 — environment error (not root, missing tool, unsupported hw).
+#   3 — bootc install failed.
+#
+# See docs/research/s72_delta_installer.md for the two-mode matrix + old-hw
+# graceful degradation walkthrough.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Colors (graceful when not a tty — red warnings remain visible either way)
+# ---------------------------------------------------------------------------
+if [ -t 1 ] && [ "${NO_COLOR:-}" = "" ]; then
+    RED=$'\033[1;31m'
+    YEL=$'\033[1;33m'
+    GRN=$'\033[1;32m'
+    CYN=$'\033[1;36m'
+    BLD=$'\033[1m'
+    RST=$'\033[0m'
+else
+    RED=""; YEL=""; GRN=""; CYN=""; BLD=""; RST=""
+fi
+
+# ---------------------------------------------------------------------------
+# Defaults (overridden by flags or prompts)
+# ---------------------------------------------------------------------------
+TARGET=""
+HOSTNAME_DEF="archwindows"
+USERNAME_DEF="archw"
+TIMEZONE_DEF=""
+FS="btrfs"                                   # btrfs | xfs | ext4
+IMAGE_REF=""                                 # auto-detect if empty
+IMAGE_SOURCE=""                              # auto: local > localhost > ghcr
+ASSUME_YES=0
+PASSWORD=""                                  # never defaulted; env AI_INSTALL_PASSWORD
+AUTHORIZED_KEYS=""                           # optional --ssh-key <path>
+MIN_DISK_GIB=16                              # below this: refuse
+
+MOUNT="/mnt"
+LOG="/var/log/ai-install-bootc.log"
+
+# Well-known image refs (search order)
+IMGREF_LOCAL_STORE="containers-storage:localhost/archwindows-bootc:latest"
+IMGREF_LIVE_ARCHIVE="oci-archive:/var/lib/archwindows/bootc-image.tar"
+IMGREF_GHCR="docker://ghcr.io/fourzerofour/archwindows-bootc:latest"
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+log()   { printf '[ai-install-bootc] %s\n' "$*" | tee -a "$LOG" >&2; }
+die()   { printf '%s[ai-install-bootc] FATAL: %s%s\n' "$RED" "$1" "$RST" | tee -a "$LOG" >&2; exit "${2:-1}"; }
+warn()  { printf '%s[ai-install-bootc] WARN:  %s%s\n' "$YEL" "$*" "$RST" | tee -a "$LOG" >&2; }
+ok()    { printf '%s[ai-install-bootc] OK:    %s%s\n' "$GRN" "$*" "$RST" | tee -a "$LOG" >&2; }
+info()  { printf '%s[ai-install-bootc] %s%s\n'       "$CYN" "$*" "$RST" | tee -a "$LOG" >&2; }
+hr()    { printf -- '------------------------------------------------------------\n'; }
+banner() {
+    # UNMISSABLE red banner — used for degradation warnings.
+    local msg="$1"
+    printf '%s' "$RED"
+    hr
+    printf '  !!! %s !!!\n' "$msg"
+    hr
+    printf '%s' "$RST"
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+Usage: ai-install-bootc [OPTIONS]
+
+Install ArchWindows onto a disk via bootc (OCI-image deploy mode).
+
+This is the recommended installer when 'bootc' is available — gives you
+atomic upgrades (\`bootc upgrade\`) and rollbacks (\`bootc rollback\`) on the
+deployed system.  Parallel to 'ai-install-to-disk', which is the legacy
+archiso/pacstrap path for systems where bootc isn't viable.
+
+Options:
+  --target <dev>        Target disk (e.g. /dev/sda, /dev/nvme0n1).
+  --image-ref <ref>     OCI image to deploy.  Accepts:
+                          containers-storage:localhost/...:tag
+                          oci-archive:/path/to/image.tar
+                          docker://ghcr.io/org/name:tag
+                        Auto-detect if unset (local store > local archive > GHCR).
+  --hostname <name>     Hostname            (default: ${HOSTNAME_DEF}).
+  --user <name>         Primary username    (default: ${USERNAME_DEF}).
+  --timezone <tz>       Timezone            (default: auto-detect or UTC).
+  --fs <btrfs|xfs|ext4> Root filesystem     (default: ${FS}).
+  --ssh-key <path>      Public key to install as root's authorized_keys (optional).
+  --yes                 Non-interactive; requires --target + \$AI_INSTALL_PASSWORD.
+  --help                Show this help.
+
+Environment:
+  AI_INSTALL_PASSWORD   Pre-set password for the new user.
+  NO_COLOR              Disable ANSI colors.
+
+Examples:
+  sudo ai-install-bootc
+  sudo ai-install-bootc --target /dev/sda --image-ref containers-storage:localhost/archwindows-bootc:latest
+  AI_INSTALL_PASSWORD=hunter2 sudo ai-install-bootc --target /dev/sda --user me --yes
+
+Capability detection is automatic.  On old hardware the installer degrades
+gracefully (BIOS/MBR, software-mode trust.ko) with visible red warnings —
+it does NOT silently change safety properties.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Parse flags (do this BEFORE touching the filesystem / logfile — so --help
+# works without root).
+# ---------------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --target)       TARGET="${2:-}";            shift 2 ;;
+        --image-ref)    IMAGE_REF="${2:-}";         shift 2 ;;
+        --hostname)     HOSTNAME_DEF="${2:-}";      shift 2 ;;
+        --user)         USERNAME_DEF="${2:-}";      shift 2 ;;
+        --timezone)     TIMEZONE_DEF="${2:-}";      shift 2 ;;
+        --fs)           FS="${2:-}";                shift 2 ;;
+        --ssh-key)      AUTHORIZED_KEYS="${2:-}";   shift 2 ;;
+        --yes|-y)       ASSUME_YES=1;               shift   ;;
+        --help|-h)      usage; exit 0 ;;
+        *) printf 'unknown flag: %s (try --help)\n' "$1" >&2; exit 1 ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Logfile (after --help so help-before-root works)
+# ---------------------------------------------------------------------------
+touch "$LOG" 2>/dev/null || LOG="/tmp/ai-install-bootc.log"
+log "=== ArchWindows bootc installer ==="
+log "CLI args captured; entering pre-flight."
+
+# ---------------------------------------------------------------------------
+# Pre-flight
+# ---------------------------------------------------------------------------
+# 1) root
+if [ "$(id -u)" -ne 0 ]; then
+    die "must run as root (try: sudo ai-install-bootc)" 2
+fi
+
+# 2) live ISO (not a hard fail — covers running the installer from a target
+#    disk too, which an admin might do for debug / re-deploy).
+if [ ! -d /run/archiso ] && ! grep -q 'archisolabel' /proc/cmdline 2>/dev/null; then
+    warn "this doesn't look like a live ISO boot (/run/archiso missing)"
+    warn "continuing — destructive ops on --target will still proceed if confirmed"
+fi
+
+# 3) bootc present?
+if ! command -v bootc >/dev/null 2>&1; then
+    banner "bootc CLI NOT FOUND"
+    cat <<EOF >&2
+This host does not have the 'bootc' binary installed.  The bootc install
+path is unavailable.
+
+You have two options:
+  (a) Install bootc and retry:
+          pacman -S bootc     # once bootc is in extra/ — AUR today
+      Then: sudo ai-install-bootc
+
+  (b) Use the legacy archiso installer (works without bootc):
+          sudo ai-install-to-disk --mode archiso
+      This produces a working ArchWindows system but without atomic
+      upgrade/rollback semantics.
+EOF
+    exit 2
+fi
+
+# 4) other required tools
+MISSING_TOOLS=""
+for bin in lsblk blkid wipefs sgdisk parted mkfs.fat mkfs.btrfs mkfs.xfs mkfs.ext4; do
+    command -v "$bin" >/dev/null 2>&1 || MISSING_TOOLS="$MISSING_TOOLS $bin"
+done
+if [ -n "$MISSING_TOOLS" ]; then
+    die "missing required tool(s):$MISSING_TOOLS" 2
+fi
+
+# 5) timezone auto-detect
+if [ -z "$TIMEZONE_DEF" ]; then
+    TIMEZONE_DEF="$(timedatectl show -p Timezone --value 2>/dev/null || echo UTC)"
+    [ -n "$TIMEZONE_DEF" ] || TIMEZONE_DEF="UTC"
+fi
+
+# 6) validate --fs
+case "$FS" in
+    btrfs|xfs|ext4) ;;
+    *) die "--fs must be btrfs | xfs | ext4 (got: $FS)" 1 ;;
+esac
+
+ok "pre-flight passed"
+
+# ---------------------------------------------------------------------------
+# Capability detection  (EFI / BIOS, TPM, disk size, network)
+# ---------------------------------------------------------------------------
+CAP_EFI="no"
+CAP_SECUREBOOT="no"
+CAP_TPM="no"
+CAP_TPM_VERSION=""
+CAP_NETWORK="no"
+DEGRADE_NOTES=""
+
+if [ -d /sys/firmware/efi/efivars ] || [ -d /sys/firmware/efi ]; then
+    CAP_EFI="yes"
+    # Secure Boot on?  byte 4 of SecureBoot efivar == 1 => SB enforced.
+    if command -v mokutil >/dev/null 2>&1; then
+        case "$(mokutil --sb-state 2>/dev/null | head -n1)" in
+            *enabled*)  CAP_SECUREBOOT="yes" ;;
+            *disabled*) CAP_SECUREBOOT="no"  ;;
+        esac
+    fi
+else
+    DEGRADE_NOTES="${DEGRADE_NOTES}BIOS/legacy boot (no UEFI)|"
+fi
+
+if [ -e /sys/class/tpm/tpm0 ] || [ -e /dev/tpm0 ] || [ -e /dev/tpmrm0 ]; then
+    CAP_TPM="yes"
+    # 2.0 vs 1.2 — prefer a direct tpm2 call if available, else parse sysfs.
+    if command -v tpm2_getcap >/dev/null 2>&1; then
+        if tpm2_getcap properties-fixed >/dev/null 2>&1; then
+            CAP_TPM_VERSION="2.0"
+        else
+            CAP_TPM_VERSION="1.2"
+        fi
+    elif [ -f /sys/class/tpm/tpm0/tpm_version_major ]; then
+        ver="$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null || echo 0)"
+        case "$ver" in
+            2) CAP_TPM_VERSION="2.0" ;;
+            1) CAP_TPM_VERSION="1.2" ;;
+            *) CAP_TPM_VERSION="unknown" ;;
+        esac
+    else
+        CAP_TPM_VERSION="present"
+    fi
+    if [ "$CAP_TPM_VERSION" != "2.0" ]; then
+        DEGRADE_NOTES="${DEGRADE_NOTES}TPM $CAP_TPM_VERSION (not 2.0)|"
+    fi
+else
+    DEGRADE_NOTES="${DEGRADE_NOTES}no TPM detected|"
+fi
+
+# network probe — bootc pulling from GHCR needs this; skip if local image works.
+if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 || ping -c1 -W2 8.8.8.8 >/dev/null 2>&1; then
+    CAP_NETWORK="yes"
+elif getent hosts ghcr.io >/dev/null 2>&1; then
+    CAP_NETWORK="yes"
+else
+    DEGRADE_NOTES="${DEGRADE_NOTES}no network (remote pull won't work)|"
+fi
+
+# ---------------------------------------------------------------------------
+# Image source resolution (local > local archive > GHCR)
+# ---------------------------------------------------------------------------
+resolve_image_source() {
+    if [ -n "$IMAGE_REF" ]; then
+        IMAGE_SOURCE="$IMAGE_REF"
+        return
+    fi
+    # Try container storage (podman/buildah loaded it already)
+    if command -v podman >/dev/null 2>&1 && \
+       podman image exists localhost/archwindows-bootc:latest 2>/dev/null; then
+        IMAGE_SOURCE="$IMGREF_LOCAL_STORE"
+        return
+    fi
+    # Try live-ISO cached tarball
+    if [ -f "/var/lib/archwindows/bootc-image.tar" ]; then
+        IMAGE_SOURCE="$IMGREF_LIVE_ARCHIVE"
+        return
+    fi
+    # Fall back to GHCR (requires network)
+    if [ "$CAP_NETWORK" = "yes" ]; then
+        IMAGE_SOURCE="$IMGREF_GHCR"
+        return
+    fi
+    IMAGE_SOURCE=""
+}
+resolve_image_source
+
+# ---------------------------------------------------------------------------
+# Print capability matrix
+# ---------------------------------------------------------------------------
+hr
+info "Capability detection:"
+printf '  %-18s %s\n' "UEFI"          "${CAP_EFI}"
+printf '  %-18s %s\n' "Secure Boot"   "${CAP_SECUREBOOT}"
+printf '  %-18s %s %s\n' "TPM"        "${CAP_TPM}" "${CAP_TPM_VERSION}"
+printf '  %-18s %s\n' "Network"       "${CAP_NETWORK}"
+printf '  %-18s %s\n' "Image source"  "${IMAGE_SOURCE:-<none>}"
+hr
+
+# Unmissable red warnings for each degradation.
+if [ -n "$DEGRADE_NOTES" ]; then
+    banner "OLD-HARDWARE / DEGRADED CAPABILITY PATH"
+    printf '%sThe installer will continue in a reduced-security mode:%s\n\n' "$RED" "$RST"
+    IFS='|' read -ra _notes <<< "$DEGRADE_NOTES"
+    for n in "${_notes[@]}"; do
+        [ -z "$n" ] && continue
+        case "$n" in
+            "no TPM detected"|"TPM "*)
+                printf '%s  - %s%s\n' "$RED" "$n" "$RST"
+                printf '    trust.ko will run in %sSOFTWARE-ONLY mode%s (no hardware-backed\n' "$BLD" "$RST"
+                printf '    APE root of trust).  See docs/research/s71_k_measured_boot.md.\n'
+                ;;
+            "BIOS/legacy boot (no UEFI)")
+                printf '%s  - %s%s\n' "$RED" "$n" "$RST"
+                printf '    Will install MBR + BIOS GRUB.  %sNO Secure Boot, NO measured boot.%s\n' "$BLD" "$RST"
+                ;;
+            "no network"*)
+                printf '%s  - %s%s\n' "$RED" "$n" "$RST"
+                printf '    Will use local image cache only.  %sbootc upgrade will require%s\n' "$BLD" "$RST"
+                printf '    network connectivity on the deployed system.\n'
+                ;;
+        esac
+    done
+    printf '\n'
+fi
+
+if [ -z "$IMAGE_SOURCE" ]; then
+    die "no image source resolvable: no local storage, no /var/lib/archwindows/bootc-image.tar, and no network for GHCR.  Provide --image-ref <ref>."
+fi
+
+# ---------------------------------------------------------------------------
+# Prompts (skipped when --yes)
+# ---------------------------------------------------------------------------
+list_disks() {
+    lsblk -dn -o NAME,SIZE,TYPE,MODEL | awk '$3=="disk"{printf "  /dev/%-10s %8s   %s\n", $1, $2, substr($0, index($0,$4))}'
+}
+
+prompt_target() {
+    hr
+    echo "Available disks:"
+    list_disks
+    hr
+    local ans
+    read -r -p "Target disk (e.g. /dev/sda): " ans
+    TARGET="$ans"
+}
+
+prompt_or_default() {
+    local varname="$1" prompt="$2" cur="$3" ans
+    read -r -p "$prompt [$cur]: " ans
+    [ -n "$ans" ] && printf -v "$varname" '%s' "$ans" || printf -v "$varname" '%s' "$cur"
+}
+
+if [ "$ASSUME_YES" -eq 0 ]; then
+    [ -n "$TARGET" ] || prompt_target
+    prompt_or_default HOSTNAME_DEF "Hostname"    "$HOSTNAME_DEF"
+    prompt_or_default USERNAME_DEF "Username"    "$USERNAME_DEF"
+    prompt_or_default TIMEZONE_DEF "Timezone"    "$TIMEZONE_DEF"
+    prompt_or_default FS           "Filesystem"  "$FS"
+fi
+
+# ---------------------------------------------------------------------------
+# Validate target + disk size
+# ---------------------------------------------------------------------------
+[ -n "$TARGET" ] || die "--target required (no disk selected)" 1
+[ -b "$TARGET" ] || die "target is not a block device: $TARGET" 1
+
+# Refuse mounted disks
+if mount | awk '{print $1}' | grep -q "^${TARGET}"; then
+    die "refusing: $TARGET has mounted partitions — unmount first" 1
+fi
+
+# Disk size gate
+DISK_BYTES="$(lsblk -bdn -o SIZE "$TARGET" 2>/dev/null || echo 0)"
+DISK_GIB=$(( DISK_BYTES / 1073741824 ))
+if [ "$DISK_GIB" -lt "$MIN_DISK_GIB" ]; then
+    banner "DISK TOO SMALL FOR bootc"
+    printf '%s%s is %d GiB — bootc needs at least %d GiB for atomic A/B deploys.%s\n' \
+        "$RED" "$TARGET" "$DISK_GIB" "$MIN_DISK_GIB" "$RST"
+    printf '\nUse the legacy installer for small disks:\n    sudo ai-install-to-disk --mode archiso --target %s\n' "$TARGET"
+    exit 1
+fi
+
+# Partition suffix (nvme/mmcblk/loop get the 'p' prefix)
+case "$TARGET" in
+    /dev/nvme*|/dev/mmcblk*|/dev/loop*) PART_PREFIX="${TARGET}p" ;;
+    *)                                  PART_PREFIX="${TARGET}"  ;;
+esac
+EFI_PART="${PART_PREFIX}1"
+ROOT_PART="${PART_PREFIX}2"
+
+# ---------------------------------------------------------------------------
+# Password
+# ---------------------------------------------------------------------------
+if [ -n "${AI_INSTALL_PASSWORD:-}" ]; then
+    PASSWORD="$AI_INSTALL_PASSWORD"
+elif [ "$ASSUME_YES" -eq 1 ]; then
+    die "--yes requires \$AI_INSTALL_PASSWORD (refusing to ship a default password)" 1
+else
+    while :; do
+        read -r -s -p "Password for '$USERNAME_DEF': " PASSWORD; echo
+        [ -n "$PASSWORD" ] || { echo "  password cannot be empty"; continue; }
+        read -r -s -p "Re-enter password: " p2; echo
+        [ "$PASSWORD" = "$p2" ] && break
+        echo "  passwords did not match — try again"
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# Triple-confirm
+# ---------------------------------------------------------------------------
+hr
+echo "About to install ArchWindows via bootc with these settings:"
+cat <<EOF
+  Target disk:    $TARGET ($DISK_GIB GiB)
+  Hostname:       $HOSTNAME_DEF
+  Username:       $USERNAME_DEF
+  Timezone:       $TIMEZONE_DEF
+  Filesystem:     $FS
+  Image source:   $IMAGE_SOURCE
+  Boot path:      $([ "$CAP_EFI" = yes ] && echo "UEFI + GPT" || echo "BIOS + MBR")
+  TPM binding:    $([ "$CAP_TPM_VERSION" = "2.0" ] && echo "yes (PCR-11 expected file will be written)" || echo "no (software-only mode)")
+EOF
+hr
+echo "Partition layout:"
+if [ "$CAP_EFI" = "yes" ]; then
+    echo "  $EFI_PART   512M  EFI System Partition (FAT32)"
+else
+    echo "  $EFI_PART   512M  /boot (ext4, BIOS-boot + legacy GRUB)"
+fi
+echo "  $ROOT_PART   rest  $FS root (/)"
+hr
+echo "Current state of $TARGET:"
+lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT "$TARGET" 2>/dev/null || true
+hr
+printf '%sALL DATA on %s will be PERMANENTLY ERASED.%s\n' "$RED" "$TARGET" "$RST"
+if [ "$ASSUME_YES" -eq 1 ]; then
+    echo "(--yes set — but you must still type the device name)"
+fi
+echo
+read -r -p "Type the device name exactly (e.g. $TARGET) to confirm: " confirm
+if [ "$confirm" != "$TARGET" ]; then
+    die "confirmation did not match ('$confirm' != '$TARGET') — aborted" 1
+fi
+read -r -p "Final check — continue? [yes/NO]: " final
+case "$final" in
+    yes|YES|Yes) ;;
+    *) die "aborted by user" 1 ;;
+esac
+
+# ---------------------------------------------------------------------------
+# PARTITION
+# ---------------------------------------------------------------------------
+log "Wiping $TARGET"
+wipefs -af "$TARGET"
+
+if [ "$CAP_EFI" = "yes" ]; then
+    log "Partitioning $TARGET (GPT: EFI + root)"
+    sgdisk -Z "$TARGET"
+    sgdisk -o "$TARGET"
+    sgdisk -n 1:0:+512MiB -t 1:ef00 -c 1:EFI     "$TARGET"
+    sgdisk -n 2:0:0       -t 2:8300 -c 2:rootfs  "$TARGET"
+else
+    # BIOS path — MBR with a BIOS-boot area up front + /boot + root.
+    # parted is cleaner than fdisk for scripted MBR.
+    log "Partitioning $TARGET (MBR: /boot + root)"
+    parted -s "$TARGET" mklabel msdos
+    parted -s "$TARGET" mkpart primary ext4 1MiB    513MiB
+    parted -s "$TARGET" mkpart primary "$FS" 513MiB 100%
+    parted -s "$TARGET" set 1 boot on
+fi
+
+command -v partprobe >/dev/null 2>&1 && partprobe "$TARGET" || true
+sleep 2
+
+# ---------------------------------------------------------------------------
+# FORMAT
+# ---------------------------------------------------------------------------
+log "Creating filesystems"
+if [ "$CAP_EFI" = "yes" ]; then
+    mkfs.fat -F32 -n EFI "$EFI_PART"
+else
+    mkfs.ext4 -F -L boot "$EFI_PART"
+fi
+
+case "$FS" in
+    btrfs)
+        mkfs.btrfs -f -L ArchWindows "$ROOT_PART"
+        ;;
+    xfs)
+        mkfs.xfs -f -L ArchWindows "$ROOT_PART"
+        ;;
+    ext4)
+        mkfs.ext4 -F -L ArchWindows -m 1 "$ROOT_PART"
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
+# MOUNT + btrfs subvolumes
+# ---------------------------------------------------------------------------
+log "Mounting under $MOUNT"
+mountpoint -q "$MOUNT" && umount -R "$MOUNT" 2>/dev/null || true
+
+if [ "$FS" = "btrfs" ]; then
+    # Ubuntu-style flat layout: @ @home @var @log
+    mount "$ROOT_PART" "$MOUNT"
+    btrfs subvolume create "$MOUNT/@"
+    btrfs subvolume create "$MOUNT/@home"
+    btrfs subvolume create "$MOUNT/@var"
+    btrfs subvolume create "$MOUNT/@log"
+    umount "$MOUNT"
+    mount -o "subvol=@,compress=zstd:3,ssd,noatime" "$ROOT_PART" "$MOUNT"
+    mkdir -p "$MOUNT/home" "$MOUNT/var" "$MOUNT/var/log"
+    mount -o "subvol=@home,compress=zstd:3,ssd,noatime" "$ROOT_PART" "$MOUNT/home"
+    mount -o "subvol=@var,compress=zstd:3,ssd,noatime"  "$ROOT_PART" "$MOUNT/var"
+    mount -o "subvol=@log,compress=zstd:3,ssd,noatime"  "$ROOT_PART" "$MOUNT/var/log"
+else
+    mount "$ROOT_PART" "$MOUNT"
+fi
+
+if [ "$CAP_EFI" = "yes" ]; then
+    mkdir -p "$MOUNT/boot"
+    mount "$EFI_PART" "$MOUNT/boot"
+else
+    mkdir -p "$MOUNT/boot"
+    mount "$EFI_PART" "$MOUNT/boot"
+fi
+
+# ---------------------------------------------------------------------------
+# BOOTC INSTALL
+# ---------------------------------------------------------------------------
+# `bootc install to-filesystem` — deploys the OCI image into the already-
+# mounted filesystem, installs bootloader, writes ostree config.  This is
+# the heavy lifting.
+#
+# Flags used:
+#   --source-imgref    where to fetch the image from (local or remote).
+#   --target-imgref    what the deployed system records as its "upgrade source".
+#                      We set it to the same — admins can override post-install
+#                      with `bootc switch <new-ref>`.
+#   --filesystem-type  xfs / btrfs / ext4 (lets bootc verify).
+#   --skip-fetch-check bypass the "am I running the image I'm installing?"
+#                      sanity — we're running from archiso, not the image,
+#                      which is exactly the "install from live ISO" flow.
+#   --karg             kernel command-line additions.  We pre-seed these so
+#                      first boot comes up with trust kernel + ai-control
+#                      in a known state.
+log "Running 'bootc install to-filesystem' → $IMAGE_SOURCE → $MOUNT"
+BOOTC_ARGS=(
+    install to-filesystem
+    --source-imgref "$IMAGE_SOURCE"
+    --target-imgref "$IMAGE_SOURCE"
+    --filesystem "$FS"
+    --skip-fetch-check
+    --karg "rw"
+    --karg "quiet"
+)
+# Pass SSH key if provided (bootc supports --root-ssh-authorized-keys).
+if [ -n "$AUTHORIZED_KEYS" ] && [ -r "$AUTHORIZED_KEYS" ]; then
+    BOOTC_ARGS+=(--root-ssh-authorized-keys "$AUTHORIZED_KEYS")
+fi
+BOOTC_ARGS+=("$MOUNT")
+
+if ! bootc "${BOOTC_ARGS[@]}"; then
+    die "bootc install to-filesystem failed — see $LOG" 3
+fi
+ok "bootc deploy complete"
+
+# ---------------------------------------------------------------------------
+# POST-INSTALL: hostname, user, timezone, MOK, expected-PCR
+# ---------------------------------------------------------------------------
+log "Configuring deployed system (hostname, user, timezone, trust)"
+
+# Hostname + /etc/hosts
+echo "$HOSTNAME_DEF" > "$MOUNT/etc/hostname"
+cat > "$MOUNT/etc/hosts" <<EOF
+127.0.0.1  localhost
+::1        localhost
+127.0.1.1  ${HOSTNAME_DEF}.localdomain ${HOSTNAME_DEF}
+EOF
+
+# Timezone
+if [ -e "$MOUNT/usr/share/zoneinfo/$TIMEZONE_DEF" ]; then
+    ln -sf "/usr/share/zoneinfo/$TIMEZONE_DEF" "$MOUNT/etc/localtime"
+fi
+
+# User creation + passwords — run inside a chroot so /etc/passwd/shadow land
+# in the deployed image, not the live ISO.  `arch-chroot` is archiso's wrapper;
+# fall back to bare chroot if unavailable.
+run_in_target() {
+    if command -v arch-chroot >/dev/null 2>&1; then
+        arch-chroot "$MOUNT" "$@"
+    else
+        chroot "$MOUNT" "$@"
+    fi
+}
+
+run_in_target bash -c "
+    id '$USERNAME_DEF' >/dev/null 2>&1 || \
+        useradd -m -G wheel,audio,video,storage,input -s /bin/bash '$USERNAME_DEF'
+    getent group trust >/dev/null && usermod -aG trust '$USERNAME_DEF' || true
+"
+# chpasswd via stdin — avoids password-on-argv leakage.
+run_in_target chpasswd <<EOF
+${USERNAME_DEF}:${PASSWORD}
+root:${PASSWORD}
+EOF
+
+# Sudoers: enable %wheel if it isn't already.
+if [ -f "$MOUNT/etc/sudoers" ]; then
+    sed -i 's/^# *\(%wheel ALL=(ALL\(:ALL\)\?) ALL\)/\1/' "$MOUNT/etc/sudoers" 2>/dev/null || true
+fi
+
+# MOK enrollment — Agent β ships a machine-owner key for signed kernel modules
+# (trust.ko, wdm_host.ko).  If the key exists in the image, queue it for
+# enrollment at next boot via mokutil.  User will see a blue MokManager prompt
+# on first boot.
+MOK_CERT="$MOUNT/etc/archwindows/keys/mok.der"
+if [ -f "$MOK_CERT" ] && [ "$CAP_EFI" = "yes" ] && command -v mokutil >/dev/null 2>&1; then
+    log "MOK certificate found — queueing enrollment for first boot"
+    # mokutil --import writes to the BootCurrent EFI var, persistent across reboot.
+    # Use a throwaway password that the MokManager UI will prompt for.  Avoid
+    # hardcoding; generate random, print it to the user once, and require they
+    # type it at the next-boot prompt.
+    MOK_PW="$(head -c16 /dev/urandom | base64 | tr -d '+/=' | cut -c1-12)"
+    if mokutil --import "$MOK_CERT" --root-pw 2>/dev/null; then
+        ok "MOK import queued"
+    else
+        # Fall back to password-based (mokutil --import wants interactive
+        # password on stdin).  Try non-interactive variant.
+        printf '%s\n%s\n' "$MOK_PW" "$MOK_PW" | mokutil --import "$MOK_CERT" 2>/dev/null || \
+            warn "mokutil --import failed; enroll manually after first boot"
+    fi
+    cat > "$MOUNT/var/lib/ai-arch/mok-enroll.txt" <<EOF
+# MOK enrollment is queued.  On next boot, press any key at the blue
+# MokManager prompt and enrol '$MOK_CERT' with this password:
+#     $MOK_PW
+# (Also printed on the installer console and in /var/log/ai-install-bootc.log.)
+EOF
+    info "MOK enrollment password (save this): $MOK_PW"
+fi
+
+# Expected PCR-11 file — Agent γ writes /etc/archwindows/expected-pcr-11
+# on TPM 2.0 systems so trust.ko's APE can verify measured-boot state.
+if [ "$CAP_TPM_VERSION" = "2.0" ]; then
+    mkdir -p "$MOUNT/etc/archwindows"
+    # Capture current PCR-11 (UKI signature region in systemd-measure's scheme).
+    # Real value filled in on first boot by systemd-pcrphase.service.  We just
+    # mark the system as TPM-capable here.
+    cat > "$MOUNT/etc/archwindows/expected-pcr-11" <<EOF
+# TPM 2.0 detected at install time.  First boot will populate this with the
+# measured UKI signature PCR.  Until then, trust.ko APE will treat this as
+# "enrolled but unverified" (degraded posture — see Agent γ's trust.ko).
+installed_at=$(date -Iseconds)
+tpm_version=2.0
+mode=pending-first-boot-measurement
+EOF
+    ok "TPM 2.0 expected-pcr-11 marker written"
+else
+    mkdir -p "$MOUNT/etc/archwindows"
+    cat > "$MOUNT/etc/archwindows/trust-mode" <<EOF
+# No TPM 2.0 detected.  trust.ko will run in software-only mode.
+installed_at=$(date -Iseconds)
+tpm_version=${CAP_TPM_VERSION:-absent}
+mode=software-only
+EOF
+    warn "TPM 2.0 absent — trust.ko will be software-only on the deployed system"
+fi
+
+# Marker + install log
+mkdir -p "$MOUNT/var/lib/ai-arch"
+cat > "$MOUNT/var/log/ai-install-bootc.log" <<EOF
+installed_at=$(date -Iseconds)
+mode=bootc
+target=$TARGET
+disk_gib=$DISK_GIB
+hostname=$HOSTNAME_DEF
+user=$USERNAME_DEF
+fs=$FS
+image_source=$IMAGE_SOURCE
+efi=$CAP_EFI
+secureboot=$CAP_SECUREBOOT
+tpm=$CAP_TPM_VERSION
+network=$CAP_NETWORK
+EOF
+
+# ---------------------------------------------------------------------------
+# FINISH
+# ---------------------------------------------------------------------------
+sync
+log "Unmounting"
+umount -R "$MOUNT" 2>/dev/null || true
+
+hr
+echo
+printf '  %sArchWindows bootc deploy complete.%s\n' "$GRN" "$RST"
+echo
+echo "  Target:       $TARGET"
+echo "  Image:        $IMAGE_SOURCE"
+echo "  Hostname:     $HOSTNAME_DEF"
+echo "  User:         $USERNAME_DEF"
+echo "  Filesystem:   $FS"
+if [ -n "${MOK_PW:-}" ]; then
+    printf '  %sMOK password:  %s%s  (type at first-boot MokManager prompt)\n' "$YEL" "$MOK_PW" "$RST"
+fi
+echo
+echo "  On the deployed system you can:"
+echo "     bootc upgrade       # pull + stage new image, reboot to apply"
+echo "     bootc rollback      # revert to previous deployment"
+echo "     bootc status        # see current + staged deployments"
+echo
+echo "  Reboot with:  sudo reboot"
+echo
+hr
+exit 0

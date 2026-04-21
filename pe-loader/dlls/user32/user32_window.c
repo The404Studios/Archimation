@@ -793,6 +793,11 @@ WINAPI_EXPORT HWND CreateWindowExW(
  * to a freed window (use-after-free). */
 extern void user32_kill_timers_for_hwnd(HWND hWnd);
 
+/* S68 Agent I: shcore's per-HWND DPI tracking table needs to drop its
+ * entry when the window is destroyed. Weak extern so user32 links fine
+ * even if libpe_shcore.so isn't loaded (headless tests). */
+extern void shcore_forget_window(HWND hWnd) __attribute__((weak));
+
 WINAPI_EXPORT BOOL DestroyWindow(HWND hWnd)
 {
     hwnd_entry_t *entry = hwnd_lookup(hWnd);
@@ -811,6 +816,11 @@ WINAPI_EXPORT BOOL DestroyWindow(HWND hWnd)
      * stale HWND or queue a WM_TIMER the app dispatches to a destroyed
      * window (UAF). */
     user32_kill_timers_for_hwnd(hWnd);
+
+    /* Drop the shcore DPI tracking entry so the table doesn't accumulate
+     * stale slots over the life of the process. */
+    if (shcore_forget_window)
+        shcore_forget_window(hWnd);
 
     gfx_backend_t *backend = gfx_get_backend();
     if (entry->gfx_win) {

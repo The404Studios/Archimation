@@ -1,0 +1,45 @@
+[Unit]
+Description=AI Arch Linux -- runtime kernel module loader
+Documentation=man:modules-load.d(5)
+# Compose with stock module loading: we run AFTER the standard
+# /etc/modules-load.d/ pipeline (which is owned by systemd-modules-load),
+# so operators using the stock pipeline are unaffected.  We own the
+# `cortex/operator-supplied at runtime` bucket via /etc/ai-control/modules.d.
+After=systemd-modules-load.service
+# Ensure cortex sees the loaded modules before deciding workload classes.
+Before=ai-control.service ai-cortex.service
+ConditionPathExists=/usr/bin/ai-load-drivers.sh
+# StartLimit lives in [Unit] (systemd >= 230) — placement in [Service]
+# would parse but emit a deprecation warning under systemd-analyze verify.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/ai-load-drivers.sh
+# modprobe needs CAP_SYS_MODULE; otherwise we lose to systemd's confinement.
+# We deliberately do NOT NoNewPrivileges=yes here because modprobe needs
+# privileged access to kernel module namespace.
+User=root
+Group=root
+TimeoutStartSec=30
+StandardOutput=journal
+StandardError=journal
+# Plymouth-friendly: suppress stdout banners; log lines still hit journal
+# via the script's `logger -t ai-driver-loader` calls.
+SyslogIdentifier=ai-driver-loader
+
+# Light hardening: we need module loading but not network / filesystems.
+ProtectHome=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectControlGroups=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

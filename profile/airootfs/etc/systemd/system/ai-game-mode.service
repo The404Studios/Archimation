@@ -1,0 +1,76 @@
+[Unit]
+Description=AI Arch Linux -- game-mode bridge (cortex coherence -> userspace)
+Documentation=file:///usr/bin/ai-game-mode.sh
+# Cortex must be up: it owns coherence_bridge.py which writes the
+# /etc/coherence/overrides/app-active.conf file we watch.  After= (not
+# Requires=): if cortex is down the bridge just polls an absent file
+# and stays in INACTIVE state — non-fatal, no point cascading.
+After=ai-cortex.service ai-control.service
+Wants=ai-cortex.service
+# If the override directory does not exist yet (cortex never started),
+# we still want to publish the empty-state /run/ai-game-mode/active
+# absence — but skip altogether if the helper script was not installed.
+ConditionPathExists=/usr/bin/ai-game-mode.sh
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+# Type=notify: ai-game-mode.sh sends READY=1 once, WATCHDOG=1 every 30s,
+# and STOPPING=1 on signal.  Uses systemd-notify (already present in
+# base systemd) — no python or libsystemd dependency.
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/ai-game-mode.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=15
+TimeoutStopSec=10
+KillSignal=SIGTERM
+KillMode=mixed
+# Heartbeat from script every 30s; 90s gives us 3x safety margin.
+WatchdogSec=90
+
+# Runtime dir: published flag at /run/ai-game-mode/active for user-space
+# launchers to probe (no root needed for the read).
+RuntimeDirectory=ai-game-mode
+RuntimeDirectoryMode=0755
+
+User=root
+Group=root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-game-mode
+
+# Confinement: we only need to read /etc/coherence/overrides and write
+# /run/ai-game-mode.  No /home, no devices, no network, no kernel knobs.
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @swap @raw-io @module @reboot @debug @cpu-emulation @obsolete @privileged
+CapabilityBoundingSet=
+AmbientCapabilities=
+MemoryDenyWriteExecute=yes
+ReadOnlyPaths=-/etc/coherence
+ReadWritePaths=-/run/ai-game-mode
+
+[Install]
+WantedBy=graphical.target

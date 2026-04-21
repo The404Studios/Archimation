@@ -1,0 +1,13 @@
+# Built corpus binaries are dev-tooling; rebuild via `make` (requires
+# x86_64-w64-mingw32-gcc).  We do NOT check them into the repo because
+# (a) they're 100-200 KB each x 10 = ~1.5 MB of binary churn per
+# toolchain bump, and (b) build-machine determinism on PE timestamps is
+# tricky.  CI/devs run `make all` to regenerate.
+*.exe
+*.o
+*.obj
+# Keep .gitignore + Makefile + sources.
+!.gitignore
+!Makefile
+!*.c
+!*.h

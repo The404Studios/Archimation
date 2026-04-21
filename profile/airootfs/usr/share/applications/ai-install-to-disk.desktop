@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Install ArchWindows to Disk
+GenericName=OS Installer
+Comment=Install this live ISO onto a disk
+Exec=xfce4-terminal --hold --title="ArchWindows Installer" -e "sudo /usr/bin/ai-install-to-disk"
+Icon=system-software-install
+Terminal=false
+Categories=System;Settings;
+Keywords=install;setup;disk;partition;arch;archwindows;
+StartupNotify=true

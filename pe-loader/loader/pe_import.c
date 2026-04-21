@@ -310,16 +310,18 @@ static dll_mapping_t g_dll_mappings[MAX_DLL_MAPPINGS] = {
     { "imm32.dll",         "libpe_imm32.so",     NULL },
     /* Common controls */
     { "comctl32.dll",      "libpe_comctl32.so",  NULL },
-    /* DirectX / Direct3D / XInput */
+    /* DirectX / Direct3D */
     { "d3d9.dll",          "libpe_d3d.so",       NULL },
     { "d3d11.dll",         "libpe_d3d.so",       NULL },
     { "dxgi.dll",          "libpe_d3d.so",       NULL },
     { "ddraw.dll",         "libpe_d3d.so",       NULL },
-    { "xinput1_1.dll",     "libpe_d3d.so",       NULL },
-    { "xinput1_2.dll",     "libpe_d3d.so",       NULL },
-    { "xinput1_3.dll",     "libpe_d3d.so",       NULL },
-    { "xinput1_4.dll",     "libpe_d3d.so",       NULL },
-    { "xinput9_1_0.dll",   "libpe_d3d.so",       NULL },
+    /* XInput: all versions alias to libpe_xinput1_4.so (symlinked from
+     * xinput1_3 and xinput9_1_0). See dlls/xinput/xinput_evdev.c. */
+    { "xinput1_1.dll",     "libpe_xinput1_4.so", NULL },
+    { "xinput1_2.dll",     "libpe_xinput1_4.so", NULL },
+    { "xinput1_3.dll",     "libpe_xinput1_4.so", NULL },
+    { "xinput1_4.dll",     "libpe_xinput1_4.so", NULL },
+    { "xinput9_1_0.dll",   "libpe_xinput1_4.so", NULL },
     /* Kernel driver support (ntoskrnl, HAL, NDIS) */
     { "ntoskrnl.exe",      "libpe_ntoskrnl.so",  NULL },
     { "hal.dll",           "libpe_hal.so",       NULL },

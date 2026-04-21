@@ -1,0 +1,136 @@
+# ARCHWINDOWS bootc Containerfile — Phase 1 foundation (Session 72 / Agent α).
+#
+# Architecture: Arch Linux base + our pacman repo layered in + airootfs
+# overrides. OCI image is the unit of shipment; bootc handles deployment,
+# upgrade, and rollback on the target.
+#
+# Why Arch as the bootc base (not Fedora): our moat is the trust kernel +
+# PE loader stack packaged as pacman. Rebasing onto Fedora would cost more
+# than the bootc tooling advantage buys. We pay the cost of being the first
+# serious Arch-in-OCI project instead — see docs/research/s72_alpha_bootc_foundation.md.
+#
+# Reference Containerfiles we cherry-picked from:
+#   - bootcrew/mono (arch/Containerfile): pacman /var -> /usr/lib/sysimage trick
+#   - M1cha/bootc-archlinux: /home, /opt, /srv, /root -> /var symlinks
+#   - ublue-os/image-template: build.sh + cache-mount pattern
+#
+# DO NOT build this as-is on the laptop — runs in CI or via bootc/build-bootc.sh
+# which bind-mounts repo/x86_64/ as a local pacman source.
+
+FROM docker.io/archlinux/archlinux:latest
+
+# --- Step 1: pacman plumbing ---------------------------------------------------
+# Strip keyring init and relocate pacman's /var databases to /usr/lib/sysimage
+# so the DB rides inside the immutable /usr tree. Without this, every boot
+# would see a pristine /var and pacman would think no packages are installed.
+# Lifted from bootcrew/mono (arch/Containerfile, Apr 2026).
+RUN pacman-key --init && pacman-key --populate archlinux \
+ && grep "= */var" /etc/pacman.conf \
+    | sed "/= *\/var/s/.*=// ; s/ //" \
+    | xargs -n1 sh -c 'mkdir -p "/usr/lib/sysimage/$(dirname $(echo $1 | sed "s@/var/@@"))" \
+        && mv -v "$1" "/usr/lib/sysimage/$(echo "$1" | sed "s@/var/@@")"' '' \
+ && sed -i -e "/= *\/var/ s/^#//" \
+           -e "s@= */var@= /usr/lib/sysimage@g" \
+           -e "/DownloadUser/d" /etc/pacman.conf
+
+# --- Step 2: base + boot + bootc stack ----------------------------------------
+# - linux + linux-firmware: stock Arch kernel (bootc image = kernel is pinned)
+# - dracut: bootc/ostree's native initramfs generator (easier than mkinitcpio
+#   for composefs). Arch ships dracut in extra.
+# - ostree + composefs: the immutable /usr substrate bootc upgrade relies on
+# - grub + efibootmgr: bootloader installed by bootc install-to-disk
+# - systemd + NetworkManager + sudo: minimum viable userspace
+# Single RUN + pacman --clean caches keeps layer size down.
+RUN pacman -Syu --noconfirm \
+ && pacman -S --noconfirm --needed \
+      base linux linux-firmware amd-ucode intel-ucode \
+      dracut ostree composefs grub efibootmgr \
+      systemd sudo networkmanager openssh \
+      bash-completion nano vim git \
+      base-devel \
+ && pacman -Scc --noconfirm
+
+# --- Step 3: bootc binary itself ----------------------------------------------
+# bootc is not in core/extra yet (April 2026). The AUR ships `bootc-bin` but
+# AUR-during-build is a yak; Agent δ will add a staged FROM that pulls the
+# binary from a known registry or builds it. For now we mark it a known gap
+# and the image will still boot — just no `bootc upgrade` until β lands it.
+# See `bootc/README.md` "Known Issues".
+
+# --- Step 4: our custom repo ---------------------------------------------------
+# build-bootc.sh bind-mounts repo/x86_64/ at /mnt/local-repo during `buildah build`.
+# We add that as a pacman source, install our packages, then DROP the source
+# from pacman.conf so the deployed system doesn't try to resolve it post-install.
+RUN --mount=type=bind,source=repo/x86_64,target=/mnt/local-repo,readonly \
+    printf '\n[pe-compat]\nSigLevel = Optional TrustAll\nServer = file:///mnt/local-repo\n' \
+      >> /etc/pacman.conf \
+ && pacman -Sy --noconfirm \
+ && pacman -S --noconfirm --needed \
+      trust-system \
+      pe-loader \
+      ai-control-daemon \
+      ai-desktop-config \
+      ai-firewall \
+      ai-first-boot-wizard \
+      windows-services \
+ && sed -i '/\[pe-compat\]/,/^$/d' /etc/pacman.conf \
+ && pacman -Scc --noconfirm
+# NOTE: trust-dkms + pe-compat-dkms are INTENTIONALLY omitted here. DKMS wants
+# to build against a running kernel; in a bootc image the kernel is pinned at
+# build time, so Agent β will ship pre-built + signed .ko's as a layer above
+# this one. Forward-reference: see bootc/README.md "DKMS in bootc".
+
+# --- Step 5: airootfs overrides (our system config) ---------------------------
+# Everything our archiso profile drops into /etc, /usr/share, /usr/bin we also
+# want here. COPY is path-preserving.
+COPY profile/airootfs/ /
+
+# --- Step 6: bootc-native filesystem layout -----------------------------------
+# bootc/ostree wants /home, /opt, /srv, /root as symlinks into /var because
+# /var is the machine-state root. Lifted from M1cha/bootc-archlinux (2024).
+# We run this as a set of guarded ops so rebuilding doesn't break if the
+# symlinks already exist.
+RUN set -e \
+ && for d in home opt srv; do \
+      if [ -d "/$d" ] && [ ! -L "/$d" ]; then \
+        mv "/$d" "/var/$d" 2>/dev/null || true; \
+        ln -sf "var/$d" "/$d"; \
+      fi; \
+    done \
+ && if [ -d /root ] && [ ! -L /root ]; then \
+      mv /root /var/roothome && ln -sf var/roothome /root; \
+    fi \
+ && mkdir -p /var/usrlocal && [ -d /usr/local ] && [ ! -L /usr/local ] \
+      && rmdir /usr/local 2>/dev/null && ln -sf ../var/usrlocal /usr/local || true
+
+# --- Step 7: ostree + composefs prepare-root config ---------------------------
+# Enables composefs-backed read-only root. Without this, ostree falls back to
+# hardlink-farm mode which defeats the tamper-resistance point.
+RUN mkdir -p /usr/lib/ostree \
+ && printf '[composefs]\nenabled = true\n' > /usr/lib/ostree/prepare-root.conf
+
+# --- Step 8: tmpfiles for bootc-expected /var layout --------------------------
+COPY bootc/ostree-integration.conf /usr/lib/tmpfiles.d/ostree-0-integration.conf
+
+# --- Step 9: pre-enable services ----------------------------------------------
+# `systemctl enable` at build time registers symlinks in /usr so services
+# come up on first boot. NO `systemctl start` (no PID 1 in container build).
+RUN systemctl enable NetworkManager sshd systemd-networkd-wait-online \
+ && (systemctl enable ai-control.service || true) \
+ && (systemctl enable ai-cortex.service || true)
+# The `|| true` guards are because ai-cortex and ai-control units live in
+# ai-control-daemon which may have a slightly different unit filename between
+# pkgrels. Harmless if missing; boot will surface the real error.
+
+# --- Step 10: labels ----------------------------------------------------------
+# `containers.bootc=1` is the marker bootc upgrade looks for (bootc-dev/bootc#892).
+# `ostree.bootable=true` is the composefs/ostree marker.
+# `Experimental=1` because this is S72 Phase 1 and we have known gaps (see README).
+LABEL containers.bootc="1" \
+      ostree.bootable="true" \
+      containers.bootc.Experimental="1" \
+      org.opencontainers.image.title="archwindows-bootc" \
+      org.opencontainers.image.description="ARCHWINDOWS — Arch Linux with trust kernel + PE loader, bootc image mode" \
+      org.opencontainers.image.source="https://github.com/fourzerofour/arch-linux-with-full-ai-control" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later" \
+      org.opencontainers.image.vendor="ARCHWINDOWS Project"

@@ -2389,14 +2389,16 @@ def create_app(config: dict):
     class ContusionContextRequest(BaseModel):
         # Accept any of these field names from clients. The GTK Contusion
         # app sends "prompt", the `ai automate` shell sends "description",
-        # and the canonical API is "request". Without multi-alias handling
-        # Pydantic returns 422 and the UI silently fails with "does not open".
+        # scripts/set_smoke.py sends "text", and the canonical API is
+        # "request". Without multi-alias handling Pydantic returns 422
+        # and the UI silently fails with "does not open".
         request: Optional[str] = None
         prompt: Optional[str] = None
         description: Optional[str] = None
+        text: Optional[str] = None
 
         def resolve(self) -> str:
-            return self.request or self.prompt or self.description or ""
+            return self.request or self.prompt or self.description or self.text or ""
 
     class ContusionLaunchRequest(BaseModel):
         app: str

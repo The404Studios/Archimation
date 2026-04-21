@@ -585,6 +585,17 @@ class EventBus:
             os.chmod(self.SOCKET_PATH, 0o660)  # Allow group members to send events
         except OSError as exc:
             logger.warning("Cannot chmod socket %s: %s", self.SOCKET_PATH, exc)
+        # Session 69 (Agent R): chgrp to pe-compat so non-root subscribers
+        # in that group can connect.  Requires SupplementaryGroups=pe-compat
+        # on the service (ai-control.service.d/group.conf drop-in) -- if the
+        # group doesn't exist or we lack CAP_CHOWN, fall back silently and
+        # leave the socket at the creating process's primary gid.
+        try:
+            import grp
+            gid = grp.getgrnam("pe-compat").gr_gid
+            os.chown(self.SOCKET_PATH, -1, gid)
+        except (KeyError, PermissionError, OSError) as exc:
+            logger.debug("Cannot chgrp socket %s to pe-compat: %s", self.SOCKET_PATH, exc)
 
         self._running = True
         logger.info("Event bus listening on %s", self.SOCKET_PATH)

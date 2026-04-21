@@ -3,7 +3,7 @@
 
 pkgname=ai-first-boot-wizard
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc="First boot setup wizard for AI Arch Linux - configures user, network, and AI control settings"
 arch=('any')
 url="https://github.com/ai-arch-linux/ai-first-boot-wizard"
@@ -306,7 +306,55 @@ class WizardApp(Adw.Application):
         self.summary_label = Gtk.Label(wrap=True, selectable=True)
         self.summary_label.set_halign(Gtk.Align.START)
         page.append(self.summary_label)
+
+        # Install buttons — only shown on live-ISO sessions where the
+        # installer is present.  Two buttons: bootc (recommended; atomic
+        # upgrades) and legacy (archiso/pacstrap).  Both open a terminal.
+        if os.path.exists("/usr/bin/ai-install-to-disk"):
+            # bootc button — recommended, shown first (visual priority)
+            if os.path.exists("/usr/bin/ai-install-bootc"):
+                bootc_btn = Gtk.Button(label="Install (bootc — recommended)")
+                bootc_btn.add_css_class("pill")
+                bootc_btn.add_css_class("suggested-action")
+                bootc_btn.set_halign(Gtk.Align.START)
+                bootc_btn.set_margin_top(8)
+                bootc_btn.set_tooltip_text(
+                    "Atomic OCI-image install with one-command upgrades "
+                    "('bootc upgrade') and rollback ('bootc rollback')."
+                )
+                bootc_btn.connect("clicked", self._on_install_bootc_clicked)
+                page.append(bootc_btn)
+
+            # Legacy button — unchanged behavior, renamed for clarity
+            install_btn = Gtk.Button(label="Install (legacy archiso)")
+            install_btn.add_css_class("pill")
+            install_btn.set_halign(Gtk.Align.START)
+            install_btn.set_margin_top(4)
+            install_btn.set_tooltip_text(
+                "Traditional pacstrap install.  Use on systems where bootc "
+                "isn't viable (old hardware, no container runtime)."
+            )
+            install_btn.connect("clicked", self._on_install_clicked)
+            page.append(install_btn)
+
         return page
+
+    def _open_in_terminal(self, argv):
+        """Launch `argv` inside a terminal emulator, non-blocking."""
+        for term in ("xfce4-terminal", "xterm"):
+            if subprocess.run(["which", term], capture_output=True).returncode == 0:
+                subprocess.Popen([term, "-e", " ".join(argv)])
+                return
+
+    def _on_install_clicked(self, _btn):
+        # Legacy archiso path — explicit --mode archiso so the mode dispatcher
+        # doesn't auto-escalate into bootc when the binary is present.
+        self._open_in_terminal(["sudo", "/usr/bin/ai-install-to-disk", "--mode", "archiso"])
+
+    def _on_install_bootc_clicked(self, _btn):
+        # bootc path — call ai-install-bootc directly (not via --mode bootc
+        # on ai-install-to-disk, to keep one extra hop out of the stack).
+        self._open_in_terminal(["sudo", "/usr/bin/ai-install-bootc"])
 
     def _update_summary(self):
         tz_idx = self.tz_combo.get_selected()

@@ -3,7 +3,7 @@
 
 pkgname=ai-desktop-config
 pkgver=0.2.0
-pkgrel=27
+pkgrel=31
 pkgdesc="AI Arch Linux desktop configuration: Windows-like XFCE desktop, .exe integration, gaming support, AI control panel, Contusion automation engine, WiFi manager, driver viewer, disk installer"
 arch=('any')
 url="https://github.com/ai-arch-linux/ai-desktop-config"

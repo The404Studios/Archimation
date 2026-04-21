@@ -1,0 +1,21 @@
+[Desktop Entry]
+# ai-health-on-login: off-by-default autostart template.
+#
+# Session 69 (Agent R).  To enable: edit this file and set Hidden=false.
+# When enabled, the XFCE session will run `ai-health --brief` once after
+# desktop login so the user immediately sees daemon + trust + pe-loader
+# status in a notification.  Kept off-by-default because:
+#   * ai-health hits the daemon which may still be starting (TCG QEMU)
+#   * Some users prefer a silent desktop
+# Agent Q's USER-MANUAL.md explains how to enable this at first boot.
+Type=Application
+Name=AI Health Check
+Comment=Run ai-health once at login (ARCHWINDOWS)
+Exec=sh -c 'sleep 5; ai-health --brief 2>&1 | head -20 | xmessage -file - -timeout 10 || true'
+Icon=utilities-system-monitor
+Hidden=true
+X-GNOME-Autostart-enabled=false
+NoDisplay=false
+Terminal=false
+StartupNotify=false
+OnlyShowIn=XFCE;GNOME;KDE;MATE;LXQt;LXDE;

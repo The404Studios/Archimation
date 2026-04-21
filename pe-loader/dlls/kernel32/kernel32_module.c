@@ -167,12 +167,13 @@ static const struct {
     { "d3dcompiler_47", "libpe_d3d.so"        },
     { "d3dcompiler_46", "libpe_d3d.so"        },
     { "d3dcompiler_43", "libpe_d3d.so"        },
-    /* XInput versions */
-    { "xinput1_1",      "libpe_d3d.so"        },
-    { "xinput1_2",      "libpe_d3d.so"        },
-    { "xinput1_3",      "libpe_d3d.so"        },
-    { "xinput1_4",      "libpe_d3d.so"        },
-    { "xinput9_1_0",    "libpe_d3d.so"        },
+    /* XInput versions (all point at libpe_xinput1_4.so; the other names
+     * are symlinks created by the DLL Makefile) */
+    { "xinput1_1",      "libpe_xinput1_4.so"  },
+    { "xinput1_2",      "libpe_xinput1_4.so"  },
+    { "xinput1_3",      "libpe_xinput1_4.so"  },
+    { "xinput1_4",      "libpe_xinput1_4.so"  },
+    { "xinput9_1_0",    "libpe_xinput1_4.so"  },
     /* Audio */
     { "xaudio2_9",      "libpe_dsound.so"     },
     { "xaudio2_8",      "libpe_dsound.so"     },

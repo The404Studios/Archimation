@@ -1,0 +1,314 @@
+name: bootc
+
+# CI gate for the bootc / atomic-rollback path (Session 72).
+#
+# Three jobs on a `needs:` chain:
+#   build              — always runs; produces image tar as artifact
+#   rollback-smoke     — depends on build; boots qcow2 A, upgrades to B,
+#                         rolls back, confirms integrity.
+#   attestation-smoke  — depends on build; tampers rootfs offline, boots,
+#                         asserts trust.ko refused to init.
+#
+# Constraints (2026-04):
+#   * Free-tier ubuntu-latest runners DO support KVM as of 2024-05 (nested
+#     virt on ubuntu-24.04 runners with AZURE nested-virt-capable SKUs) but
+#     NOT always. We detect at runtime and fall back to TCG — slow but
+#     deterministic.
+#   * swtpm + bootc-image-builder are available as Ubuntu packages.
+#   * Test harness scripts exit 5 when a local tool is missing; we grep
+#     for that code to mark the job "neutral" rather than failing the PR.
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'bootc/**'
+      - 'trust/**'
+      - 'packages/**'
+      - 'scripts/test-bootc-*.sh'
+      - 'tests/integration/test_bootc_lifecycle.py'
+      - '.github/workflows/bootc.yml'
+  pull_request:
+    paths:
+      - 'bootc/**'
+      - 'trust/**'
+      - 'packages/**'
+      - 'scripts/test-bootc-*.sh'
+      - 'tests/integration/test_bootc_lifecycle.py'
+      - '.github/workflows/bootc.yml'
+
+concurrency:
+  group: bootc-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────
+  build:
+    name: build bootc image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install podman + buildah
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            podman buildah skopeo \
+            qemu-utils \
+            python3 python3-pip
+
+      - name: Cache podman image layers
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/containers
+          key: bootc-podman-${{ runner.os }}-${{ hashFiles('bootc/Containerfile') }}
+          restore-keys: |
+            bootc-podman-${{ runner.os }}-
+
+      - name: Run test-bootc-build.sh
+        id: build
+        env:
+          IMAGE_TAG: localhost/archwindows-bootc:ci
+          OUT_DIR: /tmp/bootc-test
+        run: |
+          set -uo pipefail
+          chmod +x scripts/test-bootc-build.sh
+          bash scripts/test-bootc-build.sh
+          ec=$?
+          echo "exit_code=${ec}" >> "$GITHUB_OUTPUT"
+          exit "$ec"
+
+      - name: Upload image tar as artifact
+        if: always() && steps.build.outputs.exit_code == '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootc-image-tar
+          path: /tmp/bootc-test/image.tar
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload build-mode marker
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootc-build-mode
+          path: /tmp/bootc-test/build-mode
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ────────────────────────────────────────────────────────────────────
+  rollback-smoke:
+    name: atomic rollback smoke
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 60
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install QEMU + swtpm + OVMF + helpers
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          # swtpm: emulated TPM 2.0
+          # ovmf:  UEFI firmware (required for measured boot)
+          # qemu-kvm + qemu-system-x86 + qemu-utils: the VM + image tooling
+          # socat: QMP socket client for stop/reset commands
+          # jq: parse `bootc status --json`
+          # sshpass + openssh-client: drive the guest over SSH
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 qemu-utils qemu-kvm \
+            swtpm swtpm-tools \
+            ovmf \
+            socat jq sshpass openssh-client \
+            podman
+          # bootc-image-builder: not in stock Ubuntu yet; pull the container
+          # form as a fallback and symlink a wrapper to /usr/local/bin.
+          if ! command -v bootc-image-builder >/dev/null 2>&1; then
+            sudo podman pull quay.io/centos-bootc/bootc-image-builder:latest || true
+            sudo tee /usr/local/bin/bootc-image-builder > /dev/null <<'EOF'
+          #!/bin/sh
+          exec sudo podman run --rm --privileged \
+               --security-opt label=type:unconfined_t \
+               -v /tmp:/tmp:Z \
+               -v /var/lib/containers/storage:/var/lib/containers/storage \
+               quay.io/centos-bootc/bootc-image-builder:latest "$@"
+          EOF
+            sudo chmod +x /usr/local/bin/bootc-image-builder
+          fi
+
+      - name: Download image tar from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: bootc-image-tar
+          path: /tmp/bootc-test
+
+      - name: Load image into podman
+        run: |
+          set -euxo pipefail
+          sudo podman load -i /tmp/bootc-test/image.tar
+          sudo podman image tag $(sudo podman images -q | head -1) \
+               localhost/archwindows-bootc:test
+
+      - name: Run rollback smoke
+        id: rollback
+        env:
+          # In CI we want the real thing, not stubs — but give each stage
+          # its own escape hatch. Start permissive; tighten over time.
+          ALLOW_STUB_BUILDER: "0"
+          ALLOW_STUB_SWTPM: "0"
+          ALLOW_STUB_OVMF: "0"
+          ALLOW_STUB_QEMU: "0"
+        run: |
+          set -uo pipefail
+          chmod +x scripts/test-bootc-rollback.sh
+          bash scripts/test-bootc-rollback.sh
+          ec=$?
+          echo "exit_code=${ec}" >> "$GITHUB_OUTPUT"
+          # Exit 5 = graceful stub; treat as "neutral" not fail.
+          if [ "$ec" = "5" ]; then
+            echo "::warning::rollback harness exited 5 (graceful stub; tooling partial)"
+            exit 0
+          fi
+          exit "$ec"
+
+      - name: Upload rollback logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-logs
+          path: |
+            /tmp/bootc-rollback/serial.log
+            /tmp/bootc-rollback/swtpm.log
+          retention-days: 14
+          if-no-files-found: warn
+
+  # ────────────────────────────────────────────────────────────────────
+  attestation-smoke:
+    name: tamper attestation smoke
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 45
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install QEMU + swtpm + OVMF + libguestfs
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          # libguestfs-tools provides `guestmount` for offline rootfs edits
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 qemu-utils qemu-kvm \
+            swtpm swtpm-tools \
+            ovmf \
+            libguestfs-tools \
+            socat openssh-client \
+            podman
+          if ! command -v bootc-image-builder >/dev/null 2>&1; then
+            sudo podman pull quay.io/centos-bootc/bootc-image-builder:latest || true
+          fi
+
+      - name: Download image tar
+        uses: actions/download-artifact@v4
+        with:
+          name: bootc-image-tar
+          path: /tmp/bootc-test
+
+      - name: Load image into podman
+        run: |
+          set -euxo pipefail
+          sudo podman load -i /tmp/bootc-test/image.tar
+          sudo podman image tag $(sudo podman images -q | head -1) \
+               localhost/archwindows-bootc:test
+
+      - name: Run attestation / tamper smoke
+        id: attest
+        env:
+          ALLOW_STUB: "0"
+        run: |
+          set -uo pipefail
+          chmod +x scripts/test-bootc-attestation.sh
+          bash scripts/test-bootc-attestation.sh
+          ec=$?
+          echo "exit_code=${ec}" >> "$GITHUB_OUTPUT"
+          if [ "$ec" = "5" ]; then
+            echo "::warning::attestation harness exited 5 (graceful stub)"
+            exit 0
+          fi
+          # Exit 1 is a SECURITY REGRESSION — we want the loudest possible
+          # failure on that path.
+          if [ "$ec" = "1" ]; then
+            echo "::error::Security regression: tamper was NOT detected. Trust kernel moat is breached."
+          fi
+          exit "$ec"
+
+      - name: Upload attestation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: attestation-logs
+          path: |
+            /tmp/bootc-attest/serial.log
+            /tmp/bootc-attest/swtpm.log
+          retention-days: 14
+          if-no-files-found: warn
+
+  # ────────────────────────────────────────────────────────────────────
+  pytest-gate:
+    name: pytest lifecycle gate
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pytest + podman
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            python3 python3-pip podman
+          pip3 install pytest requests
+
+      - name: Download image tar
+        uses: actions/download-artifact@v4
+        with:
+          name: bootc-image-tar
+          path: /tmp/bootc-test
+
+      - name: Load image
+        run: |
+          sudo podman load -i /tmp/bootc-test/image.tar
+          sudo podman image tag $(sudo podman images -q | head -1) \
+               localhost/archwindows-bootc:test
+
+      - name: Run pytest lifecycle gate
+        env:
+          IMAGE_TAG: localhost/archwindows-bootc:test
+          SKIP_BUILD: "1"
+        run: |
+          python3 -m pytest tests/integration/test_bootc_lifecycle.py \
+            -v -m "bootc and integration" \
+            --tb=short \
+            -o addopts=

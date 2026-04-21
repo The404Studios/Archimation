@@ -88,6 +88,80 @@ _mark_rebuild_done() {
     find "$pkg_dir" -maxdepth 1 -type f | sort | xargs md5sum 2>/dev/null | md5sum | cut -d' ' -f1 > "$hash_file"
 }
 
+# ── trust-dkms manifest guard ──────────────────────────────────────────────
+# Kbuild lists N .o targets; the packaged trust-dkms must ship N matching .c
+# sources under /usr/src/trust-${pkgver}/.  If sources drift out of sync with
+# Kbuild (e.g. a new .c added to Kbuild but not added to the PKGBUILD's
+# `for src in` list), the package looks fine but DKMS fails to build on the
+# target host because the source isn't there.  Catch it at package-build
+# time — before ISO bake, before anyone tries to install.
+#
+# Usage: verify_trust_dkms_manifest <path/to/trust-dkms-*.pkg.tar.zst>
+# Returns 0 if every Kbuild .o target has a .c file in the tarball, 1 otherwise.
+verify_trust_dkms_manifest() {
+    local pkg_path="$1"
+    local kbuild_path="$PROJECT_DIR/trust/kernel/Kbuild"
+
+    if [ ! -f "$pkg_path" ]; then
+        echo "verify_trust_dkms_manifest: package not found: $pkg_path" >&2
+        return 1
+    fi
+    if [ ! -f "$kbuild_path" ]; then
+        echo "verify_trust_dkms_manifest: Kbuild not found: $kbuild_path" >&2
+        return 1
+    fi
+
+    # Extract the `trust-objs := ...` list (may span lines via `\`), then
+    # flatten to one token per line and keep only the .o names.
+    # Collect while lines end in `\`; stop the first time we hit one that
+    # doesn't. Test the backslash BEFORE stripping it.
+    local kbuild_objs
+    kbuild_objs=$(awk '
+        /^trust-objs/ { collecting=1; has_cont = ($0 ~ /\\$/); sub(/\\$/, ""); print; next }
+        collecting {
+            has_cont = ($0 ~ /\\$/)
+            sub(/\\$/, "")
+            print
+            if (!has_cont) collecting=0
+        }
+    ' "$kbuild_path" | tr -s ' \t' '\n' | grep -E '\.o$' | sed 's/\.o$//' | sort -u)
+
+    if [ -z "$kbuild_objs" ]; then
+        echo "verify_trust_dkms_manifest: could not parse Kbuild trust-objs" >&2
+        return 1
+    fi
+
+    # List .c basenames inside the package's /usr/src/trust-*/ directory.
+    # Use `tar -tf` and grep for .c files under usr/src/trust-.
+    local pkg_c_files
+    pkg_c_files=$(tar -tf "$pkg_path" 2>/dev/null \
+        | grep -E '^usr/src/trust-[^/]+/[^/]+\.c$' \
+        | awk -F/ '{print $NF}' \
+        | sed 's/\.c$//' \
+        | sort -u)
+
+    if [ -z "$pkg_c_files" ]; then
+        echo "verify_trust_dkms_manifest: no .c files found under usr/src/trust-*/ in $pkg_path" >&2
+        return 1
+    fi
+
+    # Compute Kbuild objs that lack a matching .c in the package.
+    local missing
+    missing=$(comm -23 <(echo "$kbuild_objs") <(echo "$pkg_c_files"))
+
+    if [ -n "$missing" ]; then
+        echo "verify_trust_dkms_manifest: Kbuild .o targets missing .c sources in package:" >&2
+        echo "$missing" | sed 's/^/  - /' >&2
+        echo "--- Kbuild objs ---" >&2
+        echo "$kbuild_objs" | sed 's/^/  /' >&2
+        echo "--- package .c   ---" >&2
+        echo "$pkg_c_files" | sed 's/^/  /' >&2
+        return 1
+    fi
+
+    return 0
+}
+
 # Handle --dry-run now that _check_rebuild_needed is defined.
 if [ "$DRY_RUN" = "1" ]; then
     echo "=== DRY RUN: packages that would be (re)built ==="
@@ -270,6 +344,22 @@ for pkg_name in "${BUILD_ORDER[@]}"; do
             # -n: only add new packages (skip already-indexed versions)
             # -R: remove old versions of this package from repo (incremental cleanup)
             repo-add -n -R -q "$REPO_DIR/pe-compat.db.tar.gz" "$REPO_DIR"/${pkg_name}-*.pkg.tar.zst 2>/dev/null || true
+
+            # ── S68 trust-dkms manifest guard ─────────────────────────────
+            # Abort the whole pipeline if Kbuild.o targets don't have matching
+            # .c sources inside the shipped trust-dkms tarball. Prevents the
+            # S47-S58 class of "DKMS build fails on first boot" silent rot.
+            if [ "$pkg_name" = "trust-dkms" ]; then
+                pkg_tarball=$(ls -t "$REPO_DIR/${pkg_name}-"[0-9]*.pkg.tar.zst 2>/dev/null | head -1)
+                if [ -n "$pkg_tarball" ]; then
+                    if ! verify_trust_dkms_manifest "$pkg_tarball"; then
+                        echo "ERROR: trust-dkms manifest guard failed — aborting pipeline." >&2
+                        exit 1
+                    fi
+                    echo "  trust-dkms manifest guard: OK"
+                fi
+            fi
+
             _mark_rebuild_done "$pkg_name" "$pkg_dir"
         else
             echo "  Skipping (unchanged): $pkg_name"

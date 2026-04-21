@@ -1,0 +1,60 @@
+PE Loader Real-Binary Test Corpus -- Licensing Notes
+=====================================================
+
+This directory holds third-party PE binaries used to validate the PE
+loader against real-world software.  They are NOT redistributed as part
+of the project; they are downloaded on-demand by
+`scripts/fetch-real-pe-binaries.sh` when developers run the corpus.
+
+DO NOT add binaries here that violate the supplier's license, EULA, or
+DRM terms.  In particular, do not add:
+  - Game binaries (almost universally EULA-restricted)
+  - Anti-cheat protected binaries (Vanguard, BattlEye, EAC, etc.)
+  - Microsoft Windows kernel or system DLLs
+  - Software with no clearly-stated redistribution license
+
+ACCEPTABLE binaries (and their licenses):
+
+  busybox64.exe          -- busybox-w32, GPL-2.0
+                            https://frippery.org/busybox/
+                            Source available; redistribution allowed
+                            with source-offer compliance.
+
+  curl.exe               -- curl, MIT-style "curl" license
+                            https://curl.se/docs/copyright.html
+                            Free to use and redistribute.
+
+  rg.exe                 -- ripgrep, MIT OR Unlicense (BurntSushi)
+                            https://github.com/BurntSushi/ripgrep/blob/master/LICENSE-MIT
+
+  7zr.exe                -- 7-Zip, LGPL-2.1 + unRAR-restriction
+                            https://7-zip.org/license.txt
+                            Console-only standalone decompressor.
+
+  nasm.exe               -- NASM, BSD-2-Clause
+                            https://github.com/netwide-assembler/nasm/blob/master/LICENSE
+
+  vc_redist.x64.exe      -- Microsoft Visual C++ Redistributable.
+                            License: Microsoft "Distributable Code"
+                            terms permit redistribution as part of a
+                            developer/test corpus.  See:
+                            https://docs.microsoft.com/visualstudio/releases/2019/redistribution
+                            Use ONLY for testing PE-format MSI/CAB
+                            handling; do NOT install onto end-user
+                            systems via this corpus.
+
+NOT acceptable (do not add):
+  - notepad.exe, mspaint.exe, regedit.exe (Windows OS components)
+  - cmd.exe, powershell.exe (Windows OS components)
+  - Any game launcher (Steam, Epic, etc. -- EULA forbids redistribution
+    even for testing in many jurisdictions)
+  - Vanguard, BattlEye, EAC binaries (anti-cheat; forbidden)
+
+If you need a new test binary not in this list, ADD IT TO
+SHA256SUMS WITH (a) the upstream URL, (b) the license name, and
+(c) a one-line rationale for what surface it tests, and (d) update
+the fetch script.  Open a PR before downloading binaries onto CI.
+
+This corpus is DEV-TOOLING ONLY.  It is NOT shipped in the ISO or any
+package; the .gitignore in this directory excludes the actual binary
+files.

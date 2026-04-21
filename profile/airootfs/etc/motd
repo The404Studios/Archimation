@@ -1,0 +1,24 @@
+
+   █████╗ ██████╗  ██████╗██╗  ██╗██╗███╗   ███╗ █████╗ ████████╗██╗ ██████╗ ███╗   ██╗
+  ██╔══██╗██╔══██╗██╔════╝██║  ██║██║████╗ ████║██╔══██╗╚══██╔══╝██║██╔═══██╗████╗  ██║
+  ███████║██████╔╝██║     ███████║██║██╔████╔██║███████║   ██║   ██║██║   ██║██╔██╗ ██║
+  ██╔══██║██╔══██╗██║     ██╔══██║██║██║╚██╔╝██║██╔══██║   ██║   ██║██║   ██║██║╚██╗██║
+  ██║  ██║██║  ██║╚██████╗██║  ██║██║██║ ╚═╝ ██║██║  ██║   ██║   ██║╚██████╔╝██║ ╚████║
+  ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝╚═╝     ╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝ ╚═════╝ ╚═╝  ╚═══╝
+
+                    Arch Linux × Native Windows × AI System Control
+
+  ─── quick start ──────────────────────────────────────────────────────────────
+    ai <command>          Natural-language system control  (e.g.  ai play music)
+    ai --help             Show usage and all options
+    pe-status             Diagnostics: PE loader, trust kernel, daemons
+    sudo journalctl -u ai-control -f         Tail the AI daemon
+    sudo journalctl -u ai-cortex -f          Tail the AI cortex
+
+  ─── documentation ────────────────────────────────────────────────────────────
+    /usr/share/doc/ai-control/ai-cli.md      AI CLI manual
+    /etc/ai-control/scripts.d/               Operator-installable .sh scripts
+    /usr/share/ai-control/dictionary_v2.pkl.zst    NL dictionary (~7000 phrases)
+
+  # Run `ai-health` for a system status summary, or `man ai-help` for the user manual.
+

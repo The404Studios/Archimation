@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "common/dll_common.h"
+#include "comctl_internal.h"
 
 /* HRESULT codes */
 #define S_OK            ((HRESULT)0x00000000)
@@ -23,12 +24,37 @@
  * InitCommonControls / InitCommonControlsEx
  *
  * Applications call these at startup to register window classes for
- * the standard common controls. No-ops for us.
+ * the standard common controls. We dispatch to each widget's
+ * register_*_class() helper so that CreateWindowEx(L"SysListView32", ...)
+ * and friends actually resolve after Init is called.
+ *
+ * Guarded by a single-shot static flag so repeated Init calls don't
+ * spam RegisterClassEx failures for an already-registered class.
  * ----------------------------------------------------------------------- */
+
+static int s_classes_registered = 0;
+
+static void comctl_register_all_classes(void)
+{
+    if (s_classes_registered) {
+        return;
+    }
+    s_classes_registered = 1;
+
+    /* Order is independent — each widget registers its own class. */
+    register_button_class();
+    register_progress_class();
+    register_listview_class();
+    register_treeview_class();
+    register_tab_class();
+    register_statusbar_class();
+    register_toolbar_class();
+}
 
 WINAPI_EXPORT void InitCommonControls(void)
 {
     fprintf(stderr, "[comctl32] InitCommonControls()\n");
+    comctl_register_all_classes();
 }
 
 WINAPI_EXPORT BOOL InitCommonControlsEx(void *icc)
@@ -36,6 +62,7 @@ WINAPI_EXPORT BOOL InitCommonControlsEx(void *icc)
     (void)icc;
 
     fprintf(stderr, "[comctl32] InitCommonControlsEx()\n");
+    comctl_register_all_classes();
 
     return TRUE;
 }

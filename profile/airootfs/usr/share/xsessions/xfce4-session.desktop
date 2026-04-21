@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=XSession
+Name=Xfce Session
+GenericName=Xfce Session
+Comment=Use this session to run Xfce as your desktop environment
+Exec=startxfce4
+TryExec=/usr/bin/startxfce4
+Icon=xfce4-logo
+DesktopNames=XFCE
+Keywords=xfce;desktop;session;
+X-LightDM-DesktopName=XFCE

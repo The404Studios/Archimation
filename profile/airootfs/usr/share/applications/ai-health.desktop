@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=ArchWindows Health Check
+GenericName=System Health
+Comment=Show AI daemon + trust kernel + PE loader status
+Exec=xfce4-terminal -e "sh -c 'ai-health; read -n1 -p \"Press any key to close...\"'"
+Icon=utilities-system-monitor
+Categories=System;Utility;Monitor;
+Terminal=false
+StartupNotify=false
+Keywords=health;status;diagnostics;ai;trust;pe;

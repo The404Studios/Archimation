@@ -33,6 +33,15 @@
 #include "compat/trust_gate.h"
 #include "../../trust/include/trust_types.h"
 #include "../../trust/include/trust_ioctl.h"
+#include "eventbus/pe_event.h"
+
+/* Forward declarations for S76 cortex telemetry helpers defined below.
+ * See the "Cortex event emit helpers" block after the trust state decls. */
+static void emit_trust_deny(trust_gate_category_t category,
+                            const char *api_name);
+static void emit_trust_escalate(trust_gate_category_t category,
+                                const char *api_name,
+                                uint32_t reason);
 
 /* ========================================================================
  * Configuration
@@ -378,6 +387,87 @@ static trust_gate_result_t slow_path_check(trust_gate_category_t category,
 }
 
 /* ========================================================================
+ * Cortex event emit helpers (S76 Agent E)
+ *
+ * Fire-and-forget emit of PE_EVT_TRUST_DENY / PE_EVT_TRUST_ESCALATE to the
+ * cortex whenever trust_gate_check() produces a non-ALLOW verdict. The
+ * payload layouts MUST stay in sync with parse_pe_trust_deny_payload and
+ * parse_pe_trust_escalate_payload in ai-control/cortex/event_bus.py.
+ *
+ * Both structs are __attribute__((packed)) to produce an unambiguous wire
+ * format (137 bytes for deny, 140 bytes for escalate) and avoid compiler
+ * padding that would make the byte offsets ambiguous to the parser.
+ *
+ * Emission is strictly non-blocking (pe_event_emit() is lock-free and
+ * silently drops when the cortex is not listening). The caller's return
+ * value is unaffected; the only side effect is the socket send.
+ * ======================================================================== */
+
+struct __attribute__((packed)) pe_evt_trust_deny_emit {
+    char     api_name[128];
+    uint8_t  category;
+    int32_t  score;
+    uint32_t tokens;
+};
+
+struct __attribute__((packed)) pe_evt_trust_escalate_emit {
+    char     api_name[128];
+    uint32_t from_score;
+    uint32_t to_score;
+    uint32_t reason;
+};
+
+static void emit_trust_deny(trust_gate_category_t category,
+                            const char *api_name)
+{
+    struct pe_evt_trust_deny_emit evt;
+    memset(&evt, 0, sizeof(evt));
+    const char *name = api_name;
+    if (!name && (unsigned)category < TRUST_GATE_MAX)
+        name = g_policy_table[category].api_name;
+    if (name) {
+        strncpy(evt.api_name, name, sizeof(evt.api_name) - 1);
+        evt.api_name[sizeof(evt.api_name) - 1] = '\0';
+    }
+    evt.category = (uint8_t)category;
+    evt.score    = tl_cache.trust_score;
+    evt.tokens   = tl_cache.token_balance;
+    pe_event_emit(PE_EVT_TRUST_DENY, &evt, sizeof(evt));
+}
+
+/* reason codes: 0 = slow-path kernel returned TRUST_RESULT_ESCALATE
+ * (generic). Future codes reserved for specific escalation causes
+ * (quorum, APE, privilege-adjust call-site, ...). */
+static void emit_trust_escalate(trust_gate_category_t category,
+                                const char *api_name,
+                                uint32_t reason)
+{
+    struct pe_evt_trust_escalate_emit evt;
+    memset(&evt, 0, sizeof(evt));
+    const char *name = api_name;
+    if (!name && (unsigned)category < TRUST_GATE_MAX)
+        name = g_policy_table[category].api_name;
+    if (name) {
+        strncpy(evt.api_name, name, sizeof(evt.api_name) - 1);
+        evt.api_name[sizeof(evt.api_name) - 1] = '\0';
+    }
+    /* from_score = current cached score; to_score = the per-category
+     * threshold the caller would need in order to be allowed. The cortex
+     * uses the delta to size a grant or refuse the request.
+     *
+     * Both are stored as uint32 on the wire (cortex parses as unsigned);
+     * when trust_score is negative we clamp to 0 so the parser does not
+     * see an accidentally huge "from_score". */
+    int32_t cur = tl_cache.trust_score;
+    evt.from_score = (cur < 0) ? 0u : (uint32_t)cur;
+    evt.to_score   = ((unsigned)category < TRUST_GATE_MAX)
+                     ? g_policy_table[category].min_trust_score
+                     : 0u;
+    evt.reason     = reason;
+    pe_event_emit(PE_EVT_TRUST_ESCALATE, &evt, sizeof(evt));
+}
+
+/* ========================================================================
  * Public API
  * ======================================================================== */
 
@@ -514,8 +604,11 @@ trust_gate_result_t trust_gate_check(trust_gate_category_t category,
         return TRUST_ALLOW;
 
     /* Bounds check the category */
-    if ((unsigned)category >= TRUST_GATE_MAX)
+    if ((unsigned)category >= TRUST_GATE_MAX) {
+        /* S76: cortex telemetry - out-of-range category is a hard deny. */
+        emit_trust_deny(category, api_name);
         return TRUST_DENY;
+    }
 
     const trust_api_policy_t *policy = &g_policy_table[category];
 
@@ -541,6 +634,8 @@ trust_gate_result_t trust_gate_check(trust_gate_category_t category,
             ioctl(g_trust_fd, TRUST_IOC_RECORD_ACTION, &rec);
         }
 
+        /* S76: cortex telemetry (fire-and-forget). */
+        emit_trust_deny(category, api_name);
         return TRUST_DENY;
     }
 
@@ -552,6 +647,11 @@ trust_gate_result_t trust_gate_check(trust_gate_category_t category,
 
         if (slow_result != TRUST_ALLOW) {
             audit_log(category, slow_result, api_name, arg_summary);
+            /* S76: cortex telemetry for non-ALLOW verdicts. */
+            if (slow_result == TRUST_ESCALATE)
+                emit_trust_escalate(category, api_name, 0u);
+            else if (slow_result == TRUST_DENY)
+                emit_trust_deny(category, api_name);
             return slow_result;
         }
         /* Slow path allowed it - the cache was stale.  Fall through. */
@@ -563,6 +663,8 @@ trust_gate_result_t trust_gate_check(trust_gate_category_t category,
          * budget.  Deny the operation but don't permanently revoke caps;
          * tokens will regenerate over time. */
         audit_log(category, TRUST_DENY, api_name, arg_summary);
+        /* S76: cortex telemetry (fire-and-forget). */
+        emit_trust_deny(category, api_name);
         return TRUST_DENY;
     }
 

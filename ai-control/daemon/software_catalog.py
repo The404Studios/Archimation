@@ -16,7 +16,8 @@ URL freshness notes:
   * Chrome / Discord / Steam / OBS: direct installer download URLs.
   * Blender, VirtualBox, VLC, GIMP: vendor sites (versions embedded).
   * Entries with uncertain or version-embedded URLs carry a `# TODO verify`
-    marker and the handler returns url_unverified for them.
+    marker for future maintainer review. At runtime all entries are attempted
+    uniformly; stale URLs surface as `download_failed` (HTTP 404) from curl.
 """
 
 from __future__ import annotations
@@ -320,22 +321,6 @@ def suggest(name: str, limit: int = 5) -> list[str]:
 def list_keys() -> list[str]:
     """All catalog keys in declaration order."""
     return list(CATALOG.keys())
-
-
-def url_verified(entry: dict) -> bool:
-    """Heuristic: an entry is 'verified' if its module source doesn't mark
-    it with # TODO verify. We can't read our own comments at runtime, so
-    this is a hardcoded deny-list of entries with known-stale pinned URLs.
-
-    Entries NOT on this list are treated as fresh (aka.ms shims, /latest
-    redirects, vendor-hosted stable paths).
-    """
-    key = entry.get("key")
-    # Entries with version-embedded URLs that may be stale — still attempted
-    # but the handler logs a warning. Returning True since curl either
-    # succeeds or the download stage fails cleanly (404 → structured error).
-    # Only return False for entries we *know* shouldn't be attempted.
-    return True  # conservative: attempt all, fail gracefully on 404
 
 
 # ---------------------------------------------------------------------------

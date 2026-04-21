@@ -57,6 +57,10 @@ _algedonic_reader = None
 _library_census = None
 # S75 Agent C: Monte-Carlo cortex sampler (research-A §2.6, roadmap §1.2.4).
 _monte_carlo = None
+# S76 Agent D: Bennett logical-depth observer (ransomware discrimination).
+_depth_observer = None
+# S76 Agent D: Bateson differential filter (signal-from-deltas).
+_differential_observer = None
 
 
 def _init_controllers(config: dict):
@@ -579,6 +583,46 @@ def create_app(config: dict):
         logger.error("Failed to register monte_carlo: %s", e)
         _monte_carlo = None
 
+    # S76 Agent D: Bennett logical-depth observer. Caller-driven (no poll
+    # thread); the cortex feeds it bytes from PE process scans + memory
+    # observers via depth_observer.observe(name, data). Useful for
+    # ransomware discrimination (encrypted blobs look random to BOTH gzip
+    # speeds; deep computation looks compressible to slow gzip only).
+    global _depth_observer
+    try:
+        from depth_observer import register_with_daemon as _reg_depth
+        _depth_observer = _reg_depth(app, event_bus=_daemon_event_sink)
+        logger.info("depth_observer registered with daemon")
+    except Exception as e:
+        logger.error("Failed to register depth_observer: %s", e)
+        _depth_observer = None
+
+    # S76 Agent D: Bateson differential filter. Wraps any observer with a
+    # snapshot()-method and publishes deltas. Registered LAST so the
+    # upstream observers (memory_observer, library_census, depth_observer)
+    # are all live; differential_observer.start_polling() begins on first
+    # request to /metrics/deltas, not at lifespan start (lazy).
+    global _differential_observer
+    try:
+        from differential_observer import register_with_daemon as _reg_diff
+        _diff_upstreams = {}
+        if _memory_observer is not None:
+            _diff_upstreams["memory"] = _memory_observer
+        if _library_census is not None:
+            _diff_upstreams["library_census"] = _library_census
+        if _depth_observer is not None:
+            _diff_upstreams["depth"] = _depth_observer
+        _differential_observer = _reg_diff(
+            app, event_bus=_daemon_event_sink, observers=_diff_upstreams,
+        )
+        logger.info(
+            "differential_observer registered with %d upstreams",
+            len(_diff_upstreams),
+        )
+    except Exception as e:
+        logger.error("Failed to register differential_observer: %s", e)
+        _differential_observer = None
+
     # Log controller status
     _controllers = {
         "keyboard": _keyboard, "mouse": _mouse, "screen": _screen,
@@ -606,6 +650,9 @@ def create_app(config: dict):
         "library_census": _library_census,
         # S75 Agent C
         "monte_carlo": _monte_carlo,
+        # S76 Agent D
+        "depth_observer": _depth_observer,
+        "differential_observer": _differential_observer,
     }
     loaded = [n for n, c in _controllers.items() if c is not None]
     failed = [n for n, c in _controllers.items() if c is None]

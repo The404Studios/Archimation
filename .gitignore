@@ -52,6 +52,10 @@ peloader
 pe-loader/nul
 trust/lib/libtrust.a
 trust/lib/libtrust.so*
+# S76 Agent E: pt_regs_compat unit-test build artifact
+tests/bisim/pt_regs_compat
+# tests/adversarial/helpers — built by tests/adversarial/Makefile
+tests/adversarial/helpers
 
 # Kernel module build
 Module.symvers

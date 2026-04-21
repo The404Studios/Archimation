@@ -362,5 +362,45 @@ class TestPollingLifecycle(unittest.TestCase):
         census.stop_polling()
 
 
+class TestStopStartRace(unittest.TestCase):
+    """Regression: stop_polling() + start_polling() must not orphan a straggler
+    poll thread against a cleared stop Event (S76 Agent B fix).
+
+    The pre-fix bug: stop_polling() cleared _poll_thread but the straggler
+    was still inside snapshot() holding _lock; start_polling() then created
+    a fresh thread AND cleared the shared _poll_stop Event. The straggler
+    would re-enter its loop check on a false _poll_stop and poll forever,
+    doubling the thread count every stop/start cycle.
+    """
+
+    def setUp(self) -> None:
+        self.mod = _load_module()
+
+    def test_stop_then_start_does_not_orphan_old_thread(self) -> None:
+        mo = _FakeMemoryObserver({1: ["kernel32.dll"]})
+        bus = _FakeBus()
+        census = self.mod.LibraryCensus(memory_observer=mo, event_bus=bus)
+        # First cycle: start → stop.
+        census.start_polling(interval_seconds=0.5)
+        first_thread = census._poll_thread
+        self.assertIsNotNone(first_thread)
+        census.stop_polling()
+        # Second cycle: start again. The old thread must be cleanly dead
+        # (or will die imminently); the new thread must not share its
+        # stop Event.
+        census.start_polling(interval_seconds=0.5)
+        second_thread = census._poll_thread
+        self.assertIsNotNone(second_thread)
+        self.assertIsNot(first_thread, second_thread,
+                         "start_polling after stop_polling must create a "
+                         "new thread object")
+        # Give the old thread a moment to observe its own Event and exit.
+        time.sleep(0.1)
+        self.assertFalse(first_thread.is_alive(),
+                         "old poll thread should have exited after "
+                         "stop_polling()")
+        census.stop_polling()
+
+
 if __name__ == "__main__":
     unittest.main()

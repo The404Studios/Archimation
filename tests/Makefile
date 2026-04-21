@@ -8,9 +8,10 @@ TRUST_DIR = $(ROOT)/trust
 PE_DIR = $(ROOT)/pe-loader
 
 .PHONY: all clean trust-tests pe-tests observer-tests api-tests \
-       automation-tests filesystem-tests qemu-test hello-exe
+       automation-tests filesystem-tests qemu-test hello-exe \
+       pt_regs_test bisim-tests
 
-all: trust-tests observer-tests automation-tests filesystem-tests
+all: trust-tests observer-tests automation-tests filesystem-tests bisim-tests
 
 # --- Trust system tests ---
 trust-tests: pe-loader/test_trust
@@ -56,9 +57,25 @@ automation-tests:
 filesystem-tests:
 	PYTHONPATH=$(AI_PYTHONPATH) python3 ai-control/test_filesystem.py
 
+# --- Bisim / pure-C unit tests ---
+# S76 Agent E: hook S75 Agent F's trust_pt_regs_compat unit test into the
+# test tree so `make -C tests` exercises it. The test is self-contained
+# (TRUST_TEST_PT_REGS makes the header synthesize a minimal x86_64 pt_regs,
+# no kernel linkage), so it builds without WSL / mkarchiso.
+
+bisim-tests: pt_regs_test
+
+pt_regs_test: bisim/pt_regs_compat
+	./bisim/pt_regs_compat
+
+bisim/pt_regs_compat: bisim/test_pt_regs_compat.c
+	$(CC) $(CFLAGS) -DTRUST_TEST_PT_REGS -I$(TRUST_DIR)/include \
+		-o $@ $<
+
 # --- Integration ---
 qemu-test:
 	bash ../scripts/test-qemu.sh
 
 clean:
-	rm -f pe-loader/test_trust pe-loader/hello_mingw.exe
+	rm -f pe-loader/test_trust pe-loader/hello_mingw.exe \
+	      bisim/pt_regs_compat

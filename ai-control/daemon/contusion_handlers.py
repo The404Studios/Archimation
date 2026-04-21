@@ -1385,9 +1385,10 @@ async def driver_load(args):
     # routes around the FastAPI surface by spamming /contusion/run.
     if not await THROTTLE_DRIVER_LOAD.try_acquire("driver_load"):
         return _bad_arg(h, "rate-limited")
-    # TODO Session 47: Agent 7 may add /driver/load endpoint with audit;
-    # until then call modprobe via subprocess (sudo will prompt unless the
-    # daemon already runs as root, which is the case under ai-control.service).
+    # Call modprobe via subprocess (sudo will prompt unless the daemon
+    # already runs as root, which is the case under ai-control.service).
+    # Audit is handled by the shared THROTTLE_DRIVER_LOAD + api_server
+    # /driver/load endpoint (S47 work shipped in S50 Agent H).
     if shutil.which("modprobe") is None:
         return _missing(h, "modprobe")
     return await _exec(h, ["modprobe", mod], timeout=15)
@@ -2292,7 +2293,7 @@ async def app_claude_workspace_init(args):
 #   catalog_key, url, cached_path, installer_type,
 #   peloader_returncode, stdout (tail 500B), stderr (tail 500B),
 #   reason (on failure -- one of: "unknown_app", "no_network",
-#     "url_unverified", "curl_missing", "peloader_missing", "download_failed",
+#     "curl_missing", "peloader_missing", "download_failed",
 #     "install_failed"),
 #   suggestions (list of alternate catalog keys) when reason=="unknown_app".
 # ---------------------------------------------------------------------------

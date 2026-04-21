@@ -34,7 +34,17 @@ Ontologies
   Maintained by the cortex trust-history module as a "clean score"; used
   by decision_engine / autonomy for throttling.
 
-All three coexist as plain Python ``int`` with no type tag, which is why
+- PE-gate level: ``int`` in ``[5, 90]``.  Five-step ladder used by the
+  PE loader trust gate to classify per-DLL load decisions
+  (5=public/unsigned, 30=user, 60=service, 80=admin, 90=kernel/signed).
+  Originally implemented inside ``pe_loader/loader/pe_trust_gate.c`` with
+  no canonical Python translator; this module is now the canonical one.
+
+- Cortex record score: ``int`` in ``[0, 100]``.  An alias for
+  cortex reputation when the source is the trust-history "record"
+  (per-event aggregate) rather than the running quarantine reputation.
+
+All five coexist as plain Python ``int`` with no type tag, which is why
 Session 41 found collisions.  The functions below are the ONLY sanctioned
 way to cross a boundary.
 """
@@ -51,12 +61,19 @@ __all__ = [
     "CORTEX_REP_MIN",
     "CORTEX_REP_MAX",
     "CORTEX_QUARANTINE_THRESHOLD",
+    "PE_GATE_MIN",
+    "PE_GATE_MAX",
+    "PE_GATE_ANCHORS",
     "API_BAND_TO_KERNEL_FLOOR",
     "EXAMPLES",
     "api_band_to_kernel_score",
     "kernel_score_to_api_band",
     "cortex_reputation_to_kernel_score",
     "is_cortex_quarantined",
+    "pe_gate_to_kernel",
+    "kernel_to_pe_gate",
+    "record_to_band",
+    "band_to_record",
 ]
 
 # ── Range constants (single source of truth) ──
@@ -73,6 +90,23 @@ CORTEX_REP_MAX: Final[int] = 100
 # Below this cortex reputation, the subject is treated as quarantined
 # (caller should reject even if kernel score is otherwise acceptable).
 CORTEX_QUARANTINE_THRESHOLD: Final[int] = 10
+
+# PE-gate level: a 5-step ladder used by the PE loader's per-DLL trust
+# gate (see pe_loader/loader/pe_trust_gate.c). The numeric values are
+# intentionally non-linear — each anchor maps to a specific kernel
+# trust-score floor that the loader must observe before allowing a DLL
+# in that tier to be linked into a process.
+PE_GATE_MIN: Final[int] = 5
+PE_GATE_MAX: Final[int] = 90
+
+PE_GATE_ANCHORS: Final[dict[int, int]] = {
+    5:   -500,   # public/unsigned PE — anyone load
+    30:    50,   # user-scoped PE
+    60:   400,   # service-scoped PE
+    80:   700,   # admin-scoped PE
+    90:  1000,   # kernel/signed PE
+}
+_PE_GATE_SORTED: Final[tuple[int, ...]] = tuple(sorted(PE_GATE_ANCHORS))
 
 # ── API band → kernel score floor mapping ──
 #
@@ -256,6 +290,87 @@ def is_cortex_quarantined(reputation: int) -> bool:
     return rep_i < CORTEX_QUARANTINE_THRESHOLD
 
 
+def pe_gate_to_kernel(gate: int) -> int:
+    """Translate a PE-loader gate level to the kernel trust score floor.
+
+    The PE loader uses gate values in ``[PE_GATE_MIN, PE_GATE_MAX]``;
+    each anchor in ``PE_GATE_ANCHORS`` maps to the kernel trust score
+    a subject must have for a DLL of that tier to be linked.  Off-anchor
+    inputs floor down to the nearest defined anchor (monotonic).
+
+    Returns:
+        Kernel trust score floor in
+        ``[KERNEL_SCORE_MIN, KERNEL_SCORE_MAX]``.
+
+    Raises:
+        TypeError: if ``gate`` is not an integer.
+    """
+    g = _require_int("gate", gate)
+    g = _clamp(g, PE_GATE_MIN, PE_GATE_MAX)
+    if g in PE_GATE_ANCHORS:
+        return PE_GATE_ANCHORS[g]
+    floor_anchor = PE_GATE_MIN
+    for a in _PE_GATE_SORTED:
+        if a <= g:
+            floor_anchor = a
+        else:
+            break
+    return PE_GATE_ANCHORS[floor_anchor]
+
+
+def kernel_to_pe_gate(score: int) -> int:
+    """Inverse of ``pe_gate_to_kernel`` — return the highest PE gate
+    whose floor ``<= score``.  Lossy because PE gates are discrete.
+    """
+    s = _require_int("score", score)
+    s = _clamp(s, KERNEL_SCORE_MIN, KERNEL_SCORE_MAX)
+    best = PE_GATE_MIN
+    for a in _PE_GATE_SORTED:
+        if PE_GATE_ANCHORS[a] <= s:
+            best = a
+        else:
+            break
+    return best
+
+
+def record_to_band(record: int) -> int:
+    """Translate a cortex record score (``[0, 100]``) to an API band.
+
+    Composes ``cortex_reputation_to_kernel_score`` and
+    ``kernel_score_to_api_band`` so all downstream comparisons go through
+    the canonical kernel-score domain.  This is the function callers
+    should use when an HTTP endpoint needs to know "is this subject
+    above band 400 right now?" given only a record score.
+
+    Raises:
+        TypeError: if ``record`` is not an integer.
+    """
+    r = _require_int("record", record)
+    r = _clamp(r, CORTEX_REP_MIN, CORTEX_REP_MAX)
+    score = cortex_reputation_to_kernel_score(r)
+    return kernel_score_to_api_band(score)
+
+
+def band_to_record(band: int) -> int:
+    """Lossy inverse of ``record_to_band``: lowest cortex record at
+    which the subject would (after canonical translation) sit at-or-above
+    ``band``.  Useful for documenting band thresholds in cortex terms.
+    Returns ``CORTEX_REP_MAX`` if the band is unreachable from any
+    record (i.e. requires a kernel score above the cortex-mapping
+    ceiling).
+    """
+    b = _require_int("band", band)
+    b = _clamp(b, API_BAND_MIN, API_BAND_MAX)
+    target_score = api_band_to_kernel_score(b)
+    # Walk record range, find the smallest record whose mapped score >=
+    # the band's kernel floor.  The mapping is monotonic so a single
+    # left-to-right scan suffices.
+    for r in range(CORTEX_REP_MIN, CORTEX_REP_MAX + 1):
+        if cortex_reputation_to_kernel_score(r) >= target_score:
+            return r
+    return CORTEX_REP_MAX
+
+
 # ── Representative mappings, for docs + manual spot-checks ──
 
 EXAMPLES: Final[dict[str, object]] = {
@@ -291,6 +406,14 @@ EXAMPLES: Final[dict[str, object]] = {
         50:  cortex_reputation_to_kernel_score(50),
         95:  cortex_reputation_to_kernel_score(95),
         100: cortex_reputation_to_kernel_score(100),
+    },
+    "pe_gate_to_kernel": {g: pe_gate_to_kernel(g) for g in _PE_GATE_SORTED},
+    "record_to_band": {
+        0:   record_to_band(0),
+        25:  record_to_band(25),
+        50:  record_to_band(50),
+        75:  record_to_band(75),
+        100: record_to_band(100),
     },
 }
 
@@ -346,6 +469,49 @@ assert cortex_reputation_to_kernel_score(100) == 1000
 assert is_cortex_quarantined(5) is True
 assert is_cortex_quarantined(10) is False
 assert is_cortex_quarantined(50) is False
+
+# PE-gate ladder: monotonic, anchored at MIN and MAX.
+assert PE_GATE_ANCHORS[PE_GATE_MIN] == -500
+assert PE_GATE_ANCHORS[PE_GATE_MAX] == KERNEL_SCORE_MAX
+_pg_prev = KERNEL_SCORE_MIN - 1
+for _g in _PE_GATE_SORTED:
+    _gv = PE_GATE_ANCHORS[_g]
+    assert _gv >= _pg_prev, (
+        f"PE_GATE_ANCHORS not monotonic at gate {_g}: {_gv} < {_pg_prev}"
+    )
+    _pg_prev = _gv
+del _g, _gv, _pg_prev
+
+# pe_gate_to_kernel + kernel_to_pe_gate round-trip on anchors.
+for _g in _PE_GATE_SORTED:
+    _s = pe_gate_to_kernel(_g)
+    _rt = kernel_to_pe_gate(_s)
+    assert PE_GATE_ANCHORS[_rt] == _s, (
+        f"PE-gate round-trip drift at gate {_g}: -> score {_s} -> gate {_rt}"
+    )
+del _g, _s, _rt
+
+# record_to_band is monotonic non-decreasing.
+_prev_band = -1
+for _r in (0, 5, 10, 25, 50, 75, 95, 100):
+    _b = record_to_band(_r)
+    assert _b >= _prev_band, (
+        f"record_to_band({_r}) = {_b} broke monotonicity (prev {_prev_band})"
+    )
+    _prev_band = _b
+del _r, _b, _prev_band
+
+# band_to_record + record_to_band must satisfy band_to_record(b) -> r,
+# and record_to_band(r) >= b for any band reachable from cortex.
+for _b in _BANDS_SORTED:
+    _r = band_to_record(_b)
+    if _r < CORTEX_REP_MAX:
+        # Reachable: round-trip must satisfy it.
+        assert record_to_band(_r) >= _b, (
+            f"band_to_record({_b}) = {_r} but record_to_band({_r}) "
+            f"= {record_to_band(_r)} (should be >= {_b})"
+        )
+del _b, _r
 
 
 if __name__ == "__main__":

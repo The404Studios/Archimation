@@ -323,14 +323,23 @@ class LibraryCensus:
         Idempotent: a second call while already running is a no-op.
         The thread is daemon=True so it does not block interpreter exit
         if stop_polling() is skipped.
+
+        Each call installs a fresh stop Event dedicated to the new thread,
+        so a stop_polling()/start_polling() race cannot leave the previous
+        thread polling against a cleared global Event. (S76 Agent B fix.)
         """
         with self._lock:
             if self._poll_thread is not None and self._poll_thread.is_alive():
                 return
             self._poll_interval = max(0.5, float(interval_seconds))
-            self._poll_stop.clear()
+            # Fresh per-thread stop Event. The OLD self._poll_stop (if any)
+            # was set by stop_polling() and will remain set for the lifetime
+            # of any straggler thread observing it; we never clear it.
+            self._poll_stop = threading.Event()
+            my_stop = self._poll_stop
             self._poll_thread = threading.Thread(
                 target=self._poll_loop,
+                args=(my_stop,),
                 name="library_census_poller",
                 daemon=True,
             )
@@ -343,23 +352,32 @@ class LibraryCensus:
 
     def stop_polling(self) -> None:
         """Stop the background poll thread. Safe to call multiple times."""
-        self._poll_stop.set()
-        thread = self._poll_thread
-        self._poll_thread = None
+        with self._lock:
+            self._poll_stop.set()
+            thread = self._poll_thread
+            self._poll_thread = None
         if thread is not None and thread.is_alive():
             # Brief join; don't hang shutdown if the thread misbehaves.
+            # Joined OUTSIDE self._lock so the poll thread can still
+            # acquire it inside snapshot() while winding down.
             thread.join(timeout=2.0)
 
-    def _poll_loop(self) -> None:
-        """Periodic snapshot + publish loop for the background thread."""
-        while not self._poll_stop.is_set():
+    def _poll_loop(self, stop_event: threading.Event) -> None:
+        """Periodic snapshot + publish loop for the background thread.
+
+        ``stop_event`` is the per-thread Event captured at start_polling()
+        time. Even if start_polling() later installs a fresh Event for a
+        new thread, this thread keeps checking its OWN event and exits
+        cleanly when stop_polling() sets it.
+        """
+        while not stop_event.is_set():
             try:
                 snap = self.snapshot()
                 self._publish(snap)
             except Exception:
                 logger.debug("library_census: poll tick failed", exc_info=True)
             # wait() returns True if stop was signaled -> exit promptly.
-            if self._poll_stop.wait(self._poll_interval):
+            if stop_event.wait(self._poll_interval):
                 return
 
     # -- Introspection ------------------------------------------------------

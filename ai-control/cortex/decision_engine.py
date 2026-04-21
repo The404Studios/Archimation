@@ -17,6 +17,47 @@ from enum import IntEnum
 logger = logging.getLogger("cortex.decision")
 
 
+# ---------------------------------------------------------------------------
+# Module-level default-engine singleton (S76 Agent E wiring)
+#
+# The AI daemon's api_server.py lifespan tries to attach a Monte-Carlo
+# confidence sampler by doing::
+#
+#     import decision_engine as _de_mod
+#     eng = getattr(_de_mod, "_default_engine", None)
+#     if eng is not None and hasattr(eng, "set_confidence_sampler"):
+#         eng.set_confidence_sampler(cs)
+#
+# Prior to S76 the attribute did not exist, so the Monte-Carlo sampler
+# auto-attachment silently fell through its try/except and never ran.
+# Exposing ``_default_engine`` here (populated on first DecisionEngine
+# instantiation) closes that wire without requiring the daemon to know
+# the engine's construction path.
+#
+# Semantics: FIRST INSTANCE WINS. Subsequent DecisionEngine() calls do
+# NOT overwrite the default, because the daemon may have already handed
+# the sampler to the first instance. Callers that explicitly want a new
+# default can use ``set_default_engine()`` below.
+# ---------------------------------------------------------------------------
+_default_engine: Optional["DecisionEngine"] = None
+
+
+def get_default_engine() -> Optional["DecisionEngine"]:
+    """Return the first DecisionEngine constructed in this process, or None.
+
+    Safe to call before any DecisionEngine has been instantiated."""
+    return _default_engine
+
+
+def set_default_engine(engine: Optional["DecisionEngine"]) -> None:
+    """Explicitly override the module-level default engine.
+
+    Intended for tests + long-running daemons that want to rebind the
+    singleton after a hot reload. Passing None clears the binding."""
+    global _default_engine
+    _default_engine = engine
+
+
 def _is_old_hw() -> bool:
     """Tight heuristic: <=2 cores or <2GB RAM => scale buffers down."""
     try:
@@ -181,6 +222,15 @@ class DecisionEngine:
         self._confidence_sampler: Any = None
 
         self._load_default_policies()
+
+        # S76 Agent E: register as the module-level default engine on
+        # first instantiation so api_server.py can discover + attach the
+        # Monte-Carlo confidence sampler without shared wiring. First
+        # instance wins; subsequent constructions do NOT rebind (the
+        # daemon may have already handed the sampler to the first one).
+        global _default_engine
+        if _default_engine is None:
+            _default_engine = self
 
     # -- Policy management --
 

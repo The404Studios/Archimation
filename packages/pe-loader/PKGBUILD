@@ -3,7 +3,7 @@
 
 pkgname=pe-loader
 pkgver=0.1.0
-pkgrel=10
+pkgrel=11
 pkgdesc="Windows PE executable loader with DLL stub libraries for native .exe execution on Linux"
 arch=('x86_64')
 url="https://github.com/ai-arch-linux/pe-loader"

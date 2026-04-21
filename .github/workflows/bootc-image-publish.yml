@@ -1,0 +1,366 @@
+name: bootc-image-publish
+
+# Phase 2 GHCR publish pipeline (S78 Dev D).
+#
+# This workflow is SCAFFOLD ONLY. The push job is guarded `if: false` until an
+# operator manually reviews the first successful bake and provisions a GHCR
+# token with `write:packages` scope. See docs/bootc-phase2.md §5.
+#
+# Relationship to .github/workflows/bootc.yml:
+#   bootc.yml                   — rollback + attestation smokes (Agent ε, S72)
+#   bootc-image-publish.yml     — bake + scan + SBOM + (disabled) push
+#
+# They share the `bootc build` step conceptually but run in separate pipelines
+# so that a supply-chain scanner regression doesn't block a functional-correctness
+# fix and vice versa.
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'bootc/**'
+      - 'packages/**'
+      - 'profile/airootfs/**'
+      - '.github/workflows/bootc-image-publish.yml'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag override (default: short SHA + :edge)'
+        required: false
+        default: ''
+
+concurrency:
+  group: bootc-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # packages: write is NEEDED for the push job but granted only there (see below).
+
+env:
+  # Non-secret image coordinates. Real push enable requires packages:write.
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/archimation-bootc
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────
+  build-image:
+    name: build OCI image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      image_digest: ${{ steps.meta.outputs.digest }}
+      image_tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install podman + buildah
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            podman buildah skopeo qemu-utils
+
+      - name: Cache podman image layers
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/containers
+          key: bootc-publish-${{ runner.os }}-${{ hashFiles('bootc/Containerfile', 'packages/**/PKGBUILD') }}
+          restore-keys: |
+            bootc-publish-${{ runner.os }}-
+
+      - name: Compute tags + metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          SHA_SHORT="$(echo "${{ github.sha }}" | cut -c1-12)"
+          TAG_INPUT="${{ github.event.inputs.tag }}"
+          TAG_PRIMARY="${TAG_INPUT:-$SHA_SHORT}"
+          FULL="${REGISTRY}/${IMAGE_NAME}"
+          echo "tag=${FULL}:${TAG_PRIMARY}" >> "$GITHUB_OUTPUT"
+          echo "tag_edge=${FULL}:edge"      >> "$GITHUB_OUTPUT"
+          echo "tag_short=${TAG_PRIMARY}"   >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+          echo "revision=${{ github.sha }}"               >> "$GITHUB_OUTPUT"
+
+      - name: Build packages (required by Containerfile bind-mount)
+        run: |
+          set -uo pipefail
+          # The Containerfile binds repo/x86_64/ as a pacman source. In CI
+          # we prime it either by (a) running scripts/build-packages.sh inside
+          # an Arch container, or (b) by downloading a prior pkg artifact.
+          # For the scaffold we accept an empty repo and let pacman fail
+          # meaningfully — a full build is integration-agent's concern.
+          mkdir -p repo/x86_64
+          ls -la repo/x86_64 || true
+
+      - name: Build bootc OCI image
+        id: build
+        env:
+          IMAGE_VERSION: ${{ steps.meta.outputs.tag_short }}
+          IMAGE_REVISION: ${{ steps.meta.outputs.revision }}
+          IMAGE_CREATED:  ${{ steps.meta.outputs.created }}
+        run: |
+          set -uo pipefail
+          # Dry-run first so the command is visible in logs.
+          ARCHIMATION_BOOTC_DRYRUN=1 TAG="${{ steps.meta.outputs.tag }}" \
+            bash bootc/build-bootc.sh || true
+          # Real build — may fail on the scaffold if repo/x86_64 is empty.
+          # We do NOT fail the job on build error in scaffold mode; the
+          # workflow's purpose is to prove the pipeline wiring, not to
+          # guarantee a bake succeeds without inputs.
+          set +e
+          TAG="${{ steps.meta.outputs.tag }}" bash bootc/build-bootc.sh \
+              --build-arg IMAGE_VERSION="$IMAGE_VERSION" \
+              --build-arg IMAGE_REVISION="$IMAGE_REVISION" \
+              --build-arg IMAGE_CREATED="$IMAGE_CREATED"
+          ec=$?
+          set -e
+          echo "build_exit=${ec}" >> "$GITHUB_OUTPUT"
+          if [ "$ec" -ne 0 ]; then
+            echo "::warning::bake exited ${ec}; continuing for pipeline verification (scaffold)"
+          fi
+
+      - name: Tag as edge
+        if: steps.build.outputs.build_exit == '0'
+        run: |
+          podman tag "${{ steps.meta.outputs.tag }}" "${{ steps.meta.outputs.tag_edge }}"
+
+      - name: Export image to tarball artifact
+        if: steps.build.outputs.build_exit == '0'
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/bootc-publish
+          podman image save --output /tmp/bootc-publish/image.tar \
+              "${{ steps.meta.outputs.tag }}"
+          sha256sum /tmp/bootc-publish/image.tar > /tmp/bootc-publish/image.tar.sha256
+          ls -lh /tmp/bootc-publish/
+
+      - name: Upload image artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootc-image
+          path: |
+            /tmp/bootc-publish/image.tar
+            /tmp/bootc-publish/image.tar.sha256
+          retention-days: 14
+          if-no-files-found: warn
+
+  # ────────────────────────────────────────────────────────────────────
+  scan-image:
+    name: scan + SBOM
+    runs-on: ubuntu-latest
+    needs: build-image
+    timeout-minutes: 30
+
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bootc-image
+          path: /tmp/bootc-publish
+
+      - name: Install podman + trivy + syft
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends podman curl
+
+          # Trivy (Aqua Security) — vulnerability + license scanner
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+
+          # Syft (Anchore) — SBOM generator (CycloneDX + SPDX)
+          curl -sfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+
+          trivy --version
+          syft version
+
+      - name: Load image into podman
+        id: load
+        run: |
+          set -uo pipefail
+          if [ ! -f /tmp/bootc-publish/image.tar ]; then
+            echo "::warning::no image.tar artifact (upstream build may have failed); skipping scan"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          podman load -i /tmp/bootc-publish/image.tar
+          podman images
+          echo "skip=0" >> "$GITHUB_OUTPUT"
+
+      - name: Trivy vulnerability scan
+        if: steps.load.outputs.skip != '1'
+        run: |
+          set -uo pipefail
+          TAG="$(podman images --format '{{.Repository}}:{{.Tag}}' | head -1)"
+          trivy image \
+            --format sarif \
+            --output /tmp/bootc-publish/trivy.sarif \
+            --severity HIGH,CRITICAL \
+            --exit-code 0 \
+            "$TAG" || echo "::warning::trivy exited non-zero (scaffold — not gating)"
+
+      - name: Syft SBOM (CycloneDX)
+        if: steps.load.outputs.skip != '1'
+        run: |
+          set -uo pipefail
+          TAG="$(podman images --format '{{.Repository}}:{{.Tag}}' | head -1)"
+          syft "$TAG" -o cyclonedx-json=/tmp/bootc-publish/sbom.cdx.json || true
+          syft "$TAG" -o spdx-json=/tmp/bootc-publish/sbom.spdx.json || true
+
+      - name: Upload scan + SBOM artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootc-scan-sbom
+          path: |
+            /tmp/bootc-publish/trivy.sarif
+            /tmp/bootc-publish/sbom.cdx.json
+            /tmp/bootc-publish/sbom.spdx.json
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ────────────────────────────────────────────────────────────────────
+  smoke-image:
+    name: image lint + trust.ko presence
+    runs-on: ubuntu-latest
+    needs: build-image
+    timeout-minutes: 20
+
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bootc-image
+          path: /tmp/bootc-publish
+
+      - name: Install podman
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends podman
+
+      - name: Load image into podman
+        id: load
+        run: |
+          set -uo pipefail
+          if [ ! -f /tmp/bootc-publish/image.tar ]; then
+            echo "::warning::no image.tar artifact; skipping smoke"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          podman load -i /tmp/bootc-publish/image.tar
+          echo "skip=0" >> "$GITHUB_OUTPUT"
+
+      - name: bootc container lint (if available)
+        if: steps.load.outputs.skip != '1'
+        run: |
+          set -uo pipefail
+          TAG="$(podman images --format '{{.Repository}}:{{.Tag}}' | head -1)"
+          # `bootc container lint` runs inside the target container. Not all
+          # images ship the bootc binary yet (S72 Phase 1 known issue). Treat
+          # missing binary as neutral, not fail.
+          if podman run --rm "$TAG" bash -c 'command -v bootc >/dev/null'; then
+            podman run --rm "$TAG" bootc container lint || \
+              echo "::warning::bootc lint reported warnings"
+          else
+            echo "::notice::bootc binary not in image (Containerfile Step 3 TODO); lint skipped"
+          fi
+
+      - name: Verify trust.ko presence
+        if: steps.load.outputs.skip != '1'
+        run: |
+          set -uo pipefail
+          TAG="$(podman images --format '{{.Repository}}:{{.Tag}}' | head -1)"
+          # Expected location per bootc/build-trust-module.sh:
+          #   /usr/lib/modules/<kver>/extra/trust.ko
+          if podman run --rm "$TAG" bash -c \
+              'ls /usr/lib/modules/*/extra/trust.ko 2>/dev/null | head -1'; then
+            echo "OK: trust.ko present"
+          else
+            echo "::warning::trust.ko NOT FOUND in /usr/lib/modules/*/extra/ (Phase 2 scaffold; Agent β owns baking it)"
+          fi
+
+      - name: Verify OCI image labels
+        if: steps.load.outputs.skip != '1'
+        run: |
+          set -uo pipefail
+          TAG="$(podman images --format '{{.Repository}}:{{.Tag}}' | head -1)"
+          podman image inspect "$TAG" \
+            --format '{{range $k,$v := .Labels}}{{$k}}={{$v}}{{"\n"}}{{end}}' \
+            | tee /tmp/bootc-publish/labels.txt
+          for required in \
+              containers.bootc \
+              ostree.bootable \
+              org.opencontainers.image.title \
+              org.opencontainers.image.source \
+              org.opencontainers.image.licenses; do
+            if ! grep -q "^${required}=" /tmp/bootc-publish/labels.txt; then
+              echo "::warning::missing OCI label: $required"
+            fi
+          done
+
+  # ────────────────────────────────────────────────────────────────────
+  push-image:
+    name: push to GHCR (DISABLED in scaffold)
+    runs-on: ubuntu-latest
+    needs: [build-image, scan-image, smoke-image]
+    timeout-minutes: 15
+    # ==========================================================================
+    # PHASE 2 GUARD — push is DISABLED. To enable:
+    #   1. Operator manually reviews a green build-image run.
+    #   2. Operator manually reviews the trivy/syft artifacts.
+    #   3. Operator (repo admin) provisions a GHCR PAT with `write:packages`
+    #      scope and adds it as repo secret `GHCR_TOKEN` (NOT a PAT stored in
+    #      anyone's personal account — use a service/bot account).
+    #   4. Flip `if: false` to `if: github.ref == 'refs/heads/main'`.
+    #   5. Remove this comment block when step 4 lands.
+    #
+    # Reasoning: an auto-push on first merge would publish an UNVETTED image
+    # to a public registry. The gate is a deliberate one-time human ack.
+    # ==========================================================================
+    if: false
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bootc-image
+          path: /tmp/bootc-publish
+
+      - name: Install podman
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends podman
+
+      - name: Log in to GHCR
+        # Uses the built-in GITHUB_TOKEN once packages:write is granted above.
+        # If repo admin prefers a dedicated PAT, replace with secrets.GHCR_TOKEN.
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Load image
+        run: |
+          podman load -i /tmp/bootc-publish/image.tar
+
+      - name: Push image (SHA tag + edge)
+        run: |
+          set -euxo pipefail
+          SHA_SHORT="$(echo "${{ github.sha }}" | cut -c1-12)"
+          FULL="${REGISTRY}/${IMAGE_NAME}"
+          LOCAL="$(podman images --format '{{.Repository}}:{{.Tag}}' | head -1)"
+          podman tag "$LOCAL" "${FULL}:${SHA_SHORT}"
+          podman tag "$LOCAL" "${FULL}:edge"
+          podman push "${FULL}:${SHA_SHORT}"
+          podman push "${FULL}:edge"

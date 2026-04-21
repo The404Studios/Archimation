@@ -50,6 +50,7 @@
 #include <linux/err.h>
 #include <linux/atomic.h>
 #include <linux/seqlock.h>
+#include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <linux/version.h>
 #include <crypto/hash.h>
@@ -65,11 +66,28 @@
  * A seqlock gives us a cheap, atomic, retryable read with no writer
  * starvation — writers (recompute) are rare so the reader almost never
  * retries.
+ *
+ * S78 Dev B follow-up (S77 Agent 4 item 1): use seqcount_spinlock_t rather
+ * than plain seqcount_t so lockdep on preemptible kernels (CONFIG_PREEMPT=y
+ * + CONFIG_DEBUG_LOCK_ALLOC=y) can prove the writer-side is serialized by
+ * g_quine_writer_lock. The writer runs from a workqueue (process context)
+ * so taking a spinlock around write_seqcount_begin/end is cheap; readers
+ * (APE compute_proof_v2) remain lock-free.
+ *
+ * S78 Dev B follow-up (item 7): g_quine_tick widened to atomic_long_t so
+ * the ~1000-tick-per-proof consume pace can't wrap the 31-bit counter in
+ * any conceivable deployment lifetime.
  */
 static u8                 g_quine_text_hash[TRUST_QUINE_HASH_LEN];
-static seqcount_t         g_quine_seq = SEQCNT_ZERO(g_quine_seq);
+static DEFINE_SPINLOCK(g_quine_writer_lock);
+static seqcount_spinlock_t g_quine_seq =
+    SEQCNT_SPINLOCK_ZERO(g_quine_seq, &g_quine_writer_lock);
 static atomic64_t         g_quine_recompute_count = ATOMIC64_INIT(0);
-static atomic_t           g_quine_tick            = ATOMIC_INIT(0);
+static atomic_long_t      g_quine_tick            = ATOMIC_LONG_INIT(0);
+/* S78 Dev B item 4: count reads that fell through to the magic sentinel
+ * (quine subsystem uninitialized). A non-zero counter is a userspace
+ * watchdog signal — see trust_attest_quine_get_hash() for the contract. */
+static atomic64_t         g_quine_uninit_reads    = ATOMIC64_INIT(0);
 static bool               g_quine_initialized;
 
 static struct kobject    *g_quine_kobj;     /* /sys/kernel/trust_attest */
@@ -174,10 +192,18 @@ static void quine_do_recompute(void)
     }
 
     /* Publish atomically. Readers using read_seqcount_retry() see either
-     * the old or the new value, never a torn mix. */
+     * the old or the new value, never a torn mix.
+     *
+     * S78 Dev B item 1: seqcount_spinlock_t requires the writer to hold
+     * the associated spinlock across write_seqcount_begin/end. This
+     * satisfies lockdep on CONFIG_PREEMPT kernels and makes concurrent
+     * recompute-from-two-threads impossible (belt-and-suspenders — the
+     * workqueue itself serializes, but explicit is better than implicit). */
+    spin_lock(&g_quine_writer_lock);
     write_seqcount_begin(&g_quine_seq);
     memcpy(g_quine_text_hash, staged, TRUST_QUINE_HASH_LEN);
     write_seqcount_end(&g_quine_seq);
+    spin_unlock(&g_quine_writer_lock);
 
     atomic64_inc(&g_quine_recompute_count);
     memzero_explicit(staged, TRUST_QUINE_HASH_LEN);
@@ -199,10 +225,29 @@ void trust_attest_quine_get_hash(u8 out[TRUST_QUINE_HASH_LEN])
     unsigned int seq;
 
     if (!g_quine_initialized) {
-        /* Pre-init APE calls (during module load ordering) get zero —
-         * preserves proof input layout; bootstraps naturally once init
-         * runs and the first recompute publishes the real hash. */
-        memset(out, 0, TRUST_QUINE_HASH_LEN);
+        /*
+         * S78 Dev B item 4: threat-model hardening.
+         *
+         * Previously we returned 32 zero bytes here. That's indistinguishable
+         * from an adversary who loaded the module with quine wholly disabled
+         * (crypto API failure, OOM during init) and then presented a
+         * zero-hash "clean" proof stream. APE's consume_proof_v2 would fold
+         * the zeros identically whether honest-but-broken or actively-evaded.
+         *
+         * Fix: publish a fixed non-zero MAGIC sentinel (0xDEADBEEF repeating)
+         * instead of zero. Any downstream consumer that sees the sentinel in
+         * a text_hash field knows the quine subsystem was uninitialized at
+         * the time of the read — NOT that the .text happened to hash to
+         * all zeros (cryptographically infeasible) AND NOT that an adversary
+         * successfully spoofed a clean state. Bump g_quine_uninit_reads so
+         * userspace (cortex algedonic_reader or a watchdog) can fire an
+         * alarm when this path is hit. See header for the contract.
+         */
+        u32 magic = 0xDEADBEEFU;
+        size_t i;
+        for (i = 0; i + sizeof(magic) <= TRUST_QUINE_HASH_LEN; i += sizeof(magic))
+            memcpy(out + i, &magic, sizeof(magic));
+        atomic64_inc(&g_quine_uninit_reads);
         return;
     }
 
@@ -228,12 +273,15 @@ EXPORT_SYMBOL_GPL(trust_attest_quine_force_recompute);
 
 int trust_attest_quine_tick(void)
 {
-    int val;
+    long val;
 
     if (!g_quine_initialized)
         return 0;
 
-    val = atomic_inc_return(&g_quine_tick);
+    /* S78 Dev B item 7: widened to atomic_long_t. On LP64 (x86_64) this
+     * is a 64-bit counter — overflow-immune for any realistic uptime.
+     * On 32-bit kernels long is still 32 bits but DKMS targets LP64 here. */
+    val = atomic_long_inc_return(&g_quine_tick);
     if ((val % TRUST_QUINE_RECOMPUTE_EVERY) == 0) {
         /*
          * schedule_work — the caller may be holding spinlocks
@@ -272,14 +320,31 @@ static ssize_t quine_recompute_count_show(struct kobject *k,
                       (long long)atomic64_read(&g_quine_recompute_count));
 }
 
+/* S78 Dev B item 4: /sys/kernel/trust_attest_quine/quine_uninit_reads
+ * exposes the uninit-sentinel-read counter. Userspace watchdog contract:
+ * any non-zero value AFTER module init completed is abnormal and
+ * indicates the quine subsystem failed to initialize (e.g. sysfs race
+ * during module load) — proofs folded over that window contain the
+ * 0xDEADBEEF sentinel instead of a real .text hash. */
+static ssize_t quine_uninit_reads_show(struct kobject *k,
+                                       struct kobj_attribute *a, char *buf)
+{
+    (void)k; (void)a;
+    return sysfs_emit(buf, "%lld\n",
+                      (long long)atomic64_read(&g_quine_uninit_reads));
+}
+
 static struct kobj_attribute attr_text_hash =
     __ATTR(text_hash,        0444, quine_text_hash_show,        NULL);
 static struct kobj_attribute attr_recompute_count =
     __ATTR(recompute_count,  0444, quine_recompute_count_show,  NULL);
+static struct kobj_attribute attr_uninit_reads =
+    __ATTR(quine_uninit_reads, 0444, quine_uninit_reads_show,   NULL);
 
 static struct attribute *quine_attrs[] = {
     &attr_text_hash.attr,
     &attr_recompute_count.attr,
+    &attr_uninit_reads.attr,
     NULL,
 };
 
@@ -313,7 +378,17 @@ static const struct attribute_group quine_group = {
  * The integration agent can wire up a cleaner kobject-sharing contract
  * via trust_attest.c exposing a getter. See report for the TODO.
  */
-int trust_attest_quine_init(void)
+/* S78 Dev B item 5: __init marker lets the kernel reclaim this function's
+ * text after module load completes. Deliberately NOT paired with __exit on
+ * trust_attest_quine_exit() because that function is also called from the
+ * init-failure rollback paths in trust_core.c:905,915,926,938,950,963.
+ * Marking the exit __exit would trigger a modpost section-mismatch warning
+ * for __init trust_init -> __exit trust_attest_quine_exit on built-in
+ * builds (and cause real text-discard issues if the module were ever
+ * compiled =y rather than =m). Keeping trust_attest_quine_exit() unmarked
+ * is the correct idiom for dual-purpose cleanup. Same applies to
+ * trust_quorum_hmac_exit(). */
+int __init trust_attest_quine_init(void)
 {
     int ret;
 

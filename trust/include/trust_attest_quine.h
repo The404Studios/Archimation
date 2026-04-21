@@ -14,17 +14,31 @@
  * the other.
  *
  * sysfs surface (read-only):
- *   /sys/kernel/trust_attest/text_hash         — 64 hex chars + '\n'
- *   /sys/kernel/trust_attest/recompute_count   — u64 decimal
+ *   /sys/kernel/trust_attest_quine/text_hash          — 64 hex chars + '\n'
+ *   /sys/kernel/trust_attest_quine/recompute_count    — u64 decimal
+ *   /sys/kernel/trust_attest_quine/quine_uninit_reads — u64 decimal (S78)
  *
- * (We nest under the SAME /sys/kernel/trust_attest/ kobject that
- *  trust_attest.c creates. Call ordering documented at the init site.)
+ * (Current layout creates a sibling /sys/kernel/trust_attest_quine/ rather
+ *  than sharing /sys/kernel/trust_attest/; see trust_attest_quine.c init
+ *  for rationale.)
+ *
+ * Uninit-sentinel contract (S78 Dev B item 4):
+ *   If trust_attest_quine_get_hash() is called BEFORE init completes (pre-
+ *   init APE ordering quirk) or AFTER init failed (OOM, crypto_alloc
+ *   failure), the returned buffer is the 32-byte MAGIC sentinel
+ *   0xDEADBEEF-repeating (bytes: DE AD BE EF DE AD BE EF ...). The counter
+ *   g_quine_uninit_reads is bumped and exposed via sysfs so userspace
+ *   watchdogs (cortex algedonic_reader, integration smoke tests) can
+ *   detect the failure mode. Downstream consumers MUST NOT treat the
+ *   sentinel as a "clean" hash — it is a flag meaning "no attestation
+ *   available at this read". See trust_attest_quine.c:get_hash comment.
  */
 
 #ifndef _TRUST_ATTEST_QUINE_H
 #define _TRUST_ATTEST_QUINE_H
 
 #ifdef __KERNEL__
+#include <linux/init.h>
 #include <linux/types.h>
 
 /*
@@ -49,21 +63,34 @@
  * sysfs/crypto failure. MUST be called AFTER trust_attest_init() so the
  * parent kobject (/sys/kernel/trust_attest/) already exists — we only
  * add attributes to it, we do not create it ourselves.
+ *
+ * S78 Dev B item 5: marked __init so the kernel can reclaim this
+ * function's text after module load completes.
  */
-int trust_attest_quine_init(void);
+int __init trust_attest_quine_init(void);
 
 /*
  * Module exit. Removes sysfs attributes. Idempotent.
+ *
+ * Deliberately NOT marked __exit: called from init-failure rollback
+ * paths in trust_core.c:905-963 as well as module unload. See
+ * trust_attest_quine.c for the full rationale.
  */
 void trust_attest_quine_exit(void);
 
 /*
  * Fill @out with the cached 32-byte .text hash.
  *
- * Called from trust_ape.c::compute_proof_v2 (surgical edit). If the
- * quine subsystem is not initialized (module bail-out path), returns
- * a 32-byte zero buffer so the proof input layout stays fixed width
- * and pre-init APE calls during module load don't fault on NULL.
+ * Called from trust_ape.c::compute_proof_v2 (surgical edit).
+ *
+ * S78 Dev B item 4: if the quine subsystem is not initialized (pre-init
+ * APE call during module load, OR init failed due to OOM/crypto-alloc
+ * failure), returns the 32-byte MAGIC sentinel 0xDEADBEEF-repeating and
+ * bumps g_quine_uninit_reads (exposed via sysfs). This is NOT a "clean"
+ * hash — downstream consumers (APE fold, cortex watchdog) must treat the
+ * sentinel as an alarm signal. Preserves fixed proof input layout and
+ * avoids NULL fault; cryptographically distinguishable from any real
+ * SHA-256 digest of live .text.
  *
  * Fast path: a single memcpy under a seqlock read. Not a hot spinlock.
  */

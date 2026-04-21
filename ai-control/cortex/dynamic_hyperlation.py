@@ -199,6 +199,19 @@ class MarkovTransitionMatrix:
         default_factory=lambda: deque(maxlen=32)
     )
 
+    def __post_init__(self) -> None:
+        # Ensure the ring buffer's capacity honours `recent_window_max` for
+        # direct constructor calls. Without this, `MarkovTransitionMatrix(
+        # recent_window_max=64)` would silently keep the factory-default
+        # maxlen=32 deque, diverging from `from_dict({"recent_window_max": 64})`
+        # which correctly sizes the ring. (S78 Dev G)
+        if self.recent_window_max is None or self.recent_window_max <= 0:
+            self.recent_window_max = 32
+        if self.recent.maxlen != self.recent_window_max:
+            # Preserve any pre-existing recent entries (factory default is
+            # empty, but a caller could have supplied `recent=deque(...)`).
+            self.recent = deque(self.recent, maxlen=self.recent_window_max)
+
     # ---- Mutators -------------------------------------------------------
 
     def update(self, new_state_idx: int) -> None:
@@ -206,8 +219,13 @@ class MarkovTransitionMatrix:
 
         Idempotent against bad indices: out-of-range values are silently
         ignored so a misclassification upstream cannot poison the matrix.
+        Rejects bool (which is an int subclass in Python but would
+        confuse downstream `MARKOV_STATES[last]` indexing and type
+        contracts; S78 Dev G).
         """
-        if not isinstance(new_state_idx, int):
+        # isinstance(True, int) is True; exclude bool explicitly so the
+        # last_seen_state stays a proper int (or None).
+        if isinstance(new_state_idx, bool) or not isinstance(new_state_idx, int):
             return
         if new_state_idx < 0 or new_state_idx >= MARKOV_N_STATES:
             return
@@ -857,12 +875,25 @@ class HyperlationStateTracker:
         narrowed to just the matching records. The tracker's internal
         snapshot is NOT mutated -- this is purely a view filter, so other
         callers (and the next poll cycle) see the unfiltered state.
+
+        The returned dict (including the `subjects` list and `global` dict)
+        is shallow-copied from the internal snapshot so that callers who
+        mutate the returned structure (e.g., add annotation fields or
+        reorder the list) cannot corrupt the tracker's internal state
+        observed by other concurrent readers. Each per-subject record is
+        also copied one level deep. (S78 Dev G fix for snapshot aliasing.)
         """
         with self._snapshot_lock:
             snap = dict(self._snapshot)
+            # Copy mutable containers under the lock so concurrent poller
+            # writers can't race with the copy pass.
+            inner_subjects = list(snap.get("subjects") or [])
+            inner_global = dict(snap.get("global") or {})
+        snap["subjects"] = [dict(s) for s in inner_subjects]
+        snap["global"] = inner_global
         if filter is None:
             return snap
-        subjects = snap.get("subjects", [])
+        subjects = snap["subjects"]
         snap["subjects"] = [s for s in subjects if filter.matches(s)]
         # Annotate the response so the caller sees the filter applied
         # (helps with debugging "why is my list empty?" GUI tickets).
@@ -901,11 +932,18 @@ class HyperlationStateTracker:
         "I have no data" from "data says steady". The
         `DecisionEngine.consult_hyperlation` wrapper applies the
         Session-49 fail-CLOSED policy on the empty case (see its docstring).
+
+        Normalises a None `state` field to "" so the empty-on-miss
+        contract holds even when a producer placed an explicit None
+        rather than omitting the key. (S78 Dev G.)
         """
         rec = self.get_subject(subject_id)
         if rec is None:
             return ""
-        return rec.get("state", "")
+        state = rec.get("state", "")
+        if state is None:
+            return ""
+        return state
 
     def markov_summary(self, subject_id: int) -> Dict[str, Any]:
         """Return the full per-subject Markov summary dict.

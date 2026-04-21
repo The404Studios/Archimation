@@ -1,0 +1,56 @@
+# ARCHIMATION — bootc install defaults (Phase 2, S78 Dev D)
+#
+# This file is COPY'd into /usr/lib/bootc/install/50-archimation.toml by the
+# Containerfile (Step 10). `bootc install to-disk` reads all *.toml in that
+# directory and merges them alphabetically — our 50- prefix sits mid-range so
+# operators can drop an 80-site.toml override.
+#
+# Spec: https://bootc-dev.github.io/bootc/bootc-install.html
+#
+# NOTE: this is a DEFAULTS file. ai-install-bootc (Agent δ) may override any
+# field via CLI flags; that override is authoritative and NOT re-merged with
+# the TOML. If a field is absent here, bootc uses its own upstream default.
+
+[install]
+# Kargs appended to the kernel command line at install time. These match
+# trust_attest.c's cmdline parser (see trust/kernel/trust_attest.c):
+#   trust.attest=hardware   — require TPM 2.0 + PCR 11 match (enforcing)
+#   rd.systemd.gpt_auto=no  — we manage partition auto-discovery ourselves;
+#                             disable systemd-gpt-auto to avoid races with
+#                             composefs mount logic on first boot.
+#   quiet splash            — Plymouth; matches archiso profile behaviour.
+kargs = [
+    "trust.attest=hardware",
+    "rd.systemd.gpt_auto=no",
+    "quiet",
+    "splash",
+]
+
+[install.filesystem]
+# BTRFS for snapshot-aware rollback. Matches ai-install-bootc --fs default.
+# Subvolumes (@ @home @var @log) are laid out by the installer, not here —
+# the bootc upstream install.toml schema doesn't yet express subvols.
+type = "btrfs"
+
+[install.filesystem.root]
+# type inherited from [install.filesystem]; this block is reserved for future
+# per-mount tuning (compression, checksum algorithm) once bootc exposes them.
+
+# --- Target disk selection (commented: deferred to runtime) -------------------
+#
+# bootc-install's [install.block-device] section can pin a target, but we
+# INTENTIONALLY do not set it here. Reasoning:
+#   - A container-shipped default disk would brick users whose layout differs.
+#   - ai-install-bootc presents a menu of candidate disks to the operator
+#     (NVMe first, then SATA, then MMC), with a dry-run preview.
+#   - CI smoke tests run against a throwaway qcow2 whose /dev/vda is passed
+#     explicitly to the installer.
+#
+# If/when a headless provisioning mode is added (kickstart-style), it should
+# land as a SEPARATE file (e.g. 90-headless.toml shipped in a variant image)
+# rather than mutating this one.
+
+# --- Secure-boot / MOK (commented: handled by first-boot service) -------------
+#
+# The upstream install.toml schema has no MOK slot. See Containerfile Step 11
+# and docs/bootc-phase2.md §3 for the first-boot enrolment dance.

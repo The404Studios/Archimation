@@ -61,10 +61,10 @@ Fidelity ratings per research-E §0's taxonomy:
 
 | # | Paper construct | Code file:line | Research citation | Fidelity | Notes |
 |---|-----------------|----------------|-------------------|----------|-------|
-| 1 | Self-consuming proof chain `Pn+1 = Hcfg(n)(Pn ‖ Rn ‖ SEED ‖ Nn ‖ Tn ‖ Sn)` | `trust/kernel/trust_ape.c:454-568` (consume_proof); `trust/kernel/trust_ape.h:7-35` (formula) | D §1.1, B §2 (mechanism 2), A §2.5 | FAITHFUL | Atomic read-and-zero via `memzero_explicit` at `trust_ape.c:488`. Compiler is forbidden from optimising out. The core crypto primitive. |
-| 2 | Destroy-on-read register semantics | `trust/kernel/trust_ape.c:486-488` | D §1.2 | FAITHFUL (field), PARTIAL (system-level) | The 32-byte field is rigorously overwritten. D §1.2 notes three residual leak paths not defended: L1/L2/L3 cache (no CLFLUSH), register file (no explicit clobber), hibernation image (no `__nosave`/mlock). |
-| 3 | SEED as "physically write-once" register | `trust/kernel/trust_ape.c:297` (generation), `:375` (store), `:492` (re-read on every consume) | D §1.3 | HONESTLY AS EMULATED | Code comment at `trust_ape.c:3-8` explicitly acknowledges the gap. In software SEED is written once by `get_random_bytes` but **re-read** on every consume — a kernel-read adversary sees it during the consume window. Paper's hardware claim is aspirational. |
-| 4 | 94,371,840 reconfigurable hash variants (720 perms × 256 windows × 16 masks × 32 rots) | `trust/kernel/trust_ape.h:44-52` (header declares); `trust/kernel/trust_ape.c:40-58` (only 3 implemented) | D §0.3, D §3.3 item 10, architecture-v2 §4 Finding #10 | REGRESSED or DOC-DRIFT | `trust_types.h:276` defines `TRUST_HASH_CFG_COUNT = 3` (SHA-256, BLAKE2b-256, SHA3-256). `docs/roa-conformance.md:58-60` references `apply_reconfigurable_hash()` at `trust_ape.c:224` — **this function does not exist**. Either code has regressed or docs have always lied. S74 Agent 10 investigation required. |
+| 1 | Self-consuming proof chain `Pn+1 = Hcfg(n)(Pn ‖ Rn ‖ SEED ‖ Nn ‖ Tn ‖ Sn)` | `trust/kernel/trust_ape.c:825` (`trust_ape_consume_proof_v2`); `trust/kernel/trust_ape.c:1067` (v1 shim); `trust/kernel/trust_ape.h:7-35` (formula) | D §1.1, B §2 (mechanism 2), A §2.5 | FAITHFUL | Atomic per-word `xchg` read-and-zero via `xchg_read_and_zero()` at `trust_ape.c:601`. Compiler is forbidden from optimising out. The core crypto primitive. Post-S74 line numbers cited; earlier revisions of this row pointed at `trust_ape.c:454-568` from the pre-recovery 655-LOC stub. |
+| 2 | Destroy-on-read register semantics | `trust/kernel/trust_ape.c:601-615` (`xchg_read_and_zero`) | D §1.2 | FAITHFUL (field), PARTIAL (system-level) | The 32-byte field is rigorously overwritten per-word with `xchg()`. D §1.2 notes three residual leak paths not defended: L1/L2/L3 cache (no CLFLUSH), register file (no explicit clobber), hibernation image (no `__nosave`/mlock). |
+| 3 | SEED as "physically write-once" register | `trust/kernel/trust_ape.c:628` (generate in `trust_ape_create_entity`), `:734` (store `local_seed` into `entry->state.seed` + set `seed_set = 1`), re-read on every consume inside `trust_ape_consume_proof_v2` at `:825` | D §1.3 | HONESTLY AS EMULATED | Code comment at `trust_ape.c:6-9` explicitly acknowledges the gap. In software SEED is written once by `get_random_bytes` but **re-read** on every consume — a kernel-read adversary sees it during the consume window. Paper's hardware claim is aspirational. |
+| 4 | 94,371,840 reconfigurable hash variants (720 perms × 256 windows × 16 masks × 32 rots) | `trust/kernel/trust_ape.h:44-52` (header declares `APE_CFG_TOTAL`); `trust/kernel/trust_ape.c:145` (`ape_perm_table[720][8]`), `:148` (`heap_permute_init`), `:195` (`decode_cfg`), `:225` (`apply_reconfigurable_hash`), `:302` (`compute_proof_v2`), `:528` (`BUILD_BUG_ON(APE_CFG_TOTAL != 94371840ULL)`) | D §0.3, D §3.3 item 10, architecture-v2 §4 Finding #10, `docs/ape-regression-archaeology.md` | FAITHFUL (post-S74 recovery) | Previously marked REGRESSED-or-DOC-DRIFT in this table: an S49→S50-era working-tree regression reduced `apply_reconfigurable_hash()` to a 3-algorithm SHA cycle while leaving the header's 94M claim intact. Recovered in S74 commit `faf6d8e4` from dangling-stash `9b04ca1` (+605 LOC). Full perm/window/mask/rot construct now shipping; `BUILD_BUG_ON` re-armed; see `docs/roa-conformance.md` §2 and §"APE configuration history" for the complete timeline. `TRUST_HASH_CFG_COUNT = 3` still defines the underlying-SHA selector (SHA-256 / BLAKE2b-256 / SHA3-256) — this is the **final** hash stage applied AFTER `apply_reconfigurable_hash()` (`hash_algo_names[]` at `trust_ape.c:112`, `cfg_to_underlying()` at `:276`), not the full configuration count. |
 | 5 | 23-pair chromosomal authority (`Parent A` runtime/behavioural + `Parent B` construction/hardware) | `trust/include/trust_chromosome.h:32-33` (`TRUST_CHR_A_COUNT 23` / `TRUST_CHR_B_COUNT 23`), `:36-60` (A segment names), `:63-87` (B segment names), `:93-96` (pair struct) | E §1 (table of chromosome numbers), E §2 (A/B critique), B §6 | DECORATIVE (N=23) + LOAD-BEARING-METAPHOR (A/B split) | N=23 is a parochial-human number (chimps 24, dogs 39, wheat 21, bacteria 1, ferns 720+). Code never exploits N=23 structurally — any N≥4 works. "Parent A/B" framing misleads biologists (biology's two parents are mother/father, each contributing a full haploid genome; not an A/B decomposition). The A/B split IS architecturally load-bearing (phenotype vs genotype is a legitimate axis) — just not "two parents." |
 | 6 | XY sex determination (XX/XY/YX/YY four-state) | `trust/include/trust_types.h:227-230` (`CHROMO_SEX_*` enum); `trust/kernel/trust_chromosome.c:149-153` (determination logic) | E §3 (biology ≠ threshold test), B §3 | BIOLOGICALLY-INACCURATE (as named) + LOAD-BEARING-METAPHOR | Real mammalian sex = binary SRY-present/absent. Neither `YX` nor diploid `YY` exists in mammalian biology (mothers can only contribute X; 47,XYY is trisomy). The 4-state enum is a Cartesian conformance quadrant over (A23 ≥ θ) × (B23 ≥ θ). Correct and useful; misnamed. |
 | 7 | "Meiotic" combination (dual-parent shared subject) | `trust/kernel/trust_meiosis.c:237-448` (754 LOC total); B §3 side-by-side; E §4 9-of-9-properties-fail table | B §3, E §4 | BIOLOGICALLY-INACCURATE (name) + FAITHFUL-ARCHITECTURE (function) | E §4.3's comparison: 9 of 9 essential meiotic properties fail. No S-phase, no synaptonemal complex, no Spo11 DSB, no Holliday junction, no independent assortment, no reductional division, no 4 haploid products. What the code actually does: per-pair dominance-selection, SHA-256 blinding with per-meiosis nonce, produces one shared subject. This is a **dual-authority bond / joint key-derivation ceremony**, not meiosis. Load-bearing for security (cross-subject cooperation with bounded combined score); mis-labelled for biology. |
@@ -80,10 +80,60 @@ Fidelity ratings per research-E §0's taxonomy:
 | 17 | Cortex-veto-only | `ai-control/cortex/decision_engine.py` (pipeline ordering) | J §3.3 | CONVENTION, NOT ENFORCED | CLAUDE.md claims "veto-only"; no typestate or kernel-side gate prevents a cortex module from calling `trust_action` directly as opposed to `trust_veto`. See §2 disclaimer T-veto and architecture-invariants.md I-3. |
 | 18 | Authority graph rooted in `trust.ko` | `trust/kernel/trust_core.c:1-1019` | J §1 comparator 8 | LOAD-BEARING, NOT AN LSM | `grep -r 'security_add_hooks\|DEFINE_LSM\|struct security_hook_list' trust/kernel/` returns **zero**. trust.ko is not a Linux Security Module; it uses kprobes + `/dev/trust` ioctl RPC. J §1 comparator 8 flags this — the project has never claimed LSM-hood, but readers may assume. Worth an explicit paper disclaimer that "trust.ko is a kernel module with LSM-adjacent hooks, not an LSM." |
 
-**Fidelity distribution across the 18 constructs.** 5 FAITHFUL, 3
-ACCURATE-METAPHOR, 3 BIOLOGICALLY-INACCURATE-but-LOAD-BEARING, 1
-DECORATIVE, 3 PARTIAL, 1 REGRESSED-or-DOC-DRIFT, 2 SUBSTRATE-or-RUNTIME
-deltas.
+**Fidelity distribution across the 18 constructs** (post-S74 APE
+recovery). 6 FAITHFUL (APE row 4 moved here from REGRESSED-or-DOC-DRIFT
+after the `faf6d8e4` recovery), 3 ACCURATE-METAPHOR, 3
+BIOLOGICALLY-INACCURATE-but-LOAD-BEARING, 1 DECORATIVE, 3 PARTIAL, 0
+REGRESSED-or-DOC-DRIFT, 2 SUBSTRATE-or-RUNTIME deltas.
+
+### §1.1 Structural vs. behavioral validation of the APE construct
+
+The row-4 update above closes **structural** validation for the
+reconfigurable hash: byte-exact paper-vs-code alignment at
+`trust/kernel/trust_ape.c:{145,148,195,225,286,302,528,601,825,1067}`
+plus the `BUILD_BUG_ON` compile-time assert. Any reviewer grepping the
+tree for `apply_reconfigurable_hash` / `APE_CFG_TOTAL` / `ape_perm_table`
+now finds the claimed implementation.
+
+**Behavioral validation** — does the primitive actually fire correctly
+under adversarial load? — is the §2.T-runtime gap. The S75 adversarial
+harness currently runs 2/14 host-runnable tests (14 designed; 2
+host-runnable; 12 require VM + kernel-module rebuild). The remaining
+12 are blocked on the runtime-validation infrastructure captured in
+`docs/runtime-theorem-validation.md`. Structural alone ≠ behavioral;
+the primitive exists in compiled form but has not been adversarially
+exercised. Peer-review reads should cite both validation modes
+explicitly.
+
+### §1.2 APE moat statement — where the novelty actually lives
+
+Per research-D §3.1 (crypto audit, synthesis) and consistent with the
+header comment in `trust/kernel/trust_ape.h`:
+
+- The **94,371,840 reconfigurable-hash multiplicity** is a *richness*
+  contribution. It raises the adversary's per-step cfg-prediction
+  probability from `1/3` (pre-S48 / regressed stub) to `1/94,371,840`
+  (≈ `2^-26.5`). Real and useful. Not the moat.
+- The **hash-chain shape** `P_{n+1} = H(P_n || ctx)` with
+  destroy-on-use is a rediscovery of Lamport 1981 / PayWord 1996 /
+  sponge constructions (Bertoni 2008). Documented openly in
+  §2.T-ape-lamport below. Not the moat either.
+- The **genuine APE novelty** is the `S_n` term in §SCP eq.(1) —
+  binding proof advancement to a behavioral fingerprint (chromosome
+  checksum at consume time). No cryptographic primitive in the prior
+  literature entangles chain integrity with an application-semantic
+  behavioral state. A forged or replayed proof whose `S_n` does not
+  match the subject's current chromosomal state cannot pass
+  verification, regardless of how well the attacker modeled `P_n` or
+  `cfg(n)`. This is the behavioral-state-binding property — the
+  architectural invariant the rest of the security argument rests on.
+
+Reviewers evaluating the APE contribution should read the 94M
+configuration count as *hardening* (attacker can't shortcut cfg
+prediction) and the `S_n` behavioral-state binding as *novelty*
+(attacker can't replay across behavioral drift, even with perfect
+cryptographic modeling). See §2.T-ape-novelty for the paper-text
+reframing that makes this explicit.
 
 ---
 

@@ -139,7 +139,7 @@ enum trust_quorum_verdict trust_quorum_vote(const trust_subject_t *s,
      * cannot also forge the matching HMAC without the kernel-derived
      * key. Failure is non-fatal — verdict still returns; tag stays stale. */
     {
-        struct {
+        struct quorum_hmac_payload {
             u32 subject_id;
             u32 field_id;
             u32 verdict;
@@ -150,6 +150,14 @@ enum trust_quorum_verdict trust_quorum_vote(const trust_subject_t *s,
             .verdict    = (u32)v,
             .agree      = agree,
         };
+        /* S78 Dev B item 3: wire-format guard. If a future change widens
+         * the verdict enum (u32 -> u64), adds a field, or touches the
+         * packing, the HMAC input shape changes and every previously-
+         * archived tag becomes un-verifiable against replayed payloads.
+         * Compile-fail loudly rather than silently rotate the wire format. */
+        _Static_assert(sizeof(struct quorum_hmac_payload) == 16,
+                       "quorum HMAC payload size drift breaks tag continuity — "
+                       "bump TRUST_QUORUM_HMAC_PAYLOAD_VERSION and update sysfs docs");
         u8 tag[TRUST_QUORUM_HMAC_LEN];
         if (trust_quorum_hmac_compute(&payload, sizeof(payload), tag) == 0) {
             memcpy(g_last_verdict_hmac, tag, TRUST_QUORUM_HMAC_LEN);

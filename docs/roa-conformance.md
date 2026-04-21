@@ -53,18 +53,72 @@ across epochs.
 
 | Concern                          | Real symbol / location                                                            | Status   |
 |----------------------------------|------------------------------------------------------------------------------------|----------|
-| Proof consumption (consume = destroy) | `trust_ape_consume_proof_v2()` at `trust/kernel/trust_ape.c:815`              | VERIFIED |
-| Legacy 1-arg shim                | `trust_ape_consume_proof()` at `trust/kernel/trust_ape.c:1038`                     | VERIFIED |
-| Reconfigurable hash kernel       | `apply_reconfigurable_hash()` at `trust/kernel/trust_ape.c:224`                    | VERIFIED |
-| Hash-config derivation           | `derive_hash_cfg()` at `trust/kernel/trust_ape.c:285`                              | VERIFIED |
+| Proof consumption (consume = destroy) | `trust_ape_consume_proof_v2()` at `trust/kernel/trust_ape.c:825`              | IMPLEMENTED (S48 + S74 recovery, faf6d8e) |
+| Legacy 1-arg shim (forwards to v2 with NULL R_n) | `trust_ape_consume_proof()` at `trust/kernel/trust_ape.c:1067`         | IMPLEMENTED |
+| Reconfigurable hash kernel       | `apply_reconfigurable_hash()` at `trust/kernel/trust_ape.c:225`                    | IMPLEMENTED (S48 + S74 recovery, faf6d8e) |
+| 720-entry permutation table      | `ape_perm_table[APE_CFG_PERM_COUNT][8]` at `trust/kernel/trust_ape.c:145`          | IMPLEMENTED |
+| Permutation table initialisation | `heap_permute_init()` (Heap's algorithm) at `trust/kernel/trust_ape.c:148`         | IMPLEMENTED |
+| cfg(n) decode (perm/window/mask/rot) | `decode_cfg()` at `trust/kernel/trust_ape.c:195`                               | IMPLEMENTED |
+| cfg-aware SHA kernel             | `compute_proof_v2()` at `trust/kernel/trust_ape.c:302`                             | IMPLEMENTED |
+| Hash-config derivation (legacy selector) | `derive_hash_cfg()` at `trust/kernel/trust_ape.c:286`                      | IMPLEMENTED |
+| `APE_CFG_TOTAL == 94371840` build-time assert | `BUILD_BUG_ON` inside `trust_ape_build_asserts()` at `trust/kernel/trust_ape.c:528` | IMPLEMENTED |
+| Atomic read-and-zero of P_n      | `xchg_read_and_zero()` at `trust/kernel/trust_ape.c:601`                           | IMPLEMENTED |
 | Proof-state struct               | `trust_proof_state_t` at `trust/include/trust_types.h:339`                         | VERIFIED |
 | `seed[32]` write-once            | `trust_proof_state_t.seed` + `seed_set` flag (same struct)                         | VERIFIED |
+
+### 2.1 What `apply_reconfigurable_hash()` actually does
+
+Per the block comment at `trust/kernel/trust_ape.c:214-224`, the
+transform is a constant-time three-stage in-place rewrite applied to
+the proof input buffer **before** the final SHA-2 / SHA-3 / BLAKE2b
+stage:
+
+1. **Per-byte left-rotate** by `cfg->rot & 0x07` bits (rot ∈ {0..31},
+   folded mod 8 — the upper 2 bits were reserved for future
+   large-byte-width substrates and are currently redundant but kept in
+   `APE_CFG_ROT_COUNT = 32` to preserve the paper's 5-bit rot field).
+2. **Window XOR-mask** over `cfg->window`-sized chunks (window ∈
+   {1..256}). The 16-byte mask pattern is derived from the 4-bit
+   `cfg->mask` field.
+3. **8-byte block permutation** driven by `ape_perm_table[cfg->perm_idx]`
+   (perm_idx ∈ {0..719}). The 720 permutations are the first 720
+   enumerated by Heap's algorithm (`heap_permute_init()` at
+   `trust/kernel/trust_ape.c:148`, populating the 5760-byte
+   `ape_perm_table` declared at `trust/kernel/trust_ape.c:145`).
+
+Post-transform, `compute_proof_v2()` dispatches to one of three
+underlying SHA primitives (`sha256`, `blake2b-256`, `sha3-256` —
+`hash_algo_names[]` at `trust/kernel/trust_ape.c:112`) selected by
+`cfg_to_underlying()` at `trust/kernel/trust_ape.c:276` (perm_idx mod
+`TRUST_HASH_CFG_COUNT`). The `_v2` proof variant is therefore
+cfg-aware per paper §SCP eq. (1), with the `R_n` result-entanglement
+term threaded through at `trust_ape.c:975`.
 
 Note: the paper's symbolic name for the reconfigurable hash is `H_cfg(n)`.
 The shipping code splits it across `derive_hash_cfg()` (which builds a
 `struct ape_hash_cfg` from the consumed proof) and
 `apply_reconfigurable_hash()` (which executes the permutation). See
 Deviations §A below.
+
+### 2.2 Configuration-space richness
+
+The four fields compose to `720 × 256 × 16 × 32 = 94,371,840`
+configurations (`APE_CFG_TOTAL` at `trust/kernel/trust_ape.h:50-52`),
+compile-asserted by `BUILD_BUG_ON(APE_CFG_TOTAL != 94371840ULL)` inside
+`trust_ape_build_asserts()` at `trust/kernel/trust_ape.c:528`.
+
+**Genuine novelty caveat.** The 94M count is a *richness* property, not
+the primary APE novelty. The primary novelty — per research-D §3.1 and
+`docs/paper-vs-implementation.md` §2.T-ape-novelty — is the **`S_n`
+behavioral-state binding** (chromosome checksum folded into the proof
+input), which entangles cryptographic chain integrity with
+application-semantic subject state. A forged / replayed proof whose
+`S_n` does not match the current chromosomal fingerprint cannot pass
+verification, regardless of how well the attacker modeled `P_n` or
+`cfg(n)`. The reconfigurable-hash richness hardens against cfg-prediction
+attacks; the behavioral-state binding is what makes this primitive
+unlike prior hash-chain literature (Lamport 1981, PayWord 1996, sponge
+constructions — see `docs/paper-vs-implementation.md` §2.T-ape-lamport).
 
 ---
 
@@ -454,6 +508,80 @@ not RISC-V silicon. Acceptable because:
 2. The FPGA PoC is the paper's reference *hardware* implementation;
    this repo is the reference *Linux* implementation — a complementary
    artefact.
+
+---
+
+## 16. APE configuration history
+
+Timeline of the 94,371,840-configuration reconfigurable-hash construct,
+kept here so future reviewers (peer-review readers and on-boarding
+engineers) can reconstruct the archaeology without spelunking git
+reflogs. Citations are to memory session files
+(`memory/session*.md`) and the archaeology report at
+`docs/ape-regression-archaeology.md`.
+
+- **S38-S47 — pre-94M baseline.** APE proof chain shipped with a
+  3-algorithm SHA cycle (SHA-256 / BLAKE2b-256 / SHA3-256) selected by
+  `proof[0..3] % 3`. `TRUST_HASH_CFG_COUNT = 3` in `trust_types.h`.
+  No perm table, no window/mask/rot fields. Paper claim of 94M
+  configurations was aspirational relative to code at this point.
+- **S48 — 94M implementation landed.** Agent 1 rewrote `trust_ape.c` to
+  add `ape_perm_table[720][8]`, `heap_permute_init()`, `decode_cfg()`,
+  `apply_reconfigurable_hash()`, `compute_proof_v2()`, and the
+  `BUILD_BUG_ON(APE_CFG_TOTAL != 94371840ULL)` compile-time assert.
+  Paper-vs-code structural bisimulation closed.
+- **S49→S50-era regression.** A working-tree manipulation (not a commit
+  — an unsynced edit) reverted `trust_ape.c` to the pre-S48 3-algo stub
+  while leaving `trust_ape.h` advertising `APE_CFG_TOTAL = 94,371,840`.
+  Result: 7-order-of-magnitude paper-vs-code gap. Root cause documented
+  in `docs/ape-regression-archaeology.md` (Agent S, S74).
+- **Pre-S74 HEAD (prior to faf6d8e).** `trust_ape.c` was 655 LOC,
+  header still advertised 94M, `apply_reconfigurable_hash` did not
+  exist, and `docs/roa-conformance.md` claimed `apply_reconfigurable_hash()
+  at trust_ape.c:224` — a row that pointed at a non-existent symbol.
+  Research-D §0.3 flagged as REGRESSED-or-DOC-DRIFT; S74 Agent 10
+  triaged.
+- **S74 (faf6d8e — 2026-04-20).** Recovery from dangling-stash commit
+  `9b04ca1` (end-of-S49 checkpoint the original Agent 1 work lived on).
+  `trust_ape.c` restored to 1260 LOC (+605 vs stub); 12 target-symbol
+  matches (was 0). `BUILD_BUG_ON` re-armed to prevent silent
+  re-regression. Paper-vs-code bisimulation re-closed at the structural
+  layer.
+- **S75 (Agent E).** `SHA-256(trust.ko .text)` folded into the APE
+  proof input via the attestation quine
+  (`trust/include/trust_attest_quine.h`, included at
+  `trust/kernel/trust_ape.c:56`). This raises the adversary's model
+  requirement from "predict cfg(n)" to "predict cfg(n) AND the
+  kernel-module code image is unchanged".
+- **S78 (Dev E — this commit).** Docs reconciled to match the shipping
+  code: (a) `docs/roa-conformance.md` §2 line numbers point at real
+  post-recovery symbols (previous rows claimed `trust_ape.c:224` for
+  `apply_reconfigurable_hash` and `trust_ape.c:815/1038` for the v2/v1
+  consume entry points — post-recovery, the symbols live at 225 /
+  825 / 1067 respectively); (b) header comment in `trust/kernel/trust_ape.h`
+  states the implementation reality, references §SCP eq.(1), cites the
+  S74 recovery SHA, and calls out the `S_n` behavioral-state binding as
+  the genuine moat per research-D §3.1; (c) `docs/paper-vs-implementation.md`
+  row 4 advanced from REGRESSED-or-DOC-DRIFT to FAITHFUL.
+
+Related references:
+
+- `docs/ape-regression-archaeology.md` — pre-recovery forensics
+  (Agent S, S74) establishing the regression was a working-tree
+  manipulation, not aspirational scaffolding.
+- `docs/ape-regression-triage.md` — the S74 Agent 10 triage report.
+- `memory/session74_research_architecture_build.md` Finding #10 — the
+  entry point into the research-D crypto audit.
+- `memory/session75_8agent_s75_punchlist.md` — APE recovery consolidation.
+- `memory/session76_5agent_arc.md` — APE 94M/3 deferred section (this
+  doc reconciliation was carried forward as a moat-credibility item).
+
+The `BUILD_BUG_ON(APE_CFG_TOTAL != 94371840ULL)` assert at
+`trust/kernel/trust_ape.c:528` is the mechanical guarantee that any
+future session weakening the macro will fail the kernel build. CI
+should additionally `grep -c apply_reconfigurable_hash trust/kernel/trust_ape.c`
+and fail on zero, per the last remediation item in
+`docs/ape-regression-archaeology.md`.
 
 ---
 

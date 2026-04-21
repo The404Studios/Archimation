@@ -51,6 +51,27 @@
 #define PE_EVT_DRIVER_LOAD       0x08
 #define PE_EVT_DEVICE_CREATE     0x09
 
+/* ------------------------------------------------------------------ *
+ * PE_EVT_TRUST_ESCALATE reason codes (S78 Dev C).
+ *
+ * All values fit in uint32_t (the wire-format field is uint32, NOT an
+ * enum, because enum size is implementation-defined). 0 is the generic
+ * / unspecified fallback: callers that predate the per-cause work
+ * continue to emit 0 and the cortex treats the cause as opaque.
+ *
+ * Higher numeric values are NOT more severe; they are disjoint causes.
+ * The cortex maps each code to a human-readable name via
+ * cortex.event_bus._REASON_NAMES which MUST stay in sync with this
+ * block. When adding a new code, add it here AND in event_bus.py.
+ * ------------------------------------------------------------------ */
+#define PE_TRUST_ESCALATE_REASON_GENERIC            0u
+#define PE_TRUST_ESCALATE_REASON_QUORUM_DISCREPANT  1u
+#define PE_TRUST_ESCALATE_REASON_QUORUM_DIVERGENT   2u
+#define PE_TRUST_ESCALATE_REASON_APE_EXHAUSTION     3u
+#define PE_TRUST_ESCALATE_REASON_PRIVILEGE_ADJUST   4u
+#define PE_TRUST_ESCALATE_REASON_DRIVER_LOAD        5u
+#define PE_TRUST_ESCALATE_REASON_ANTI_TAMPER        6u
+
 /* Event types -- Object Broker (source=1) */
 #define OBJ_EVT_CREATE           0x01
 #define OBJ_EVT_DESTROY          0x02
@@ -143,6 +164,41 @@ typedef struct {
     int32_t score;
     uint32_t tokens;
 } pe_evt_trust_deny_t;
+
+/* Canonical wire-format typedef for PE_EVT_TRUST_DENY (S78 Dev C hoist).
+ * 137 bytes, packed — this is the byte layout the cortex parser expects.
+ * The unpacked pe_evt_trust_deny_t above is 140 bytes (3 bytes struct
+ * padding after ``category``) and remains for legacy callers; new code
+ * SHOULD use pe_evt_trust_deny_packed_t so the on-wire size matches
+ * sizeof() exactly. The cortex parse_pe_trust_deny_payload accepts
+ * either layout (len 137 or 140), but only the packed form is unambiguous.
+ */
+typedef struct {
+    char     api_name[128];
+    uint8_t  category;
+    int32_t  score;
+    uint32_t tokens;
+} __attribute__((packed)) pe_evt_trust_deny_packed_t;
+_Static_assert(sizeof(pe_evt_trust_deny_packed_t) == 137,
+               "pe_evt_trust_deny_packed_t wire-format drift");
+
+/* Canonical wire-format typedef for PE_EVT_TRUST_ESCALATE (S78 Dev C).
+ * 140 bytes, packed. Single source of truth: trust_gate.c emits this,
+ * cortex.event_bus.parse_pe_trust_escalate_payload reads this. Any
+ * change here MUST update both sides in the same commit.
+ *
+ * Score fields are SIGNED (kernel score range is [-1000, +1000]) — do
+ * not change to uint32 without revisiting the parser and S77 Agent 1
+ * history (commit 56b85ab, <iiI> format).
+ */
+typedef struct {
+    char     api_name[128];
+    int32_t  from_score;        /* SIGNED: kernel score range [-1000, +1000] */
+    int32_t  to_score;          /* SIGNED: same domain (policy threshold) */
+    uint32_t reason;            /* one of PE_TRUST_ESCALATE_REASON_* */
+} __attribute__((packed)) pe_evt_trust_escalate_t;
+_Static_assert(sizeof(pe_evt_trust_escalate_t) == 140,
+               "pe_evt_trust_escalate_t wire-format drift");
 
 /* ========================================================================
  * Emission API

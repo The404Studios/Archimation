@@ -36,12 +36,15 @@
 #include "eventbus/pe_event.h"
 
 /* Forward declarations for S76 cortex telemetry helpers defined below.
- * See the "Cortex event emit helpers" block after the trust state decls. */
+ * See the "Cortex event emit helpers" block after the trust state decls.
+ * S78 Dev C added emit_trust_escalate_auto() for per-cause reason codes. */
 static void emit_trust_deny(trust_gate_category_t category,
                             const char *api_name);
 static void emit_trust_escalate(trust_gate_category_t category,
                                 const char *api_name,
                                 uint32_t reason);
+static void emit_trust_escalate_auto(trust_gate_category_t category,
+                                     const char *api_name);
 
 /* ========================================================================
  * Configuration
@@ -387,40 +390,58 @@ static trust_gate_result_t slow_path_check(trust_gate_category_t category,
 }
 
 /* ========================================================================
- * Cortex event emit helpers (S76 Agent E)
+ * Cortex event emit helpers (S76 Agent E; S78 Dev C typedef hoist +
+ * per-cause reason discrimination)
  *
  * Fire-and-forget emit of PE_EVT_TRUST_DENY / PE_EVT_TRUST_ESCALATE to the
  * cortex whenever trust_gate_check() produces a non-ALLOW verdict. The
- * payload layouts MUST stay in sync with parse_pe_trust_deny_payload and
- * parse_pe_trust_escalate_payload in ai-control/cortex/event_bus.py.
+ * payload layouts live in eventbus/pe_event.h as canonical packed typedefs
+ * (pe_evt_trust_deny_packed_t = 137 bytes, pe_evt_trust_escalate_t = 140
+ * bytes); those are the single source of truth shared with the cortex
+ * parse_pe_trust_*_payload functions in ai-control/cortex/event_bus.py.
  *
- * Both structs are __attribute__((packed)) to produce an unambiguous wire
- * format (137 bytes for deny, 140 bytes for escalate) and avoid compiler
- * padding that would make the byte offsets ambiguous to the parser.
+ * S78 Dev C removed the LOCAL packed struct definitions that used to
+ * mirror the cortex contract here, and now uses the hoisted typedefs
+ * directly. If you change either struct, update pe_event.h AND
+ * event_bus.py in the same commit or the _Static_assert in pe_event.h
+ * will catch the drift at compile time.
  *
  * Emission is strictly non-blocking (pe_event_emit() is lock-free and
  * silently drops when the cortex is not listening). The caller's return
  * value is unaffected; the only side effect is the socket send.
  * ======================================================================== */
 
-struct __attribute__((packed)) pe_evt_trust_deny_emit {
-    char     api_name[128];
-    uint8_t  category;
-    int32_t  score;
-    uint32_t tokens;
-};
-
-struct __attribute__((packed)) pe_evt_trust_escalate_emit {
-    char     api_name[128];
-    uint32_t from_score;
-    uint32_t to_score;
-    uint32_t reason;
-};
+/* Map a gate category to the best-fit PE_TRUST_ESCALATE_REASON_* code.
+ * Categories with semantic escalation meaning (DRIVER_LOAD, PRIVILEGE_ADJUST,
+ * ANTI_TAMPER) produce a specific reason so the cortex can route on cause.
+ * Other categories fall back to GENERIC unless the caller overrides with
+ * a more specific reason (e.g. APE_EXHAUSTION from the token-starve path).
+ *
+ * Quorum reason codes (QUORUM_DISCREPANT / QUORUM_DIVERGENT) are reserved
+ * for future use once the kernel TRUST_IOC_POLICY_EVAL response exposes
+ * the quorum verdict. Until then no caller in this file returns them;
+ * they are still declared in pe_event.h so cortex-side consumers can
+ * match on them when the kernel side lands. */
+static uint32_t category_to_escalate_reason(trust_gate_category_t category)
+{
+    if ((unsigned)category >= TRUST_GATE_MAX)
+        return PE_TRUST_ESCALATE_REASON_GENERIC;
+    switch (category) {
+    case TRUST_GATE_DRIVER_LOAD:
+        return PE_TRUST_ESCALATE_REASON_DRIVER_LOAD;
+    case TRUST_GATE_PRIVILEGE_ADJUST:
+        return PE_TRUST_ESCALATE_REASON_PRIVILEGE_ADJUST;
+    case TRUST_GATE_ANTI_TAMPER:
+        return PE_TRUST_ESCALATE_REASON_ANTI_TAMPER;
+    default:
+        return PE_TRUST_ESCALATE_REASON_GENERIC;
+    }
+}
 
 static void emit_trust_deny(trust_gate_category_t category,
                             const char *api_name)
 {
-    struct pe_evt_trust_deny_emit evt;
+    pe_evt_trust_deny_packed_t evt;
     memset(&evt, 0, sizeof(evt));
     const char *name = api_name;
     if (!name && (unsigned)category < TRUST_GATE_MAX)
@@ -446,14 +467,16 @@ static void emit_trust_deny(trust_gate_category_t category,
     pe_event_emit(PE_EVT_TRUST_DENY, &evt, sizeof(evt));
 }
 
-/* reason codes: 0 = slow-path kernel returned TRUST_RESULT_ESCALATE
- * (generic). Future codes reserved for specific escalation causes
- * (quorum, APE, privilege-adjust call-site, ...). */
+/* reason: one of PE_TRUST_ESCALATE_REASON_* defined in pe_event.h.
+ * Callers that have no specific cause should pass
+ * PE_TRUST_ESCALATE_REASON_GENERIC (0) rather than guessing. The helper
+ * emit_trust_escalate_auto() below picks the best-fit reason from the
+ * category alone; use it when the call site has no extra context. */
 static void emit_trust_escalate(trust_gate_category_t category,
                                 const char *api_name,
                                 uint32_t reason)
 {
-    struct pe_evt_trust_escalate_emit evt;
+    pe_evt_trust_escalate_t evt;
     memset(&evt, 0, sizeof(evt));
     const char *name = api_name;
     if (!name && (unsigned)category < TRUST_GATE_MAX)
@@ -466,20 +489,45 @@ static void emit_trust_escalate(trust_gate_category_t category,
      * threshold the caller would need in order to be allowed. The cortex
      * uses the delta to size a grant or refuse the request.
      *
-     * Both are stored as uint32 on the wire (cortex parses as unsigned);
-     * when trust_score is negative we clamp to 0 so the parser does not
-     * see an accidentally huge "from_score".
+     * S78 Dev C: both fields are now SIGNED int32 on the wire (matching
+     * the kernel score range [-1000, +1000]). The prior uint32 encoding
+     * silently wrapped negative scores to ~4 billion; S77 Agent 1 fixed
+     * the parser side, and the canonical typedef in pe_event.h now fixes
+     * the producer side.
      *
      * S77 A3: only read cache when valid — defense in depth even though
      * current call sites all invoke cache_refresh() via slow_path_check
      * before reaching here. */
-    int32_t cur = tl_cache.valid ? tl_cache.trust_score : 0;
-    evt.from_score = (cur < 0) ? 0u : (uint32_t)cur;
+    evt.from_score = tl_cache.valid ? tl_cache.trust_score : 0;
     evt.to_score   = ((unsigned)category < TRUST_GATE_MAX)
-                     ? g_policy_table[category].min_trust_score
-                     : 0u;
+                     ? (int32_t)g_policy_table[category].min_trust_score
+                     : 0;
     evt.reason     = reason;
     pe_event_emit(PE_EVT_TRUST_ESCALATE, &evt, sizeof(evt));
+}
+
+/* Convenience wrapper: emit an escalate with the reason automatically
+ * derived from the category + cache state.
+ *
+ * Precedence (first match wins):
+ *   1. token_balance exhausted  -> APE_EXHAUSTION
+ *   2. category-specific code   -> DRIVER_LOAD / PRIVILEGE_ADJUST / ANTI_TAMPER
+ *   3. fallback                 -> GENERIC
+ *
+ * Rationale: APE exhaustion is a per-subject metabolic condition that
+ * transcends which API was called — if the subject is starved it
+ * dominates the reason regardless of category. Category-specific codes
+ * only fire when tokens are healthy. */
+static void emit_trust_escalate_auto(trust_gate_category_t category,
+                                     const char *api_name)
+{
+    uint32_t reason;
+    if (tl_cache.valid && tl_cache.token_balance <= 0) {
+        reason = PE_TRUST_ESCALATE_REASON_APE_EXHAUSTION;
+    } else {
+        reason = category_to_escalate_reason(category);
+    }
+    emit_trust_escalate(category, api_name, reason);
 }
 
 /* ========================================================================
@@ -662,9 +710,13 @@ trust_gate_result_t trust_gate_check(trust_gate_category_t category,
 
         if (slow_result != TRUST_ALLOW) {
             audit_log(category, slow_result, api_name, arg_summary);
-            /* S76: cortex telemetry for non-ALLOW verdicts. */
+            /* S76: cortex telemetry for non-ALLOW verdicts.
+             * S78 Dev C: emit_trust_escalate_auto() picks a per-cause
+             * reason code (APE_EXHAUSTION / DRIVER_LOAD / PRIVILEGE_ADJUST
+             * / ANTI_TAMPER / GENERIC) from the cache + category rather
+             * than hard-coding 0. The cortex uses reason to route. */
             if (slow_result == TRUST_ESCALATE)
-                emit_trust_escalate(category, api_name, 0u);
+                emit_trust_escalate_auto(category, api_name);
             else if (slow_result == TRUST_DENY)
                 emit_trust_deny(category, api_name);
             return slow_result;

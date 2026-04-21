@@ -72,6 +72,8 @@ class TestTrustEscalateParser(TrustEscalatePipelineBase):
         self.assertEqual(parsed["from_score"], 40)
         self.assertEqual(parsed["to_score"], 85)
         self.assertEqual(parsed["reason"], 2)
+        # S78 Dev C: reason_name is always present.
+        self.assertEqual(parsed["reason_name"], "quorum_divergent")
 
     def test_parser_registered_in_dispatch_table(self) -> None:
         """Regression guard: the parser is wired into _PAYLOAD_PARSERS.
@@ -89,6 +91,88 @@ class TestTrustEscalateParser(TrustEscalatePipelineBase):
         parsed = self.eb.parse_pe_trust_escalate_payload(b"\x00" * 32)
         self.assertIn("raw_len", parsed)
         self.assertEqual(parsed["raw_len"], 32)
+
+
+class TestTrustEscalateReasonCodes(TrustEscalatePipelineBase):
+    """S78 Dev C: per-cause reason codes must decode to the contract names
+    defined alongside PE_TRUST_ESCALATE_REASON_* in pe-loader/include/
+    eventbus/pe_event.h. Any drift between the C enum and the Python map
+    would silently strip meaning from cortex-side routing, so we pin the
+    integer -> name map field by field."""
+
+    _EXPECTED_NAMES = {
+        0: "generic",
+        1: "quorum_discrepant",
+        2: "quorum_divergent",
+        3: "ape_exhaustion",
+        4: "privilege_adjust",
+        5: "driver_load",
+        6: "anti_tamper",
+    }
+
+    def test_reason_names_map_matches_contract(self) -> None:
+        """The _REASON_NAMES dict in event_bus.py MUST match the C header
+        block-for-block. Adding a new code in pe_event.h without updating
+        event_bus.py would flip it to ``unknown(<n>)`` silently — this
+        test catches that before it ships."""
+        self.assertEqual(self.eb._REASON_NAMES, self._EXPECTED_NAMES)
+
+    def test_parser_decodes_each_known_reason(self) -> None:
+        """Round-trip every contract reason through the parser and check
+        both the integer (``reason``) and the decoded name
+        (``reason_name``) land in the returned dict."""
+        for code, name in self._EXPECTED_NAMES.items():
+            payload = build_trust_escalate_payload(
+                api_name=f"ApiForReason{code}",
+                from_score=10, to_score=80, reason=code,
+            )
+            parsed = self.eb.parse_pe_trust_escalate_payload(payload)
+            self.assertEqual(parsed["reason"], code,
+                             f"reason int mismatch for code {code}")
+            self.assertEqual(parsed["reason_name"], name,
+                             f"reason_name mismatch for code {code}")
+
+    def test_parser_unknown_reason_renders_unknown_n(self) -> None:
+        """Forward-compat: a reason code the cortex hasn't learned yet
+        MUST decode to ``unknown(<n>)`` — never crash, never silently
+        drop the integer, and never collide with an existing name.
+        Pick a code well above the current contract so we'd catch any
+        future collision with a newly-added name."""
+        # 0xDEADBEEF — clearly synthetic and far past any reasonable
+        # future code allocation.
+        payload = build_trust_escalate_payload(
+            api_name="UnknownCauseApi",
+            from_score=0, to_score=100, reason=0xDEADBEEF,
+        )
+        parsed = self.eb.parse_pe_trust_escalate_payload(payload)
+        self.assertEqual(parsed["reason"], 0xDEADBEEF)
+        self.assertEqual(parsed["reason_name"], f"unknown({0xDEADBEEF})")
+
+    def test_reason_name_helper_directly(self) -> None:
+        """Cortex handlers may import _reason_name directly; cover that
+        surface so it does not drift from the parser-injected copy."""
+        reason_name = self.eb._reason_name
+        self.assertEqual(reason_name(0), "generic")
+        self.assertEqual(reason_name(3), "ape_exhaustion")
+        self.assertEqual(reason_name(6), "anti_tamper")
+        self.assertEqual(reason_name(999), "unknown(999)")
+
+    def test_reason_codes_are_disjoint_not_bitmask(self) -> None:
+        """The contract is that reason codes are DISJOINT (one per cause),
+        not a bitmask. Guard the convention: the defined codes all fit
+        in small integers, and no two names collide."""
+        codes = list(self._EXPECTED_NAMES.keys())
+        self.assertEqual(len(codes), len(set(codes)),
+                         "duplicate reason codes in _REASON_NAMES")
+        names = list(self._EXPECTED_NAMES.values())
+        self.assertEqual(len(names), len(set(names)),
+                         "duplicate reason names in _REASON_NAMES")
+        # Current contract uses [0, 6]; allow room but flag wild outliers.
+        for code in codes:
+            self.assertGreaterEqual(code, 0)
+            self.assertLess(code, 256,
+                            "reason code escaped small-int range; if intentional, "
+                            "update this bound and the C header comment")
 
 
 class TestTrustEscalateHandlerChain(TrustEscalatePipelineBase):

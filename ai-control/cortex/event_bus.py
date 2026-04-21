@@ -278,6 +278,31 @@ def parse_pe_trust_deny_payload(data: bytes) -> dict:
     }
 
 
+# PE_EVT_TRUST_ESCALATE reason codes (S78 Dev C). Mirror of the
+# PE_TRUST_ESCALATE_REASON_* constants in
+# pe-loader/include/eventbus/pe_event.h. If you add a new code, add it
+# in BOTH places in the same commit; the _Static_assert in pe_event.h
+# guards the wire-format size but cannot guard the semantic map.
+_REASON_NAMES: Dict[int, str] = {
+    0: "generic",
+    1: "quorum_discrepant",
+    2: "quorum_divergent",
+    3: "ape_exhaustion",
+    4: "privilege_adjust",
+    5: "driver_load",
+    6: "anti_tamper",
+}
+
+
+def _reason_name(reason: int) -> str:
+    """Decode a PE_TRUST_ESCALATE_REASON_* integer to its human-readable
+    name. Unknown codes render as ``unknown(<n>)`` so cortex logs can
+    surface new kernel-side codes before the Python side learns them."""
+    if reason in _REASON_NAMES:
+        return _REASON_NAMES[reason]
+    return f"unknown({reason})"
+
+
 def parse_pe_trust_escalate_payload(data: bytes) -> dict:
     """Parse pe_evt_trust_escalate_t: char[128] api_name, int32 from_score,
     int32 to_score, uint32 reason. Mirrors trust_deny payload shape; the
@@ -291,7 +316,12 @@ def parse_pe_trust_escalate_payload(data: bytes) -> dict:
     unsigned (``I``). The prior schema silently turned any negative score
     into a huge positive (e.g. -50 → 4294967246), which would have made
     the cortex refuse every escalation whose source band was below
-    baseline. ``reason`` is a 32-bit enum bitmap so it stays unsigned."""
+    baseline. ``reason`` is a 32-bit enum bitmap so it stays unsigned.
+
+    S78 Dev C: ``reason`` is now discriminated per cause (see
+    :data:`_REASON_NAMES`). The returned dict includes ``reason_name``
+    so downstream handlers can route without re-implementing the lookup.
+    Unknown reasons decode to ``unknown(<n>)`` (forward-compat)."""
     if len(data) < 140:
         return {"raw_len": len(data)}
     api_name = _decode_cstr(data[:128])
@@ -301,6 +331,7 @@ def parse_pe_trust_escalate_payload(data: bytes) -> dict:
         "from_score": from_score,
         "to_score": to_score,
         "reason": reason,
+        "reason_name": _reason_name(reason),
     }
 
 

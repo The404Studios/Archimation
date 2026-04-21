@@ -31,7 +31,12 @@ static u8          g_hmac_key[TRUST_QUORUM_HMAC_KEY_LEN];
 static bool        g_hmac_initialized;
 static DEFINE_MUTEX(g_hmac_key_lock);
 
-int trust_quorum_hmac_init(void)
+/* S78 Dev B item 5: __init marker lets the kernel reclaim this function's
+ * text post-boot. trust_quorum_hmac_exit() is left unmarked because, like
+ * trust_attest_quine_exit(), it may be called from init-failure rollback
+ * paths (integration agent's responsibility to wire; present-day trust_core
+ * only calls it from module __exit, but we keep the symmetry for safety). */
+int __init trust_quorum_hmac_init(void)
 {
     mutex_lock(&g_hmac_key_lock);
     if (g_hmac_initialized) {

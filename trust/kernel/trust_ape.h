@@ -4,7 +4,7 @@
  * Spec: "Root of Authority" by Roberts/Eli/Leelee
  *       (Zenodo 18710335, DOI 10.5281/zenodo.18710335), §SCP / §APE.
  *
- * The canonical Self-Consuming Proof formula is:
+ * The canonical Self-Consuming Proof formula (paper §SCP eq. (1)) is:
  *
  *   P_{n+1} = H_{cfg(n)}(P_n || R_n || SEED || N_n || T_n || S_n)
  *
@@ -14,7 +14,8 @@
  *   SEED = write-once entity identity (no read path; verify via call-graph)
  *   N_n  = monotonic public nonce
  *   T_n  = timestamp
- *   S_n  = behavioral state snapshot (chromosome checksum)
+ *   S_n  = behavioral state snapshot (chromosome checksum) — see "Moat"
+ *          note below.
  *   H_cfg(n) = reconfigurable hash whose configuration cfg(n) is extracted
  *              from the bits of the destroyed P_n (Theorem 3 — Reconfig
  *              Unpredictability):
@@ -25,13 +26,75 @@
  *                rot(P_n[24:20]) )     // 5-bit pre-rotation
  *
  * Total distinct configurations: 720 * 256 * 16 * 32 = 94,371,840
- * (asserted with BUILD_BUG_ON in trust_ape.c)
+ * (APE_CFG_TOTAL, below — asserted with BUILD_BUG_ON in
+ *  trust_ape.c:trust_ape_build_asserts()).
  *
  * The 720 permutations are the first 720 of 8! = 40,320 entries enumerated
  * by Heap's algorithm.  This truncation is intentional: 720 fits in a
  * compact 720*8 = 5760-byte table and produces enough variety for the
  * downstream entanglement (the perm output is XOR-mixed into the SHA-256
  * input, not the only source of entropy).
+ *
+ * ---------------------------------------------------------------------
+ * IMPLEMENTATION REALITY (as of S75+).
+ *
+ *   The 94,371,840-configuration reconfigurable hash IS implemented in
+ *   the shipping kernel module.  Concretely:
+ *
+ *     • ape_perm_table[720][8]            at trust_ape.c:145
+ *     • heap_permute_init()               at trust_ape.c:148
+ *     • decode_cfg()                      at trust_ape.c:195
+ *     • apply_reconfigurable_hash()       at trust_ape.c:225
+ *     • compute_proof_v2()                at trust_ape.c:302
+ *     • BUILD_BUG_ON(APE_CFG_TOTAL        at trust_ape.c:528
+ *         != 94371840ULL)
+ *
+ *   compute_proof_v2() is the cfg-aware SHA kernel invoked by both the
+ *   create-entity path (trust_ape.c:668) and the v2 consume path
+ *   (trust_ape.c:975).  trust_ape_consume_proof_v2() at trust_ape.c:825
+ *   threads R_n through the proof per paper §SCP eq. (1); the legacy
+ *   trust_ape_consume_proof() at trust_ape.c:1067 forwards to v2 with
+ *   a 32-byte zero R_n for back-compat.
+ *
+ *   Archaeology: an earlier S49→S50-era working-tree regression reduced
+ *   apply_reconfigurable_hash() to a 3-algorithm SHA cycle (SHA-256 /
+ *   BLAKE2b-256 / SHA3-256 only, i.e. 3 configurations — a
+ *   7-order-of-magnitude gap against the paper's 94M claim).  The full
+ *   implementation was recovered in S74 from dangling-stash commit
+ *   9b04ca1 via restoration commit faf6d8e4 ("S74 recovery: APE
+ *   bring-back from dangling commit 9b04ca1 (+605 LOC restored)").  See
+ *   docs/ape-regression-archaeology.md for the full forensics and
+ *   docs/roa-conformance.md §"APE configuration history" for the
+ *   timeline.  The BUILD_BUG_ON above exists precisely to prevent a
+ *   silent re-regression — any edit that weakens APE_CFG_TOTAL will
+ *   compile-fail.
+ *
+ * ---------------------------------------------------------------------
+ * MOAT NOTE (research-D §3.1 synthesis, confirmed S74/S78).
+ *
+ *   The 94,371,840 configuration count is a *richness* contribution:
+ *   it raises an adversary's per-step prediction probability from
+ *   1/3 (3-algo cycle) to 1/94,371,840 (~2^-26.5).  Real and useful.
+ *
+ *   However, per research-D §3.1, it is NOT the genuine novelty of APE.
+ *   The hash-chain shape itself (P_{n+1} = H(P_n || ctx) with
+ *   destroy-on-use) is a rediscovery of Lamport 1981 / PayWord 1996 /
+ *   sponge constructions (Bertoni 2008); the reconfigurable-hash twist,
+ *   while novel, is in the same family.
+ *
+ *   The GENUINE APE NOVELTY is the S_n term — binding proof
+ *   advancement to a behavioral fingerprint (chromosome checksum) at
+ *   consume time.  No cryptographic primitive in the prior literature
+ *   entangles chain integrity with an application-semantic behavioral
+ *   state.  A forged or replayed proof whose S_n does not match the
+ *   subject's current chromosomal state cannot pass verification,
+ *   regardless of how well the attacker modeled P_n or cfg(n).
+ *
+ *   Docs/roa-conformance.md §2 and docs/paper-vs-implementation.md §1
+ *   (row 4 + §2.T-ape-novelty) describe the claim hierarchy in detail.
+ *   Peer reviewers should read the behavioral-state-binding framing as
+ *   the primary contribution; the 94M count as a richness bound.
+ * ---------------------------------------------------------------------
  */
 #ifndef _TRUST_APE_H
 #define _TRUST_APE_H

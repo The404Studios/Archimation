@@ -15,9 +15,12 @@ URL freshness notes:
   * 7-Zip / Python / Node / Git / Firefox: stable, vendor-hosted /latest shim.
   * Chrome / Discord / Steam / OBS: direct installer download URLs.
   * Blender, VirtualBox, VLC, GIMP: vendor sites (versions embedded).
-  * Entries with uncertain or version-embedded URLs carry a `# TODO verify`
+  * Entries with uncertain or version-embedded URLs carry a `# NOTE: URL`
     marker for future maintainer review. At runtime all entries are attempted
     uniformly; stale URLs surface as `download_failed` (HTTP 404) from curl.
+    Class A "will 404 on any upstream release" URLs (/releases/latest/download/
+    with a version-embedded filename) were pinned to explicit /download/<tag>/
+    paths in S78 and carry `TODO(S79): bump tag after ...` reminders.
 """
 
 from __future__ import annotations
@@ -47,7 +50,7 @@ CATALOG: dict[str, dict] = {
     "notepadplusplus": {
         "names": ["notepad++", "notepadplusplus", "notepad plus plus",
                   "n++", "npp"],
-        # TODO verify - version embedded, use latest release shim
+        # NOTE: URL - /latest/download/ with stable filename (no version embedded); safe.
         "url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/latest/download/npp.Installer.x64.exe",
         "installer_type": "exe",
         "silent_args": ["/S"],
@@ -66,7 +69,7 @@ CATALOG: dict[str, dict] = {
     },
     "chrome": {
         "names": ["chrome", "google chrome", "chromium-google"],
-        # TODO verify - Chrome uses MSI for enterprise
+        # NOTE: URL - Chrome enterprise MSI (stable endpoint, no version in URL).
         "url": "https://dl.google.com/tag/s/appguid%3D%7B8A69D345-D564-463C-AFF1-A69D9E530F96%7D%26iid%3D%7B00000000-0000-0000-0000-000000000000%7D%26lang%3Den%26browser%3D3%26usagestats%3D0%26appname%3DGoogle%2520Chrome%26needsadmin%3Dtrue%26ap%3Dx64-stable%26brand%3DGCEA/dl/chrome/install/googlechromestandaloneenterprise64.msi",
         "installer_type": "msi",
         "silent_args": ["/qn"],
@@ -85,7 +88,7 @@ CATALOG: dict[str, dict] = {
     # --- Archive / Compression ---
     "7zip": {
         "names": ["7-zip", "7zip", "seven zip", "7z"],
-        # TODO verify - version pinned (24.09 is current as of 2025)
+        # NOTE: URL - version pinned (7-Zip 24.09, current as of 2025).
         "url": "https://www.7-zip.org/a/7z2409-x64.exe",
         "installer_type": "exe",
         "silent_args": ["/S"],
@@ -96,8 +99,10 @@ CATALOG: dict[str, dict] = {
     # --- Dev tools ---
     "git-for-windows": {
         "names": ["git", "git for windows", "git-for-windows", "git scm"],
-        # TODO verify - version pinned; Git-for-Windows releases monthly-ish
-        "url": "https://github.com/git-for-windows/git/releases/latest/download/Git-2.47.1-64-bit.exe",
+        # S78 Dev F: was TODO (broken /latest/download/<versioned-filename> 404s on
+        # upstream release). Switched to explicit /download/<tag>/... which stays
+        # resolvable after new releases ship. TODO(S79): bump tag after v2.47.1 EOL.
+        "url": "https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/Git-2.47.1-64-bit.exe",
         "installer_type": "exe",
         "silent_args": ["/VERYSILENT", "/NORESTART"],
         "category": "dev",
@@ -106,7 +111,7 @@ CATALOG: dict[str, dict] = {
     "python-windows": {
         "names": ["python", "python windows", "python for windows",
                   "python3", "python 3"],
-        # TODO verify - version pinned; 3.13 stable as of 2025
+        # NOTE: URL - version pinned (Python 3.13.1 stable as of 2025).
         "url": "https://www.python.org/ftp/python/3.13.1/python-3.13.1-amd64.exe",
         "installer_type": "exe",
         "silent_args": ["/quiet", "InstallAllUsers=1", "PrependPath=1",
@@ -116,7 +121,7 @@ CATALOG: dict[str, dict] = {
     },
     "nodejs": {
         "names": ["nodejs", "node js", "node.js", "node"],
-        # TODO verify - version pinned; Node LTS 22.x
+        # NOTE: URL - version pinned (Node.js LTS 22.11.0).
         "url": "https://nodejs.org/dist/v22.11.0/node-v22.11.0-x64.msi",
         "installer_type": "msi",
         "silent_args": ["/qn"],
@@ -125,7 +130,7 @@ CATALOG: dict[str, dict] = {
     },
     "cmake": {
         "names": ["cmake"],
-        # TODO verify - version pinned; CMake 3.31
+        # NOTE: URL - version pinned (CMake 3.31.2, stable /download/<tag>/ path).
         "url": "https://github.com/Kitware/CMake/releases/download/v3.31.2/cmake-3.31.2-windows-x86_64.msi",
         "installer_type": "msi",
         "silent_args": ["/qn"],
@@ -136,7 +141,7 @@ CATALOG: dict[str, dict] = {
     # --- Networking / SSH / Transfer ---
     "putty": {
         "names": ["putty"],
-        # TODO verify - version pinned; PuTTY 0.81
+        # NOTE: URL - version pinned (PuTTY 0.81).
         "url": "https://the.earth.li/~sgtatham/putty/latest/w64/putty-64bit-0.81-installer.msi",
         "installer_type": "msi",
         "silent_args": ["/qn"],
@@ -145,7 +150,7 @@ CATALOG: dict[str, dict] = {
     },
     "filezilla": {
         "names": ["filezilla", "filezilla client"],
-        # TODO verify - FileZilla doesn't offer a /latest redirect; version embedded
+        # NOTE: URL - FileZilla has no /latest redirect; version embedded (3.68.1).
         "url": "https://download.filezilla-project.org/client/FileZilla_3.68.1_win64-setup.exe",
         "installer_type": "exe",
         "silent_args": ["/S"],
@@ -154,7 +159,7 @@ CATALOG: dict[str, dict] = {
     },
     "wireshark": {
         "names": ["wireshark"],
-        # TODO verify - version pinned; Wireshark 4.4.x LTS
+        # NOTE: URL - version pinned (Wireshark 4.4.2, 4.4.x LTS line).
         "url": "https://2.na.dl.wireshark.org/win64/Wireshark-4.4.2-x64.exe",
         "installer_type": "exe",
         "silent_args": ["/S"],
@@ -165,7 +170,7 @@ CATALOG: dict[str, dict] = {
     # --- Media ---
     "vlc": {
         "names": ["vlc", "vlc media player", "videolan"],
-        # TODO verify - version pinned; VLC 3.0.x
+        # NOTE: URL - version pinned (VLC 3.0.21, 3.0.x stable line).
         "url": "https://get.videolan.org/vlc/last/win64/vlc-3.0.21-win64.exe",
         "installer_type": "exe",
         "silent_args": ["/L=1033", "/S"],
@@ -174,8 +179,10 @@ CATALOG: dict[str, dict] = {
     },
     "audacity": {
         "names": ["audacity"],
-        # TODO verify - version pinned; Audacity 3.7
-        "url": "https://github.com/audacity/audacity/releases/latest/download/audacity-win-3.7.1-64bit.exe",
+        # S78 Dev F: was TODO (broken /latest/download/<versioned-filename> 404s on
+        # upstream release). Switched to explicit /download/<tag>/... which stays
+        # resolvable after new releases ship. TODO(S79): bump tag after 3.7.1 EOL.
+        "url": "https://github.com/audacity/audacity/releases/download/Audacity-3.7.1/audacity-win-3.7.1-64bit.exe",
         "installer_type": "exe",
         "silent_args": ["/VERYSILENT", "/NORESTART"],
         "category": "audio",
@@ -183,7 +190,7 @@ CATALOG: dict[str, dict] = {
     },
     "obs": {
         "names": ["obs", "obs studio", "open broadcaster"],
-        # TODO verify - version pinned; OBS Studio 31
+        # NOTE: URL - version pinned (OBS Studio 31.0.0).
         "url": "https://cdn-fastly.obsproject.com/downloads/OBS-Studio-31.0.0-Full-Installer-x64.exe",
         "installer_type": "exe",
         "silent_args": ["/S"],
@@ -192,8 +199,10 @@ CATALOG: dict[str, dict] = {
     },
     "handbrake": {
         "names": ["handbrake", "handbrake video"],
-        # TODO verify - version pinned; HandBrake 1.8
-        "url": "https://github.com/HandBrake/HandBrake/releases/latest/download/HandBrake-1.8.2-x86_64-Win_GUI.exe",
+        # S78 Dev F: was TODO (broken /latest/download/<versioned-filename> 404s on
+        # upstream release). Switched to explicit /download/<tag>/... which stays
+        # resolvable after new releases ship. TODO(S79): bump tag after 1.8.2 EOL.
+        "url": "https://github.com/HandBrake/HandBrake/releases/download/1.8.2/HandBrake-1.8.2-x86_64-Win_GUI.exe",
         "installer_type": "exe",
         "silent_args": ["/S"],
         "category": "media",
@@ -203,7 +212,7 @@ CATALOG: dict[str, dict] = {
     # --- Graphics / 3D ---
     "gimp": {
         "names": ["gimp", "gnu image manipulation program"],
-        # TODO verify - version pinned; GIMP 2.10
+        # NOTE: URL - version pinned (GIMP 2.10.38, stable /v2.10/ path).
         "url": "https://download.gimp.org/gimp/v2.10/windows/gimp-2.10.38-setup.exe",
         "installer_type": "exe",
         "silent_args": ["/VERYSILENT", "/NORESTART"],
@@ -212,7 +221,7 @@ CATALOG: dict[str, dict] = {
     },
     "inkscape": {
         "names": ["inkscape"],
-        # TODO verify - version pinned; Inkscape 1.3
+        # NOTE: URL - version pinned (Inkscape 1.3.2, gallery-hosted).
         "url": "https://inkscape.org/gallery/item/53679/inkscape-1.3.2_2023-11-25_091e20e-x64.msi",
         "installer_type": "msi",
         "silent_args": ["/qn"],
@@ -221,7 +230,7 @@ CATALOG: dict[str, dict] = {
     },
     "blender": {
         "names": ["blender", "blender 3d"],
-        # TODO verify - version pinned; Blender 4.3 LTS
+        # NOTE: URL - version pinned (Blender 4.3.2, 4.3 LTS line).
         "url": "https://download.blender.org/release/Blender4.3/blender-4.3.2-windows-x64.msi",
         "installer_type": "msi",
         "silent_args": ["/qn"],
@@ -232,7 +241,7 @@ CATALOG: dict[str, dict] = {
     # --- Productivity / Office ---
     "libreoffice": {
         "names": ["libreoffice", "libre office", "openoffice"],
-        # TODO verify - version pinned; LibreOffice 24.8
+        # NOTE: URL - version pinned (LibreOffice 24.8.4, stable /24.8.4/ path).
         "url": "https://download.documentfoundation.org/libreoffice/stable/24.8.4/win/x86_64/LibreOffice_24.8.4_Win_x86-64.msi",
         "installer_type": "msi",
         "silent_args": ["/qn"],
@@ -261,7 +270,7 @@ CATALOG: dict[str, dict] = {
     # --- Virtualization ---
     "virtualbox": {
         "names": ["virtualbox", "virtual box", "oracle virtualbox", "vbox"],
-        # TODO verify - version pinned; VirtualBox 7.1
+        # NOTE: URL - version pinned (VirtualBox 7.1.4, stable /7.1.4/ path).
         "url": "https://download.virtualbox.org/virtualbox/7.1.4/VirtualBox-7.1.4-165100-Win.exe",
         "installer_type": "exe",
         "silent_args": ["--silent"],

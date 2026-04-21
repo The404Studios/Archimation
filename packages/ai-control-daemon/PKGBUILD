@@ -3,7 +3,7 @@
 
 pkgname=ai-control-daemon
 pkgver=0.1.0
-pkgrel=28
+pkgrel=29
 pkgdesc="AI control daemon providing full system access via REST API (screen, keyboard, mouse, filesystem, processes)"
 arch=('any')
 url="https://github.com/ai-arch-linux/ai-control-daemon"

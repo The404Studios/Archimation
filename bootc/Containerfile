@@ -16,6 +16,38 @@
 #
 # DO NOT build this as-is on the laptop — runs in CI or via bootc/build-bootc.sh
 # which bind-mounts repo/x86_64/ as a local pacman source.
+#
+# --- Phase 2 policy notes (S78 Dev D) -----------------------------------------
+#
+# (a) BASE IMAGE DIGEST PINNING:
+#     The FROM line below uses `:latest` (floating tag). For reproducible,
+#     supply-chain-auditable bakes we MUST move to digest-pinned form:
+#         FROM docker.io/archlinux/archlinux:base-devel@sha256:<64hex>
+#     Deferred to Phase 3 because:
+#       - The digest changes weekly (Arch rolls the base image); pinning here
+#         without automation (e.g. Renovate/Dependabot) fossilises the build.
+#       - Current S72 build script has no lockfile; pinning without a bump
+#         workflow means manual digest-chase, high friction.
+#     Exit criterion: add `.github/dependabot.yml` or a scheduled action that
+#     rewrites this FROM line on mirror roll. Until then we take the
+#     reproducibility hit and document it openly in docs/bootc-phase2.md §3.
+#
+# (b) LAYER ORDERING (cache reuse):
+#     Current order: pacman-key/pacman install (Steps 1-4) BEFORE COPY of
+#     profile/airootfs (Step 5). This is already correct for cache reuse —
+#     a source-tree churn does not bust the expensive pacman layer. Retained
+#     as-is. Do NOT move the COPY earlier. Do NOT split `repo/x86_64` from
+#     `profile/airootfs/` — a user code-only change should hit cache in Steps
+#     1-4 and only rerun 5-9.
+#
+# (c) DKMS MOK SIGNING / FIRST-BOOT ENROLMENT:
+#     See Step 11 below. MOK enrolment is PER-MACHINE (the user's firmware
+#     enrols the cert via shim→MokManager during first boot); it cannot be
+#     baked into the container image. The image therefore ships an UNSIGNED
+#     trust.ko plus a systemd unit that prompts the operator on first boot.
+#     Hardware-rooted attestation (Agent γ's trust_attest.c) is the second
+#     line of defence and works regardless of whether MOK enrolment succeeded.
+# ------------------------------------------------------------------------------
 
 FROM docker.io/archlinux/archlinux:latest
 
@@ -122,15 +154,59 @@ RUN systemctl enable NetworkManager sshd systemd-networkd-wait-online \
 # ai-control-daemon which may have a slightly different unit filename between
 # pkgrels. Harmless if missing; boot will surface the real error.
 
-# --- Step 10: labels ----------------------------------------------------------
+# --- Step 10: bootc-install defaults ------------------------------------------
+# `bootc install to-disk` reads /usr/lib/bootc/install/*.toml to decide target
+# filesystem, partition layout, kargs. Agent δ's ai-install-bootc wrapper can
+# override these at CLI time; the TOML is the default when invoked with no
+# flags.
+COPY bootc/install/install.toml /usr/lib/bootc/install/50-archimation.toml
+
+# --- Step 11: MOK first-boot enrolment scaffold (Phase 2, S78 Dev D) ----------
+# The trust.ko module is signed at image-build time by bootc/build-trust-module.sh
+# (Agent β) using a project key whose public half lands at /etc/archimation/keys/
+# mok.der inside the image. On a machine with Secure Boot enforcing, the kernel
+# will refuse to load an unsigned module — which means our trust authority will
+# be ABSENT unless the user has enrolled our MOK cert into their firmware.
+#
+# MOK enrolment is a three-step dance that cannot be automated inside the
+# container:
+#   1. shim reads /boot/efi/EFI/<vendor>/MokManager.efi on next boot
+#   2. operator types the enrolment password at the blue MokManager screen
+#   3. kernel then trusts our cert for module verification
+#
+# Agent δ's ai-install-bootc generates the enrolment password and stages the
+# .der under /var/lib/archimation/mok-enroll.txt. This Containerfile step ONLY
+# enables the systemd oneshot that prompts/logs the user on the first boot
+# after install.
+#
+# NOTE: unit file itself is expected to land via profile/airootfs/ COPY in
+# Step 5 (archimation-mok-enroll.service). If absent (current Phase 2 state),
+# the enable is guarded with `|| true` so the container build doesn't fail.
+RUN (systemctl enable archimation-mok-enroll.service 2>/dev/null || true)
+
+# --- Step 12: labels ----------------------------------------------------------
 # `containers.bootc=1` is the marker bootc upgrade looks for (bootc-dev/bootc#892).
 # `ostree.bootable=true` is the composefs/ostree marker.
 # `Experimental=1` because this is S72 Phase 1 and we have known gaps (see README).
+#
+# OCI image-spec labels: https://github.com/opencontainers/image-spec/blob/main/annotations.md
+# ARG IMAGE_VERSION is overridable at build time via --build-arg, defaults to
+# a "phase2-dev" tag so local bakes are clearly distinguishable from CI bakes.
+ARG IMAGE_VERSION=phase2-dev
+ARG IMAGE_REVISION=unknown
+ARG IMAGE_CREATED=1970-01-01T00:00:00Z
+
 LABEL containers.bootc="1" \
       ostree.bootable="true" \
       containers.bootc.Experimental="1" \
       org.opencontainers.image.title="archimation-bootc" \
       org.opencontainers.image.description="ARCHIMATION — Arch Linux with trust kernel + PE loader, bootc image mode" \
       org.opencontainers.image.source="https://github.com/fourzerofour/arch-linux-with-full-ai-control" \
+      org.opencontainers.image.url="https://github.com/fourzerofour/arch-linux-with-full-ai-control" \
+      org.opencontainers.image.documentation="https://github.com/fourzerofour/arch-linux-with-full-ai-control/blob/main/docs/bootc-phase2.md" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}" \
+      org.opencontainers.image.created="${IMAGE_CREATED}" \
       org.opencontainers.image.licenses="GPL-3.0-or-later" \
-      org.opencontainers.image.vendor="ARCHIMATION Project"
+      org.opencontainers.image.vendor="ARCHIMATION Project" \
+      org.opencontainers.image.authors="ARCHIMATION Project <https://github.com/fourzerofour>"

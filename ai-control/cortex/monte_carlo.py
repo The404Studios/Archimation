@@ -161,8 +161,19 @@ class MonteCarloSampler:
         with self._lock:
             while len(accepted) < n and proposed < max_proposals:
                 x = self._rng.uniform(low, high)
-                w = float(likelihood_fn(x))
+                # S79 fuzz: likelihood_fn is caller-supplied; siblings
+                # estimate_expectation + mcmc_chain already swallow
+                # likelihood exceptions. Symmetric defensiveness here so a
+                # flaky likelihood on a boundary input doesn't crash the
+                # cortex veto path.
+                try:
+                    w = float(likelihood_fn(x))
+                except Exception:
+                    proposed += 1
+                    continue
                 proposed += 1
+                if not math.isfinite(w) or w < 0.0:
+                    continue
                 if w > envelope_m:
                     envelope_m = w
                 if envelope_m <= 0.0:
@@ -372,8 +383,13 @@ class UncertaintyQuantifier:
 
         elapsed = time.perf_counter() - t0
         if len(outputs) < MIN_VALID_SAMPLES:
-            logger.warning("quantify: only %d/%d valid samples -> nan CI",
-                           len(outputs), n)
+            # S79 fuzz: demoted WARN -> DEBUG. The nan CI in the returned
+            # UncertaintyResult already communicates "undefined" upstream;
+            # WARN-level spam drowns useful prod logs when pathological
+            # inputs are legitimate (e.g., early cold-start, degenerate
+            # boundary subject).
+            logger.debug("quantify: only %d/%d valid samples -> nan CI",
+                         len(outputs), n)
             res = UncertaintyResult(math.nan, math.nan, math.nan, math.nan,
                                     n_valid=len(outputs), elapsed_s=elapsed)
         else:
@@ -984,7 +1000,18 @@ class StochasticRateLimiter:
         self._tokens = min(self.capacity, self._tokens + arrivals)
 
     def consume(self, tokens: float = 1.0) -> bool:
-        """Attempt to consume ``tokens``. Return True if granted."""
+        """Attempt to consume ``tokens``. Return True if granted.
+
+        Negative / non-finite / zero ``tokens`` are treated as a no-op grant
+        (return True, bucket unchanged). S79 fuzz: caller-passed -1 used to
+        INCREMENT the bucket (``self._tokens -= -1``), silently giving
+        callers who pass unvalidated counts free tokens.
+        """
+        if not math.isfinite(tokens) or tokens <= 0.0:
+            # No-op grant; don't corrupt the bucket.
+            with self._lock:
+                self._granted += 1
+            return True
         now = self.time_fn()
         with self._lock:
             self._refill(now)

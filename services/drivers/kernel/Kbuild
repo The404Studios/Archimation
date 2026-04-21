@@ -9,10 +9,13 @@ obj-m := wdm_host.o
 wdm_host-y := wdm_host_main.o \
               wdm_host_loader.o \
               wdm_host_irp.o \
+              wdm_host_irp_driverapi.o \
               wdm_host_device.o \
               wdm_host_thunk.o \
               wdm_host_dma.o \
               wdm_host_pnp.o \
-              wdm_host_registry.o
+              wdm_host_registry.o \
+              wdm_host_hal.o \
+              wdm_host_hid.o
 
-ccflags-y := -DWDM_HOST_MODULE -I$(src)/../stubs
+ccflags-y := -DWDM_HOST_MODULE -DWDM_HOST_KERNEL=1 -I$(src)/../stubs

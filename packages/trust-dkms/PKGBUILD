@@ -3,7 +3,7 @@
 
 pkgname=trust-dkms
 pkgver=0.1.0
-pkgrel=7
+pkgrel=8
 pkgdesc="Root of Authority trust kernel module (DKMS) - dynamic trust enforcement at kernel level"
 arch=('x86_64')
 url="https://github.com/ai-arch-linux/trust-system"
@@ -38,7 +38,9 @@ package() {
         trust_dispatch_tables.c trust_memory.c trust_syscall.c \
         trust_vector.c trust_fused.c trust_stats.c \
         trust_subject_pool.c trust_ape_markov.c trust_authz.c \
-        trust_compat.c trust_invariants.c trust_meiosis.c; do
+        trust_compat.c trust_invariants.c trust_meiosis.c \
+        trust_attest.c trust_morphogen.c trust_quorum.c \
+        trust_algedonic.c; do
         install -Dm644 "$_srcdir/kernel/$src" "$_dkms_dir/$src"
     done
 
@@ -46,7 +48,8 @@ package() {
     for hdr in \
         trust_ape.h trust_authz.h trust_compat.h trust_internal.h \
         trust_isa.h trust_lifecycle.h trust_meiosis.h \
-        trust_memory.h trust_syscall.h; do
+        trust_memory.h trust_syscall.h trust_attest.h \
+        trust_morphogen.h; do
         install -Dm644 "$_srcdir/kernel/$hdr" "$_dkms_dir/$hdr"
     done
 
@@ -58,6 +61,10 @@ package() {
     install -Dm644 "$_srcdir/include/trust_ioctl.h"  "$_dkms_dir/include/trust_ioctl.h"
     install -Dm644 "$_srcdir/include/trust_uapi.h"   "$_dkms_dir/include/trust_uapi.h"
     install -Dm644 "$_srcdir/include/trust_chromosome.h" "$_dkms_dir/include/trust_chromosome.h"
+    install -Dm644 "$_srcdir/include/trust_algedonic.h" "$_dkms_dir/include/trust_algedonic.h"
+    install -Dm644 "$_srcdir/include/trust_quorum.h"    "$_dkms_dir/include/trust_quorum.h"
+    install -Dm644 "$_srcdir/include/trust_theorems.h"  "$_dkms_dir/include/trust_theorems.h"
+    install -Dm644 "$_srcdir/include/trust_isa.h"       "$_dkms_dir/include/trust_isa.h"
 
     # ── DKMS configuration ────────────────────────────────────────────
     install -Dm644 /dev/stdin "$_dkms_dir/dkms.conf" <<DKMS

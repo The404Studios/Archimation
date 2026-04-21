@@ -24,6 +24,7 @@
 #include <linux/bug.h>
 #include <linux/ratelimit.h>
 #include <linux/ktime.h>
+#include <linux/init.h>      /* __ro_after_init */
 
 #include "../include/trust_cmd.h"
 #include "../include/trust_ioctl.h"
@@ -1290,7 +1291,18 @@ static int cmd_fused_run(const trust_cmd_entry_t *cmd,
  * reach the right helper regardless of table width.
  * ======================================================================== */
 
-static trust_cmd_handler_t dispatch_table[TRUST_STAT_FAMILY_SLOTS][TRUST_CMD_MAX_OPCODES] = {
+/*
+ * S74 Finding #4 (W^X hardening): dispatch_table is the single authority
+ * pivot in the entire kernel module -- any write primitive that can
+ * redirect cmd_auth_verify -> return 0 collapses the authority graph
+ * silently. Mark const + __ro_after_init so the table is placed in the
+ * .rodata_after_init segment that the kernel frees-read-only-write once
+ * module init completes. Verified: no code in any trust_*.c writes to
+ * dispatch_table[x][y] -- only reads at trust_dispatch.c:2061.
+ */
+static const trust_cmd_handler_t
+dispatch_table[TRUST_STAT_FAMILY_SLOTS][TRUST_CMD_MAX_OPCODES]
+__ro_after_init = {
 	[TRUST_FAMILY_AUTH] = {
 		[AUTH_OP_MINT]      = cmd_auth_mint,
 		[AUTH_OP_BURN]      = cmd_auth_burn,

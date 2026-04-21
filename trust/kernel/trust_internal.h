@@ -385,6 +385,9 @@ int trust_isa_decode_batch(const void *buf, u32 buf_len,
 int  trust_stats_register(void);
 void trust_stats_unregister(void);
 
+/* Shared /sys/kernel/trust/ parent for quorum/morphogen/algedonic. */
+struct kobject *trust_stats_parent_kobj(void);
+
 u64  trust_stats_caps_bitmap(void);
 
 void trust_stats_record_dispatch(unsigned int family);

@@ -30,6 +30,7 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/hash.h>
+#include "trust_internal.h"   /* trust_stats_parent_kobj() */
 #endif
 
 #include <trust_types.h>
@@ -190,11 +191,23 @@ static struct kobject *g_quorum_kobj;
 int trust_quorum_init(void)
 {
     int ret;
+    struct kobject *parent;
 
-    g_quorum_kobj = kobject_create_and_add("quorum", kernel_kobj);
+    /* S74 Finding #9: nest under /sys/kernel/trust/quorum (documented in
+     * trust_quorum.h:48) rather than /sys/kernel/quorum. The parent is
+     * created by trust_stats_register() -- if that failed earlier we fall
+     * back to kernel_kobj so the counters remain observable. */
+    parent = trust_stats_parent_kobj();
+    if (!parent) {
+        pr_warn("trust_quorum: trust_stats parent kobject absent; "
+                "falling back to /sys/kernel/quorum\n");
+        parent = kernel_kobj;
+    }
+
+    g_quorum_kobj = kobject_create_and_add("quorum", parent);
     if (!g_quorum_kobj) {
         pr_warn("trust_quorum: kobject_create_and_add failed — "
-                "/sys/kernel/quorum unavailable\n");
+                "/sys/kernel/trust/quorum unavailable\n");
         return -ENOMEM;
     }
 

@@ -48,6 +48,11 @@ _syscall_translator = None
 _syscall_monitor = None
 _thermal = None
 _power = None
+# S74 agents 6+7 + integration finding #1
+_active_inference = None
+_entropy_observer = None
+_assembly_index = None
+_algedonic_reader = None
 
 
 def _init_controllers(config: dict):
@@ -59,6 +64,8 @@ def _init_controllers(config: dict):
     global _stub_generator, _behavioral_model, _win_api_db
     global _syscall_translator, _syscall_monitor
     global _thermal, _power
+    global _active_inference, _entropy_observer, _assembly_index
+    global _algedonic_reader
 
     def _safe_init(name, factory):
         try:
@@ -332,6 +339,16 @@ def create_app(config: dict):
                 await _power.start()
             except Exception as e:
                 logger.error("Power orchestrator failed to start: %s (continuing without it)", e)
+        # S74 integration: algedonic_reader drains /dev/trust_algedonic.
+        # Graceful if the device is absent (WSL/QEMU/no trust.ko).
+        if _algedonic_reader:
+            try:
+                await _algedonic_reader.start()
+            except Exception as e:
+                logger.error(
+                    "Algedonic reader failed to start: %s "
+                    "(continuing without it)", e
+                )
         yield
         # Shutdown: close all WebSocket clients, then stop trust observer
         for ws in list(_ws_clients):
@@ -368,6 +385,17 @@ def create_app(config: dict):
                 await _trust_observer.stop()
             except Exception as e:
                 logger.error("Trust observer failed to stop cleanly: %s", e)
+        # S74 integration: stop algedonic reader + cortex agent cleanly.
+        if _algedonic_reader:
+            try:
+                await _algedonic_reader.stop()
+            except Exception as e:
+                logger.error("Algedonic reader failed to stop cleanly: %s", e)
+        if _active_inference:
+            try:
+                _active_inference.stop()
+            except Exception as e:
+                logger.error("Active inference failed to stop cleanly: %s", e)
         # Close uinput devices to prevent resource leaks
         if _keyboard:
             try:
@@ -407,6 +435,80 @@ def create_app(config: dict):
     except ImportError:
         logger.warning("CORS middleware not available")
 
+    # ---- S74 cortex + observer integration (agents 6, 7 + Finding #1) ----
+    #
+    # Agent 6 (active_inference.py) uses trust_observer + memory_observer to
+    # build a generative-model belief over the authority landscape and picks
+    # actions by expected free energy minimisation. Agents 7 (entropy and
+    # assembly) feed it Shannon / Assembly-Theory priors. Finding #1 closes
+    # the producer-without-consumer loop on /dev/trust_algedonic.
+    #
+    # Registration order: entropy + assembly BEFORE active_inference so the
+    # cortex can subscribe to their emissions through the shared bus.
+    # Everything is fault-isolated: a failure in any one module leaves the
+    # rest of the daemon functional.
+    global _active_inference, _entropy_observer, _assembly_index
+    global _algedonic_reader
+
+    # The daemon does not currently operate a cortex event_bus in-process
+    # (that bus lives in ai-control/cortex/event_bus.py and may be remote).
+    # For observer publishing we use the existing _broadcast_trust_event
+    # WebSocket fan-out as a best-effort sink.  When the in-process event
+    # bus lands (S75), wire it here.
+    _daemon_event_sink = None  # Wired after _broadcast_trust_event is defined
+
+    try:
+        from entropy_observer import register_with_daemon as _reg_entropy
+        _entropy_observer = _reg_entropy(
+            app, _daemon_event_sink, trust_observer=_trust_observer,
+        )
+        logger.info("entropy_observer registered with daemon")
+    except Exception as e:
+        logger.error("Failed to register entropy_observer: %s", e)
+        _entropy_observer = None
+
+    try:
+        from assembly_index import register_with_daemon as _reg_assembly
+        _assembly_index = _reg_assembly(
+            app, _daemon_event_sink, trust_observer=_trust_observer,
+        )
+        logger.info("assembly_index registered with daemon")
+    except Exception as e:
+        logger.error("Failed to register assembly_index: %s", e)
+        _assembly_index = None
+
+    try:
+        # active_inference lives under ai-control/cortex/ so we have to
+        # adjust sys.path before importing.
+        import sys as _sys
+        from pathlib import Path as _P
+        _cortex_dir = str(_P(__file__).resolve().parent.parent / "cortex")
+        if _cortex_dir not in _sys.path:
+            _sys.path.insert(0, _cortex_dir)
+        from active_inference import register_with_daemon as _reg_ai
+        _active_inference = _reg_ai(
+            app,
+            {
+                "trust_observer": _trust_observer,
+                "memory_observer": _memory_observer,
+                "event_bus": _daemon_event_sink,
+            },
+        )
+        logger.info("active_inference registered with daemon")
+    except Exception as e:
+        logger.error("Failed to register active_inference: %s", e)
+        _active_inference = None
+
+    try:
+        from algedonic_reader import register_with_daemon as _reg_alg
+        _algedonic_reader = _reg_alg(
+            app, _daemon_event_sink, cortex=_active_inference,
+        )
+        logger.info("algedonic_reader registered with daemon")
+    except Exception as e:
+        logger.error("Failed to register algedonic_reader: %s", e)
+        _algedonic_reader = None
+
     # Log controller status
     _controllers = {
         "keyboard": _keyboard, "mouse": _mouse, "screen": _screen,
@@ -425,6 +527,11 @@ def create_app(config: dict):
         "behavioral_model": _behavioral_model,
         "thermal": _thermal,
         "power": _power,
+        # S74 integration
+        "active_inference": _active_inference,
+        "entropy_observer": _entropy_observer,
+        "assembly_index": _assembly_index,
+        "algedonic_reader": _algedonic_reader,
     }
     loaded = [n for n, c in _controllers.items() if c is not None]
     failed = [n for n, c in _controllers.items() if c is None]

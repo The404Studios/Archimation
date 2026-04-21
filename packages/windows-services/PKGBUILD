@@ -3,7 +3,7 @@
 
 pkgname=windows-services
 pkgver=0.1.0
-pkgrel=5
+pkgrel=6
 pkgdesc="Windows Service Control Manager daemon, driver framework, and anti-cheat compatibility layer"
 arch=('x86_64')
 url="https://github.com/ai-arch-linux/windows-services"

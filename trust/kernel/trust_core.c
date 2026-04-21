@@ -31,10 +31,13 @@
 
 #include "../include/trust_ioctl.h"
 #include "../include/trust_cmd.h"
+#include "../include/trust_algedonic.h"   /* S74 Agent 8 */
+#include "../include/trust_quorum.h"      /* S74 Agent 8 */
 #include "trust_internal.h"
 #include "trust_memory.h"
 #include "trust_syscall.h"
 #include "trust_attest.h"
+#include "trust_morphogen.h"               /* S74 Agent 5 */
 
 #define DEVICE_NAME "trust"
 #define CLASS_NAME  "trust"
@@ -961,6 +964,17 @@ static int __init trust_init(void)
     if (trust_stats_register() < 0)
         pr_warn("trust: stats sysfs registration failed; /sys/kernel/trust/{stats,caps} will be absent\n");
 
+    /* S74 meta-exploit: spatial tissue + Byzantine quorum + algedonic
+     * bypass. All non-fatal on failure -- the module still runs without
+     * them; only the biological-analogue surface is absent.
+     */
+    if (trust_morphogen_init() < 0)
+        pr_warn("trust: morphogen init failed; tissue field unavailable\n");
+    if (trust_quorum_init() < 0)
+        pr_warn("trust: quorum init failed; 23-way voting unavailable\n");
+    if (trust_algedonic_init() < 0)
+        pr_warn("trust: algedonic init failed; /dev/trust_algedonic absent\n");
+
     pr_info("trust: Root of Authority module loaded - /dev/trust created\n");
     pr_info("trust: Architecture: Dynamic Hyperlation with Self-Consuming Proof Chain\n");
     pr_info("trust: TLB: %d sets x %d ways = %d entries\n",
@@ -991,6 +1005,10 @@ static int __init trust_init(void)
 
 static void __exit trust_exit(void)
 {
+    /* S74 meta-exploit teardown. Each *_exit is idempotent. */
+    trust_algedonic_exit();
+    trust_quorum_exit();
+    trust_morphogen_fini();
     timer_shutdown_sync(&trust_decay_timer);
     trust_stats_unregister();
     tsc_cleanup();

@@ -305,6 +305,21 @@ int trust_stats_register(void)
 }
 EXPORT_SYMBOL_GPL(trust_stats_register);
 
+/*
+ * S74 Finding #9: expose /sys/kernel/trust/ as a shared parent kobject so
+ * quorum / algedonic / morphogen / invariants can all register under it
+ * (rather than littering /sys/kernel with peer directories). Returns NULL
+ * if trust_stats_register has not yet been called (or failed).
+ *
+ * NOTE: do NOT kobject_put() the return value -- lifetime is owned by
+ * trust_stats.
+ */
+struct kobject *trust_stats_parent_kobj(void)
+{
+	return trust_stats_kobj;
+}
+EXPORT_SYMBOL_GPL(trust_stats_parent_kobj);
+
 void trust_stats_unregister(void)
 {
 	if (trust_stats_kobj) {

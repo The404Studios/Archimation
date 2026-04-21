@@ -1343,18 +1343,22 @@ cat >> /etc/issue <<'BANNER'
   /_/ \_\_| \__|_||_||_|_| |_| |_|\__,_|\__|_|\___/|_| |_|
 BANNER
 printf '\e[0m' >> /etc/issue
-printf '\e[38;5;243m  AI-Powered Arch Linux  \e[38;5;240m//\e[38;5;243m  fourzerofour\e[0m\n' >> /etc/issue
+printf '\e[38;5;243m  Arch Linux · Windows Runtime · Trust Kernel · AI Cortex  \e[38;5;240m//\e[38;5;243m  fourzerofour\e[0m\n' >> /etc/issue
 printf '\e[38;5;60m  ──────────────────────────────────────────\e[0m\n' >> /etc/issue
 printf '\e[38;5;141m  \\r\e[0m \e[38;5;243mtty\e[38;5;240m\\l\e[0m\n\n' >> /etc/issue
 
 # --- /etc/motd: shown after login ---
 cat > /etc/motd <<'MOTD'
 
-  Welcome to Archimation.
-  fastfetch          system overview
-  peloader app.exe   run Windows PE binary
-  ai-health          AI daemon status
-  pe-status           PE runtime info
+  Archimation.  Arch Linux · Windows Runtime · Trust Kernel · AI Cortex.
+
+    ai <command>         Natural-language system control  (try: ai play music)
+    fastfetch            Brand + live system overview
+    peloader <app.exe>   Run a Windows PE binary
+    ai-health            Daemon + trust status
+    pe-status            PE runtime + DLL resolution map
+
+  Docs:  /usr/share/doc/archimation/   ·   man ai-help   ·   ai --help
 
 MOTD
 

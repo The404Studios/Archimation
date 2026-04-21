@@ -46,7 +46,7 @@ ATTEST_SCRIPT = REPO_ROOT / "scripts" / "test-bootc-attestation.sh"
 CONTAINERFILE = REPO_ROOT / "bootc" / "Containerfile"
 AIROOTFS = REPO_ROOT / "profile" / "airootfs"
 
-IMAGE_TAG = os.environ.get("IMAGE_TAG", "localhost/archwindows-bootc:test")
+IMAGE_TAG = os.environ.get("IMAGE_TAG", "localhost/archimation-bootc:test")
 OUT_DIR = Path(os.environ.get("OUT_DIR", "/tmp/bootc-test"))
 
 pytestmark = [
@@ -127,8 +127,8 @@ REQUIRED_PACKAGES = ("trust-system", "ai-control-daemon", "pe-loader")
 
 
 def test_image_contains_required_packages(bootc_image: str) -> None:
-    """pacman -Q succeeds for the three packages that make ARCHWINDOWS
-    *ARCHWINDOWS* (trust kernel, AI daemon, PE loader).
+    """pacman -Q succeeds for the three packages that make ARCHIMATION
+    *ARCHIMATION* (trust kernel, AI daemon, PE loader).
 
     On a STUB build (test-bootc-build.sh fell back to plain archlinux:latest
     when Agent α's Containerfile wasn't reachable) this is xfail'd with a
@@ -136,7 +136,7 @@ def test_image_contains_required_packages(bootc_image: str) -> None:
     missing the packages, but we still want to exercise the gate plumbing.
     """
     if _build_mode() == "STUB":
-        pytest.xfail("STUB build: no ARCHWINDOWS packages expected inside")
+        pytest.xfail("STUB build: no ARCHIMATION packages expected inside")
 
     proc = _run(
         ["podman", "run", "--rm", bootc_image,

@@ -1,4 +1,4 @@
-# ARCHWINDOWS trust-keys — project MOK key lifecycle
+# ARCHIMATION trust-keys — project MOK key lifecycle
 
 This directory is where the project's **Machine Owner Key (MOK)** for signing
 `trust.ko` lives during a CI build or a local developer build. **No actual
@@ -54,7 +54,7 @@ a working system. Secure-Boot users can re-sign manually post-build.
 
 | Key                              | Scope             | Private lives...                   | Public ships in image... | Used for...                              |
 |----------------------------------|-------------------|------------------------------------|--------------------------|------------------------------------------|
-| **Project MOK**                  | ARCHWINDOWS-wide  | CI secret (`TRUST_MOK_PRIV`)       | `/usr/share/archwindows/trust-pub.der` | Signing `trust.ko` at image build; enrolled via mokutil on user machines |
+| **Project MOK**                  | ARCHIMATION-wide  | CI secret (`TRUST_MOK_PRIV`)       | `/usr/share/archimation/trust-pub.der` | Signing `trust.ko` at image build; enrolled via mokutil on user machines |
 | **Per-install MOK**              | single machine    | `/var/lib/dkms/mok.key` (600, root) | `/var/lib/dkms/mok.pub`  | Signing DKMS rebuilds on-target (archiso path only)                      |
 | **sbctl / UEFI db signing key**  | single machine    | `/var/lib/sbctl/keys/db/db.key`    | `/var/lib/sbctl/keys/db/db.pem` | Signing the UKI / GRUB EFI binaries (Agent gamma scope)                 |
 
@@ -71,7 +71,7 @@ rotated annually (see Section 7).
 
 ```bash
 # Working dir — never commit this output
-cd /tmp/archwindows-mok-gen
+cd /tmp/archimation-mok-gen
 rm -rf ./*
 
 # Config file that openssl will read
@@ -84,10 +84,10 @@ prompt              = no
 x509_extensions     = v3_ca
 
 [ req_dn ]
-CN = ARCHWINDOWS Project trust.ko Signing
-O  = ARCHWINDOWS
+CN = ARCHIMATION Project trust.ko Signing
+O  = ARCHIMATION
 OU = Trust Root Authority
-emailAddress = trust-root@archwindows.invalid
+emailAddress = trust-root@archimation.invalid
 
 [ v3_ca ]
 basicConstraints        = critical,CA:FALSE
@@ -124,10 +124,10 @@ After running:
 - `trust-priv.pem` goes into CI secret store (GitHub Actions Secret name
   `TRUST_MOK_PRIV_PEM`, base64-encoded).
 - `trust-pub.der` is copied into the bootc image at image-build time to
-  `/usr/share/archwindows/trust-pub.der` where `mokutil --import` can find it.
+  `/usr/share/archimation/trust-pub.der` where `mokutil --import` can find it.
 - `trust-pub.pem` is kept with the private key in CI for audit purposes;
   do NOT ship it in the image (DER is smaller and is what mokutil wants).
-- Everything in `/tmp/archwindows-mok-gen` except the CI-vault upload is
+- Everything in `/tmp/archimation-mok-gen` except the CI-vault upload is
   `shred`ded. Never push any of it to git.
 
 ---
@@ -138,7 +138,7 @@ After running:
 
 ```dockerfile
 # Build stage — kernel headers layer + trust sources
-FROM archwindows-build-base:latest AS trust-build
+FROM archimation-build-base:latest AS trust-build
 ARG KERNEL_VERSION
 COPY trust/ /src/trust/
 COPY bootc/build-trust-module.sh /usr/local/bin/
@@ -151,10 +151,10 @@ RUN --mount=type=secret,id=trust_mok_priv,target=/tmp/trust-priv.pem \
     /usr/local/bin/build-trust-module.sh
 
 # Runtime stage
-FROM archwindows-base:latest
+FROM archimation-base:latest
 COPY --from=trust-build /usr/lib/modules/${KERNEL_VERSION}/extra/trust.ko \
                         /usr/lib/modules/${KERNEL_VERSION}/extra/trust.ko
-COPY bootc/trust-keys/trust-pub.der /usr/share/archwindows/trust-pub.der
+COPY bootc/trust-keys/trust-pub.der /usr/share/archimation/trust-pub.der
 RUN depmod -a ${KERNEL_VERSION}
 ```
 
@@ -170,10 +170,10 @@ When a user boots the bootc image the first time:
 
 ```bash
 # 1. Copy the project pub cert to a location shim can read
-sudo cp /usr/share/archwindows/trust-pub.der /boot/efi/archwindows-trust.der
+sudo cp /usr/share/archimation/trust-pub.der /boot/efi/archimation-trust.der
 
 # 2. Queue the MOK import — shim's MokManager will prompt on reboot
-sudo mokutil --import /boot/efi/archwindows-trust.der
+sudo mokutil --import /boot/efi/archimation-trust.der
 # ENTER a one-time password (8+ chars) — shim's blue screen will ask for it
 
 # 3. Reboot
@@ -182,11 +182,11 @@ sudo systemctl reboot
 # --- on reboot, shim interrupts with a blue MokManager screen ---
 # Enroll MOK → Continue → Enter password → Reboot
 #
-# After this, `mokutil --list-enrolled` includes the ARCHWINDOWS cert.
+# After this, `mokutil --list-enrolled` includes the ARCHIMATION cert.
 # `trust.ko` now passes signature verification and loads under lockdown.
 ```
 
-ARCHWINDOWS ships an optional first-boot wizard (`archwindows-enroll-mok`)
+ARCHIMATION ships an optional first-boot wizard (`archimation-enroll-mok`)
 that walks the user through this with plain-English explanations of what
 the blue MokManager screen means. Users can also decline enrollment —
 in that case the system boots with `lockdown=none` (see Section 8) and
@@ -208,9 +208,9 @@ tail -c 28 /usr/lib/modules/$(uname -r)/extra/trust.ko
 modinfo /usr/lib/modules/$(uname -r)/extra/trust.ko | grep -E 'sig|signer'
 
 # Is the certificate itself the one we expect?
-openssl x509 -inform DER -in /usr/share/archwindows/trust-pub.der \
+openssl x509 -inform DER -in /usr/share/archimation/trust-pub.der \
     -noout -subject -fingerprint -sha256
-# Subject: CN = ARCHWINDOWS Project trust.ko Signing, ...
+# Subject: CN = ARCHIMATION Project trust.ko Signing, ...
 # SHA256 Fingerprint: <expected value from the current active key>
 
 # Has the kernel loaded it?
@@ -244,9 +244,9 @@ Rotation procedure:
    rollback images can still be rebuilt.
 3. Update `Containerfile` to reference the new secret name.
 4. Next build signs with new key; ships new pub cert alongside the old one
-   at `/usr/share/archwindows/trust-pub-v<n>.der` and
-   `/usr/share/archwindows/trust-pub-v<n+1>.der`.
-5. `archwindows-enroll-mok` wizard imports both on first boot; user sees
+   at `/usr/share/archimation/trust-pub-v<n>.der` and
+   `/usr/share/archimation/trust-pub-v<n+1>.der`.
+5. `archimation-enroll-mok` wizard imports both on first boot; user sees
    two MokManager enroll prompts (one per key). This means rollback to
    an older image still works without wiping MOK state.
 6. After **two full release cycles** with the new key as default, the old
@@ -256,7 +256,7 @@ Rotation procedure:
 
 **Emergency rotation** (key compromise suspected): run rotation procedure
 above in a single day; submit SBAT bump to revoke signatures chained to
-the compromised key; push an `archwindows-trust-revoke` hotfix package
+the compromised key; push an `archimation-trust-revoke` hotfix package
 that `dbxupdate` the hashes of any known-signed `trust.ko` binaries built
 against the compromised key. Target-users MUST update within 7 days or
 their disks will be refused at next kernel-lockdown boot.
@@ -278,7 +278,7 @@ freely. `trust.ko` loads regardless of whether it is signed.
 Use case: pre-2013 hardware with no UEFI; systems with SB disabled in
 firmware for any reason; dev boxes; VMs without UEFI.
 
-UX: ARCHWINDOWS prints on first boot
+UX: ARCHIMATION prints on first boot
 > `NOTICE: trust.ko loaded without signature verification (lockdown=none). Authority root is software-only; enable Secure Boot + enroll MOK for hardware-strength.`
 
 ### 8b. Secure Boot ON, MOK not enrolled, `lockdown=integrity`
@@ -288,7 +288,7 @@ This is the failure mode we most want to prevent. Kernel refuses to load
 emits a loud SCM error; cortex disables trust-mediated paths; system
 boots to a functional but degraded state.
 
-UX: ARCHWINDOWS firstboot wizard detects `mokutil --sb-state` ==
+UX: ARCHIMATION firstboot wizard detects `mokutil --sb-state` ==
 `SecureBoot enabled` and `trust.ko` not loaded; pops a 3-option dialog:
   (a) Enroll MOK now (recommended)
   (b) Disable Secure Boot in firmware (press F2 on reboot, explain steps)

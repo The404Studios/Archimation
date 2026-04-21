@@ -1,7 +1,7 @@
-# ARCHWINDOWS `bootc/` — image-mode foundation
+# ARCHIMATION `bootc/` — image-mode foundation
 
 Phase 1 of the S72 migration from archiso to bootc/OCI. This directory contains
-everything needed to build ARCHWINDOWS as a bootable container image instead of
+everything needed to build ARCHIMATION as a bootable container image instead of
 (or in addition to) the traditional live ISO.
 
 Owners: Agent α (foundation, this README), Agent β (`build-trust-module.sh`,
@@ -47,7 +47,7 @@ Sources: [bootc upstream](https://containers.github.io/bootc/),
 
 ```
    ┌──────────────────────────────────────────────────────────┐
-   │  ghcr.io/fourzerofour/archwindows-bootc:latest  (OCI)    │
+   │  ghcr.io/fourzerofour/archimation-bootc:latest  (OCI)    │
    │                                                          │
    │  Layer N:  airootfs overrides    (profile/airootfs/)     │
    │  Layer …:  custom pacman pkgs    (repo/x86_64/*.zst)     │
@@ -97,10 +97,10 @@ bash bootc/build-bootc.sh
 
 # Dry-run mode (prints the builder command it would invoke, useful on WSL2
 # where you may not have podman/buildah set up yet):
-ARCHWINDOWS_BOOTC_DRYRUN=1 bash bootc/build-bootc.sh
+ARCHIMATION_BOOTC_DRYRUN=1 bash bootc/build-bootc.sh
 
 # Override the tag:
-TAG=ghcr.io/fourzerofour/archwindows-bootc:dev bash bootc/build-bootc.sh
+TAG=ghcr.io/fourzerofour/archimation-bootc:dev bash bootc/build-bootc.sh
 ```
 
 `build-bootc.sh` picks `buildah` > `podman` > `docker` in that order. First
@@ -116,7 +116,7 @@ at the contents like any OCI container:
 
 ```bash
 # drop into a shell inside the image
-podman run --rm -it --entrypoint /bin/bash archwindows-bootc:dev
+podman run --rm -it --entrypoint /bin/bash archimation-bootc:dev
 
 # inside:
 pacman -Q | wc -l           # ~400+ packages
@@ -125,7 +125,7 @@ ls /usr/lib/modules/*/extra/trust.ko   # pre-built signed module (Agent β)
 systemctl list-unit-files | grep ai-   # our units are enabled
 
 # from the host — sanity checks:
-podman run --rm --entrypoint /bin/bash archwindows-bootc:dev \
+podman run --rm --entrypoint /bin/bash archimation-bootc:dev \
   -c 'bootc container --check 2>/dev/null || echo "bootc binary not shipped yet"'
 ```
 
@@ -146,7 +146,7 @@ from inside it.
 # (run as root, destructive — /dev/sdX is the target disk)
 podman run --privileged --pid=host \
     --security-opt=label=type:unconfined_t \
-    ghcr.io/fourzerofour/archwindows-bootc:latest \
+    ghcr.io/fourzerofour/archimation-bootc:latest \
     bootc install to-disk --wipe /dev/sdX
 ```
 

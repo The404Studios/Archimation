@@ -143,7 +143,7 @@ log "compiling trust.ko against $KERNEL_VERSION"
 # deterministic timestamps in the resulting .ko.
 make -C "$KHDR" M="$WORK" modules -j"$(nproc 2>/dev/null || echo 2)" \
     KBUILD_EXTMOD="$WORK" \
-    KCPPFLAGS="-DARCHWINDOWS_BOOTC_BUILD=1" \
+    KCPPFLAGS="-DARCHIMATION_BOOTC_BUILD=1" \
     >&2
 
 KO="$WORK/trust.ko"

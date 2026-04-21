@@ -1,5 +1,5 @@
 #!/bin/bash
-# build-bootc.sh — orchestrator for ARCHWINDOWS bootc image builds.
+# build-bootc.sh — orchestrator for ARCHIMATION bootc image builds.
 #
 # Session 72 / Agent α / Phase 1 foundation. Wraps `buildah build` (preferred,
 # rootless) or `podman build` (fallback) and ties together:
@@ -7,12 +7,12 @@
 #   - our archiso airootfs at profile/airootfs/   (COPY'd verbatim into /)
 #   - our Containerfile at bootc/Containerfile    (the actual build graph)
 #
-# Output: a local OCI image tagged `archwindows-bootc:dev` (override with $TAG).
-# Smoke-test: `podman run --rm -it archwindows-bootc:dev /bin/bash`
+# Output: a local OCI image tagged `archimation-bootc:dev` (override with $TAG).
+# Smoke-test: `podman run --rm -it archimation-bootc:dev /bin/bash`
 # Deploy:     `bootc install to-disk /dev/sdX` (from within the image, booted)
 # Upgrade:    `bootc upgrade` (user-facing, on deployed system)
 #
-# DOES NOT run the build automatically if ARCHWINDOWS_BOOTC_DRYRUN=1 is set;
+# DOES NOT run the build automatically if ARCHIMATION_BOOTC_DRYRUN=1 is set;
 # it just prints the command it would run. That's the default way to smoke
 # this script on WSL2 where podman may not be installed.
 
@@ -22,9 +22,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-TAG="${TAG:-archwindows-bootc:dev}"
+TAG="${TAG:-archimation-bootc:dev}"
 CONTAINERFILE="${CONTAINERFILE:-bootc/Containerfile}"
-DRYRUN="${ARCHWINDOWS_BOOTC_DRYRUN:-0}"
+DRYRUN="${ARCHIMATION_BOOTC_DRYRUN:-0}"
 
 # ---- sanity --------------------------------------------------------------------
 if [ ! -f "$CONTAINERFILE" ]; then
@@ -95,7 +95,7 @@ case "$BUILDER" in
 esac
 
 # ---- run (or print) ------------------------------------------------------------
-echo "=== ARCHWINDOWS bootc build ==="
+echo "=== ARCHIMATION bootc build ==="
 echo "    builder:       $BUILDER"
 echo "    tag:           $TAG"
 echo "    containerfile: $CONTAINERFILE"
@@ -104,7 +104,7 @@ echo "    workdir:       $PROJECT_DIR"
 echo ""
 
 if [ "$DRYRUN" = "1" ]; then
-    echo "DRY-RUN (ARCHWINDOWS_BOOTC_DRYRUN=1). Would run:"
+    echo "DRY-RUN (ARCHIMATION_BOOTC_DRYRUN=1). Would run:"
     printf '    %q ' "${CMD[@]}"
     echo ""
     exit 0

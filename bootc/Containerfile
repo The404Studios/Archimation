@@ -1,4 +1,4 @@
-# ARCHWINDOWS bootc Containerfile — Phase 1 foundation (Session 72 / Agent α).
+# ARCHIMATION bootc Containerfile — Phase 1 foundation (Session 72 / Agent α).
 #
 # Architecture: Arch Linux base + our pacman repo layered in + airootfs
 # overrides. OCI image is the unit of shipment; bootc handles deployment,
@@ -129,8 +129,8 @@ RUN systemctl enable NetworkManager sshd systemd-networkd-wait-online \
 LABEL containers.bootc="1" \
       ostree.bootable="true" \
       containers.bootc.Experimental="1" \
-      org.opencontainers.image.title="archwindows-bootc" \
-      org.opencontainers.image.description="ARCHWINDOWS — Arch Linux with trust kernel + PE loader, bootc image mode" \
+      org.opencontainers.image.title="archimation-bootc" \
+      org.opencontainers.image.description="ARCHIMATION — Arch Linux with trust kernel + PE loader, bootc image mode" \
       org.opencontainers.image.source="https://github.com/fourzerofour/arch-linux-with-full-ai-control" \
       org.opencontainers.image.licenses="GPL-3.0-or-later" \
-      org.opencontainers.image.vendor="ARCHWINDOWS Project"
+      org.opencontainers.image.vendor="ARCHIMATION Project"

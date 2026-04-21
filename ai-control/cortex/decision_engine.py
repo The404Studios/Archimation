@@ -40,6 +40,11 @@ logger = logging.getLogger("cortex.decision")
 # default can use ``set_default_engine()`` below.
 # ---------------------------------------------------------------------------
 _default_engine: Optional["DecisionEngine"] = None
+# Guard the first-instance-wins CAS in __init__ against concurrent
+# DecisionEngine() constructors (pytest parallel runs, rapid daemon
+# reloads, etc). Lazy creation is safe because module import itself is
+# serialised by Python's import lock (PEP 328).
+_default_engine_lock: Any = None
 
 
 def get_default_engine() -> Optional["DecisionEngine"]:
@@ -54,8 +59,12 @@ def set_default_engine(engine: Optional["DecisionEngine"]) -> None:
 
     Intended for tests + long-running daemons that want to rebind the
     singleton after a hot reload. Passing None clears the binding."""
-    global _default_engine
-    _default_engine = engine
+    global _default_engine, _default_engine_lock
+    if _default_engine_lock is None:
+        import threading as _threading
+        _default_engine_lock = _threading.Lock()
+    with _default_engine_lock:
+        _default_engine = engine
 
 
 def _is_old_hw() -> bool:
@@ -228,9 +237,18 @@ class DecisionEngine:
         # Monte-Carlo confidence sampler without shared wiring. First
         # instance wins; subsequent constructions do NOT rebind (the
         # daemon may have already handed the sampler to the first one).
-        global _default_engine
-        if _default_engine is None:
-            _default_engine = self
+        #
+        # S77 Agent 1: guard the check+set with a lock so two concurrent
+        # constructors (pytest-xdist, race-y hot reload) cannot both see
+        # _default_engine is None and both bind themselves. Without this,
+        # api_server.py could attach its sampler to the losing instance.
+        global _default_engine, _default_engine_lock
+        if _default_engine_lock is None:
+            import threading as _threading
+            _default_engine_lock = _threading.Lock()
+        with _default_engine_lock:
+            if _default_engine is None:
+                _default_engine = self
 
     # -- Policy management --
 
@@ -871,22 +889,40 @@ class DecisionMarkovModel:
         actions produces the bigram chain implicitly. First call is a
         no-op for transitions (no predecessor) but still records the state
         for state_counts tracking.
+
+        S77 Agent 1 fix: previously this method acquired ``self._lock`` in
+        two separate ``with`` blocks around the stream append and the
+        first-observation state-count update, which left a race window
+        where a parallel observer could sneak in an ``observe()`` call and
+        cause the stream/state_counts to desynchronize (e.g., double-
+        incrementing a state count for the first observation if two
+        threads both saw ``prev is None``). Consolidating into a single
+        critical section closes that window while still doing the single
+        follow-up ``self.observe()`` call outside the lock to avoid
+        re-entering with a plain ``Lock`` (not ``RLock``).
         """
         if not isinstance(action, str):
             return
         prev: Optional[str]
+        do_observe = False
         with self._lock:
             prev = self._stream[-1] if self._stream else None
             self._stream.append(action)
-        if prev is None:
-            # First observation: just record the state visit.
-            with self._lock:
+            if prev is None:
+                # First observation: record the state visit in-line so the
+                # stream append + state-count update are atomic w.r.t. any
+                # concurrent observer.
                 self._state_counts[action] = self._state_counts.get(action, 0) + 1
                 self._last_action = action
                 self._last_timestamp = time.time()
                 self._total_observations += 1
-            return
-        self.observe(prev, action)
+            else:
+                do_observe = True
+        if do_observe:
+            # Deferred: call observe() outside the lock. observe() re-acquires
+            # the same Lock; doing it inline would self-deadlock because
+            # _lock is a plain threading.Lock (not RLock).
+            self.observe(prev, action)
 
     # --- Read-only derived quantities --------------------------------------
 

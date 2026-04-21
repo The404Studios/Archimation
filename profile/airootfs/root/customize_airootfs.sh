@@ -642,7 +642,9 @@ for f in \
     /usr/bin/ai-control-daemon \
     /usr/bin/ai-cortex \
     /usr/bin/pe-status \
-    /usr/lib/systemd/system-generators/ai-safe-mode-generator; do
+    /usr/lib/systemd/system-generators/ai-safe-mode-generator \
+    /root/setup-users.sh \
+    /root/setup-services.sh; do
     [ -f "$f" ] && chmod 755 "$f"
 done
 

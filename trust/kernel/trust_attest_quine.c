@@ -103,14 +103,14 @@ static int quine_locate_text(const void **base_out, size_t *size_out)
      * of the unified mem[MOD_MEM_NUM_TYPES] array. MOD_TEXT is the
      * executable segment of the module's "core" region.
      */
-    if (mod->mem[MOD_TEXT].size == 0)
+    if (mod->mem[MOD_TEXT].size == 0 || mod->mem[MOD_TEXT].base == NULL)
         return -ENOENT;
     *base_out = mod->mem[MOD_TEXT].base;
     *size_out = mod->mem[MOD_TEXT].size;
     return 0;
 #else
     /* 5.x / early 6.x: legacy layout. text_size is the .text span. */
-    if (mod->core_layout.text_size == 0)
+    if (mod->core_layout.text_size == 0 || mod->core_layout.base == NULL)
         return -ENOENT;
     *base_out = mod->core_layout.base;
     *size_out = (size_t)mod->core_layout.text_size;

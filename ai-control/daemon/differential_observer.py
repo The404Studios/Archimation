@@ -314,7 +314,14 @@ class DifferentialFilter:
                     return True
                 continue
             if isinstance(v, dict):
-                if "added" in v or "removed" in v:
+                # S77 Agent 5 fix: list-shaped deltas always carry the
+                # {"added":[],"removed":[]} keys even when both are empty;
+                # check non-emptiness, not key presence, or every tick
+                # publishes a noisy "no-op" delta on any list-bearing
+                # observer (e.g. library_census.rare_libraries).
+                added = v.get("added")
+                removed = v.get("removed")
+                if (added or removed):
                     return True
                 if v.get("changed"):
                     return True
@@ -349,6 +356,11 @@ class DifferentialFilter:
         filter with observer=None then want to wire it at lifespan).
 
         Idempotent: a second call while running is a no-op.
+
+        Each call installs a fresh stop Event dedicated to the new thread,
+        so a stop_polling()/start_polling() race cannot leave the previous
+        thread polling against a cleared shared Event. (Same fix pattern as
+        library_census S76 Agent B; S77 Agent 2 surfaced the bug here too.)
         """
         with self._lock:
             if observer is not None:
@@ -356,9 +368,13 @@ class DifferentialFilter:
             if self._poll_thread is not None and self._poll_thread.is_alive():
                 return
             self._poll_interval = max(0.25, float(interval_seconds))
-            self._poll_stop.clear()
+            # Fresh per-thread stop Event; old one (if any) stays set for
+            # any straggler thread so it exits cleanly.
+            self._poll_stop = threading.Event()
+            my_stop = self._poll_stop
             self._poll_thread = threading.Thread(
                 target=self._poll_loop,
+                args=(my_stop,),
                 name=f"differential[{self._name}]",
                 daemon=True,
             )
@@ -370,20 +386,25 @@ class DifferentialFilter:
 
     def stop_polling(self) -> None:
         """Stop the background poll thread. Safe to call multiple times."""
-        self._poll_stop.set()
-        thread = self._poll_thread
-        self._poll_thread = None
+        with self._lock:
+            self._poll_stop.set()
+            thread = self._poll_thread
+            self._poll_thread = None
         if thread is not None and thread.is_alive():
+            # Join outside lock so the poll thread can still acquire it
+            # inside tick() while winding down.
             thread.join(timeout=2.0)
 
-    def _poll_loop(self) -> None:
-        while not self._poll_stop.is_set():
+    def _poll_loop(self, stop_event: threading.Event) -> None:
+        """Periodic tick loop. ``stop_event`` is captured per-thread at
+        start_polling() time so it survives a stop/start cycle intact."""
+        while not stop_event.is_set():
             try:
                 self.tick()
             except Exception:
                 logger.debug("differential_observer[%s]: tick failed",
                              self._name, exc_info=True)
-            if self._poll_stop.wait(self._poll_interval):
+            if stop_event.wait(self._poll_interval):
                 return
 
     # -- Event publishing ---------------------------------------------------

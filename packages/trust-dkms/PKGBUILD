@@ -3,7 +3,7 @@
 
 pkgname=trust-dkms
 pkgver=0.1.0
-pkgrel=11
+pkgrel=12
 pkgdesc="Root of Authority trust kernel module (DKMS) - dynamic trust enforcement at kernel level"
 arch=('x86_64')
 url="https://github.com/ai-arch-linux/trust-system"

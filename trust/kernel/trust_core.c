@@ -902,6 +902,7 @@ static int __init trust_init(void)
     ret = tms_init();
     if (ret < 0) {
         pr_err("trust: TMS init failed (%d)\n", ret);
+        trust_attest_quine_exit();   /* S77 Agent 4: tear down quine kobj + workqueue on failure */
         trust_tlb_cleanup();
         return ret;
     }
@@ -911,6 +912,7 @@ static int __init trust_init(void)
     if (ret < 0) {
         pr_err("trust: TSC init failed (%d)\n", ret);
         tms_cleanup();
+        trust_attest_quine_exit();
         trust_tlb_cleanup();
         return ret;
     }
@@ -921,6 +923,7 @@ static int __init trust_init(void)
         pr_err("trust: failed to allocate chrdev region\n");
         tsc_cleanup();
         tms_cleanup();
+        trust_attest_quine_exit();
         trust_tlb_cleanup();
         return ret;
     }
@@ -932,6 +935,7 @@ static int __init trust_init(void)
         unregister_chrdev_region(trust_dev, 1);
         tsc_cleanup();
         tms_cleanup();
+        trust_attest_quine_exit();
         trust_tlb_cleanup();
         pr_err("trust: failed to add cdev\n");
         return ret;
@@ -943,6 +947,7 @@ static int __init trust_init(void)
         unregister_chrdev_region(trust_dev, 1);
         tsc_cleanup();
         tms_cleanup();
+        trust_attest_quine_exit();
         trust_tlb_cleanup();
         pr_err("trust: failed to create class\n");
         return PTR_ERR(trust_class);
@@ -955,6 +960,7 @@ static int __init trust_init(void)
         unregister_chrdev_region(trust_dev, 1);
         tsc_cleanup();
         tms_cleanup();
+        trust_attest_quine_exit();
         trust_tlb_cleanup();
         pr_err("trust: failed to create device\n");
         return PTR_ERR(dev);

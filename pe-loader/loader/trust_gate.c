@@ -429,9 +429,20 @@ static void emit_trust_deny(trust_gate_category_t category,
         strncpy(evt.api_name, name, sizeof(evt.api_name) - 1);
         evt.api_name[sizeof(evt.api_name) - 1] = '\0';
     }
-    evt.category = (uint8_t)category;
-    evt.score    = tl_cache.trust_score;
-    evt.tokens   = tl_cache.token_balance;
+    /* Clamp lossy cast: a category above 255 would wrap; with TRUST_GATE_MAX
+     * currently 22 this is safe, but 0xFF is the explicit "invalid" signal
+     * so the cortex can distinguish from a real in-range enum value. */
+    evt.category = ((unsigned)category < TRUST_GATE_MAX)
+                   ? (uint8_t)category : 0xFFu;
+    /* S77 A3: the out-of-range-category emit site skips cache_ensure_fresh()
+     * for its hard-deny branch. Only read cached score/tokens when the
+     * cache has been populated for this thread; otherwise emit zeros so
+     * the cortex does not receive misleading "score=0, tokens=0" values
+     * that look identical to a genuine "just-starved" subject. */
+    if (tl_cache.valid) {
+        evt.score  = tl_cache.trust_score;
+        evt.tokens = tl_cache.token_balance;
+    } /* else leave as memset-zero */
     pe_event_emit(PE_EVT_TRUST_DENY, &evt, sizeof(evt));
 }
 
@@ -457,8 +468,12 @@ static void emit_trust_escalate(trust_gate_category_t category,
      *
      * Both are stored as uint32 on the wire (cortex parses as unsigned);
      * when trust_score is negative we clamp to 0 so the parser does not
-     * see an accidentally huge "from_score". */
-    int32_t cur = tl_cache.trust_score;
+     * see an accidentally huge "from_score".
+     *
+     * S77 A3: only read cache when valid — defense in depth even though
+     * current call sites all invoke cache_refresh() via slow_path_check
+     * before reaching here. */
+    int32_t cur = tl_cache.valid ? tl_cache.trust_score : 0;
     evt.from_score = (cur < 0) ? 0u : (uint32_t)cur;
     evt.to_score   = ((unsigned)category < TRUST_GATE_MAX)
                      ? g_policy_table[category].min_trust_score

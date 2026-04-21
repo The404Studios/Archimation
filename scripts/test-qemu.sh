@@ -847,14 +847,18 @@ fi
 # and mutex/event/semaphore creation paths are reachable from PE clients.
 echo -n "  [23] pe-objectd socket: "
 if [ -n "$SSH_USER" ]; then
-    SOCK=$(ssh_cmd "ss -lx 2>/dev/null | grep -E 'pe-objectd|objectd' | head -1" 2>/dev/null || echo "")
+    # Match the actual socket name (objects.sock) and runtime path
+    # (/run/pe-compat) per services/objectd/objectd_main.c:10. S77:
+    # prior pattern looked for "pe-objectd" / "objectd" in `ss -lx` and
+    # fallback dir /run/pe-objectd — both wrong.
+    SOCK=$(ssh_cmd "ss -lx 2>/dev/null | grep -E 'objects\\.sock|pe-compat' | head -1" 2>/dev/null || echo "")
     SOCK=$(echo "$SOCK" | tr -d '\r')
     if [ -n "$SOCK" ]; then
         echo "PASS"
         PASS=$((PASS + 1))
     else
-        # Fall back: anything under /run/pe-objectd/ listening?
-        ALT=$(ssh_cmd "ls /run/pe-objectd 2>/dev/null; ls /var/run/pe-objectd 2>/dev/null" 2>/dev/null || echo "")
+        # Fall back: socket file at the canonical path, listening or not
+        ALT=$(ssh_cmd "ls /run/pe-compat/objects.sock /run/pe-compat/ 2>/dev/null | head -3" 2>/dev/null || echo "")
         if [ -n "$ALT" ]; then
             echo "PASS (runtime dir exists)"
             PASS=$((PASS + 1))

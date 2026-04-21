@@ -254,10 +254,11 @@ def parse_pe_exit_payload(data: bytes) -> dict:
 def parse_pe_trust_deny_payload(data: bytes) -> dict:
     """Parse pe_evt_trust_deny_t: char[128] api_name, uint8 category,
     int32 score, uint32 tokens."""
-    if len(data) < 137:  # 128 + 1 + (3 pad) + 4 + 4 = 140 likely with padding
-        # Try without padding: 128 + 1 + 4 + 4 = 137
-        if len(data) < 137:
-            return {}
+    # Minimum size is the packed layout: 128 (api_name) + 1 (category)
+    # + 4 (int32 score) + 4 (uint32 tokens) = 137 bytes. The padded layout
+    # (with 3 bytes of struct alignment between category and score) is 140.
+    if len(data) < 137:
+        return {}
     api_name = _decode_cstr(data[:128])
     category = data[128]
     # Use exact payload length to determine layout
@@ -278,15 +279,23 @@ def parse_pe_trust_deny_payload(data: bytes) -> dict:
 
 
 def parse_pe_trust_escalate_payload(data: bytes) -> dict:
-    """Parse pe_evt_trust_escalate_t: char[128] api_name, uint32 from_score,
-    uint32 to_score, uint32 reason. Mirrors trust_deny payload shape; the
+    """Parse pe_evt_trust_escalate_t: char[128] api_name, int32 from_score,
+    int32 to_score, uint32 reason. Mirrors trust_deny payload shape; the
     semantic difference is the cortex *grants* (or refuses) the escalation
     instead of merely auditing the deny. Pre-S76 the C-side emit may be
-    absent — this parser is here so any future emit lands on a real consumer."""
+    absent — this parser is here so any future emit lands on a real consumer.
+
+    S77 Agent 1 schema fix: kernel trust scores live in the signed range
+    ``[-1000, +1000]`` (see ``trust_translate.KERNEL_SCORE_MIN/MAX``) so
+    from_score / to_score MUST be parsed as signed int32 (``i``), not
+    unsigned (``I``). The prior schema silently turned any negative score
+    into a huge positive (e.g. -50 → 4294967246), which would have made
+    the cortex refuse every escalation whose source band was below
+    baseline. ``reason`` is a 32-bit enum bitmap so it stays unsigned."""
     if len(data) < 140:
         return {"raw_len": len(data)}
     api_name = _decode_cstr(data[:128])
-    from_score, to_score, reason = struct.unpack_from("<III", data, 128)
+    from_score, to_score, reason = struct.unpack_from("<iiI", data, 128)
     return {
         "api_name": api_name,
         "from_score": from_score,

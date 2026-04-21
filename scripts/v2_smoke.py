@@ -101,20 +101,40 @@ def http_post(path, body, timeout=10):
 
 
 def extract_handler_and_source(body):
-    """Pull handler_type + source label out of /contusion/context response."""
+    """Pull handler_type + source label out of /contusion/context response.
+
+    S74 (Agent W): the /contusion/context endpoint wraps the Contusion.route()
+    output in ``{"status": "ok", "result": {...}}``. Pre-S74 versions of this
+    script read ``body.get("handler_type")`` directly, always returning None,
+    so the "S63 42/42 routed" claim in MEMORY.md was a phantom — this script
+    has been 0/42 against the wrapped API since it was written. Match the
+    pattern used by ``scripts/set_smoke.py:120`` and unwrap ``body["result"]``
+    first if present.
+    """
     if not isinstance(body, dict):
         return None, None
-    handler_type = body.get("handler_type")
-    source = body.get("source") or body.get("rationale")
-    actions = body.get("actions") or body.get("pending") or []
+    # Unwrap {"status": "ok", "result": {...}} → {...}
+    inner = body.get("result") if isinstance(body.get("result"), dict) else body
+    handler_type = inner.get("handler_type")
+    source = inner.get("source") or inner.get("rationale")
+    actions = inner.get("actions") or inner.get("pending") or []
     if not handler_type and isinstance(actions, list) and actions:
         a = actions[0]
         if isinstance(a, dict):
             handler_type = a.get("handler_type")
             if not source:
                 source = a.get("source") or a.get("rationale")
+    # results list shape (S68 route() also returns results: [{handler_type: ...}])
     if not handler_type:
-        proposal = body.get("proposal") or {}
+        results = inner.get("results") or []
+        if isinstance(results, list) and results:
+            r0 = results[0]
+            if isinstance(r0, dict):
+                handler_type = r0.get("handler_type")
+                if not source:
+                    source = r0.get("source") or r0.get("rationale")
+    if not handler_type:
+        proposal = inner.get("proposal") or {}
         results = proposal.get("results") or []
         if isinstance(results, list) and results:
             r = results[0]

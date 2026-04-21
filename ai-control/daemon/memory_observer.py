@@ -442,6 +442,40 @@ class MemoryObserver:
         # Set whenever an event landed -- wakes the simulation loop.
         self._event_wake: Optional[asyncio.Event] = None
 
+        # S75 Agent B: DLL-load observer hooks. Callbacks registered here
+        # are fired with (pid, dll_name) whenever we first observe a DLL
+        # in a PID's memory map (either via a TMS mmap event or via the
+        # simulation-mode /proc/PID/maps re-parse).
+        # Kept as a list so multiple consumers can subscribe (library_census
+        # is the first; future RNA/ROS/microbiome sub-observers can stack).
+        # Stored as list[Callable[[int, str], None]]; exceptions are
+        # swallowed so one bad consumer can't poison the hot path.
+        self._dll_load_callbacks: list = []
+
+    def register_dll_load_callback(self, cb) -> None:
+        """Register *cb* for per-DLL-load events.
+
+        Signature: ``cb(pid: int, dll_name: str) -> None``.
+
+        Called whenever a DLL first appears in a tracked PID's memory
+        map. Both TMS-mode (event-driven) and simulation-mode (periodic
+        /proc/PID/maps re-parse) paths invoke the callback. The hook is
+        additive -- callers that don't register see no behavioral change.
+        """
+        if callable(cb) and cb not in self._dll_load_callbacks:
+            self._dll_load_callbacks.append(cb)
+
+    def _fire_dll_load(self, pid: int, dll_name: str) -> None:
+        """Fire DLL-load callbacks; swallow consumer exceptions."""
+        if not self._dll_load_callbacks or not dll_name:
+            return
+        for cb in self._dll_load_callbacks:
+            try:
+                cb(pid, dll_name)
+            except Exception:
+                logger.debug("DLL-load callback failed for pid=%d dll=%s",
+                             pid, dll_name, exc_info=True)
+
     # ── Lifecycle ──
 
     async def start(self):
@@ -948,10 +982,15 @@ class MemoryObserver:
                 })
 
         self._detect_anomalies(pid, old_regions, new_regions, pmap.exe_name)
+        # S75 Agent B: fire DLL-load callbacks for names that are new in
+        # this rescan. Computed before the dict swap so we diff old->new.
+        newly_loaded = [n for n in new_dlls if n not in pmap.dlls_loaded]
         pmap.regions = new_regions
         pmap.dlls_loaded = new_dlls
         pmap.last_updated = now
         pmap.event_count += 1
+        for dll_name in newly_loaded:
+            self._fire_dll_load(pid, dll_name)
 
     async def _scan_process(self, pid: int):
         """Scan a single process and update its memory map."""
@@ -1033,11 +1072,17 @@ class MemoryObserver:
         # Detect anomalies by comparing old and new regions
         self._detect_anomalies(pid, old_regions, new_regions, pmap.exe_name)
 
+        # S75 Agent B: diff old/new dlls_loaded for the callback hook
+        # BEFORE we overwrite the map.
+        newly_loaded = [n for n in new_dlls if n not in pmap.dlls_loaded]
+
         # Update the process map
         pmap.regions = new_regions
         pmap.dlls_loaded = new_dlls
         pmap.last_updated = now
         pmap.event_count += 1
+        for dll_name in newly_loaded:
+            self._fire_dll_load(pid, dll_name)
 
     # ── Event handlers (for TMS mode) ──
 
@@ -1076,6 +1121,9 @@ class MemoryObserver:
                     "[pid=%d] DLL loaded: %s at 0x%x (size=0x%x)",
                     pid, dll_name, addr, length,
                 )
+                # S75 Agent B: notify census / sub-observers of the new
+                # DLL. The hook is a no-op when no consumer registered.
+                self._fire_dll_load(pid, dll_name)
 
         # Anomaly: executable heap / RWX anon
         if "x" in prot_str and "w" in prot_str and not pathname:

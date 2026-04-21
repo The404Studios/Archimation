@@ -105,6 +105,12 @@ class GenerativeModel:
         self._outcomes: set[str] = set()
         self._lock = threading.RLock()
         self._total_updates: int = 0
+        # S75 Agent C: optional Monte-Carlo posterior sampler. When set, the
+        # ``predict()`` path returns a Dirichlet SAMPLE instead of the
+        # Dirichlet MEAN, giving ActiveInferenceAgent a stochastic
+        # posterior over s'. Default None = original point-estimate
+        # behaviour preserved bit-for-bit.
+        self._mc_rng: Optional[Any] = None
 
     # ---- learning ----------------------------------------------------------
 
@@ -128,12 +134,22 @@ class GenerativeModel:
 
     # ---- inference ---------------------------------------------------------
 
-    def predict(self, s: str, a: str) -> dict[str, float]:
+    def predict(self, s: str, a: str,
+                sample: Optional[bool] = None) -> dict[str, float]:
         """
         Return normalized posterior P(s' | s, a) with Dirichlet smoothing.
 
         For unseen (s, a) pairs returns uniform distribution over the full
         outcome vocabulary (max-entropy ignorance prior).
+
+        S75 Agent C: when ``sample`` is True (or None and ``self._mc_rng``
+        is set), a Dirichlet SAMPLE is returned instead of the Dirichlet
+        MEAN. This gives a stochastic posterior compatible with Monte
+        Carlo rollouts. A Dirichlet(alpha_1, ..., alpha_K) draw is
+        equivalent to gamma_k ~ Gamma(alpha_k, 1) normalised, so we use
+        ``random.Random.gammavariate(alpha_k, 1)`` and renormalise.
+        Default behaviour (``sample=None`` and ``_mc_rng is None``) is
+        numerically identical to the pre-S75 code path.
         """
         with self._lock:
             bucket = self._counts.get((s, a))
@@ -147,6 +163,27 @@ class GenerativeModel:
             alpha = self.alpha
             counts = {o: (bucket[o] if bucket and o in bucket else 0) + alpha
                       for o in outcomes}
+
+            # Decide which path to take. Explicit ``sample`` wins; else if
+            # an RNG is attached we sample; else mean. Preserves default
+            # behaviour bit-for-bit when both are None/unset.
+            use_sample = sample if sample is not None else (self._mc_rng is not None)
+            if use_sample and self._mc_rng is not None:
+                gammas: dict[str, float] = {}
+                total = 0.0
+                for o, a_k in counts.items():
+                    try:
+                        g = float(self._mc_rng.gammavariate(max(a_k, 1e-9), 1.0))
+                    except Exception:
+                        g = 0.0
+                    gammas[o] = g
+                    total += g
+                if total <= 0.0:
+                    # Fall through to mean.
+                    pass
+                else:
+                    return {o: g / total for o, g in gammas.items()}
+
             total = sum(counts.values())
             if total <= 0.0:
                 return {}
@@ -356,7 +393,9 @@ class ActiveInferenceAgent:
                  memory_observer: Any = None,
                  observer_handles: Optional[dict[str, Any]] = None,
                  action_candidates: Optional[Iterable[str]] = None,
-                 bootstrap: int = BOOTSTRAP_OBSERVATIONS) -> None:
+                 bootstrap: int = BOOTSTRAP_OBSERVATIONS,
+                 monte_carlo_posterior: bool = False,
+                 mc_seed: Optional[int] = None) -> None:
         # Support both explicit kwargs and a bundle dict (api_server pattern).
         if observer_handles:
             trust_observer = trust_observer or observer_handles.get("trust_observer")
@@ -370,6 +409,19 @@ class ActiveInferenceAgent:
         self.candidates: tuple[str, ...] = tuple(
             action_candidates or DEFAULT_ACTION_CANDIDATES)
         self.bootstrap = int(bootstrap)
+
+        # S75 Agent C: optional Monte-Carlo posterior sampling. Default off
+        # so the existing Dirichlet-mean path is preserved. When on, the
+        # GenerativeModel draws from its Dirichlet posterior on every
+        # predict() call, giving FEP action selection access to Thompson-
+        # sampling-style exploration.
+        self.monte_carlo_posterior = bool(monte_carlo_posterior)
+        if self.monte_carlo_posterior:
+            import random as _random
+            self.model._mc_rng = (
+                _random.Random(mc_seed) if mc_seed is not None
+                else _random.SystemRandom()
+            )
 
         self._prev_state: Optional[str] = None
         self._last_action: str = "noop"

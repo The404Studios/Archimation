@@ -53,6 +53,10 @@ _active_inference = None
 _entropy_observer = None
 _assembly_index = None
 _algedonic_reader = None
+# S75 Agent B: library_census ecosystem observer (Maturana-Varela Criterion 1).
+_library_census = None
+# S75 Agent C: Monte-Carlo cortex sampler (research-A §2.6, roadmap §1.2.4).
+_monte_carlo = None
 
 
 def _init_controllers(config: dict):
@@ -66,6 +70,8 @@ def _init_controllers(config: dict):
     global _thermal, _power
     global _active_inference, _entropy_observer, _assembly_index
     global _algedonic_reader
+    global _library_census
+    global _monte_carlo
 
     def _safe_init(name, factory):
         try:
@@ -349,6 +355,17 @@ def create_app(config: dict):
                     "Algedonic reader failed to start: %s "
                     "(continuing without it)", e
                 )
+        # S75 Agent B: library_census polls memory_observer DLL maps and
+        # publishes cross-PID histograms. Runs in a background thread so
+        # the asyncio loop is untouched.
+        if _library_census:
+            try:
+                _library_census.start_polling(_library_census._poll_interval)
+            except Exception as e:
+                logger.error(
+                    "Library census failed to start: %s "
+                    "(continuing without it)", e
+                )
         yield
         # Shutdown: close all WebSocket clients, then stop trust observer
         for ws in list(_ws_clients):
@@ -391,6 +408,12 @@ def create_app(config: dict):
                 await _algedonic_reader.stop()
             except Exception as e:
                 logger.error("Algedonic reader failed to stop cleanly: %s", e)
+        # S75 Agent B: library_census polling thread shutdown.
+        if _library_census:
+            try:
+                _library_census.stop_polling()
+            except Exception as e:
+                logger.error("Library census failed to stop cleanly: %s", e)
         if _active_inference:
             try:
                 _active_inference.stop()
@@ -449,6 +472,7 @@ def create_app(config: dict):
     # rest of the daemon functional.
     global _active_inference, _entropy_observer, _assembly_index
     global _algedonic_reader
+    global _library_census
 
     # The daemon does not currently operate a cortex event_bus in-process
     # (that bus lives in ai-control/cortex/event_bus.py and may be remote).
@@ -509,6 +533,51 @@ def create_app(config: dict):
         logger.error("Failed to register algedonic_reader: %s", e)
         _algedonic_reader = None
 
+    # S75 Agent B: library_census -- cross-PID DLL histogram exposed at
+    # /metrics/ecosystem. Closes Maturana-Varela Criterion 1 by giving
+    # the cortex a library-keyed population census to pair with the
+    # existing immune/risk/sex census in trust_observer.get_anomaly_status.
+    try:
+        from library_census import register_with_daemon as _reg_lc
+        _library_census = _reg_lc(
+            app, _daemon_event_sink, memory_observer=_memory_observer,
+            poll_interval=config.get("library_census_poll_interval", 5.0),
+        )
+        logger.info("library_census registered with daemon")
+    except Exception as e:
+        logger.error("Failed to register library_census: %s", e)
+        _library_census = None
+
+    # S75 Agent C: Monte-Carlo cortex.  Installs shared samplers
+    # (ConfidenceSampler / RolloutSearch / FaultInjector /
+    # StochasticRateLimiter) and registers:
+    #   * GET  /metrics/monte_carlo
+    #   * POST /cortex/monte_carlo/rollout
+    # Best-effort: a failure here does not disrupt other controllers.
+    global _monte_carlo
+    try:
+        from monte_carlo import (
+            register_with_daemon as _reg_mc,
+            get_confidence_sampler as _get_cs,
+        )
+        _monte_carlo = _reg_mc(app, _daemon_event_sink)
+        # Attach the shared confidence sampler to any reachable DecisionEngine
+        # singleton. Best-effort: if decision_engine exposes no default
+        # instance we skip silently; the /cortex/monte_carlo/rollout endpoint
+        # still works.
+        try:
+            import decision_engine as _de_mod  # type: ignore
+            cs = _get_cs()
+            eng = getattr(_de_mod, "_default_engine", None)
+            if eng is not None and cs is not None and hasattr(eng, "set_confidence_sampler"):
+                eng.set_confidence_sampler(cs)
+        except Exception:
+            pass
+        logger.info("monte_carlo registered with daemon")
+    except Exception as e:
+        logger.error("Failed to register monte_carlo: %s", e)
+        _monte_carlo = None
+
     # Log controller status
     _controllers = {
         "keyboard": _keyboard, "mouse": _mouse, "screen": _screen,
@@ -532,6 +601,10 @@ def create_app(config: dict):
         "entropy_observer": _entropy_observer,
         "assembly_index": _assembly_index,
         "algedonic_reader": _algedonic_reader,
+        # S75 Agent B
+        "library_census": _library_census,
+        # S75 Agent C
+        "monte_carlo": _monte_carlo,
     }
     loaded = [n for n, c in _controllers.items() if c is not None]
     failed = [n for n, c in _controllers.items() if c is None]

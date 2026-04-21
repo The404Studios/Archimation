@@ -36,6 +36,7 @@
 
 #include "trust_internal.h"
 #include "trust_memory.h"
+#include "../include/trust_pt_regs_compat.h"
 
 /* ========================================================================
  * Global TMS state
@@ -894,15 +895,20 @@ int tms_scan_region(u32 subject_id, u64 va_start, u64 va_end)
  * These filter to only trust-tracked PIDs and extract the relevant
  * arguments from the registers before calling the tms_on_* functions.
  *
- * x86_64 calling convention (System V ABI):
- *   arg0=rdi, arg1=rsi, arg2=rdx, arg3=rcx, arg4=r8, arg5=r9
+ * NB: these kprobes target *interior kernel functions* (do_mmap,
+ * __do_munmap, do_mprotect_pkey) — NOT __x64_sys_* wrappers — so the
+ * calling convention is the System V function-call ABI, where on
+ * x86_64 arg3 lives in %rcx (not %r10). Use REG_ARG3_FUNCALL for that
+ * slot. REG_ARG0..2 are identical between syscall-context and
+ * funcall-context on x86_64, and on riscv64 arg0..7 are all in a0..a7
+ * regardless. See trust_pt_regs_compat.h.
  * ======================================================================== */
 
 /*
  * do_mmap(struct file *file, unsigned long addr, unsigned long len,
  *         unsigned long prot, unsigned long flags, ...)
  *
- * We extract: addr (rsi), len (rdx), prot (rcx).
+ * We extract: addr (arg1), len (arg2), prot (arg3, funcall-context).
  */
 static int tms_kp_mmap_pre(struct kprobe *p, struct pt_regs *regs)
 {
@@ -921,9 +927,9 @@ static int tms_kp_mmap_pre(struct kprobe *p, struct pt_regs *regs)
     if (!tms_find_map_by_pid(pid))
         return 0;
 
-    addr = regs->si;    /* addr */
-    len  = regs->dx;    /* len */
-    prot = (u32)regs->cx; /* prot */
+    addr = REG_ARG1(regs);              /* addr */
+    len  = REG_ARG2(regs);              /* len */
+    prot = (u32)REG_ARG3_FUNCALL(regs); /* prot (funcall-context: cx on x86_64) */
 
     tms_on_mmap(pid, addr, len, prot);
     return 0;
@@ -933,7 +939,7 @@ static int tms_kp_mmap_pre(struct kprobe *p, struct pt_regs *regs)
  * __do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
  *             struct list_head *uf, bool downgrade)
  *
- * We extract: start (rsi), len (rdx).
+ * We extract: start (arg1), len (arg2).
  */
 static int tms_kp_munmap_pre(struct kprobe *p, struct pt_regs *regs)
 {
@@ -949,8 +955,8 @@ static int tms_kp_munmap_pre(struct kprobe *p, struct pt_regs *regs)
     if (!tms_find_map_by_pid(pid))
         return 0;
 
-    addr = regs->si;    /* start */
-    len  = regs->dx;    /* len */
+    addr = REG_ARG1(regs);  /* start */
+    len  = REG_ARG2(regs);  /* len */
 
     tms_on_munmap(pid, addr, len);
     return 0;
@@ -959,7 +965,7 @@ static int tms_kp_munmap_pre(struct kprobe *p, struct pt_regs *regs)
 /*
  * do_mprotect_pkey(unsigned long start, size_t len, unsigned long prot, int pkey)
  *
- * We extract: start (rdi), len (rsi), prot (rdx).
+ * We extract: start (arg0), len (arg1), prot (arg2).
  */
 static int tms_kp_mprotect_pre(struct kprobe *p, struct pt_regs *regs)
 {
@@ -976,9 +982,9 @@ static int tms_kp_mprotect_pre(struct kprobe *p, struct pt_regs *regs)
     if (!tms_find_map_by_pid(pid))
         return 0;
 
-    addr = regs->di;    /* start */
-    len  = regs->si;    /* len */
-    prot = (u32)regs->dx; /* prot */
+    addr = REG_ARG0(regs);      /* start */
+    len  = REG_ARG1(regs);      /* len */
+    prot = (u32)REG_ARG2(regs); /* prot */
 
     tms_on_mprotect(pid, addr, len, prot);
     return 0;

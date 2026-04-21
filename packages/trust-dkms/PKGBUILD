@@ -3,7 +3,7 @@
 
 pkgname=trust-dkms
 pkgver=0.1.0
-pkgrel=9
+pkgrel=10
 pkgdesc="Root of Authority trust kernel module (DKMS) - dynamic trust enforcement at kernel level"
 arch=('x86_64')
 url="https://github.com/ai-arch-linux/trust-system"
@@ -40,7 +40,7 @@ package() {
         trust_subject_pool.c trust_ape_markov.c trust_authz.c \
         trust_compat.c trust_invariants.c trust_meiosis.c \
         trust_attest.c trust_morphogen.c trust_quorum.c \
-        trust_algedonic.c; do
+        trust_algedonic.c trust_attest_quine.c trust_quorum_hmac.c; do
         install -Dm644 "$_srcdir/kernel/$src" "$_dkms_dir/$src"
     done
 
@@ -65,6 +65,9 @@ package() {
     install -Dm644 "$_srcdir/include/trust_quorum.h"    "$_dkms_dir/include/trust_quorum.h"
     install -Dm644 "$_srcdir/include/trust_theorems.h"  "$_dkms_dir/include/trust_theorems.h"
     install -Dm644 "$_srcdir/include/trust_isa.h"       "$_dkms_dir/include/trust_isa.h"
+    install -Dm644 "$_srcdir/include/trust_attest_quine.h" "$_dkms_dir/include/trust_attest_quine.h"
+    install -Dm644 "$_srcdir/include/trust_quorum_hmac.h"  "$_dkms_dir/include/trust_quorum_hmac.h"
+    install -Dm644 "$_srcdir/include/trust_pt_regs_compat.h" "$_dkms_dir/include/trust_pt_regs_compat.h"
 
     # ── DKMS configuration ────────────────────────────────────────────
     install -Dm644 /dev/stdin "$_dkms_dir/dkms.conf" <<DKMS

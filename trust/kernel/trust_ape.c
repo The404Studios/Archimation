@@ -53,6 +53,7 @@
 #include "trust_internal.h"
 #include "trust_ape.h"
 #include "../include/trust_theorems.h"
+#include "../include/trust_attest_quine.h"   /* S75 Item #7: .text fold */
 
 /* Global APE state */
 trust_ape_t g_trust_ape;
@@ -834,7 +835,9 @@ int trust_ape_consume_proof_v2(u32 subject_id,
     u8 hash_input[TRUST_PROOF_SIZE +
                   APE_RESULT_HASH_LEN +
                   256 +                            /* req-derived bytes */
-                  TRUST_SEED_SIZE + 8 + 8];
+                  TRUST_SEED_SIZE + 8 + 8 +
+                  TRUST_QUINE_HASH_LEN];           /* S75: .text fold */
+    u8 text_hash[TRUST_QUINE_HASH_LEN];
     u32 input_len;
     u64 nonce_copy;
     u64 ts;
@@ -953,6 +956,19 @@ int trust_ape_consume_proof_v2(u32 subject_id,
     input_len += 8;
 
     /*
+     * S75 Item #7: fold SHA-256(trust.ko .text) into the proof input.
+     * A kernel-write adversary who has modified the live module cannot
+     * produce a matching text hash while their exploit is resident —
+     * every proof they mint diverges from honest-kernel output. See
+     * trust/include/trust_attest_quine.h and research-F §3.
+     * Pre-init (and if the quine subsystem failed to start) returns
+     * a zero buffer, preserving input layout without breaking proofs.
+     */
+    trust_attest_quine_get_hash(text_hash);
+    memcpy(hash_input + input_len, text_hash, TRUST_QUINE_HASH_LEN);
+    input_len += TRUST_QUINE_HASH_LEN;
+
+    /*
      * Compute P_{n+1} = H_cfg(n)(input).  cfg(n) is derived from the
      * destroyed P_n inside compute_proof_v2().
      */
@@ -962,7 +978,11 @@ int trust_ape_consume_proof_v2(u32 subject_id,
     memzero_explicit(consumed_proof, TRUST_PROOF_SIZE);
     memzero_explicit(seed_copy, TRUST_SEED_SIZE);
     memzero_explicit(result_hash, APE_RESULT_HASH_LEN);
+    memzero_explicit(text_hash, TRUST_QUINE_HASH_LEN);
     memzero_explicit(hash_input, sizeof(hash_input));
+
+    /* Tick the quine consume counter (deferred recompute every N). */
+    (void)trust_attest_quine_tick();
 
     /* Re-acquire locks to write results back */
     spin_lock(&g_trust_ape.lock);

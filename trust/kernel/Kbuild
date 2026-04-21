@@ -6,5 +6,5 @@ trust-objs := trust_core.o trust_tlb.o trust_risc.o trust_fbc.o trust_dna_gate.o
               trust_subject_pool.o trust_ape_markov.o trust_authz.o \
               trust_compat.o trust_invariants.o trust_meiosis.o \
               trust_attest.o trust_morphogen.o trust_quorum.o \
-              trust_algedonic.o
+              trust_algedonic.o trust_attest_quine.o trust_quorum_hmac.o
 ccflags-y := -I$(src)/../include -I$(src)/include

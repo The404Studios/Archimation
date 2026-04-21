@@ -33,6 +33,8 @@
 #include "../include/trust_cmd.h"
 #include "../include/trust_algedonic.h"   /* S74 Agent 8 */
 #include "../include/trust_quorum.h"      /* S74 Agent 8 */
+#include "../include/trust_attest_quine.h" /* S75 Item 7: .text fold into APE */
+#include "../include/trust_quorum_hmac.h"  /* S75 Item 7 pair: HMAC over verdicts */
 #include "trust_internal.h"
 #include "trust_memory.h"
 #include "trust_syscall.h"
@@ -888,6 +890,11 @@ static int __init trust_init(void)
     trust_dna_gate_init();
     trust_dep_graph_init();
     trust_escalation_queue_init();
+    /* S75 Item 7: quine_init MUST precede trust_ape_init so the first proof
+     * consumed already folds in a real (non-zero) .text hash. Pre-init calls
+     * to trust_attest_quine_get_hash() degrade to a zero buffer by design. */
+    if (trust_attest_quine_init() < 0)
+        pr_warn("trust: quine init failed; .text attestation unavailable\n");
     trust_ape_init();
     trust_lifecycle_init();
 
@@ -972,6 +979,8 @@ static int __init trust_init(void)
         pr_warn("trust: morphogen init failed; tissue field unavailable\n");
     if (trust_quorum_init() < 0)
         pr_warn("trust: quorum init failed; 23-way voting unavailable\n");
+    if (trust_quorum_hmac_init() < 0)
+        pr_warn("trust: quorum HMAC init failed; verdict integrity tag absent\n");
     if (trust_algedonic_init() < 0)
         pr_warn("trust: algedonic init failed; /dev/trust_algedonic absent\n");
 
@@ -1007,7 +1016,9 @@ static void __exit trust_exit(void)
 {
     /* S74 meta-exploit teardown. Each *_exit is idempotent. */
     trust_algedonic_exit();
+    trust_quorum_hmac_exit();    /* S75 Item 7 pair */
     trust_quorum_exit();
+    trust_attest_quine_exit();   /* S75 Item 7 */
     trust_morphogen_fini();
     timer_shutdown_sync(&trust_decay_timer);
     trust_stats_unregister();

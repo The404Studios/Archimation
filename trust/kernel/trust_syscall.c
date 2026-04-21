@@ -34,6 +34,7 @@
 
 #include "trust_internal.h"
 #include "trust_syscall.h"
+#include "../include/trust_pt_regs_compat.h"
 
 /* ========================================================================
  * Global TSC state
@@ -223,18 +224,20 @@ static void tsc_record_event(struct tsc_pid_slot *slot, u16 syscall_nr,
 /* ========================================================================
  * kprobe handlers
  *
- * x86_64 System V ABI: arg0=rdi, arg1=rsi, arg2=rdx, arg3=rcx, arg4=r8
+ * Syscall argument register mapping is now abstracted by REG_ARGn() in
+ * trust_pt_regs_compat.h. In brief:
+ *   x86_64 System V funcall ABI: arg0=rdi, arg1=rsi, arg2=rdx, arg3=rcx,
+ *                                 arg4=r8, arg5=r9
+ *   x86_64 Linux syscall ABI:    arg0=rdi, arg1=rsi, arg2=rdx, arg3=r10,
+ *                                 arg4=r8, arg5=r9
+ *   riscv64 (both funcall/syscall): arg0..5 = a0..5
  *
- * For __x64_sys_* functions, the kernel passes a pointer to struct pt_regs
- * in rdi. The actual syscall arguments are in the *inner* pt_regs:
- *   arg0=inner->di, arg1=inner->si, arg2=inner->dx,
- *   arg3=inner->r10, arg4=inner->r8, arg5=inner->r9
- *
- * We use the outer regs->di to get the inner pt_regs pointer, then read
- * arguments from there. In kprobe pre-handlers we cannot safely
- * dereference that pointer (it could fault), so we read the outer
- * pt_regs arguments directly. For __x64_sys_* wrappers, the kernel
- * passes the user-side pt_regs in rdi, so we cast and read.
+ * For __x64_sys_* functions, the x86_64 kernel passes a pointer to the
+ * user-side pt_regs in rdi (arg0 of the wrapper). The actual syscall
+ * arguments are in that *inner* pt_regs. tsc_get_inner_regs() retrieves
+ * the pointer portably via REG_ARG0(regs). On riscv64 the __riscv_sys_*
+ * handler receives the real pt_regs directly — when riscv64 support
+ * lands, tsc_get_inner_regs() can become a no-op under an ifdef.
  * ======================================================================== */
 
 /*
@@ -243,7 +246,15 @@ static void tsc_record_event(struct tsc_pid_slot *slot, u16 syscall_nr,
  */
 static inline struct pt_regs *tsc_get_inner_regs(struct pt_regs *regs)
 {
-    struct pt_regs *inner = (struct pt_regs *)regs->di;
+    /* On x86_64, __x64_sys_* wrappers receive the user-side pt_regs
+     * pointer as their first and only argument — i.e. arg0 of the
+     * wrapper is itself a pt_regs*. Use REG_ARG0 to portably fetch it.
+     * On riscv64, __riscv_sys_* wrappers receive the real pt_regs
+     * directly, so callers pass `regs` through unchanged (and this
+     * helper is effectively a no-op on that arch — callers check
+     * TRUST_NEEDS_INNER_REGS if/when we split the arch-specific
+     * dispatch). */
+    struct pt_regs *inner = (struct pt_regs *)REG_ARG0(regs);
 
     /* Basic sanity: must be a kernel address */
     if ((unsigned long)inner < PAGE_OFFSET)
@@ -272,9 +283,9 @@ static int tsc_kp_openat_pre(struct kprobe *p, struct pt_regs *regs)
 
     inner = tsc_get_inner_regs(regs);
     if (inner) {
-        /* arg0=dfd(di), arg1=filename(si), arg2=flags(dx) */
+        /* arg0=dfd, arg1=filename, arg2=flags (syscall ABI) */
         tsc_record_event(slot, TSC_NR_OPENAT, TSC_CAT_FILE,
-                          inner->di, inner->si, inner->dx, 0);
+                          REG_ARG0(inner), REG_ARG1(inner), REG_ARG2(inner), 0);
     }
     return 0;
 }
@@ -300,9 +311,9 @@ static int tsc_kp_read_pre(struct kprobe *p, struct pt_regs *regs)
 
     inner = tsc_get_inner_regs(regs);
     if (inner) {
-        /* arg0=fd(di), arg1=buf(si), arg2=count(dx) */
+        /* arg0=fd, arg1=buf (not logged), arg2=count (syscall ABI) */
         tsc_record_event(slot, TSC_NR_READ, TSC_CAT_FILE,
-                          inner->di, 0, inner->dx, 0);
+                          REG_ARG0(inner), 0, REG_ARG2(inner), 0);
     }
     return 0;
 }
@@ -328,9 +339,9 @@ static int tsc_kp_write_pre(struct kprobe *p, struct pt_regs *regs)
 
     inner = tsc_get_inner_regs(regs);
     if (inner) {
-        /* arg0=fd(di), arg1=buf(si), arg2=count(dx) */
+        /* arg0=fd, arg1=buf (not logged), arg2=count (syscall ABI) */
         tsc_record_event(slot, TSC_NR_WRITE, TSC_CAT_FILE,
-                          inner->di, 0, inner->dx, 0);
+                          REG_ARG0(inner), 0, REG_ARG2(inner), 0);
     }
     return 0;
 }
@@ -356,9 +367,9 @@ static int tsc_kp_ioctl_pre(struct kprobe *p, struct pt_regs *regs)
 
     inner = tsc_get_inner_regs(regs);
     if (inner) {
-        /* arg0=fd(di), arg1=cmd(si), arg2=arg(dx) */
+        /* arg0=fd, arg1=cmd, arg2=arg (syscall ABI) */
         tsc_record_event(slot, TSC_NR_IOCTL, TSC_CAT_FILE,
-                          inner->di, inner->si, inner->dx, 0);
+                          REG_ARG0(inner), REG_ARG1(inner), REG_ARG2(inner), 0);
     }
     return 0;
 }
@@ -384,9 +395,9 @@ static int tsc_kp_socket_pre(struct kprobe *p, struct pt_regs *regs)
 
     inner = tsc_get_inner_regs(regs);
     if (inner) {
-        /* arg0=family(di), arg1=type(si), arg2=protocol(dx) */
+        /* arg0=family, arg1=type, arg2=protocol (syscall ABI) */
         tsc_record_event(slot, TSC_NR_SOCKET, TSC_CAT_NETWORK,
-                          inner->di, inner->si, inner->dx, 0);
+                          REG_ARG0(inner), REG_ARG1(inner), REG_ARG2(inner), 0);
     }
     return 0;
 }
@@ -412,9 +423,9 @@ static int tsc_kp_connect_pre(struct kprobe *p, struct pt_regs *regs)
 
     inner = tsc_get_inner_regs(regs);
     if (inner) {
-        /* arg0=fd(di), arg1=addr(si), arg2=addrlen(dx) */
+        /* arg0=fd, arg1=addr, arg2=addrlen (syscall ABI) */
         tsc_record_event(slot, TSC_NR_CONNECT, TSC_CAT_NETWORK,
-                          inner->di, inner->si, inner->dx, 0);
+                          REG_ARG0(inner), REG_ARG1(inner), REG_ARG2(inner), 0);
     }
     return 0;
 }
@@ -440,9 +451,9 @@ static int tsc_kp_bind_pre(struct kprobe *p, struct pt_regs *regs)
 
     inner = tsc_get_inner_regs(regs);
     if (inner) {
-        /* arg0=fd(di), arg1=addr(si), arg2=addrlen(dx) */
+        /* arg0=fd, arg1=addr, arg2=addrlen (syscall ABI) */
         tsc_record_event(slot, TSC_NR_BIND, TSC_CAT_NETWORK,
-                          inner->di, inner->si, inner->dx, 0);
+                          REG_ARG0(inner), REG_ARG1(inner), REG_ARG2(inner), 0);
     }
     return 0;
 }
@@ -468,9 +479,9 @@ static int tsc_kp_mmap_pre(struct kprobe *p, struct pt_regs *regs)
 
     inner = tsc_get_inner_regs(regs);
     if (inner) {
-        /* arg0=addr(di), arg1=len(si), arg2=prot(dx) */
+        /* arg0=addr, arg1=len, arg2=prot (syscall ABI) */
         tsc_record_event(slot, TSC_NR_MMAP, TSC_CAT_MEMORY,
-                          inner->di, inner->si, inner->dx, 0);
+                          REG_ARG0(inner), REG_ARG1(inner), REG_ARG2(inner), 0);
     }
     return 0;
 }
@@ -496,9 +507,9 @@ static int tsc_kp_clone_pre(struct kprobe *p, struct pt_regs *regs)
 
     inner = tsc_get_inner_regs(regs);
     if (inner) {
-        /* arg0=clone_flags(di), arg1=newsp(si), arg2=parent_tidptr(dx) */
+        /* arg0=clone_flags, arg1=newsp, arg2=parent_tidptr (syscall ABI) */
         tsc_record_event(slot, TSC_NR_CLONE, TSC_CAT_PROCESS,
-                          inner->di, inner->si, inner->dx, 0);
+                          REG_ARG0(inner), REG_ARG1(inner), REG_ARG2(inner), 0);
     }
     return 0;
 }

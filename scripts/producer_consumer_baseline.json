@@ -261,22 +261,22 @@
       "line": 65,
       "source": "trust_morphogen_event"
     },
-    "TRUST_QUORUM_MAJORITY": {
+    "TRUST_QUORUM_CONSISTENT": {
       "status": "no_consumer",
       "file": "trust/include/trust_quorum.h",
-      "line": 29,
+      "line": 48,
       "source": "trust_quorum_verdict"
     },
-    "TRUST_QUORUM_DISPUTED": {
+    "TRUST_QUORUM_DISCREPANT": {
       "status": "no_consumer",
       "file": "trust/include/trust_quorum.h",
-      "line": 30,
+      "line": 49,
       "source": "trust_quorum_verdict"
     },
-    "TRUST_QUORUM_APOPTOSIS_CANDIDATE": {
+    "TRUST_QUORUM_DIVERGENT": {
       "status": "no_consumer",
       "file": "trust/include/trust_quorum.h",
-      "line": 31,
+      "line": 50,
       "source": "trust_quorum_verdict"
     }
   }

@@ -281,9 +281,12 @@ single `trust_subject_t` struct inside one kernel module. A
 kernel-write adversary flips all 23 in one move → vote is 23-0 for the
 adversary's chosen verdict.
 
-The current sysfs counter names (MAJORITY / DISPUTED / APOPTOSIS) and
-the word "quorum" itself suggest BFT semantics the implementation
-does not deliver.
+The sysfs counter names were renamed in S75 (§3 Decision 4) from
+MAJORITY / DISPUTED / APOPTOSIS to CONSISTENT / DISCREPANT / DIVERGENT
+to stop suggesting BFT semantics the implementation does not deliver.
+The word "quorum" itself still evokes BFT connotations; the enum
+rename is a partial fix but does not change the underlying
+threat-model disclaimer below.
 
 **Recommendation.** Paper text: *"The `trust_quorum` primitive provides
 Byzantine-shaped but not Byzantine-tolerant integrity checking. The 23

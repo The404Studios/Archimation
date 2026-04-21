@@ -1,21 +1,39 @@
 /*
- * trust_quorum.h — Byzantine 2f+1 voting across 23 chromosomal slots.
+ * trust_quorum.h — 23-slot chromosomal integrity witness (CFT+, not BFT).
  *
  * S74 Agent 8, Cluster 4A. Implements von Neumann's 1956 "Probabilistic
  * Logics and the Synthesis of Reliable Organisms from Unreliable Components"
  * over the paper's existing 23-fold chromosomal redundancy: when we need to
- * decide an authority question we vote across the 23 (A,B) segment pairs
+ * decide an authority question we hash across the 23 (A,B) segment pairs
  * rather than trusting any single replica.
  *
+ * IMPORTANT — these verdicts are CFT+ integrity witnesses, not BFT votes.
+ * ---------------------------------------------------------------------
+ * Research-G (docs/research/s74_g_reliability_consensus.md §0) classifies
+ * trust_quorum_vote() as a **crash/bit-flip-tolerant chi-square-style
+ * consistency check**: replicas are deterministic hashes of a shared
+ * chromosomal snapshot, not independent voters with conflicting states.
+ * The verdict enum below is therefore named in the language of integrity
+ * (CONSISTENT / DISCREPANT / DIVERGENT) rather than consensus
+ * (majority / disputed / apoptosis). This closes the S75 §3 Decision 4
+ * naming gap flagged by research-G — peer reviewers at USENIX Security /
+ * S&P / CCS would (justly) push back on BFT-evocative names for a
+ * mechanism that has no actual Byzantine fault model.
+ *
  * Verdict meanings:
- *   MAJORITY             — >= 16/23 agree (~2/3); proceed normally
- *   DISPUTED             — 8..15 dissent; force FBC slow-path re-evaluation
- *   APOPTOSIS_CANDIDATE  —  >7 dissent; recommend immune response
+ *   CONSISTENT  — >=16/23 replicas agree on the bit-state (~2/3 rule);
+ *                 quorum is coherent; proceed normally.
+ *   DISCREPANT  — 8..15 disagree; single-flip / localized-corruption
+ *                 suspect; force FBC slow-path re-evaluation.
+ *   DIVERGENT   — <8 agree (tallies collapsed to one side with severe
+ *                 disagreement); unrecoverable corruption; recommend
+ *                 apoptosis or subject restart.
  *
  * The call is deterministic, non-sleeping, and allocation-free so it is
  * safe on the authz fast-path.
  *
- * See docs/architecture-meta-exploit-s73.md §Cluster 4A.
+ * See docs/architecture-meta-exploit-s73.md §Cluster 4A and
+ *     docs/research/s74_g_reliability_consensus.md §0, §2.3, §2.4.
  */
 
 #ifndef TRUST_QUORUM_H
@@ -26,9 +44,9 @@
 #include <trust_types.h>        /* trust_subject_t */
 
 enum trust_quorum_verdict {
-    TRUST_QUORUM_MAJORITY            = 0,
-    TRUST_QUORUM_DISPUTED            = 1,
-    TRUST_QUORUM_APOPTOSIS_CANDIDATE = 2,
+    TRUST_QUORUM_CONSISTENT = 0,
+    TRUST_QUORUM_DISCREPANT = 1,
+    TRUST_QUORUM_DIVERGENT  = 2,
 };
 
 /* Vote over a single chromosomal field index (0..22).

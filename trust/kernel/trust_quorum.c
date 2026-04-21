@@ -1,15 +1,23 @@
 /*
- * trust_quorum.c — Byzantine majority vote across 23 chromosomal slots.
+ * trust_quorum.c — 23-slot chromosomal integrity witness (CFT+, not BFT).
  *
  * S74 Agent 8 (Cluster 4A). Closes the gap the paper itself exposes:
  * trust_subject_t already carries 23 (A,B) segment pairs (von-Neumann-
- * style R=23 redundancy) but nothing in-tree actually *votes* over
- * them. This file aggregates those 23 replicas into a single verdict.
+ * style R=23 redundancy) but nothing in-tree actually *checks* coherence
+ * across them. This file aggregates those 23 replicas into a single
+ * verdict.
  *
- * Thresholds (inclusive):
- *   agree >= 16           -> MAJORITY            ( ~2/3 rule )
- *   8 <= agree <= 15      -> DISPUTED            ( force FBC slow path )
- *   agree <  8            -> APOPTOSIS_CANDIDATE ( recommend apoptosis )
+ * S75 §3 Decision 4 note: the verdict enum is named in the language of
+ * integrity (CONSISTENT / DISCREPANT / DIVERGENT) rather than consensus
+ * (majority / disputed / apoptosis). Per research-G (docs/research/
+ * s74_g_reliability_consensus.md §0), this quorum is a crash/bit-flip-
+ * tolerant chi-square-style consistency check — not a Byzantine vote.
+ * See trust_quorum.h for the full CFT+ rationale.
+ *
+ * Thresholds (inclusive, unchanged — numeric verdict codes preserved):
+ *   agree >= 16           -> CONSISTENT   ( ~2/3 rule, code 0 )
+ *   8 <= agree <= 15      -> DISCREPANT   ( force FBC slow path, code 1 )
+ *   agree <  8            -> DIVERGENT    ( recommend apoptosis, code 2 )
  *
  * Deterministic, allocation-free, IRQ-safe. No locks taken — the caller
  * is expected to hold whatever snapshot protects `*s` (typically RCU
@@ -38,10 +46,10 @@
 
 /* --- Counters (exported via sysfs) ------------------------------------ */
 
-static atomic64_t q_total_votes         = ATOMIC64_INIT(0);
-static atomic64_t q_majorities          = ATOMIC64_INIT(0);
-static atomic64_t q_disputes            = ATOMIC64_INIT(0);
-static atomic64_t q_apoptosis_nominees  = ATOMIC64_INIT(0);
+static atomic64_t q_total_votes = ATOMIC64_INIT(0);
+static atomic64_t q_consistent  = ATOMIC64_INIT(0);
+static atomic64_t q_discrepant  = ATOMIC64_INIT(0);
+static atomic64_t q_divergent   = ATOMIC64_INIT(0);
 
 /* --- Voting core ------------------------------------------------------ */
 
@@ -78,11 +86,11 @@ enum trust_quorum_verdict trust_quorum_vote(const trust_subject_t *s,
     atomic64_inc(&q_total_votes);
 
     if (!s) {
-        /* Defensive: no subject = no quorum. */
+        /* Defensive: no subject = no coherent witness. */
         if (agree_count)
             *agree_count = 0;
-        atomic64_inc(&q_apoptosis_nominees);
-        return TRUST_QUORUM_APOPTOSIS_CANDIDATE;
+        atomic64_inc(&q_divergent);
+        return TRUST_QUORUM_DIVERGENT;
     }
 
     /* Clamp field_id to valid segment index (deterministic, never error). */
@@ -105,17 +113,17 @@ enum trust_quorum_verdict trust_quorum_vote(const trust_subject_t *s,
 
     /* Thresholds: >=16 of 23 is the 2/3 rule (von Neumann). */
     if (agree >= 16) {
-        v = TRUST_QUORUM_MAJORITY;
-        atomic64_inc(&q_majorities);
+        v = TRUST_QUORUM_CONSISTENT;
+        atomic64_inc(&q_consistent);
     } else if (agree >= 8) {
-        v = TRUST_QUORUM_DISPUTED;
-        atomic64_inc(&q_disputes);
+        v = TRUST_QUORUM_DISCREPANT;
+        atomic64_inc(&q_discrepant);
     } else {
         /* agree < 8 — shouldn't happen normally (majority is at least
          * ceil(23/2) = 12). This means the tallies collapsed to one
          * side with < 8 — treat as pathological corruption. */
-        v = TRUST_QUORUM_APOPTOSIS_CANDIDATE;
-        atomic64_inc(&q_apoptosis_nominees);
+        v = TRUST_QUORUM_DIVERGENT;
+        atomic64_inc(&q_divergent);
     }
     return v;
 }
@@ -140,45 +148,45 @@ static ssize_t total_votes_show(struct kobject *k, struct kobj_attribute *a,
                       (long long)atomic64_read(&q_total_votes));
 }
 
-static ssize_t majorities_show(struct kobject *k, struct kobj_attribute *a,
+static ssize_t consistent_show(struct kobject *k, struct kobj_attribute *a,
                                char *buf)
 {
     (void)k; (void)a;
     return sysfs_emit(buf, "%lld\n",
-                      (long long)atomic64_read(&q_majorities));
+                      (long long)atomic64_read(&q_consistent));
 }
 
-static ssize_t disputes_show(struct kobject *k, struct kobj_attribute *a,
-                             char *buf)
+static ssize_t discrepant_show(struct kobject *k, struct kobj_attribute *a,
+                               char *buf)
 {
     (void)k; (void)a;
     return sysfs_emit(buf, "%lld\n",
-                      (long long)atomic64_read(&q_disputes));
+                      (long long)atomic64_read(&q_discrepant));
 }
 
-static ssize_t apoptosis_nominations_show(struct kobject *k,
-                                          struct kobj_attribute *a,
-                                          char *buf)
+static ssize_t divergent_show(struct kobject *k,
+                              struct kobj_attribute *a,
+                              char *buf)
 {
     (void)k; (void)a;
     return sysfs_emit(buf, "%lld\n",
-                      (long long)atomic64_read(&q_apoptosis_nominees));
+                      (long long)atomic64_read(&q_divergent));
 }
 
 static struct kobj_attribute attr_total_votes =
     __ATTR(total_votes, 0444, total_votes_show, NULL);
-static struct kobj_attribute attr_majorities =
-    __ATTR(majorities, 0444, majorities_show, NULL);
-static struct kobj_attribute attr_disputes =
-    __ATTR(disputes, 0444, disputes_show, NULL);
-static struct kobj_attribute attr_apoptosis_nominations =
-    __ATTR(apoptosis_nominations, 0444, apoptosis_nominations_show, NULL);
+static struct kobj_attribute attr_consistent =
+    __ATTR(consistent, 0444, consistent_show, NULL);
+static struct kobj_attribute attr_discrepant =
+    __ATTR(discrepant, 0444, discrepant_show, NULL);
+static struct kobj_attribute attr_divergent =
+    __ATTR(divergent, 0444, divergent_show, NULL);
 
 static struct attribute *quorum_attrs[] = {
     &attr_total_votes.attr,
-    &attr_majorities.attr,
-    &attr_disputes.attr,
-    &attr_apoptosis_nominations.attr,
+    &attr_consistent.attr,
+    &attr_discrepant.attr,
+    &attr_divergent.attr,
     NULL,
 };
 
@@ -219,7 +227,7 @@ int trust_quorum_init(void)
         return ret;
     }
 
-    pr_info("trust_quorum: Byzantine 2/3 vote over 23 chromosomal slots active\n");
+    pr_info("trust_quorum: CFT+ integrity witness over 23 chromosomal slots active\n");
     return 0;
 }
 

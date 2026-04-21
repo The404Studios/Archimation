@@ -167,6 +167,19 @@ class DecisionEngine:
         # None until the first decision is finalized.
         self._last_verdict_name: Optional[str] = None
 
+        # S75 Agent C: optional Monte-Carlo confidence sampler. When set,
+        # EvalResult.confidence is re-drawn from a beta posterior on
+        # _finalize (surgical stochasticity injection). When left as None,
+        # confidence is the original deterministic value from the tier
+        # (ALL existing behaviour unchanged).
+        #
+        # Wire contract (from set_confidence_sampler below):
+        #   sampler.deterministic_mean == True  -> behaviour identical to
+        #     the pre-S75 deterministic path (posterior mean ~= base conf).
+        #   sampler.deterministic_mean == False -> confidence becomes a
+        #     beta-distributed random variable with E[x] ~= base conf.
+        self._confidence_sampler: Any = None
+
         self._load_default_policies()
 
     # -- Policy management --
@@ -293,6 +306,21 @@ class DecisionEngine:
         self._finalize(result, start)
         return result
 
+    def set_confidence_sampler(self, sampler: Any) -> None:
+        """Attach a ConfidenceSampler (S75 Agent C, roadmap §1.2.4).
+
+        When attached, EvalResult.confidence is re-drawn on _finalize from
+        a beta posterior centred on the tier's original confidence. Pass
+        a ConfidenceSampler constructed with ``deterministic_mean=True``
+        to preserve pre-S75 behaviour (posterior mean) while keeping the
+        wiring validated end-to-end. Pass ``None`` to detach.
+
+        This is additive, opt-in wiring: default engine construction does
+        not invoke the sampler so existing tests and callers are
+        unchanged.
+        """
+        self._confidence_sampler = sampler
+
     def _finalize(self, result: EvalResult, start: float) -> None:
         """Record timing and verdict statistics.
 
@@ -302,6 +330,23 @@ class DecisionEngine:
         """
         elapsed = time.monotonic() - start
         self._eval_times.append(elapsed)
+
+        # S75 Agent C: optional Monte-Carlo confidence calibration. When a
+        # sampler is attached, redraw the confidence from a beta posterior
+        # centred on the tier's original deterministic confidence; when
+        # the sampler is in ``deterministic_mean`` mode the returned
+        # value is the posterior mean, so behaviour is numerically
+        # indistinguishable from the pre-S75 path.  Guarded by try/except
+        # so a sampler malfunction cannot poison decision flow.
+        sampler = self._confidence_sampler
+        if sampler is not None:
+            try:
+                base = float(max(0.0, min(1.0, result.confidence)))
+                new_conf = float(sampler.calibrated(base))
+                if 0.0 <= new_conf <= 1.0:
+                    result.confidence = new_conf
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("ConfidenceSampler failed: %s", exc)
 
         verdict_name = result.verdict.name
         self._verdict_counts[verdict_name] = (

@@ -14,7 +14,7 @@ recognisable function prologues; "joining steps" are the reachable edges in a
 lightweight call / import graph; A is an approximation of the path length
 needed to assemble the whole executable from those parts.
 
-Purpose within ARCHWINDOWS:
+Purpose within ARCHIMATION:
 
     * Low A AND low σ  → trivial / likely auto-generated / possibly hostile —
       flag for trust_observer scrutiny.

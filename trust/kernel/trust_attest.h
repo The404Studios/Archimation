@@ -6,7 +6,7 @@
  * PCR 11 from the TPM2 chip (where systemd-stub measures the Unified
  * Kernel Image — see systemd TPM2_PCR_MEASUREMENTS doc) and compares
  * it against an expected value written at bootc image build time to
- *   /etc/archwindows/expected-pcr-11
+ *   /etc/archimation/expected-pcr-11
  *
  * The module exposes three terminal modes:
  *

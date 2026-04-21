@@ -8,7 +8,7 @@
  *      unavailable).  NULL → no TPM → SOFTWARE mode.
  *   3. Verify the chip advertises TPM 2.0 (TPM_CHIP_FLAG_TPM2).  TPM
  *      1.2 cannot carry SHA-256 PCR banks → SOFTWARE mode.
- *   4. Read /etc/archwindows/expected-pcr-11 (32-byte hex, 64 ASCII
+ *   4. Read /etc/archimation/expected-pcr-11 (32-byte hex, 64 ASCII
  *      chars + optional newline).  Missing / short / unreadable →
  *      SOFTWARE mode (degraded, never a silent HARDWARE claim).
  *   5. tpm_pcr_read(chip, 11, &digest) for the SHA-256 bank.
@@ -52,7 +52,7 @@
 #include "trust_attest.h"
 
 #define PCR_INDEX_UKI           11
-#define EXPECTED_PCR_PATH       "/etc/archwindows/expected-pcr-11"
+#define EXPECTED_PCR_PATH       "/etc/archimation/expected-pcr-11"
 #define PCR11_SHA256_LEN        32
 #define PCR11_HEX_LEN           (PCR11_SHA256_LEN * 2)
 #define CMDLINE_MAX_TOKEN_LEN   32

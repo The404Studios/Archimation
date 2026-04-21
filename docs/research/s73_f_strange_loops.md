@@ -3,7 +3,7 @@
 **Agent:** Research Agent F (S73 12-agent framework push)
 **Framework:** Douglas Hofstadter — *Gödel, Escher, Bach: An Eternal Golden Braid* (1979) + *I Am a Strange Loop* (2007).
 **Date:** 2026-04-20
-**Scope:** Read the ARCHWINDOWS trust kernel through the lens of strange loops, Gödelian self-reference, and Tarskian undefinability. Locate where our self-reference is genuine, where it is shallow, and where the ONE exploit lives that would turn the APE into a Hofstadter-class system.
+**Scope:** Read the ARCHIMATION trust kernel through the lens of strange loops, Gödelian self-reference, and Tarskian undefinability. Locate where our self-reference is genuine, where it is shallow, and where the ONE exploit lives that would turn the APE into a Hofstadter-class system.
 
 ---
 
@@ -32,7 +32,7 @@ Cryptographic cousins that *engineer* the pattern rather than stumble into it:
 
 ---
 
-## 2. Evidence survey — where the ARCHWINDOWS code already loops
+## 2. Evidence survey — where the ARCHIMATION code already loops
 
 All citations are absolute file paths inside `C:\Users\wilde\Downloads\arch-linux-with-full-ai-control\`. Line numbers are literal.
 
@@ -99,7 +99,7 @@ But again: the analog is in the narrative more than the mechanism. The kernel po
 
 ### 2.5 Attestation — `trust/kernel/trust_attest.c`
 
-**trust_attest.c:3-28** says the TPM attests the boot chain to PCR 11 and we compare against `/etc/archwindows/expected-pcr-11`. That is *external* self-reference: the trust chain stakes its legitimacy on a hash produced by hardware the module did not write. `trust.ko` does *not* — at present — compute any hash of *itself* to fold into its own state. If an attacker flips a bit in `trust.ko` after load (e.g., via a kernel write primitive), nothing inside `trust.ko` would ever notice. The boot-time TPM check sees the on-disk bytes; it does not observe the live `.text`.
+**trust_attest.c:3-28** says the TPM attests the boot chain to PCR 11 and we compare against `/etc/archimation/expected-pcr-11`. That is *external* self-reference: the trust chain stakes its legitimacy on a hash produced by hardware the module did not write. `trust.ko` does *not* — at present — compute any hash of *itself* to fold into its own state. If an attacker flips a bit in `trust.ko` after load (e.g., via a kernel write primitive), nothing inside `trust.ko` would ever notice. The boot-time TPM check sees the on-disk bytes; it does not observe the live `.text`.
 
 This is the strongest spot to deepen. See §4.
 

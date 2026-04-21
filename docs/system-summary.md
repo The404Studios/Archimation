@@ -46,7 +46,7 @@ ready=$(curl -sf http://localhost:8420/system/summary | jq -r .state)
   "version": "0.1.0",
   "uptime_s": 123,
   "session": "headless",
-  "hostname": "archwindows",
+  "hostname": "archimation",
   "subsystems": {
     "scanner":            {"loaded": true, "patterns": 39, "scans_total": 0, "hits_total": 0},
     "memory_observer":    {"loaded": true, "tracked_pids": 0, "enabled": true},

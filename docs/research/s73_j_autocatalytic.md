@@ -1,4 +1,4 @@
-# S73-J: ARCHWINDOWS through Stuart Kauffman's Autocatalytic Sets
+# S73-J: ARCHIMATION through Stuart Kauffman's Autocatalytic Sets
 
 **Agent**: 10 of 12 (S73 framework series) -- Autocatalytic closure / NK landscapes
 **Date**: 2026-04-20
@@ -101,11 +101,11 @@ corporate engineering dashboards.
 
 ---
 
-## 3. Mapping ARCHWINDOWS to Kauffman
+## 3. Mapping ARCHIMATION to Kauffman
 
 ### 3.1 The mapping table
 
-| Kauffman concept | Biology | ARCHWINDOWS |
+| Kauffman concept | Biology | ARCHIMATION |
 |---|---|---|
 | Food set | Small molecules (CO2, H2, NH3) | External binaries (`playerctl`, `systemctl`, `peloader`), host kernel, Python stdlib |
 | Catalysts | Enzymes | Infrastructure helpers (`_exec`, `_systemctl`, `_pctl`, `_tile`, `_audio_vol`, `_compositor_status`) |
@@ -212,7 +212,7 @@ The only real autocatalytic loop is the **outermost one**: user -> daemon
 -> envelope -> cortex/user-model -> user's next phrase. The handler
 layer itself is deliberately DAG-shaped. This is a good design -- it
 means handlers cannot infinite-loop among themselves -- but it also
-means the catalytic closure of ARCHWINDOWS depends on infrastructure
+means the catalytic closure of ARCHIMATION depends on infrastructure
 helpers (not replaceable) and external binaries (replaceable in theory
 but rarely in practice).
 
@@ -332,7 +332,7 @@ prune set**. The script identifies it automatically.
 
 ### 4.6 The two-layer design insight
 
-The most important architectural finding is that **ARCHWINDOWS has
+The most important architectural finding is that **ARCHIMATION has
 spontaneously evolved the two-layer structure that biology uses**: a
 small, tightly-coupled catalytic core (17 helpers) that enables a large,
 loosely-coupled product layer (150 handlers). Kauffman (1996) pointed out
@@ -342,7 +342,7 @@ lead to cascade death; loosely-coupled catalysts lead to the inability
 to support any products at all. The K=N-1 core / K=0 shell pattern is
 why cells have universal ribosomes and species-specific proteins, why
 the Linux kernel has universal syscalls and application-specific
-binaries, and why ARCHWINDOWS has `_exec` with 80 callers and 150
+binaries, and why ARCHIMATION has `_exec` with 80 callers and 150
 handlers with zero cross-calls.
 
 This two-layer invariant should be **explicitly protected**: any

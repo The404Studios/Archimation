@@ -1,7 +1,7 @@
-# Session 71 / Agent F — Porting ARCHWINDOWS to RISC-V and ARM64
+# Session 71 / Agent F — Porting ARCHIMATION to RISC-V and ARM64
 
 **Date:** 2026-04-20
-**Scope:** Architecture-portability audit of the ARCHWINDOWS stack (trust.ko, pe-loader, AI daemon, packaging) with an eye toward running on aarch64 and riscv64 hardware shipping in 2024-2026.
+**Scope:** Architecture-portability audit of the ARCHIMATION stack (trust.ko, pe-loader, AI daemon, packaging) with an eye toward running on aarch64 and riscv64 hardware shipping in 2024-2026.
 
 ## TL;DR
 
@@ -64,7 +64,7 @@ From the grep above on `packages/*/PKGBUILD`:
 | pe-compat-dkms | `'x86_64'` | add `'aarch64'` (binfmt_pe works) |
 | windows-services | `'x86_64'` | conditional (depends on PE) |
 
-The profile (`profile/profiledef.sh:14`) hard-codes `arch="x86_64"`; mkarchiso only supports one target per build, so we would produce `archwindows-2026.xx.xx-aarch64.iso` as a parallel artifact.
+The profile (`profile/profiledef.sh:14`) hard-codes `arch="x86_64"`; mkarchiso only supports one target per build, so we would produce `archimation-2026.xx.xx-aarch64.iso` as a parallel artifact.
 
 ---
 
@@ -86,7 +86,7 @@ The profile (`profile/profiledef.sh:14`) hard-codes `arch="x86_64"`; mkarchiso o
 - **BPF/eBPF:** functional but arch-specific JIT still trailing x86_64 — the spec is the same, the behaviour isn't. Not in our critical path (trust kernel does no BPF).
 - **Arch Linux RISC-V** ([archriscv.felixc.at](https://archriscv.felixc.at/)): unofficial port on RV64GC/lp64d. 243/264 core+extra packages current (92 %), 10072/13220 extra (76 %). Test boards listed: VisionFive 1, Unmatched, Milk-V Pioneer, LicheePi 4A.
 
-**Verdict for ARCHWINDOWS on RISC-V:** Jupiter/BPI-F3 is the cheapest entry, Oasis is the interesting target (16-core desktop class), Veyron V2 is the only thing that could plausibly run the full AI cortex + PE loader workload. All of them are slower than a 2018-era x86_64 laptop. RISC-V is an **experimental track** for this project in 2026.
+**Verdict for ARCHIMATION on RISC-V:** Jupiter/BPI-F3 is the cheapest entry, Oasis is the interesting target (16-core desktop class), Veyron V2 is the only thing that could plausibly run the full AI cortex + PE loader workload. All of them are slower than a 2018-era x86_64 laptop. RISC-V is an **experimental track** for this project in 2026.
 
 ---
 
@@ -106,7 +106,7 @@ The profile (`profile/profiledef.sh:14`) hard-codes `arch="x86_64"`; mkarchiso o
 - **Arch Linux ARM** (ALARM) — mirrors stalled around 2024-12-22 per a forum thread (Python rebuild); no official ETA. Packages still shipping but behind.
 - **Arch Linux Ports** (ports.archlinux.page/aarch64) — unofficial, tracks Arch proper. Most core+extra packages build unmodified. AWS images every ~15 days (eu-central-1).
 
-**Verdict for ARCHWINDOWS on AArch64:** this is where real user demand lives in 2026. Snapdragon X laptops (imperfect but shipping), Apple Silicon (if users tolerate Asahi), cloud on Graviton/Ampere. Tier-1 port target.
+**Verdict for ARCHIMATION on AArch64:** this is where real user demand lives in 2026. Snapdragon X laptops (imperfect but shipping), Apple Silicon (if users tolerate Asahi), cloud on Graviton/Ampere. Tier-1 port target.
 
 ---
 
@@ -265,7 +265,7 @@ x86_64 Mach-O → ARM64. Available inside Linux VMs (Parallels, UTM, Docker-Desk
 
 ## Appendix — 400-word executive summary (per brief)
 
-ARCHWINDOWS today targets x86_64 exclusively. A codebase audit confirms the **trust kernel module is architecturally portable**: 22 `.c` sources, zero inline assembly, no x86-specific intrinsics. A ≤ 1-day PKGBUILD widening (adding `'aarch64'` and `'riscv64'` to five packages) plus a kernel-headers CI pass gets `trust.ko` building on both new architectures. trust-system, pe-compat-dkms, and windows-services need similar surgery.
+ARCHIMATION today targets x86_64 exclusively. A codebase audit confirms the **trust kernel module is architecturally portable**: 22 `.c` sources, zero inline assembly, no x86-specific intrinsics. A ≤ 1-day PKGBUILD widening (adding `'aarch64'` and `'riscv64'` to five packages) plus a kernel-headers CI pass gets `trust.ko` building on both new architectures. trust-system, pe-compat-dkms, and windows-services need similar surgery.
 
 The **PE loader is structurally x86_64-centric**. A deliberate machine-type gate at `pe_parser.c:157` rejects anything that is not `IMAGE_FILE_MACHINE_I386` or `IMAGE_FILE_MACHINE_AMD64`; the ARM64 constant (0xAA64) is already defined and surfaced in `pe_diag.c` but never accepted. The one hand-written x86_64 assembly file is `abi_thunk.S` (177 LOC), bridging SysV and Windows-x64 calling conventions. Across 20+ DLL stubs there are 494 usages of `ms_abi` / `__builtin_ms_va_list`, each of which would need a parallel ARM64 track. No SSE/AVX intrinsics exist in-tree — good.
 

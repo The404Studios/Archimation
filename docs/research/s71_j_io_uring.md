@@ -1,4 +1,4 @@
-# S71 Agent J — io_uring and Modern Linux I/O Patterns for ARCHWINDOWS daemon
+# S71 Agent J — io_uring and Modern Linux I/O Patterns for ARCHIMATION daemon
 
 Research angle: could the ai-control-daemon (FastAPI + uvicorn on :8420, cortex
 on :8421, heavy subprocess fan-out, some disk I/O) benefit from io_uring, and
@@ -44,7 +44,7 @@ directly to the 6.6 sysctl `kernel.io_uring_disabled`:
 Google ChromeOS and Android both run with this at 2 on many builds [3, 7]. An
 io_uring-based rootkit demoed in early 2025 bypassed most syscall-watching
 antivirus because it literally never issues the watched syscalls — the ring
-sidesteps them entirely [7]. Any security-sensitive ARCHWINDOWS deployment
+sidesteps them entirely [7]. Any security-sensitive ARCHIMATION deployment
 needs to think about this before making io_uring a hard dependency.
 
 ## 3. Python-side reality check
@@ -140,7 +140,7 @@ What's left is the perimeter modules.
 
 ## 7. Old-hardware constraint
 
-ARCHWINDOWS boots Arch rolling, kernel 6.x is typical — io_uring is
+ARCHIMATION boots Arch rolling, kernel 6.x is typical — io_uring is
 available everywhere. The hardened kernel variant in `profile/packages.x86_64`
 (`linux-hardened`) ships with `kernel.io_uring_disabled=2` as of its
 2025-backport, so io_uring literally does not work there. Any adoption must
@@ -210,7 +210,7 @@ io_uring is mature in 2026 but its Python story is still "not yet." uvloop
 under uvicorn still runs on epoll; granian (the obvious upgrade from
 uvicorn) uses Tokio+Hyper, also not io_uring. Using io_uring from Python
 requires going below FastAPI — `python-io-uring` bindings, `socketify.py`,
-or a full Rust rewrite. None of those map cleanly onto the ARCHWINDOWS
+or a full Rust rewrite. None of those map cleanly onto the ARCHIMATION
 daemon's shape (ASGI endpoints whose latency is dominated by forking
 `pactl`/`brightnessctl`/`systemctl`, not by HTTP parsing).
 

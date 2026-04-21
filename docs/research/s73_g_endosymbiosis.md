@@ -1,4 +1,4 @@
-# S73-G — Endosymbiosis & Horizontal Gene Transfer for ARCHWINDOWS
+# S73-G — Endosymbiosis & Horizontal Gene Transfer for ARCHIMATION
 
 **Framework agent**: G of 12 (Lynn Margulis endosymbiosis + holobiont theory + horizontal
 gene transfer + host-symbiont co-evolution).
@@ -118,9 +118,9 @@ These are the biological precedent for the trust gate. [8]
 
 ---
 
-## 2. Mapping to ARCHWINDOWS
+## 2. Mapping to ARCHIMATION
 
-| Biology | ARCHWINDOWS |
+| Biology | ARCHIMATION |
 |---|---|
 | Eukaryotic host | Linux kernel + userspace (Arch base) |
 | Mitochondrion (alpha-proteobacterium symbiont) | PE loader `pe-loader/` (foreign Windows ABI) |
@@ -135,7 +135,7 @@ These are the biological precedent for the trust gate. [8]
 | EGT — gene transfer to nucleus | **Migration of a Win32 function from PE stub .c file to a thin libc thunk** |
 | DRP1 fission control | Trust kernel `TRUST_ACTION_LOAD_KERNEL_BINARY` vetoing PE driver load (Session 65 A1) |
 | Uniparental inheritance | Trust domain marker `TRUST_DOMAIN_WIN32 = 1` (`trust_observer.py:31`) — foreign origin is permanently labelled |
-| Holobiont | `ARCHWINDOWS = Linux (host) + PE loader (mito) + containers (microbiome) + AI cortex (nervous system)` |
+| Holobiont | `ARCHIMATION = Linux (host) + PE loader (mito) + containers (microbiome) + AI cortex (nervous system)` |
 | CRISPR adaptive immunity | Markov-chain behavioral model in `ai-control/daemon/behavioral_markov.py` (S58 A4) — records past process behavior and flags reappearing hostile patterns |
 | Asgard + alpha-proteobacterium fusion | `binfmt_misc` + `TRUST_DOMAIN_WIN32` — the fusion event wired at boot |
 | Complex I (NADH dehydrogenase) | `kernel32_file.c` I/O + trust gate — CoRR-locked (needs local state, can't migrate) |
@@ -156,7 +156,7 @@ Four tests. PE loader passes all four:
 3. **Own genome** — yes. The PE file itself is the genome, carrying its own
    imports and exports table. A PE binary cannot be read by Linux's ELF loader
    without the PE symbiont infrastructure.
-4. **Can't remove without killing the organism** — yes. ARCHWINDOWS' value
+4. **Can't remove without killing the organism** — yes. ARCHIMATION' value
    proposition (run Windows apps natively under AI control with trust gating)
    disappears if the PE loader is removed. The symbiont is **obligate**.
 

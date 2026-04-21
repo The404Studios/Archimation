@@ -139,7 +139,7 @@ After Phases 1-3, `trust_syscall.c` can shed its `file_open/read/write/socket/co
 | BPF-LSM hooks (`BPF_PROG_TYPE_LSM`) | 5.7       | Baseline.                                                                                  |
 | Integrity Policy Enforcement (IPE)  | 6.12      | Optional — aligns with PE's Authenticode-shape check in wdm_host.                           |
 
-Our ARCHWINDOWS current kernel is whatever Arch's stable is (likely 6.14 at the time of this session). **Any feature above works today.** The "5.4 old hw floor" in the research prompt is obsolete — we already require 5.13+ for Landlock baseline and 6.7+ makes sense given Jan 2024 is far enough back.
+Our ARCHIMATION current kernel is whatever Arch's stable is (likely 6.14 at the time of this session). **Any feature above works today.** The "5.4 old hw floor" in the research prompt is obsolete — we already require 5.13+ for Landlock baseline and 6.7+ makes sense given Jan 2024 is far enough back.
 
 If we want to boot on older hardware (say, long-term-support 5.15 for enterprise), we'd gate Landlock network features behind `#ifdef LANDLOCK_ACCESS_NET_BIND_TCP` and fall back to kprobe-era behavior. Practical: don't support <5.13 at all — Landlock is required-by-pitch in S64's "trust-mediated Windows execution" framing.
 
@@ -147,7 +147,7 @@ If we want to boot on older hardware (say, long-term-support 5.15 for enterprise
 
 ## 6. Risk & drift
 
-1. **LSM stacking regressions.** Stacking has been default since 5.1 but real-world bugs still surface — see kernel 6.x tree for periodic patches fixing "blob ordering" between stacked modules. Mitigation: run with only trust.ko + Landlock (no SELinux/AppArmor on ARCHWINDOWS profile by default). We control the stack.
+1. **LSM stacking regressions.** Stacking has been default since 5.1 but real-world bugs still surface — see kernel 6.x tree for periodic patches fixing "blob ordering" between stacked modules. Mitigation: run with only trust.ko + Landlock (no SELinux/AppArmor on ARCHIMATION profile by default). We control the stack.
 2. **Performance.** LSM hook chains are O(N) over registered modules per hook. With just trust + Landlock in our profile, N=2, negligible. BPF-LSM programs add per-invocation verifier-checked cost (JIT-compiled, typically <1% overhead for sane programs).
 3. **Upstream drift.** If trust.ko moves to LSM hooks, we inherit the LSM hook ABI's stability guarantees — *much* more stable than kprobe names. Net win on drift.
 4. **Security-of-the-security-system.** A BPF-LSM companion needs careful privilege model. Use Microsoft's Hornet LSM (proposed 2025) pattern once it lands upstream: PKCS#7-signed `.ko` and `.bpf.o` that trust.ko verifies at load. Today: require CAP_BPF and trust userspace; same posture as SELinux load.

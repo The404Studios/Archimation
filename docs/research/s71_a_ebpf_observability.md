@@ -7,7 +7,7 @@
 
 ---
 
-## 0. Why this research matters for ARCHWINDOWS
+## 0. Why this research matters for ARCHIMATION
 
 The current `trust.ko` (22 `.c` files, Session 59 manifest GUARD verified 22 sources ship) mixes three concerns in one kernel object:
 
@@ -45,7 +45,7 @@ The following table is cross-checked against `iovisor/bcc`'s `kernel-versions.md
 | **`sched_ext`** (eBPF CPU scheduler) | **6.12** | 2024 | Meta + Google ship in production. Fedora ARK enables by default. |
 | Sched_ext fault-recovery improvements | 6.19 | 2025 | ~15% latency boost in the published benchmark; graceful fallback when eBPF scheduler faults. |
 
-Arch Linux's 2026 releases ship on `linux-lts 6.18.22-1` (January 2026 ISO, `9to5linux.com/arch-linux-kicks-off-2026...`). Rolling-release users are at 6.18+ by default. That means **every ARCHWINDOWS installation targeted at 2026 hardware has BPF arena, sched_ext, and signed-BPF-adjacent infrastructure available.** We are not constrained by old kernels on the baseline target.
+Arch Linux's 2026 releases ship on `linux-lts 6.18.22-1` (January 2026 ISO, `9to5linux.com/arch-linux-kicks-off-2026...`). Rolling-release users are at 6.18+ by default. That means **every ARCHIMATION installation targeted at 2026 hardware has BPF arena, sched_ext, and signed-BPF-adjacent infrastructure available.** We are not constrained by old kernels on the baseline target.
 
 ### 1.2 Verifier hardening and CVE posture (2024–2025)
 

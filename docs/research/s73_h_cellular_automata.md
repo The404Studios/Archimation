@@ -1,6 +1,6 @@
 # S73-H — Cellular Automata as the Missing Topology Layer in the Trust Kernel
 
-**Project:** ARCHWINDOWS — `trust.ko` (22 `.c` files) + `coherence/daemon`
+**Project:** ARCHIMATION — `trust.ko` (22 `.c` files) + `coherence/daemon`
 **Research angle:** Conway (1970), Wolfram NKS (2002), Cook's Rule 110 universality, Langton's Ant, Lenia (2019), Neural Cellular Automata (2020–2024), CA-based intrusion detection — applied to `trust_subject_pool.c` which is currently a *flat population without neighborhoods*.
 **Date:** 2026-04-20
 **One-line exploit:** *Add a process-tree + cgroup-co-membership neighborhood index to `trust_subject_pool` and let each subject's trust score undergo a Lenia-style continuous local update; Class-4 emergent immune behavior (compromised sub-trees spontaneously isolate) falls out without any central decision.*

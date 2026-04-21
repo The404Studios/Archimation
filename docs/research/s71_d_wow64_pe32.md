@@ -1,4 +1,4 @@
-# S71 Research Report D — WoW64 / PE32 Support for ARCHWINDOWS
+# S71 Research Report D — WoW64 / PE32 Support for ARCHIMATION
 
 **Agent:** Research Agent D
 **Date:** 2026-04-20
@@ -9,11 +9,11 @@
 
 ## 400-word Executive Summary
 
-ARCHWINDOWS's `pe-loader` is x86_64-only today. `pe-loader/loader/main.c:336-343` rejects any PE with `optional_magic == 0x010B` (PE32 / i386) and prints "Try running this through Wine." The rejection is architecturally correct — our 64-bit process cannot directly execute 32-bit x86 code without mode-switching — but it cuts off a meaningful segment of the Windows software corpus: every VB6 binary (no 64-bit IDE ever existed), every pre-2010 commercial game built for 32-bit Windows, a large slice of Delphi/Builder applications, and most retro titles. Whether this is "big" depends on how you measure. Steam Hardware Survey 2025 shows only **0.01% of players on 32-bit Windows 10** and Valve is ending 32-bit Steam support in January 2026 — so 32-bit *operating systems* are dead. But 32-bit *applications* running under 64-bit WoW64 are still shipped constantly; PCGamingWiki maintains a page of 32-bit Windows games covering Win95 through Win10, and anything built before about 2008 is commonly 32-bit-only.
+ARCHIMATION's `pe-loader` is x86_64-only today. `pe-loader/loader/main.c:336-343` rejects any PE with `optional_magic == 0x010B` (PE32 / i386) and prints "Try running this through Wine." The rejection is architecturally correct — our 64-bit process cannot directly execute 32-bit x86 code without mode-switching — but it cuts off a meaningful segment of the Windows software corpus: every VB6 binary (no 64-bit IDE ever existed), every pre-2010 commercial game built for 32-bit Windows, a large slice of Delphi/Builder applications, and most retro titles. Whether this is "big" depends on how you measure. Steam Hardware Survey 2025 shows only **0.01% of players on 32-bit Windows 10** and Valve is ending 32-bit Steam support in January 2026 — so 32-bit *operating systems* are dead. But 32-bit *applications* running under 64-bit WoW64 are still shipped constantly; PCGamingWiki maintains a page of 32-bit Windows games covering Win95 through Win10, and anything built before about 2008 is commonly 32-bit-only.
 
 Microsoft's native WoW64 runs `wow64.dll` + `wow64cpu.dll` + `wow64win.dll` in every 32-bit-on-64-bit process: 32-bit `ntdll` stubs jump through the "Heaven's Gate" far-jmp to CS=0x33 to switch the CPU to long mode, the thunks in `wow64.dll` extend 32-bit parameters to 64-bit and issue the real syscall, then the CPU returns to CS=0x23 for 32-bit execution. Wine 9.0 (Jan 2024) shipped the first "new WoW64" Unix equivalent; Wine 11.0 (Jan 2026) made it feature-complete and the default, dropping the separate `wine64` binary. Wine's approach: 32-bit PE modules call into a set of generated WoW64 thunks that convert 32→64-bit arguments before invoking the single 64-bit `ntdll.so` Unix library. Performance is reduced for 32-bit OpenGL workloads but most applications run.
 
-For ARCHWINDOWS, three options present. **(a)** Full native PE32 with our own Heaven's-Gate and thunks is 8-12 sessions (~15,000 LOC), duplicates Wine's core work, and primarily exists to say we did it. **(b)** A PE32→Wine handoff shim that detects `magic==0x010B` and execs `wine` with trust-gating via `libtrust_wine_shim.so LD_PRELOAD` is ~1-2 sessions (~400 LOC) and inherits Wine's 25-year compatibility corpus. **(c)** Continue refusing and document it. **Recommendation: option (b).** It matches S64/S65's "no-Wine-for-native-paths but Wine-for-compatibility" hybrid and respects the user's "don't want Wine" boundary by keeping Wine strictly as a PE32 *fallback* (not the default path for 64-bit binaries).
+For ARCHIMATION, three options present. **(a)** Full native PE32 with our own Heaven's-Gate and thunks is 8-12 sessions (~15,000 LOC), duplicates Wine's core work, and primarily exists to say we did it. **(b)** A PE32→Wine handoff shim that detects `magic==0x010B` and execs `wine` with trust-gating via `libtrust_wine_shim.so LD_PRELOAD` is ~1-2 sessions (~400 LOC) and inherits Wine's 25-year compatibility corpus. **(c)** Continue refusing and document it. **Recommendation: option (b).** It matches S64/S65's "no-Wine-for-native-paths but Wine-for-compatibility" hybrid and respects the user's "don't want Wine" boundary by keeping Wine strictly as a PE32 *fallback* (not the default path for 64-bit binaries).
 
 ---
 
@@ -148,7 +148,7 @@ Confirmed from inspection (all paths absolute within project root):
 
 ## 9. Old Hardware Fit
 
-- **Actual 32-bit-only x86 CPUs (Pentium 4 pre-EMT64, Pentium M, old Atom):** Don't boot ARCHWINDOWS at all — we require x86_64. Out of scope.
+- **Actual 32-bit-only x86 CPUs (Pentium 4 pre-EMT64, Pentium M, old Atom):** Don't boot ARCHIMATION at all — we require x86_64. Out of scope.
 - **64-bit CPUs running 32-bit OS (rare today):** Also out of scope.
 - **Modern low-end hardware running 64-bit OS that wants to run old 32-bit apps:** This is the actual use case. Option (b) fits perfectly — the device has 64-bit capability, just needs a path for 32-bit PE input.
 

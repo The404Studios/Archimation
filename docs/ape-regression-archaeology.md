@@ -310,7 +310,7 @@ Why this matters for classification:
 
 **"Maybe Agent K's `git log --all -S` check is authoritative."** — Refuted: `-S` on master's reachable history genuinely misses unreachable objects. Agent K's methodology was sound for their scope, but their scope was incomplete. `git fsck --lost-found` is required for completeness.
 
-**"Maybe the dangling stashes are from a different project / different branch."** — Refuted: `git show 0c55eec --stat` enumerates dozens of files that match this project's exact layout (ai-control/, trust/kernel/, services/scm, etc.). These are ARCHWINDOWS stashes.
+**"Maybe the dangling stashes are from a different project / different branch."** — Refuted: `git show 0c55eec --stat` enumerates dozens of files that match this project's exact layout (ai-control/, trust/kernel/, services/scm, etc.). These are ARCHIMATION stashes.
 
 ---
 

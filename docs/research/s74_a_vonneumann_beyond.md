@@ -124,7 +124,7 @@ process calculi (Luu et al. 2023, *Cambridge J. Symbolic Logic*,
 "On the equational theory of projection lattices"), affiliated-ring
 dimension in L²-cohomology, noncommutative measure theory.
 
-**Mapping to ARCHWINDOWS.** The trust ISA is organised as 6 families ×
+**Mapping to ARCHIMATION.** The trust ISA is organised as 6 families ×
 4-bit opcode × 4-bit flags (`trust_isa.h:58-83`). Family codes
 AUTH/TRUST/GATE/RES/LIFE/META (0–5) and the S61 extensions VEC/FUSED
 (6–7) form a *flat* 3-bit field. **There is no lattice structure on
@@ -252,7 +252,7 @@ estimators. The theorem is what says your estimator converges to the
 true mean in L², regardless of correlation structure — a much
 weaker assumption than iid.
 
-**ARCHWINDOWS mapping.** We compute running averages in several places:
+**ARCHIMATION mapping.** We compute running averages in several places:
 
 - `ai-control/cortex/decision_engine.py:156-167` keeps a `_eval_times`
   deque of the last N evaluation latencies for p99 reporting.
@@ -608,7 +608,7 @@ implement VN's 1958 "mixed analog-digital" thesis. Arxiv
 2510.06721v2 "Neuromorphic Computing — An Overview" (2025)
 cites *The Computer and the Brain* as foundational.
 
-**ARCHWINDOWS mapping — the gap.** Our trust-score arithmetic
+**ARCHIMATION mapping — the gap.** Our trust-score arithmetic
 is *pure fixed-point digital*:
 
 - `trust_types.h:442`: `cost_multiplier` is 8.8 fixed-point.
@@ -743,7 +743,7 @@ arXiv 2512.11148 (2025) "Solutions of Koopman-von Neumann
 equations". The framework has become *the* bridge between
 classical dynamics and ML / quantum computing.
 
-**ARCHWINDOWS mapping.** Our decision-engine state space is
+**ARCHIMATION mapping.** Our decision-engine state space is
 discrete (Markov over event types) — no Koopman applicability.
 However, the *running averages* in ergodic_witness (§2.4) and
 the *spectral-gap* estimates there are exactly the observables

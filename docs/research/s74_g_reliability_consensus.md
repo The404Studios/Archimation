@@ -5,7 +5,7 @@
 Agent 8) actually sit on the spectrum from von Neumann 1956 classical
 reliability, through crash-tolerant replication (Paxos, Raft), through
 Byzantine-tolerant replication (PBFT, HotStuff, HoneyBadger), and
-what does that imply for the ARCHWINDOWS moat against increasingly
+what does that imply for the ARCHIMATION moat against increasingly
 capable adversaries?
 **Authored:** 2026-04-20 (S74, parallel to Agents 1-10).
 **Git HEAD at authoring:** 5013ad9.
@@ -286,7 +286,7 @@ entry. Leader election: O(n) per election.
 leader-elected log replication — a distributed systems problem we
 don't have. The closest touchpoint is the **audit log**: if we ever
 wanted to ensure the ordering of `trust_ape_consume_proof` events
-across multiple ARCHWINDOWS machines, Raft would be a clean primitive.
+across multiple ARCHIMATION machines, Raft would be a clean primitive.
 That is a future problem, not a quorum problem.
 
 **What Raft defeats that we don't.** Nothing relevant. Orthogonal.
@@ -428,7 +428,7 @@ without trusting any single publisher.
 **S72-γ's measured boot**: PCR-11 values attest that a specific set
 of bytes were loaded into the kernel. That's the closest we get to
 "data availability proofs." If we ever extend the quorum to run over
-multiple ARCHWINDOWS machines (clustered AI agents, §7), DA becomes
+multiple ARCHIMATION machines (clustered AI agents, §7), DA becomes
 relevant — but not today.
 
 ---
@@ -543,7 +543,7 @@ requires **separate trust domains per key**, which in practice means:
 | Different user namespaces | unprivileged user ns per key | Low |
 | Different kernel namespaces + cgroups | per-cgroup enclave | Medium |
 | Different hardware enclaves (SGX/SEV/TDX) | Intel SGX v2, AMD SEV-SNP, Intel TDX | High, platform-dep |
-| Different physical machines | clustered ARCHWINDOWS | Very high |
+| Different physical machines | clustered ARCHIMATION | Very high |
 
 Each additional domain raises the attacker's required capability
 count by one. Without any of these, all 23 "replicas" collapse to a
@@ -613,7 +613,7 @@ USENIX Security 2016):
 | Hardware enclave | CPU manufacturer's key | Intel/AMD/Arm attestation service |
 | Distributed BFT | 2f+1 other machines | each other |
 
-ARCHWINDOWS currently sits at (1), with S72-γ adding a *measurement*
+ARCHIMATION currently sits at (1), with S72-γ adding a *measurement*
 layer via TPM PCR-11. S72-γ is valuable but limited: it only checks
 **load-time** state, not runtime. The quorum runs at **runtime** but
 is self-attested.
@@ -651,7 +651,7 @@ Summary table:
 | 3 | Aggregate with BLS threshold signature | +400 LOC | External verifier can check any vote |
 | 4 | Hardware-rooted keys via TPM (one key per trust domain, max ~8 keys practical) | +600 LOC | Kernel-write bound by TPM sealing policy |
 | 5 | Separate-process replicas (23 userspace daemons signing independently) | +1200 LOC | Adversary must escalate from one to 2f+1=16 processes |
-| 6 | Distributed ARCHWINDOWS cluster (2f+1 machines vote) | huge | Real PBFT/HotStuff analog |
+| 6 | Distributed ARCHIMATION cluster (2f+1 machines vote) | huge | Real PBFT/HotStuff analog |
 
 **Recommended trajectory for S75:**
 - Level 1 (HMAC per-pair) as a **~80 LOC patch** that would land
@@ -728,10 +728,10 @@ from MEMORY.md:`roa_paper_validation_tier_audit_and_s74_plan.md`):
 add an explicit note that chromosomal redundancy provides **integrity-
 witness** not **BFT**, with a pointer to this survey.
 
-### 7.2  Clustered ARCHWINDOWS (S80+)
+### 7.2  Clustered ARCHIMATION (S80+)
 
 The trajectory that would make chromosomal voting *actual* BFT is:
-run 3 ARCHWINDOWS machines, each computes its own opinion about each
+run 3 ARCHIMATION machines, each computes its own opinion about each
 field (possibly against local chromosomal state), aggregate opinions
 via HotStuff or PBFT, land the aggregate as the shared verdict.
 This is S80+ territory; useful to enumerate as an architectural

@@ -3,7 +3,7 @@
 **Agent:** H of 10 (S74 parallel push — AUTOPOIESIS + OBSERVATION PRIMITIVE COMPLETENESS)
 **Date:** 2026-04-20
 **Git HEAD:** 5013ad9
-**Scope:** survey 8 observation-theoretic frameworks (Maturana-Varela, Rosen, Friston, Bateson, Beer, Shannon-Kolmogorov-Bennett, Tononi IIT, Rao-Ballard/Clark/Seth predictive coding), enumerate the complete set of observation primitives a fully-autopoietic *authority* system must carry, cross-reference against the 5 observers ARCHWINDOWS already has after S74 (trust, memory, entropy, assembly, active-inference) plus the kernel-side S74 primitives (algedonic, quorum, morphogen), and produce a priority-ordered gap list.
+**Scope:** survey 8 observation-theoretic frameworks (Maturana-Varela, Rosen, Friston, Bateson, Beer, Shannon-Kolmogorov-Bennett, Tononi IIT, Rao-Ballard/Clark/Seth predictive coding), enumerate the complete set of observation primitives a fully-autopoietic *authority* system must carry, cross-reference against the 5 observers ARCHIMATION already has after S74 (trust, memory, entropy, assembly, active-inference) plus the kernel-side S74 primitives (algedonic, quorum, morphogen), and produce a priority-ordered gap list.
 
 **Research only, no source edits.** Files under `ai-control/`, `trust/`, and `coherence/` were read; nothing was modified.
 
@@ -303,7 +303,7 @@ Three complementary information measures:
 2. **Kolmogorov K** — semantic; "what is the shortest program that produces this?"
 3. **Bennett depth LD** — valuable; "how long does the shortest program take to produce this?"
 
-A complete information-theoretic observer must carry all three. S73-C §1 argues ARCHWINDOWS is deeply blind without LD because it cannot distinguish a ransomware encrypter (shallow random — high H, low LD) from a video encoder (deep computed — high H, high LD). This is the axis on which *insider* attacks hide.
+A complete information-theoretic observer must carry all three. S73-C §1 argues ARCHIMATION is deeply blind without LD because it cannot distinguish a ransomware encrypter (shallow random — high H, low LD) from a video encoder (deep computed — high H, high LD). This is the axis on which *insider* attacks hide.
 
 **Does our code have this observation?**
 
@@ -676,7 +676,7 @@ Only priority-1 first is defensible under the autopoietic-criticality ranking. T
 
 **Cited in-repo docs:**
 
-[46] S73-B (this repo) `docs/research/s73_b_cybernetics_vsm.md` — VSM mapping of ARCHWINDOWS.
+[46] S73-B (this repo) `docs/research/s73_b_cybernetics_vsm.md` — VSM mapping of ARCHIMATION.
 [47] S73-C (this repo) `docs/research/s73_c_shannon_kolmogorov.md` — information-theoretic gaps.
 [48] S73-E (this repo) `docs/research/s73_e_autopoiesis.md` — autopoiesis audit.
 [49] S73-F (this repo) `docs/research/s73_f_strange_loops.md` — Hofstadter self-reference.

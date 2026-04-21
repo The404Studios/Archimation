@@ -1,4 +1,4 @@
-# ARCHWINDOWS Permission Model
+# ARCHIMATION Permission Model
 
 Status: living document, Session 69 (Agent R) baseline.  
 Scope: how non-root users reach the AI daemon, the event bus, and `/dev/trust` without escalating to root.
@@ -126,12 +126,12 @@ curl -sSf http://127.0.0.1:8420/health && echo                  || echo "daemon:
 Session 68's audit and the top-level README both say so; this section is the honest checklist.
 
 - **Hostile root.** A user who already has root on the box can do whatever they want. We make no attempt to defend against the local superuser.
-- **SUID bits.** No ARCHWINDOWS binary is SUID. Privilege escalation to root goes through `sudo` and nothing else. If a hostile actor gets SUID somewhere unrelated (stock `passwd`, `ping`, etc.) we inherit the stock Arch attack surface, unchanged.
+- **SUID bits.** No ARCHIMATION binary is SUID. Privilege escalation to root goes through `sudo` and nothing else. If a hostile actor gets SUID somewhere unrelated (stock `passwd`, `ping`, etc.) we inherit the stock Arch attack surface, unchanged.
 - **The Python daemon's attack surface.** The daemon is ~30k LOC of Python with FastAPI, evdev, subprocess, nftables, and LLM integration. It exposes 100+ endpoints on localhost:8420 without CSRF tokens, without rate limiting beyond the cortex's circuit breaker, and with token auth that is mint-by-asking. If a user can run arbitrary code as the `arch` user they can post to `/keyboard/type` and own the session — which is fine because they're already that user.
 - **The event bus is lossy.** `/run/pe-compat/events.sock` is a datagram socket with a bounded kernel buffer. Under sustained load, events drop on the floor. A hostile subscriber in the `pe-compat` group can flood the daemon with bogus events to mask real ones.
 - **Trust kernel module as a whole.** The module is GPL-3 but unsigned, DKMS-built, and does not go through Secure Boot's chain. A hostile root can `rmmod trust; insmod evil.ko` and the system won't notice.
 
-If your threat model includes any of the above, ARCHWINDOWS is not the right distro for you today.
+If your threat model includes any of the above, ARCHIMATION is not the right distro for you today.
 
 ---
 

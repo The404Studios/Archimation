@@ -92,7 +92,7 @@ bash scripts/build-iso.sh
 
 | Metric | Value |
 |---|---|
-| Output | `output/archwindows-2026.04.20-x86_64.iso` |
+| Output | `output/archimation-2026.04.20-x86_64.iso` |
 | Size | **2 295 889 920 bytes (2.2 GB)** |
 | SHA256 | `e32ee5a930c0e1c2e3ec0181ee3760b34b14f832cbc90fa5139646bc9c321529` |
 | mkarchiso time | **430 s** |
@@ -336,7 +336,7 @@ None of the above are ship-blockers. Core platform (kernel, daemon, routing, PE 
 
 ## Final verdict
 
-**SHIP** — ISO `archwindows-2026.04.20-x86_64.iso` (SHA256 `e32ee5a930c0e1c2e3ec0181ee3760b34b14f832cbc90fa5139646bc9c321529`, 2 295 889 920 bytes) is strictly better than V's baseline and passes every live-QEMU suite. The recovery chain W/X/Y/Z landed cleanly. Residual pytest failures are documented phantom-claims + X's scoped-out S75 items.
+**SHIP** — ISO `archimation-2026.04.20-x86_64.iso` (SHA256 `e32ee5a930c0e1c2e3ec0181ee3760b34b14f832cbc90fa5139646bc9c321529`, 2 295 889 920 bytes) is strictly better than V's baseline and passes every live-QEMU suite. The recovery chain W/X/Y/Z landed cleanly. Residual pytest failures are documented phantom-claims + X's scoped-out S75 items.
 
 **S75 handoffs:**
 1. Land `/contusion/ai` and `/ai/plan` endpoints (or delete phantom tests) — 10 failing tests.
@@ -357,7 +357,7 @@ None of the above are ship-blockers. Core platform (kernel, daemon, routing, PE 
 - `logs/s74_agent_bb_v2.log` — v2 long-tail smoke (42/42 / 42 v2_template)
 - `logs/s74_agent_bb_pe_corpus.log` — PE corpus (16/0/2)
 - `logs/s74_agent_bb_pytest.log` — pytest sweep (280/24/83/1)
-- `output/archwindows-2026.04.20-x86_64.iso` (2.2 GB, sha e32ee5a9...)
+- `output/archimation-2026.04.20-x86_64.iso` (2.2 GB, sha e32ee5a9...)
 
 ---
 

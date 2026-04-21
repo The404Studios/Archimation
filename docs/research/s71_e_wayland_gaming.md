@@ -1,18 +1,18 @@
 # S71 Research E — Wayland, Gaming, and the X11 Transition
 
 Research Agent E, Session 71 (2026-04-20)
-Project: ARCHWINDOWS (Arch Linux + pe-loader + XFCE for Windows apps/games)
-Angle: How ARCHWINDOWS survives the 2024-2026 X11 → Wayland window on both ends of the hardware spectrum.
+Project: ARCHIMATION (Arch Linux + pe-loader + XFCE for Windows apps/games)
+Angle: How ARCHIMATION survives the 2024-2026 X11 → Wayland window on both ends of the hardware spectrum.
 
 ---
 
 ## 400-Word Executive Summary
 
-X11's upstream maintenance has effectively ended. KDE Plasma 6.0 (2024-02-28) made Wayland the default; KDE is committing to Wayland-only in the near future. GNOME 48 (2025-03-19) disabled the X11 session by default from GNOME 49 onward, and GNOME 50 (March 2026) ships with zero X11 code in Mutter — the Wayland backend merge that removed X11 landed 2025-11-05. XFCE, which ARCHWINDOWS currently ships, is still X11-primary: Xfce 4.20 (2024-12) has only experimental Wayland support via labwc or wayfire (both wlroots-based), xfwm4 remains X11-only, and a brand-new xfwl4 compositor is planned rather than a port. Ubuntu 24.04, Fedora 43, and KDE-based distros are Wayland-default. Hyprland 0.50 (2025-07), 0.53 (2025-12) are production-stable for daily gaming; Niri graduated past 0.1 in 2025-01 (25.01) as a scrollable-tiling daily driver; Sway 1.11 and labwc 0.8.x are mature wlroots compositors.
+X11's upstream maintenance has effectively ended. KDE Plasma 6.0 (2024-02-28) made Wayland the default; KDE is committing to Wayland-only in the near future. GNOME 48 (2025-03-19) disabled the X11 session by default from GNOME 49 onward, and GNOME 50 (March 2026) ships with zero X11 code in Mutter — the Wayland backend merge that removed X11 landed 2025-11-05. XFCE, which ARCHIMATION currently ships, is still X11-primary: Xfce 4.20 (2024-12) has only experimental Wayland support via labwc or wayfire (both wlroots-based), xfwm4 remains X11-only, and a brand-new xfwl4 compositor is planned rather than a port. Ubuntu 24.04, Fedora 43, and KDE-based distros are Wayland-default. Hyprland 0.50 (2025-07), 0.53 (2025-12) are production-stable for daily gaming; Niri graduated past 0.1 in 2025-01 (25.01) as a scrollable-tiling daily driver; Sway 1.11 and labwc 0.8.x are mature wlroots compositors.
 
 Gaming on Wayland is finally first-class in 2025-2026. KDE Plasma 6.2 made the Wayland color-management protocol the default for HDR displays; Plasma 6.3 overhauled fractional scaling; Plasma 6.5.3 (2025-11) fixed multi-monitor VRR smoothness. The DRM Color Pipeline API merged to drm-misc-next 2025-11-26, in Linux 6.19-rc1 — AMD is first landing with DCN 3.0+ HDR; NVIDIA announced preview. VRR under KDE Wayland works end-to-end in windowed mode; under Hyprland it works fullscreen-gated via `vrr=2`. GameScope (Valve's micro-compositor) is the de-facto gaming isolation layer: FSR/NIS upscaling (`-F fsr`/`-F nis`), resolution spoofing (`-h`/`-H`), frame limit (`-r`), HDR10 via `--hdr-enabled`, VRR only in embedded/DRM-KMS mode (not nested). XWayland for DXVK games shows measurable performance loss (one report: >60% DXVK drop, 15% native GL drop) vs X11 in 2024; the gap has narrowed but not closed.
 
-**Recommendation for ARCHWINDOWS**: keep X11 as the primary desktop through 2026 (XFCE's Wayland story is 2+ years away), ship GameScope as the gaming compositor of choice in BOTH sessions (it works under X11 and Wayland), preserve `ai.display=x11` as a boot mode for pre-2013 hardware (Ivy Bridge, GMA 3150), and **begin a libwayland backend in pe-loader now as a sibling to `gfx_x11.c` / `gfx_wayland.c` stub** — the abstraction already exists (`gfx_backend_t` in `pe-loader/graphics/gfx_backend.h`), only the implementation is stubbed. Estimated 1,400-1,800 LOC to reach feature parity with the X11 backend (952 LOC today), feature-gated by `GFX_BACKEND=wayland` env var. This is the single piece of engineering that unlocks HDR, VRR, and fractional scaling for Win32 games run under pe-loader.
+**Recommendation for ARCHIMATION**: keep X11 as the primary desktop through 2026 (XFCE's Wayland story is 2+ years away), ship GameScope as the gaming compositor of choice in BOTH sessions (it works under X11 and Wayland), preserve `ai.display=x11` as a boot mode for pre-2013 hardware (Ivy Bridge, GMA 3150), and **begin a libwayland backend in pe-loader now as a sibling to `gfx_x11.c` / `gfx_wayland.c` stub** — the abstraction already exists (`gfx_backend_t` in `pe-loader/graphics/gfx_backend.h`), only the implementation is stubbed. Estimated 1,400-1,800 LOC to reach feature parity with the X11 backend (952 LOC today), feature-gated by `GFX_BACKEND=wayland` env var. This is the single piece of engineering that unlocks HDR, VRR, and fractional scaling for Win32 games run under pe-loader.
 
 ---
 
@@ -49,7 +49,7 @@ Gaming on Wayland is finally first-class in 2025-2026. KDE Plasma 6.2 made the W
 
 ### Takeaway
 
-**2026 is the last year X11 is a credible default**. Rolling distros (Arch, Fedora) ship Wayland-first KDE/GNOME. XFCE is the last holdout among major DEs and its Wayland story is *years* from feature parity. ARCHWINDOWS is currently on the XFCE+X11 path — that's fine for another 12-18 months but needs planning.
+**2026 is the last year X11 is a credible default**. Rolling distros (Arch, Fedora) ship Wayland-first KDE/GNOME. XFCE is the last holdout among major DEs and its Wayland story is *years* from feature parity. ARCHIMATION is currently on the XFCE+X11 path — that's fine for another 12-18 months but needs planning.
 
 ---
 
@@ -59,7 +59,7 @@ Gaming on Wayland is finally first-class in 2025-2026. KDE Plasma 6.2 made the W
 
 **What it is**: A Wayland micro-compositor that runs ONE application (the game) in its own sandboxed compositor. Runs either **embedded** (owns the DRM/KMS device, e.g. Steam Deck's Gaming Mode; ARCH Linux `--steamos3` session) or **nested** (runs inside another compositor, treated as a window).
 
-**Why it matters for ARCHWINDOWS**:
+**Why it matters for ARCHIMATION**:
 - Resolution/refresh spoofing lets a game see only a single virtual display — isolates it from the user's multi-monitor reality. Critical for pe-loader correctness when Win32 enumerates monitors.
 - Direct-scanout bypass: captures frames via Wayland/Xwayland without intermediate copies, flips via DRM/KMS. Lower latency than the normal desktop path.
 - FSR/NIS upscaling for free, regardless of game support. 720p→1440p via `gamescope -h 720 -H 1440 -F fsr -- %command%`.
@@ -67,9 +67,9 @@ Gaming on Wayland is finally first-class in 2025-2026. KDE Plasma 6.2 made the W
 - VRR via `--adaptive-sync` works only in embedded/DRM-KMS mode; nested mode under Hyprland is broken as of [gamescope#1957](https://github.com/ValveSoftware/gamescope/issues/1957) (blocking direct scanout).
 - [Arch Wiki: Gamescope](https://wiki.archlinux.org/title/Gamescope), [ValveSoftware/gamescope](https://github.com/ValveSoftware/gamescope)
 
-**Installation note for ARCHWINDOWS**: already in `profile/packages.x86_64:71` as of Session 33 Agent 8. Session 34's compositor-bypass work added `ai.gamescope_owns_present_loop` — that was the right call.
+**Installation note for ARCHIMATION**: already in `profile/packages.x86_64:71` as of Session 33 Agent 8. Session 34's compositor-bypass work added `ai.gamescope_owns_present_loop` — that was the right call.
 
-**Integration pattern** (recommended for ARCHWINDOWS):
+**Integration pattern** (recommended for ARCHIMATION):
 ```bash
 # Nested launch in any session (desktop mode):
 gamescope -w 1920 -h 1080 -W 2560 -H 1440 -F fsr -f -- \
@@ -99,7 +99,7 @@ See [Arch Wiki: Variable refresh rate](https://wiki.archlinux.org/title/Variable
 - GameScope: `--hdr-enabled` end-to-end.
 - [ArchWiki HDR monitor support](https://wiki.archlinux.org/title/HDR_monitor_support) documents per-compositor state.
 
-**For ARCHWINDOWS**: HDR is now a concrete feature, not a promise. GameScope is the path to expose it to Win32 games under pe-loader.
+**For ARCHIMATION**: HDR is now a concrete feature, not a promise. GameScope is the path to expose it to Win32 games under pe-loader.
 
 ### 2.4 XWayland Performance for pe-loader
 
@@ -117,7 +117,7 @@ Because pe-loader's `gfx_x11.c` uses Xlib, a Wayland user sees pe-loader Win32 w
 
 **The constraint**: Wayland compositors all assume GL or GLES acceleration. Software rendering (`vulkan-swrast` + `llvmpipe`) works but is slow (10-20 fps for desktop compositing on an Atom).
 
-**Hardware ARCHWINDOWS should support**:
+**Hardware ARCHIMATION should support**:
 - Intel GMA 3150 (Pineview, ~2009 netbooks) — no GL2 support, Wayland compositors run in software rendering only.
 - Intel Ivy Bridge HD 4000 (~2012) — GL3.3 works, Wayland in GNOME/KDE fine with a modest performance hit.
 - ThinkPad T61 (GM965, 2007-2008) — KMS works, but no GLES2 — Wayland compositors essentially unusable. [archlinux forum #310154](https://bbs.archlinux.org/viewtopic.php?id=310154)
@@ -129,8 +129,8 @@ Because pe-loader's `gfx_x11.c` uses Xlib, a Wayland user sees pe-loader Win32 w
 
 Expose a GRUB boot entry:
 ```
-GRUB_ENTRY_Arch_X11:    "ARCHWINDOWS (X11 session, compat)"   → ai.display=x11
-GRUB_ENTRY_Arch_Wayland:"ARCHWINDOWS (Wayland session)"       → ai.display=wayland
+GRUB_ENTRY_Arch_X11:    "ARCHIMATION (X11 session, compat)"   → ai.display=x11
+GRUB_ENTRY_Arch_Wayland:"ARCHIMATION (Wayland session)"       → ai.display=wayland
 ```
 
 Back this with a kernel-cmdline-driven session selector:
@@ -243,7 +243,7 @@ All paths absolute as of this session:
 **Don't do**:
 - Rip X11 out. Not yet. Probably not through 2027.
 - Rewrite pe-loader to libwayland-only. The abstraction is correct.
-- Ship a KDE-Wayland default. KWin is huge and will dominate the image; XFCE stays the ARCHWINDOWS look-and-feel.
+- Ship a KDE-Wayland default. KWin is huge and will dominate the image; XFCE stays the ARCHIMATION look-and-feel.
 
 ---
 

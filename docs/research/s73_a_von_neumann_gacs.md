@@ -99,9 +99,9 @@ Gács-Reif 1988 to polynomial in 3D).
 
 ---
 
-## 2. Mapping to ARCHWINDOWS (with file:line refs)
+## 2. Mapping to ARCHIMATION (with file:line refs)
 
-| Von Neumann Part | ARCHWINDOWS Structure | File:Line | Notes |
+| Von Neumann Part | ARCHIMATION Structure | File:Line | Notes |
 |---|---|---|---|
 | **A — Universal Constructor** | `trust_ioctl()` + `trust_dispatch` cmd buffer processor | `trust/kernel/trust_core.c:222` + `trust/kernel/trust_dispatch.c:1-2191` | Reads packed 32-bit instructions (tape) and *builds* trust effects in kernel state. 48-entry dispatch table (6 families × 8 opcodes), bsearch-indexed. |
 | **B — Tape Copier** | `trust_chromosome_inherit()` + `trust_ape_create_entity()` | `trust/kernel/trust_chromosome.c:216-241` + `trust/kernel/trust_ape.c` (fresh-seed path) | Memcpy of a+b segments parent→child; mitotic child gets chromosome copy, fresh APE seed (NOT inherited — gap). |
@@ -150,7 +150,7 @@ replica, majority).
 
 ## 3. Mapping to User's Biological Framework
 
-| User's bio structure | VN-constructor part | ARCHWINDOWS equivalent |
+| User's bio structure | VN-constructor part | ARCHIMATION equivalent |
 |---|---|---|
 | **Cell** (`trust_subject_t`) | The child machine being built | 496-byte subject struct in TLB |
 | **Ribosome** | Universal Constructor A | `trust_dispatch.c` cmd processor + `trust_risc.c` record-action path |
@@ -224,7 +224,7 @@ The cmd buffer is read-only during dispatch. This is safer but
 *rules out* the emergent self-modification that makes vN's Class 4
 behavior possible. Modern NCAs (ICLR 2025) achieve universality only
 because the substrate *can* modify itself. If we ever want
-ARCHWINDOWS to **evolve** rather than merely *replicate*, we need a
+ARCHIMATION to **evolve** rather than merely *replicate*, we need a
 "write-instruction" opcode. Contra-indicated for a security kernel —
 but a controlled userspace version (in `ai-control/cortex/`) is
 tractable.
@@ -429,7 +429,7 @@ behavior von Neumann demanded in 1956.
 ## 7. Summary
 
 Von Neumann's 1948-49 construction is an astonishingly good fit for
-ARCHWINDOWS. The four parts (constructor / copier / controller / tape)
+ARCHIMATION. The four parts (constructor / copier / controller / tape)
 map cleanly to our dispatcher + chromosome-inherit + mitotic-divide +
 ISA batch. The user's biology framework also maps beautifully:
 **ribosome = `trust_dispatch.c`, mRNA = `trust_cmd_buffer_t`, DNA =

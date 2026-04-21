@@ -613,7 +613,7 @@ Key property: **gene flow bypasses reproduction**. A bacterium can acquire novel
 - **Conjugation:** would require IPC-based DLL handle sharing. UNIX domain sockets with SCM_RIGHTS could pass mmap'd DLL image fds between processes. The receiving process would skip its own import resolution. (Referenced as potential S65 work in the memory files.)
 - **Transduction:** would require a "carrier" process model — a service that offers packaged DLLs on request. Effectively what Windows SxS (Side-by-Side) does but across the Linux boundary.
 
-The **transformation** case is load-bearing for the paper's claim — the whole premise of ARCHWINDOWS is that foreign Windows binaries execute under the trust kernel. This IS the mechanism. **The biology vocabulary here is not metaphor; it's literally what's happening.**
+The **transformation** case is load-bearing for the paper's claim — the whole premise of ARCHIMATION is that foreign Windows binaries execute under the trust kernel. This IS the mechanism. **The biology vocabulary here is not metaphor; it's literally what's happening.**
 
 ---
 
@@ -647,7 +647,7 @@ Both would benefit from closing the gap (see #3 + #9 above). Both would make the
 
 The PE loader + binfmt_misc ecosystem is **literally transformation**: foreign DNA (Windows .exe) is taken up by a competent cell (Linux process running the loader), degraded-and-recombined (import resolution patches IAT), and the integrated information starts functioning (the program runs).
 
-This isn't just architecturally accurate — it's the thing that differentiates ARCHWINDOWS from Wine conceptually. Wine reimplements the Win32 API surface; ARCHWINDOWS accepts the foreign DNA directly. The "trust-mediated horizontal gene transfer" framing is honest AND load-bearing for the product story.
+This isn't just architecturally accurate — it's the thing that differentiates ARCHIMATION from Wine conceptually. Wine reimplements the Win32 API surface; ARCHIMATION accepts the foreign DNA directly. The "trust-mediated horizontal gene transfer" framing is honest AND load-bearing for the product story.
 
 ---
 

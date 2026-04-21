@@ -1,4 +1,4 @@
-# ARCHWINDOWS — S75 Roadmap + Strategic Handoff
+# ARCHIMATION — S75 Roadmap + Strategic Handoff
 
 **Document status:** S74 Agent O deliverable (strategic planning, no source
 edits).
@@ -66,7 +66,7 @@ Post-S74 (expected; pending Agent K's final bake + PE corpus):
 architectural specification. Paper remains `PLAN/Root_of_Authority_Full_Paper`
 at DOI 10.5281/zenodo.18710335; `architecture-v2.md` is the implementation-side
 companion. Name: **KEEP EXISTING** per `docs/architecture-name-decision.md`
-(Root of Authority for the primitive, ARCHWINDOWS for the distribution). No
+(Root of Authority for the primitive, ARCHIMATION for the distribution). No
 S74 research finding argued for a rename. S75 will treat this as settled unless
 the user overrides.
 
@@ -691,7 +691,7 @@ For the next session's Claude instance.
 ### §4.1 Decisions already made in S74 — do not re-litigate
 
 - **Architecture name: KEEP** per `docs/architecture-name-decision.md`. Root of
-  Authority names the primitive; ARCHWINDOWS names the distribution.
+  Authority names the primitive; ARCHIMATION names the distribution.
 - **Trust ISA: NO self-emission** (research-F §0, §1, §7). The Turing-
   incompleteness is a moat feature, not a gap. Do NOT add homoiconicity.
 - **Meiosis fate:** still open — rename or disclaimer or both (Decision 1
@@ -929,7 +929,7 @@ re-stage, create a NEW commit.
 
 ## §8. Closing orientation
 
-S75 is the first session where ARCHWINDOWS starts shipping **validated** claims
+S75 is the first session where ARCHIMATION starts shipping **validated** claims
 rather than *asserted* claims. The theorem harness (Item 1) is the load-bearing
 move: every Tier-1 item after it compounds on a foundation of "things that
 demonstrably work" rather than "things that theoretically work."

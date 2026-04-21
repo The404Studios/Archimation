@@ -1,7 +1,7 @@
 # S74 Agent E — 23-Pair Chromosomal Model: Biology vs Metaphor
 
 **Session 74 · Research Axis E · 2026-04-20**
-**Scope:** Critical audit of the ARCHWINDOWS trust-kernel "23-pair chromosomal authority" model against real molecular/cell biology. Identify what is biologically faithful, what is accurate metaphor, what is architectural-only, and what claims would fail peer review in a biology venue.
+**Scope:** Critical audit of the ARCHIMATION trust-kernel "23-pair chromosomal authority" model against real molecular/cell biology. Identify what is biologically faithful, what is accurate metaphor, what is architectural-only, and what claims would fail peer review in a biology venue.
 **Source-of-truth:** `trust/include/trust_chromosome.h`, `trust/include/trust_types.h:151-248`, `trust/kernel/trust_chromosome.c`, `trust/kernel/trust_meiosis.c`, `trust/kernel/trust_lifecycle.c` (mitosis), `trust/include/trust_theorems.h` (T4 bounded-authority, T6 metabolic fairness).
 **Cited paper (the project's reference):** Roberts/Eli/Leelee, *Root of Authority*, Zenodo DOI 10.5281/zenodo.18710335.
 **Research-only.** No source edits. No modifications to the cited paper's claims either; this is critical commentary, not a rewrite.
@@ -58,7 +58,7 @@ The great-ape lineage had 24 chromosome pairs; **human chromosome 2 is the end-t
 
 - *Source:* [Chromosome 2 — Wikipedia](https://en.wikipedia.org/wiki/Chromosome_2); [Revised time estimation of the ancestral human chromosome 2 fusion — BMC Genomics 2022](https://link.springer.com/article/10.1186/s12864-022-08828-7); [When did human chromosome 2 fuse? — John Hawks 2023](https://www.johnhawks.net/p/when-did-human-chromosome-2-fuse).
 
-**Implication for ARCHWINDOWS:** choosing 23 is cosplaying a *parochial primate* genome. If the paper aspires to generality ("every authority subject has 23 pairs"), it is overclaiming. Our subjects are closer to bacteria (one "authority genome" per subject, no sex) in architectural role — bacteria have **one circular chromosome**, not 23 pairs.
+**Implication for ARCHIMATION:** choosing 23 is cosplaying a *parochial primate* genome. If the paper aspires to generality ("every authority subject has 23 pairs"), it is overclaiming. Our subjects are closer to bacteria (one "authority genome" per subject, no sex) in architectural role — bacteria have **one circular chromosome**, not 23 pairs.
 
 ### 1.4 Is there a biological reason FOR 23?
 
@@ -365,7 +365,7 @@ Both T4 and T6 are **formally stateable without any chromosome vocabulary**. The
 
 Cross-checks performed:
 
-| ARCHWINDOWS element | Alberts ch ref | Verdict |
+| ARCHIMATION element | Alberts ch ref | Verdict |
 |---|---|---|
 | Mitotic division | Ch 17 | Matches at abstraction level |
 | Meiotic combination | Ch 21 | Does NOT match — missing synaptonemal complex, PRDM9, DSB/dHJ |
@@ -407,7 +407,7 @@ Bacteria famously exchange genetic material via **conjugation, transformation, a
 - doesn't require cell division;
 - can cross species boundaries.
 
-Our ARCHWINDOWS model has nothing resembling HGT. If we *were* modeling bacterial-style architecture (one chromosome, no pairs, plasmid accessory modules), we'd model package installs / dlopen / LD_PRELOAD as HGT. We don't. This is a **gap** if we wanted to claim prokaryote-universal coverage — but the paper doesn't claim that, so it's not a gap against its own scope.
+Our ARCHIMATION model has nothing resembling HGT. If we *were* modeling bacterial-style architecture (one chromosome, no pairs, plasmid accessory modules), we'd model package installs / dlopen / LD_PRELOAD as HGT. We don't. This is a **gap** if we wanted to claim prokaryote-universal coverage — but the paper doesn't claim that, so it's not a gap against its own scope.
 
 - *Source:* [Horizontal Gene Transfer — Microbial Genetics](https://open.maricopa.edu/microbialgenetics/chapter/horizontal-gene-transfer/).
 
@@ -442,7 +442,7 @@ Biology has at least four major epigenetic inheritance modes that our Parent A /
 
 ### 8.2 What mapping could our system do?
 
-| Biological mechanism | Possible ARCHWINDOWS analogue | Currently modeled? |
+| Biological mechanism | Possible ARCHIMATION analogue | Currently modeled? |
 |---|---|---|
 | DNA methylation (CpG) | Overlay mask of "disabled" segments | No |
 | Histone modifications | Per-segment modifier flags (active/repressed) | No |
@@ -604,7 +604,7 @@ Primary biology sources cited (25 sources, 2020-2026 weighted):
 
 ## 13. Final verdict
 
-The ARCHWINDOWS trust kernel uses biology vocabulary honestly **as architectural inspiration**, but several key labels overclaim biological fidelity:
+The ARCHIMATION trust kernel uses biology vocabulary honestly **as architectural inspiration**, but several key labels overclaim biological fidelity:
 
 1. **23 pairs** — cosmetic, not structural, and not universal. Keep as mnemonic with disclaimer.
 2. **Parent A / Parent B** — mislabeled axis. What we actually have is phenotype/genotype within one subject, not a two-parent inheritance. Keep the split; rename the axis.

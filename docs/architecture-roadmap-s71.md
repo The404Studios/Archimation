@@ -1,4 +1,4 @@
-# ARCHWINDOWS — Architecture Roadmap S71
+# ARCHIMATION — Architecture Roadmap S71
 
 **Synthesis of 12 parallel research reports** (S71 agents A-L, 2026-04-20).
 
@@ -123,7 +123,7 @@ The distribution ships one ISO + one package-tree + one install path. Hardware t
 
 From the research, explicit "don't" list:
 
-- **Don't build an OSTree-native ARCHWINDOWS** as primary — too much rework for unclear user demand (Agent G).
+- **Don't build an OSTree-native ARCHIMATION** as primary — too much rework for unclear user demand (Agent G).
 - **Don't chase Python io_uring** — ecosystem still broken in 2026; Granian is Tokio not tokio-uring (Agent J).
 - **Don't start with DPO/PPO/GRPO** — 121-way handler classification is a bandit problem, not an LLM problem (Agent L).
 - **Don't LTO_CLANG_FULL** — breaks BTF (Agent H).
@@ -143,7 +143,7 @@ From the research, explicit "don't" list:
 - **S76**: Tier 2 item 7 (trust-bpf sidecar parity). Requires libbpf-rs toolchain; dedicated build-system session.
 - **S77**: Tier 2 item 10 (scx_lavd pilot) + item 12 (llama-server tier detection). New-hardware demonstration.
 
-Total: 6 sessions → ARCHWINDOWS pkg-30-ish ships with signed kernel modules, atomic updates, PE32 support, Wayland optional, LSM-proper trust.ko, learning AI cortex, hybrid-CPU-aware scheduling, and on-device LLM tier.
+Total: 6 sessions → ARCHIMATION pkg-30-ish ships with signed kernel modules, atomic updates, PE32 support, Wayland optional, LSM-proper trust.ko, learning AI cortex, hybrid-CPU-aware scheduling, and on-device LLM tier.
 
 ---
 

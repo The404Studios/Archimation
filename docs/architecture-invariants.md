@@ -1,4 +1,4 @@
-# Architecture Invariants — ARCHWINDOWS / Root-of-Authority
+# Architecture Invariants — ARCHIMATION / Root-of-Authority
 
 **Document purpose.** Formalise the architectural invariants that make
 this specifically an **architecture** (as opposed to a pile of features)
@@ -655,7 +655,7 @@ attestation).
 ## §12. Closing notes
 
 **These nine invariants are the architecture.** A system that
-preserves all nine is an instance of the ARCHWINDOWS / Root-of-
+preserves all nine is an instance of the ARCHIMATION / Root-of-
 Authority architecture. A system that violates one of them is *not*
 an instance; it is a related-but-distinct system that may or may not
 have similar security properties.

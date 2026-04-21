@@ -11,7 +11,7 @@
 
 ## 1. Executive summary
 
-The S72 strategic decision — migrate ARCHWINDOWS from mutable archiso to an
+The S72 strategic decision — migrate ARCHIMATION from mutable archiso to an
 image-mode OS — commits us to one of four families of tooling:
 
 1. **`bootc` on top of OSTree + composefs** (upstream, CNCF Sandbox).
@@ -37,7 +37,7 @@ patterns to cherry-pick without being on the bleeding edge.
 
 ### 2.1 Criteria
 
-| # | Criterion | Why it matters for ARCHWINDOWS |
+| # | Criterion | Why it matters for ARCHIMATION |
 |---|---|---|
 | C1 | `/usr` integrity at mount time | The trust kernel's authority proofs are meaningless if `/usr/bin/pe-loader` can be swapped offline. |
 | C2 | TPM2 / measured-boot support | We want cert-chain-to-TPM anchoring in S74+. Needs fs-verity digest in cmdline → measured into a PCR. |
@@ -197,7 +197,7 @@ From [ublue-os/image-template](https://github.com/ublue-os/image-template):
              │ bash bootc/build-bootc.sh          │
              │   bind-mounts repo/x86_64/         │
              │   invokes buildah > podman > docker│
-             │   writes archwindows-bootc:dev     │
+             │   writes archimation-bootc:dev     │
              └─────────────────┬──────────────────┘
                                │
                   ┌────────────┴─────────────┐
@@ -244,7 +244,7 @@ with the requested packages and makes it the next-boot target. The
 mechanism is the same as an upgrade, just with a locally-modified image.
 
 **Phase 3 (S74+, aspirational): declarative overlay spec.** A yaml file
-under `/etc/archwindows/overlay.yaml` listing packages the user wants;
+under `/etc/archimation/overlay.yaml` listing packages the user wants;
 `bootc upgrade` honors it by producing a sibling image each cycle. This is
 how Universal Blue does it, approximately, and it's the best UX — but it's
 a non-trivial amount of tooling we haven't designed yet.
@@ -259,7 +259,7 @@ a non-trivial amount of tooling we haven't designed yet.
 | Pull but don't apply | `bootc upgrade --apply=false` | Fetches layers, stages nothing. Good for pre-download. |
 | Pull and stage for next boot | `bootc upgrade` | Default. Next `systemctl reboot` boots the new image. |
 | Apply a previously-downloaded update | `bootc upgrade --apply` | Pairs with `--apply=false`. |
-| Switch to a different image stream | `bootc switch ghcr.io/.../archwindows-bootc:beta` | Cross-stream; full-image replacement. |
+| Switch to a different image stream | `bootc switch ghcr.io/.../archimation-bootc:beta` | Cross-stream; full-image replacement. |
 | Rollback to previous deployment | `bootc rollback` | Swaps boot-entry ordering. Next reboot boots previous. |
 | Inspect current deployment | `bootc status` | Shows booted, rollback, staged. JSON output via `--json`. |
 | Wipe staged update | `bootc upgrade --reset` | Un-stages; keeps booted deployment. |
@@ -354,7 +354,7 @@ To keep scope tight:
 - [x] `bootc/README.md` documents the build / install / upgrade / rollback flow. **Shipped, ~200 lines.**
 - [x] This research doc exists, ≥ 10 citations, named prior art. **This doc, ~450 lines, 13+ citations.**
 - [ ] `podman build bootc/` produces an image (deferred to S73 on real Arch host — NOT attempted on WSL2 per agent instruction).
-- [ ] Image smoke-tests: `podman run archwindows-bootc:dev` drops into a shell, `/usr/bin/pe-loader` present, `pacman -Q trust-system pe-loader ai-control-daemon` returns three installed packages. **Deferred to Agent γ CI.**
+- [ ] Image smoke-tests: `podman run archimation-bootc:dev` drops into a shell, `/usr/bin/pe-loader` present, `pacman -Q trust-system pe-loader ai-control-daemon` returns three installed packages. **Deferred to Agent γ CI.**
 
 ---
 
@@ -401,7 +401,7 @@ To keep scope tight:
   signed-module build between Steps 4 and 5 (or as a late step — the
   symlink layout is already ready to receive `/usr/lib/modules/<kver>/extra/trust.ko`).
 - **Agent γ** (rollback tests, CI): `bootc/build-bootc.sh` writes tag
-  `archwindows-bootc:dev` by default; your rollback test can pull that
+  `archimation-bootc:dev` by default; your rollback test can pull that
   tag, `bootc install to-disk` it into a QEMU disk, do an `upgrade` to
   `:dev-v2`, then `rollback`. All three commands are documented in the
   README.

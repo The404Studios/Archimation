@@ -1,4 +1,4 @@
-# S72-β — DKMS to bootc transition, module signing, and key management for ARCHWINDOWS
+# S72-β — DKMS to bootc transition, module signing, and key management for ARCHIMATION
 
 **Agent:** Research Agent β (Session 72 Phase 1 foundation push)
 **Date:** 2026-04-20
@@ -15,7 +15,7 @@ S71-K flagged that `trust-dkms` ships unsigned sources and builds on first boot.
 2. **Pinned kernel at image build time.** `bootc upgrade` replaces the entire image atomically. The kernel version inside an image is frozen; kernel headers on the target may never match. DKMS's "rebuild on every kernel change" premise assumes a mutable system.
 3. **Signed chain-of-trust.** bootc images are expected to be signed (cosign, Sigstore, etc.) end-to-end, and the bootc community expects anything in `/usr/lib/modules/*/extra` to be signed by a key whose cert is in the image. An unsigned module under `lockdown=integrity` (the setting `linux-hardened` flips by default — see [kernel_lockdown(7)](https://man7.org/linux/man-pages/man7/kernel_lockdown.7.html)) just **won't load**.
 
-ARCHWINDOWS's moat is `trust.ko`. Shipping it unsigned to a bootc deployment is equivalent to shipping no moat at all.
+ARCHIMATION's moat is `trust.ko`. Shipping it unsigned to a bootc deployment is equivalent to shipping no moat at all.
 
 ---
 
@@ -75,7 +75,7 @@ For Secure Boot, Silverblue ships `silverblue-akmods-keys` ([Silverblue first im
 | `integrity`            | `lockdown=integrity`            | **Refused**      | Readable by root                  | Default for any Secure Boot + linux-hardened     |
 | `confidentiality`      | `lockdown=confidentiality`      | **Refused**      | Hidden even from root             | Paranoid workloads; closed appliances; BPF-lite  |
 
-The critical clause for us: **linux-hardened upstream defaults to `integrity`** (which Arch packages as-is). Any user installing `linux-hardened` on ARCHWINDOWS with an unsigned `trust.ko` will silently get a system where the Root of Authority never loads. This is the single worst failure mode we need to prevent before Phase 2.
+The critical clause for us: **linux-hardened upstream defaults to `integrity`** (which Arch packages as-is). Any user installing `linux-hardened` on ARCHIMATION with an unsigned `trust.ko` will silently get a system where the Root of Authority never loads. This is the single worst failure mode we need to prevent before Phase 2.
 
 ### 1.5 Arch sbctl + mokutil tooling
 
@@ -93,7 +93,7 @@ Phoronix reported Nov 2025 that [Linux is dropping SHA-1 from the module signing
 
 ---
 
-## 2. ARCHWINDOWS key management choice
+## 2. ARCHIMATION key management choice
 
 ### 2.1 The three key spaces
 
@@ -121,7 +121,7 @@ This S72-β doc covers **the first two**. The third is Agent γ's patch and is d
 
 **Decision: hybrid.** `bootc/build-trust-module.sh` takes a project key as input (from CI secret), signs at build time, ships cert in image. `trust-dkms.install` tries project key at `/var/lib/ai-control/trust-*.{pem,der}` first, site override at `/etc/ai-control/signing.conf` second, lazy-generated per-install MOK third, unsigned-with-warning fourth. This lets:
 
-- Home users: boot bootc image, run one-time `mokutil --import /usr/share/archwindows/trust-pub.der`, reboot, done.
+- Home users: boot bootc image, run one-time `mokutil --import /usr/share/archimation/trust-pub.der`, reboot, done.
 - Fleet operators: drop their own `/etc/ai-control/signing.conf` into the image via a derived layer, re-sign during derive.
 - Developers on archiso/legacy: DKMS auto-generates a per-install MOK, prints `mokutil --import` hint, works same as Ubuntu's NVIDIA flow.
 - Anti-integrity users (old HW, lockdown=none): everything works without signing; loud warning, no functional loss.
@@ -129,9 +129,9 @@ This S72-β doc covers **the first two**. The third is Agent γ's patch and is d
 ### 2.3 Project MOK lifecycle
 
 - **Generation:** Once, on a secure CI-vault host. 4096-bit RSA, SHA-256, 395-day validity. See `bootc/trust-keys/README.md` §3 for exact openssl invocation.
-- **Storage:** Private key only in GitHub Actions secret `TRUST_MOK_PRIV_PEM` (base64). Public cert in image at `/usr/share/archwindows/trust-pub.der`. Public also kept next to private in CI vault for audit — never shipped.
+- **Storage:** Private key only in GitHub Actions secret `TRUST_MOK_PRIV_PEM` (base64). Public cert in image at `/usr/share/archimation/trust-pub.der`. Public also kept next to private in CI vault for audit — never shipped.
 - **Rotation:** Annual. New secret name `_V<n+1>`, old `_V<n>` kept for one release cycle. Image ships both pubs, user MOK-enrolls both; two cycles later old pub is dropped. See README §7.
-- **Emergency rotation:** Key compromise → SBAT bump + `archwindows-trust-revoke` hotfix package + 7-day target update window. Standard Red Hat drill, scaled down.
+- **Emergency rotation:** Key compromise → SBAT bump + `archimation-trust-revoke` hotfix package + 7-day target update window. Standard Red Hat drill, scaled down.
 
 ---
 
@@ -190,7 +190,7 @@ Two builds of the same source against the same kernel version with the same comp
 - `modprobe trust` → fails, `dmesg` shows "module verification failed: signature and/or required key missing — tainting kernel"
 - `/dev/trust` missing → ai-control daemon falls back to software-only mode with a loud SCM event
 
-UX response: first-boot wizard `archwindows-enroll-mok` detects this state and offers three choices:
+UX response: first-boot wizard `archimation-enroll-mok` detects this state and offers three choices:
 1. Enroll project MOK now (recommended; step through `mokutil --import` + reboot)
 2. Disable Secure Boot in firmware (F2 walkthrough)
 3. Proceed without `trust.ko` (trust-mediated features off, warn loudly)
@@ -215,7 +215,7 @@ This is why our install path **always** attempts to sign (even on archiso), and 
 
 There is a subtle gotcha: enrolling a MOK with `mokutil --import` loads it into shim's MokList at reboot, but **does not automatically propagate it to the kernel's `.machine` keyring** on modern kernels. The missing step is `mokutil --trust-mok` (sets `MokListTrustedRT=01`), which is documented in [itsfoss.gitlab.io — module verification signature missing](https://itsfoss.gitlab.io/blog/module-verification-signature-and-or-required-key-missing-tainting-kernel/).
 
-Our `archwindows-enroll-mok` wizard runs **both** import and trust-mok in the same flow, so users who go through the wizard don't hit this gotcha. Users who run `mokutil` manually may; we document it in `bootc/trust-keys/README.md` §6.
+Our `archimation-enroll-mok` wizard runs **both** import and trust-mok in the same flow, so users who go through the wizard don't hit this gotcha. Users who run `mokutil` manually may; we document it in `bootc/trust-keys/README.md` §6.
 
 ---
 
@@ -232,7 +232,7 @@ Our `archwindows-enroll-mok` wizard runs **both** import and trust-mok in the sa
 
 **S72 known gaps handed off to S73 or later:**
 
-- `archwindows-enroll-mok` first-boot wizard. Today users run `mokutil --import` manually; wizard is scoped but not implemented.
+- `archimation-enroll-mok` first-boot wizard. Today users run `mokutil --import` manually; wizard is scoped but not implemented.
 - Project MOK genesis. S72 lands the tooling; the actual first keypair must be generated on a CI vault host out-of-band and stored as GitHub Actions secrets before the Containerfile build works for real. Until then, `ALLOW_UNSIGNED=1` is set in CI and the resulting image is marked "unsigned — dev only".
 - SBAT integration. Our `trust-pub.der` has no SBAT stanza yet. When we wire it up ([shim SBAT.md](https://github.com/rhboot/shim/blob/main/SBAT.md)), we'll get the "per-generation revocation" property that Red Hat uses post-BootHole.
 - Sidecar RPM style kmod-trust packages matching each supported kernel ABI. Right now we only support the one kernel version the bootc base image pins. For rpm-ostree style layering of alternate kernels, we'd need to build kmod-trust-<kver> packages the way akmods does.
@@ -255,10 +255,10 @@ dmesg | grep -E 'module verification failed' && echo "BAD: unverified — MOK no
 
 # (3) The cert you have in hand is the cert that signed the module
 modinfo /usr/lib/modules/$(uname -r)/extra/trust.ko | grep -E 'sig_hashalgo|signer'
-openssl x509 -inform DER -in /usr/share/archwindows/trust-pub.der -noout -subject -fingerprint -sha256
+openssl x509 -inform DER -in /usr/share/archimation/trust-pub.der -noout -subject -fingerprint -sha256
 
 # (4) MOK is enrolled AND trusted by kernel
-mokutil --list-enrolled | grep -iE 'archwindows|trust.ko'
+mokutil --list-enrolled | grep -iE 'archimation|trust.ko'
 keyctl list %:.machine   # on 5.13+; should include the project cert
 
 # (5) Lockdown state

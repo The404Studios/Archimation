@@ -1,6 +1,6 @@
-# ArchWindows User Manual
+# Archimation User Manual
 
-Welcome. This manual is for end users -- people booting the ArchWindows ISO on
+Welcome. This manual is for end users -- people booting the Archimation ISO on
 a laptop or VM, not developers hacking on the distro. If you want build
 instructions, start at [`build.md`](build.md) instead.
 
@@ -9,9 +9,9 @@ about what works today and what doesn't.
 
 ---
 
-## 1. What is ArchWindows?
+## 1. What is Archimation?
 
-ArchWindows is a custom Arch Linux distribution with three unusual features:
+Archimation is a custom Arch Linux distribution with three unusual features:
 
 - **Native `.exe` execution.** A built-in PE loader runs many Windows
   executables directly, without Wine. Double-click a `.exe` in the file
@@ -24,7 +24,7 @@ ArchWindows is a custom Arch Linux distribution with three unusual features:
   natural-language commands (`ai play music`, `ai lock the screen`) and
   routes them to the right system call.
 
-ArchWindows **does not**:
+Archimation **does not**:
 
 - run Photoshop, Microsoft Office, or Adobe Premiere. They use Windows APIs
   we haven't implemented, and anyway you can run them under Wine/Proton on
@@ -63,7 +63,7 @@ GRUB menu (or systemd-boot, if your firmware prefers it):
   normal graphical session with `ai-control.service` and
   `ai-cortex.service` masked. Use this if the AI daemon is crashing the
   system at startup.
-- **Install ArchWindows to Disk** -- triggers the disk installer flow (see
+- **Install Archimation to Disk** -- triggers the disk installer flow (see
   section 6).
 - **AI Arch Linux - Safe Mode (nomodeset, no splash)** -- for graphics
   card trouble, not AI-daemon trouble. This is a *different* safe mode.
@@ -134,7 +134,7 @@ Enter to launch.
   run under Wine.
 - **Apps with DRM.** Denuvo, Arxan, Vanguard, BattleEye. We don't (and
   won't) defeat these. Expected error: the app crashes on startup or
-  refuses to run. No workaround in ArchWindows.
+  refuses to run. No workaround in Archimation.
 - **DirectX 12 Ultimate / mesh shaders.** VKD3D-Proton covers most but
   not all DX12 features. If a game refuses to launch, try the DX11
   renderer in its graphics settings.
@@ -163,7 +163,7 @@ journalctl -u systemd-binfmt -n 50
 
 ## 4. The AI control daemon
 
-ArchWindows ships with an AI system-control service on TCP port 8420
+Archimation ships with an AI system-control service on TCP port 8420
 (`ai-control.service`) and a decision engine on 8421
 (`ai-cortex.service`). These speak JSON over HTTP and accept both
 structured commands and natural-language phrases.
@@ -184,7 +184,7 @@ execution under AI control." The daemon is the control plane; it decides
 what gets to run, what priority it runs at, and whether the trust kernel
 lets a given operation through.
 
-You can use ArchWindows without ever typing `ai <anything>`, but the
+You can use Archimation without ever typing `ai <anything>`, but the
 daemon is still running in the background, observing. If you don't want
 that, use safe mode at boot (section 2) or mask the services once
 installed:
@@ -219,7 +219,7 @@ to `/contusion/context` on 8420.
 
 ## 5. Trust scores explained
 
-Every process on ArchWindows is a "trust subject" in the kernel. Subjects
+Every process on Archimation is a "trust subject" in the kernel. Subjects
 have a trust score (0 to 1000) and a token balance. Here is what happens:
 
 1. When a process launches, the kernel creates a `trust_subject_t` for
@@ -247,7 +247,7 @@ You as the interactive user can spend tokens on demand by typing
 enough authority tokens yourself. This mostly matters when debugging a
 process that keeps getting throttled.
 
-You do not need to understand the token economics to use ArchWindows
+You do not need to understand the token economics to use Archimation
 day-to-day. The defaults are tuned so that typical desktop use never
 trips trust gates. The system quietly keeps logs, and if something gets
 killed unexpectedly `journalctl -u ai-control` will tell you why.
@@ -257,15 +257,15 @@ killed unexpectedly `journalctl -u ai-control` will tell you why.
 ## 6. Installing to disk
 
 Booting the ISO repeatedly is fine for evaluation. To install
-ArchWindows permanently, use the disk installer. From a terminal:
+Archimation permanently, use the disk installer. From a terminal:
 
 ```bash
 sudo ai-install-to-disk
 ```
 
-Or pick **Install ArchWindows to Disk** from the GRUB menu, which
+Or pick **Install Archimation to Disk** from the GRUB menu, which
 triggers the same installer. There's also a desktop entry named
-*Install ArchWindows* in the Applications menu.
+*Install Archimation* in the Applications menu.
 
 The installer asks for:
 
@@ -351,7 +351,7 @@ dmesg | grep -i trust | tail -20
   `sudo pacman -Syu trust-dkms`.
 - DKMS couldn't build it. Install kernel headers:
   `sudo pacman -S linux-headers && sudo dkms autoinstall`.
-- Still failing? You can boot without it -- ArchWindows degrades
+- Still failing? You can boot without it -- Archimation degrades
   cleanly to plain Arch Linux with a PE loader and nothing trust-gated.
   Mask the module at boot: add `trust.disabled=1` to the kernel cmdline.
 
@@ -415,7 +415,7 @@ Don't include:
 
 ## 9. License + credits
 
-ArchWindows is distributed under the terms of its component licenses:
+Archimation is distributed under the terms of its component licenses:
 
 - **Linux kernel**: GPLv2. See `/usr/src/linux-*/COPYING`.
 - **Trust kernel module** (`trust.ko`): GPLv2, in-tree with the kernel

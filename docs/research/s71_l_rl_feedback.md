@@ -2,7 +2,7 @@
 
 **Agent:** Research Agent L (S71 12-agent push)
 **Date:** 2026-04-20
-**Scope:** Can ARCHWINDOWS's cortex learn from its own operation, and if yes, with what methods / what cost / what privacy posture?
+**Scope:** Can ARCHIMATION's cortex learn from its own operation, and if yes, with what methods / what cost / what privacy posture?
 
 ---
 
@@ -28,7 +28,7 @@ Before talking about "add RL to it", the hard question is: what does "it" know r
 
 Ranked roughly by "setup pain for our pipeline".
 
-| Method                          | Data needed                                       | Compute (train)                                  | Compute (infer)                  | Works offline? | Fit for ARCHWINDOWS                                                                                       |
+| Method                          | Data needed                                       | Compute (train)                                  | Compute (infer)                  | Works offline? | Fit for ARCHIMATION                                                                                       |
 |---------------------------------|---------------------------------------------------|--------------------------------------------------|----------------------------------|----------------|-----------------------------------------------------------------------------------------------------------|
 | **Contextual bandits** (Thompson / LinUCB) | (context, arm, reward) tuples                     | **None — online update** in O(k) per call        | O(k) — k ≈ |handlers| ≤ 121      | Yes            | **Best-first** option. Zero new ML infra; just bookkeeping in `DecisionMarkovModel` or next to it.       |
 | **Frequency-weighted n-grams** (kitchen-sink Markov) | Ambient route logs                                | Free — already happening                          | O(1) dict lookup                 | Yes            | We already do this 4× (decision, NL, syscall, trust). Extending n from 2→3 is cheap.                      |
@@ -46,7 +46,7 @@ Ranked roughly by "setup pain for our pipeline".
 
 ---
 
-## 2. What ARCHWINDOWS actually has that is fertile ground
+## 2. What ARCHIMATION actually has that is fertile ground
 
 ### 2.1 The trace substrate already exists
 
@@ -196,7 +196,7 @@ Per [Qwen docs](https://qwen.readthedocs.io/en/v2.5/benchmark/speed_benchmark.ht
 
 [DSPy (ICLR 2024)](https://arxiv.org/abs/2310.03714) and the broader "compiled prompt" research line demonstrate that **on classification-shaped tasks, retrieving the nearest past trace and dropping it into the LLM context is within a few % of fine-tuning, with 0 training infra.**
 
-For ARCHWINDOWS specifically:
+For ARCHIMATION specifically:
 - Encode all successful traces once (~11 K short utterances × 384 dims × float32 = ~17 MB).
 - At inference: encode user utterance, retrieve top-5, feed to the small LLM as `f"Past similar requests: {traces}. Current: {utt}. handler_type =?"`.
 - If no LLM loaded, skip to "top-1 retrieval wins".

@@ -1,4 +1,4 @@
-# S74-C — Endosymbiosis & Mitochondrial Mechanism Depth for ARCHWINDOWS
+# S74-C — Endosymbiosis & Mitochondrial Mechanism Depth for ARCHIMATION
 
 **Framework agent**: C of 10 parallel (S74 research axis: mitochondrial biology →
 retrograde signaling primitives).
@@ -23,11 +23,11 @@ sites (MAMs). Collectively these close the feedback loop that lets the nucleus
 
 S73-G mapped PE loader → mitochondrion structurally. This S74-C audit asked:
 of the 14 known mechanisms by which a real mitochondrion signals up to its
-nucleus, how many does ARCHWINDOWS implement, and at what fidelity?
+nucleus, how many does ARCHIMATION implement, and at what fidelity?
 
 **Verdict in one table**:
 
-| Mechanism | Signal produced | ARCHWINDOWS analogue | File:line | Fidelity |
+| Mechanism | Signal produced | ARCHIMATION analogue | File:line | Fidelity |
 |---|---|---|---|---|
 | 1. SET (origin) | ontological, not runtime | PE loader loaded as foreign symbiont, marked `TRUST_DOMAIN_WIN32` | `ai-control/daemon/trust_observer.py:31` | faithful |
 | 2. mtDNA retention (37 genes) | genome partitioning | CoRR-locked core stays in PE stubs | `pe-loader/dlls/kernel32/kernel32_file.c:39` | partial |
@@ -89,7 +89,7 @@ retrograde-signaling axis flagged in the task specification.
    exception-correlation in decision_engine.
 
 The rest of the document: each of the 14 mechanisms, one section each,
-exactly as required (biology citation, signal, ARCHWINDOWS analogue grep,
+exactly as required (biology citation, signal, ARCHIMATION analogue grep,
 gap sketch, fidelity rating).
 
 ---
@@ -120,7 +120,7 @@ SET itself produces no runtime signal — it describes a **phylogenetic event**
 and a foreign-origin organelle. The signal is ontological: "this component
 is from a different lineage".
 
-### (c) ARCHWINDOWS analogue — present
+### (c) ARCHIMATION analogue — present
 
 The PE loader is loaded as a foreign symbiont and every PE process is
 permanently tagged `TRUST_DOMAIN_WIN32 = 1` in the trust subject:
@@ -174,7 +174,7 @@ Complex I, CYTB of Complex III, COX1-3 of Complex IV, ATP6/8 of Complex V)
 whose expression MUST be locally co-regulated with the quinone-pool redox
 state (milliseconds-to-seconds). Nuclear regulation is too slow and too far.
 
-### (c) ARCHWINDOWS analogue — partial
+### (c) ARCHIMATION analogue — partial
 
 S73-G catalogued 20 CoRR-locked Win32 functions that stay in PE stubs because
 they carry trust-state (C1), PE-internal-struct state (C2), ms_abi ABI-lock
@@ -232,7 +232,7 @@ motif; other signals route to inner membrane, outer membrane, or
 intermembrane space). Rout 2025 [14] shows the supercomplex is dynamic —
 hydrophobicity of the substrate modulates routing by Mgr2 association.
 
-### (c) ARCHWINDOWS analogue — present
+### (c) ARCHIMATION analogue — present
 
 `pe-loader/loader/pe_import.c` contains the import resolver. Central table
 is `pe_find_crt_wrapper()` with ~120 ms_abi ↔ sysv_abi wrappers. This is a
@@ -292,7 +292,7 @@ also active in inner-membrane shape). Stress-responsive remodeling is a
 functional-capacity-shift signal: the same mitochondrion reorganizes its
 interior topology to prioritize different fluxes.
 
-### (c) ARCHWINDOWS analogue — absent
+### (c) ARCHIMATION analogue — absent
 
 Grep: no code reorganizes the PE runtime's internal topology in response to
 stress. PE stubs are statically linked .so files; the import resolver is a
@@ -348,7 +348,7 @@ The key retrograde aspect: the nucleus controls whether the organelle
 is defined locally by the ER-mitochondrion contact — nucleus doesn't decide
 where.
 
-### (c) ARCHWINDOWS analogue — metaphor-only
+### (c) ARCHIMATION analogue — metaphor-only
 
 S73-G mapped DRP1-equivalence to `TRUST_ACTION_LOAD_KERNEL_BINARY` (the
 trust kernel can veto a PE-side kernel driver load, preventing the symbiont
@@ -423,7 +423,7 @@ mitophagy". *Nat. Rev. Mol. Cell Biol.* (2025). [30]
 Signal: "I am damaged and should be removed" — four-step
 tag-amplify-recruit-digest.
 
-### (c) ARCHWINDOWS analogue — partial
+### (c) ARCHIMATION analogue — partial
 
 `trust/kernel/trust_lifecycle.c:465` implements `trust_lifecycle_apoptosis()`
 with a 4-deep apoptotic cascade. This is the **digestion** phase (terminate
@@ -502,7 +502,7 @@ biology: one protein, bifunctional localization, response triggered by
 proteins" by NOT degrading the very protein whose job it is to escalate that
 failure.
 
-### (c) ARCHWINDOWS analogue — absent
+### (c) ARCHIMATION analogue — absent
 
 Grep for "mtupr|atf5|unfolded_protein" returns zero hits. We have:
 - Event for unresolved import (`PE_EVT_UNIMPLEMENTED_API` — emitted, see
@@ -580,7 +580,7 @@ blood and responds.
 
 **This is exactly the signaling shape our event bus has but we don't emit.**
 
-### (c) ARCHWINDOWS analogue — absent
+### (c) ARCHIMATION analogue — absent
 
 Event bus (`pe_event.h`) emits per-process events. Grep confirms:
 
@@ -678,7 +678,7 @@ is a graded, continuous, diffusible signal** rather than a threshold-switch.
 Low ROS = proliferation; moderate ROS = stress adaptation; high ROS =
 apoptosis.
 
-### (c) ARCHWINDOWS analogue — metaphor-only
+### (c) ARCHIMATION analogue — metaphor-only
 
 The closest pattern we have is the oscillation detector in `trust_observer.py`:
 
@@ -747,7 +747,7 @@ complex breaks, cyt c dissociates → Bax recruitment → MOMP (see §12).
 
 **Pre-apoptotic surface marker: "I am damaged but not yet dead."**
 
-### (c) ARCHWINDOWS analogue — partial
+### (c) ARCHIMATION analogue — partial
 
 The trust observer sets `TRUST_FLAG_FROZEN` as a pre-apoptotic state:
 
@@ -823,7 +823,7 @@ the biological system literally can't tell mitochondria apart from bacteria
 when the membrane fails. The signal is **"foreign-origin contents are in the
 wrong compartment."**
 
-### (c) ARCHWINDOWS analogue — absent
+### (c) ARCHIMATION analogue — absent
 
 No analog. A crashed PE doesn't emit a "my foreign-origin contents are now
 accessible to the system" event. We don't have:
@@ -885,7 +885,7 @@ leaks to cytosol → binds Apaf-1 → apoptosome assembles → activates caspase
 Biology's **urgent-bypass channel** — it doesn't go through slow pathways; it
 jumps directly to the executioner.
 
-### (c) ARCHWINDOWS analogue — **faithful SCAFFOLD, UNWIRED on receive**
+### (c) ARCHIMATION analogue — **faithful SCAFFOLD, UNWIRED on receive**
 
 The kernel side is **built**:
 
@@ -1050,7 +1050,7 @@ Recent 2024 finding (Liang et al. [78]): the **distance** matters — 20 nm is
 optimal, different by a few nm changes Ca²⁺ uptake dramatically. It's a
 metric-precision signal.
 
-### (c) ARCHWINDOWS analogue — metaphor-only
+### (c) ARCHIMATION analogue — metaphor-only
 
 The closest mechanism we have is `coherence_bridge.py` which writes setpoint
 overrides to `coherenced` when PE loads/exits:
@@ -1116,9 +1116,9 @@ into an enucleated donor oocyte (pronuclear transfer) or transferring just
 the spindle-chromosome complex (maternal spindle transfer). As of 2025,
 8 babies born in UK via MRT; pending in Australia.
 
-### (c) ARCHWINDOWS analogue — absent
+### (c) ARCHIMATION analogue — absent
 
-No equivalent. There's no mechanism in ARCHWINDOWS to **replace the PE
+No equivalent. There's no mechanism in ARCHIMATION to **replace the PE
 loader wholesale** at runtime with a known-good version from a trusted
 donor image — in the way bootc or OSTree offers at the image layer, but not
 at the running-PE-subsystem layer.
@@ -1157,7 +1157,7 @@ independent retrograde-signaling channels** from mitochondrion to nucleus:
 | **C. Cytochrome c / cardiolipin** | seconds | per-organelle urgent | point-of-no-return |
 | **D. mtROS redox / Ca²⁺ (MAMs)** | milliseconds | continuous metabolic | analog-gradient coupling |
 
-ARCHWINDOWS has the wires for all four but only one channel's **receiver**
+ARCHIMATION has the wires for all four but only one channel's **receiver**
 is built:
 
 - **A mtUPR**: WIRE missing (no PE-aggregate "I am failing" event). §7 fix.

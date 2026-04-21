@@ -20,7 +20,7 @@
 
 ## 0. Why this framework, not another
 
-Shannon + Kolmogorov + Bennett are the *only* lens in the ARCHWINDOWS observer stack that asks a question none of the current telemetry answers: **"how much information does this trust subject's behaviour contain?"** Everything else — bands, scores, chi-square, Markov log-likelihood — measures *distance from a baseline*. Distance tells you "different from usual". Information content tells you "what kind of process generated this". A stuck-in-a-loop ransomware encryptor and a busy but legitimate video encoder both have divergent Markov log-likelihoods against their baselines; only an information-theoretic measure distinguishes the *shallow randomness* of the encryptor (high Shannon entropy, low Bennett depth — the output looks random because it IS random) from the *deep computation* of the encoder (high Shannon entropy, high Bennett depth — the output looks random because a long deterministic computation produced it).
+Shannon + Kolmogorov + Bennett are the *only* lens in the ARCHIMATION observer stack that asks a question none of the current telemetry answers: **"how much information does this trust subject's behaviour contain?"** Everything else — bands, scores, chi-square, Markov log-likelihood — measures *distance from a baseline*. Distance tells you "different from usual". Information content tells you "what kind of process generated this". A stuck-in-a-loop ransomware encryptor and a busy but legitimate video encoder both have divergent Markov log-likelihoods against their baselines; only an information-theoretic measure distinguishes the *shallow randomness* of the encryptor (high Shannon entropy, low Bennett depth — the output looks random because it IS random) from the *deep computation* of the encoder (high Shannon entropy, high Bennett depth — the output looks random because a long deterministic computation produced it).
 
 This is the reason every other observer in the stack can miss a legitimate-looking encryptor: they measure entropy (H) but never the complement, **logical depth (LD)**. A trust system without LD is deeply blind to the hardest class of insider attack.
 
@@ -28,7 +28,7 @@ This is the reason every other observer in the stack can miss a legitimate-looki
 
 ## 1. Core definitions, re-stated for this codebase
 
-| Quantity | Definition | ARCHWINDOWS analogue | Computable? |
+| Quantity | Definition | ARCHIMATION analogue | Computable? |
 |---|---|---|---|
 | **Shannon entropy** H(X) | `-Σ p(x) log p(x)` over a symbol distribution | byte-distribution entropy of a syscall trace, an IAT table, a proof chain | Yes, exactly; 1 pass over the buffer |
 | **Joint entropy** H(X,Y) | entropy of the (X,Y) pair | e.g., (prev_syscall, next_syscall) 2-gram entropy | Yes |
@@ -38,7 +38,7 @@ This is the reason every other observer in the stack can miss a legitimate-looki
 | **Algorithmic mutual info** I_K(x;y) | `K(x) + K(y) - K(x,y)` — the compression-sibling of mutual info | how much x tells you about y when both are strings | Via NCD, yes |
 | **Normalized Compression Distance (NCD)** | `NCD(x,y) = (C(xy) - min(C(x), C(y))) / max(C(x), C(y))` (Cilibrasi & Vitanyi 2005) | metric space for PE binaries / syscall traces / proof chains — 0=identical, 1=unrelated | Yes, via zstd |
 | **Bennett logical depth** LD(x) | running time of the shortest program (within `ε` of K) that outputs x | **the key signal we don't yet measure** — separates "computation" from "noise" | Approximable via compress-then-decompress-time (see §5) |
-| **Solomonoff prior** M(x) | `≈ 2^(-K(x))`, the universal prior for inductive inference | the prior ARCHWINDOWS *should* put on previously-unseen subject behaviour but currently approximates via uniform | Approximable; used as a mass function over compressor output |
+| **Solomonoff prior** M(x) | `≈ 2^(-K(x))`, the universal prior for inductive inference | the prior ARCHIMATION *should* put on previously-unseen subject behaviour but currently approximates via uniform | Approximable; used as a mass function over compressor output |
 | **Chaitin's Ω** | halting probability — a specific random real in [0,1] | not directly useful operationally; philosophically grounds why K is uncomputable | No |
 
 **Key theorem we will use operationally** (Grunwald & Vitanyi 2003, reprinted in Li & Vitanyi 4th ed., 2019): for any computable compressor C (e.g., zstd), `C(x) ≥ K(x) + O(log |x|)` — so compressed length *upper-bounds* Kolmogorov complexity with a log-factor slack. The slack doesn't matter for *ratio* comparisons on traces of comparable length, which is exactly the observer setting.
@@ -185,7 +185,7 @@ Pure LD is uncomputable (requires searching all programs). The operational proxi
 - **Zenil, Soler-Toscano & Kiani 2019** (*Methods of Information Theory and Algorithmic Complexity*): ACSS — approximation via exhaustive enumeration of short Turing machines, tabulated as a CTM prior.
 - **Compress-then-decode time ratio** (practical): `LD_proxy(x) ≈ decompress_time(compress(x)) / |x|`. A legitimate video frame decompresses slowly because the codec is doing real work; a blob of random bytes decompresses instantly because the "compressed form" is just the original.
 
-For ARCHWINDOWS the **compress-then-decode ratio** is tractable (≤ 2 ms per 1 MB buffer on modern hardware with zstd) and catches the "noise-masquerading-as-work" class.
+For ARCHIMATION the **compress-then-decode ratio** is tractable (≤ 2 ms per 1 MB buffer on modern hardware with zstd) and catches the "noise-masquerading-as-work" class.
 
 ### 5.2 Concrete recipe
 
@@ -346,7 +346,7 @@ All behind TRUST_USER band.
 
 ## 10. Executive summary (400–500 words)
 
-The ARCHWINDOWS observer stack measures many things — Markov log-likelihoods, chi-square statistics of the APE hash output, memory-map delta anomalies, trust-score oscillation — but it never measures the single quantity that best distinguishes legitimate computation from adversarial noise: information content. Shannon entropy (H), Kolmogorov complexity (K, approximated by compressed length), and Bennett logical depth (LD, approximated by decompress-time-per-byte) together form an orthogonal axis to everything the stack currently watches. A busy video encoder and a busy ransomware encryptor both produce high-entropy bytestreams that diverge from their baselines in the current telemetry; only logical depth tells you which one is doing real work and which one is emitting shallow pseudo-random noise.
+The ARCHIMATION observer stack measures many things — Markov log-likelihoods, chi-square statistics of the APE hash output, memory-map delta anomalies, trust-score oscillation — but it never measures the single quantity that best distinguishes legitimate computation from adversarial noise: information content. Shannon entropy (H), Kolmogorov complexity (K, approximated by compressed length), and Bennett logical depth (LD, approximated by decompress-time-per-byte) together form an orthogonal axis to everything the stack currently watches. A busy video encoder and a busy ransomware encryptor both produce high-entropy bytestreams that diverge from their baselines in the current telemetry; only logical depth tells you which one is doing real work and which one is emitting shallow pseudo-random noise.
 
 The first concrete proposal is an entropy ledger for the APE proof chain. `trust_ape.c` already self-consumes 32-byte proofs and mixes 32-byte fresh seeds per step, so each cycle contributes a known number of information-theoretic bits to the chain. Publishing `ape_cumulative_entropy_bits = (mint+consume) * 256` as a boot-to-now scalar gives operators a forensic invariant no one has today — and costs ~10 LOC.
 
@@ -356,4 +356,4 @@ The third and largest is `ai-control/daemon/entropy_observer.py` (~200 LOC). It 
 
 The DNA parallel is operationally direct: human DNA has ~4 billion bits of K but is Bennett-deep because evolution is a long computation; a random 4-Gbit blob has the same K but LD ≈ 0. Legitimate compiled PE code is Bennett-deep (the compiler's optimiser is a long computation); a packer's output is Bennett-shallow; a polymorphic virus is Bennett-very-shallow. The observer stack should know the difference, and today it does not. LD_proxy is the missing scalar.
 
-**Three modules, ~490 LOC total, zero new kernel code, zero new dependencies. This is the cheapest-to-ship, highest-leverage signal upgrade available to ARCHWINDOWS today.**
+**Three modules, ~490 LOC total, zero new kernel code, zero new dependencies. This is the cheapest-to-ship, highest-leverage signal upgrade available to ARCHIMATION today.**

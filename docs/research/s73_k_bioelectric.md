@@ -3,7 +3,7 @@
 **Agent:** Research Agent K (S73 12-agent framework push)
 **Date:** 2026-04-20
 **Framework:** Michael Levin's bioelectric morphogenesis (Tufts Allen Discovery Center, 2010-2026)
-**Codebase:** ARCHWINDOWS trust subsystem at `trust/` and `ai-control/cortex/`
+**Codebase:** ARCHIMATION trust subsystem at `trust/` and `ai-control/cortex/`
 
 ---
 
@@ -72,7 +72,7 @@ Resting Vmem of a typical eukaryotic cell: -70 mV. Active depolarization can swi
 | 0 mV (depolarized, active) | 0 (neutral, working) |
 | +50 mV (depolarized, "be a head", proliferative) | +500 (privileged, decision-maker) |
 
-The ARCHWINDOWS mapping is *roughly* the inverse of the biology (lower trust = bad = analogous to depolarized "cancerous" Vmem in Levin's tumour-suppression work), so we keep our existing convention and note that Vmem polarity is a sign convention, not a constraint.
+The ARCHIMATION mapping is *roughly* the inverse of the biology (lower trust = bad = analogous to depolarized "cancerous" Vmem in Levin's tumour-suppression work), so we keep our existing convention and note that Vmem polarity is a sign convention, not a constraint.
 
 ### 2.2 Subject = cell
 

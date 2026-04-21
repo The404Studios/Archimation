@@ -1,4 +1,4 @@
-# S71-C: On-Device LLM Inference for ARCHWINDOWS Cortex (2024-2026)
+# S71-C: On-Device LLM Inference for ARCHIMATION Cortex (2024-2026)
 
 **Author:** Research Agent C
 **Date:** 2026-04-20
@@ -76,7 +76,7 @@ All sizes below are **instruction-tuned, Q4_K_M GGUF** (the llama.cpp default). 
 | **TensorRT-LLM** | C++/Python | NVIDIA only | Fastest on NVIDIA; lookahead decoding | NVIDIA-locked; big build |
 | **Ollama** | Go wrapper over llama.cpp | Cross-platform | "it just works" UX | Adds daemon-in-daemon; we already have a daemon |
 
-### 3.2 Recommendation for ARCHWINDOWS
+### 3.2 Recommendation for ARCHIMATION
 
 Keep **llama.cpp as the baseline everywhere** (it's the only option that runs on a 2015 Skylake laptop *and* a $5K workstation). Add **MLX as an optional fast-path on Apple Silicon**, and **ONNX Runtime + QNN/DirectML as an optional NPU fast-path on supported hardware**. The cortex should auto-select at boot. Drop the `llama-cpp-python` binding and shell out to the `llama.cpp` binary (`llama-server` / `llama-cli`) over a Unix socket — **fewer Python deps, no ABI pinning, same performance**. We already have the FastAPI daemon; it can just proxy.
 
@@ -147,7 +147,7 @@ Implementation: `llama-server -m target.gguf -md draft.gguf --draft-max 8 --draf
 | **Qualcomm Hexagon** | Snapdragon X Elite / X2 | 45 | Kernel 6.8 onwards for SoC; **NPU driver upstream mainline = not yet (Q2 2026)** | Windows-only for LLM work (QNN EP); Linux NPU = binary only | Basic mainline support, NPU inference blocked on Linux |
 | **Apple Neural Engine** | M1-M5 + A-series | 17-38 | N/A (closed; Metal used instead) | MLX / Core ML (from Linux: nothing) | Not reachable from Linux |
 
-**Takeaway:** For Linux, Intel NPU is the most mature (OpenVINO + Level Zero is upstream and tested). AMD XDNA2 works on Ubuntu 25.04 + kernel 6.14+ with caveats (XRT SHIM is still a separate tarball). **Qualcomm Linux NPU for LLM = not yet on mainline.** On a Copilot+ PC booted into ARCHWINDOWS, the NPU is dark — we fall back to the Adreno GPU via Vulkan/OpenCL, which is still fine for 3 B models.
+**Takeaway:** For Linux, Intel NPU is the most mature (OpenVINO + Level Zero is upstream and tested). AMD XDNA2 works on Ubuntu 25.04 + kernel 6.14+ with caveats (XRT SHIM is still a separate tarball). **Qualcomm Linux NPU for LLM = not yet on mainline.** On a Copilot+ PC booted into ARCHIMATION, the NPU is dark — we fall back to the Adreno GPU via Vulkan/OpenCL, which is still fine for 3 B models.
 
 ---
 
@@ -172,7 +172,7 @@ The cortex boot should read `/proc/meminfo`, `/proc/cpuinfo` and GPU nodes, then
 ## 7. Privacy considerations
 
 - **Licenses to prefer (true permissive, no phone-home clause):** **Qwen2.5 (Apache 2.0)**, **Phi-3.5 / Phi-4 (MIT)**, **Gemma 3 (Gemma terms — permissive, commercial OK)**, **Mistral Small (Apache 2.0)**. These are what we ship.
-- **Licenses to gate:** **Llama 3.x (Community License)** — 700 M MAU cap + EU acceptable-use restrictions. Probably fine for ARCHWINDOWS, but document the trap and keep a Qwen-based alternative as the default.
+- **Licenses to gate:** **Llama 3.x (Community License)** — 700 M MAU cap + EU acceptable-use restrictions. Probably fine for ARCHIMATION, but document the trap and keep a Qwen-based alternative as the default.
 - **Qwen2.5-3B license gotcha:** Alibaba published the 3B variant under the **Qwen Research License** (non-commercial) while 0.5/1.5/7/14/32 B are Apache 2.0. Ship the 1.5B and 7B, skip the 3B.
 - **No telemetry in llama.cpp.** Confirmed in source. No outbound sockets during inference. MLX, same. ONNX Runtime, same (local inference path).
 - **Disk-resident models only.** Never fetch at runtime. All models pre-baked into `/var/lib/ai-control/models/` or the `ai-models-basic` Arch package.

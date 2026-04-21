@@ -11,7 +11,7 @@ surveyed primitives as compatible upgrades; explicitly reject 4; gate 1 behind a
 
 ## Exec summary table
 
-| # | Primitive | Classical substrate | ARCHWINDOWS analogue | Unlocks | Safety requirement | Should adopt? | LOC |
+| # | Primitive | Classical substrate | ARCHIMATION analogue | Unlocks | Safety requirement | Should adopt? | LOC |
 |---|---|---|---|---|---|---|---|
 | 1 | Lisp homoiconicity (McCarthy 1960) | cons-cells, eval/quote | Instruction word = data word | Full reflection; macros | TOTAL LOSS of decidability | **NO — explicit reject** | N/A |
 | 2 | Forth immediate words (Moore 1969) | dictionary self-extension | Fused ops as compile-time macros | Userspace batch fusion | No runtime dispatch mutation | **YES — already partial (fused ops)** | ~80 (harden as rodata) |
@@ -879,7 +879,7 @@ edits with quorum + attestation; never add self-emission.**
    (fused selftest, capability seal/unseal, quorum-signed metadata patch, codegen for fused
    ops, rodata hardening) totaling ~840 LOC. Defer eBPF-style signed policy bytecode to S80+
    gated on a real TPM2/MOK story. The *totality* property — that every trust batch terminates
-   in bounded steps and every authorization decision is decidable — is the ARCHWINDOWS moat
+   in bounded steps and every authorization decision is decidable — is the ARCHIMATION moat
    itself. Homoiconicity would trade it for flexibility we do not need.
 
 ---

@@ -1,4 +1,4 @@
-# S73-E: ARCHWINDOWS through Maturana & Varela's Autopoiesis
+# S73-E: ARCHIMATION through Maturana & Varela's Autopoiesis
 
 **Agent**: 1 of 12 (S73 framework series) -- Autopoiesis / operational closure
 **Date**: 2026-04-20
@@ -92,7 +92,7 @@ the additional constraint of recursion (each viable sub-system is
 itself viable). Beer's System 4 ("intelligence/outside-and-future")
 and System 5 ("policy/identity") correspond closely to what would
 now be called a *cognitive loop* over the system's own state.
-ARCHWINDOWS's cortex layer is shaped roughly like Beer's System 3-4-5.
+ARCHIMATION's cortex layer is shaped roughly like Beer's System 3-4-5.
 
 ### 2.4 Sensorimotor enactment and the "hard problem"
 
@@ -110,25 +110,25 @@ Ruiz-Mirazo & Moreno (2024) survey the minimal autopoietic cell:
 roughly, a lipid bilayer produced by fatty-acid-synthesis enzymes
 encoded by genes transcribed by ribosomes made of rRNA transcribed
 from the same genome, inside the same bilayer. The circularity is
-the point. This is the paradigm against which ARCHWINDOWS must be
+the point. This is the paradigm against which ARCHIMATION must be
 measured.
 
 ---
 
-## 3. Mapping ARCHWINDOWS Against the Four Criteria
+## 3. Mapping ARCHIMATION Against the Four Criteria
 
 ### 3.1 Criterion 1 -- Self-production of components
 
 **Verdict: Partially. Mostly allopoietic.**
 
-ARCHWINDOWS's components include: kernel modules (`trust.ko`,
+ARCHIMATION's components include: kernel modules (`trust.ko`,
 `wdm_host.ko`), userspace daemons (`ai-control.service`,
 `scm-daemon`, `pe-objectd`), shared libraries (37+ PE DLL stubs),
 and data (`dictionary_v2.pkl.zst`, trust subjects).
 
 Evidence of production:
 - **bootc/OCI image** (S72): the system ships as an OCI container
-  image (`archwindows-bootc:latest`) that can reproduce itself
+  image (`archimation-bootc:latest`) that can reproduce itself
   through `bootc upgrade`. *However*, the image is built
   exogenously by CI/`scripts/build-packages.sh`, not by the
   running system. **Allopoietic.**
@@ -153,7 +153,7 @@ Evidence of production:
   same -- online LRU/FIFO updates from live syscall streams.
   Autopoietic within its domain.
 
-**Conclusion**: ARCHWINDOWS is mostly allopoietic at the system
+**Conclusion**: ARCHIMATION is mostly allopoietic at the system
 scale (the image builds itself only through CI), but has three
 autopoietic islands: the trust subject pool (meiosis/lifecycle
 inside the kernel), the markov NLP model (online learning), and
@@ -162,7 +162,7 @@ whole-system closure.
 
 ### 3.2 Criterion 2 -- Self-maintained boundary
 
-**Verdict: Yes. This is ARCHWINDOWS's strongest autopoietic
+**Verdict: Yes. This is ARCHIMATION's strongest autopoietic
 property.**
 
 The boundary is multi-layered:
@@ -188,7 +188,7 @@ The boundary is multi-layered:
   than native Linux subjects.
 
 Of the four autopoiesis criteria, boundary production is where
-ARCHWINDOWS most strongly resembles a living cell. The analog
+ARCHIMATION most strongly resembles a living cell. The analog
 to the user's biological framework is direct: **`trust.ko`'s
 `/dev/trust` gating is the plasma membrane; composefs + UKI is
 the peptidoglycan cell wall**; the two together separate self
@@ -218,7 +218,7 @@ in the self-network's ontology.
 
 **Verdict: Broken. This is the autopoietic gap.**
 
-Here ARCHWINDOWS fails the Maturanian test. The cortex publishes
+Here ARCHIMATION fails the Maturanian test. The cortex publishes
 decisions outward (handler dispatch, trust-band emission, websocket
 broadcasts) but the trust observer's events do **not** flow back
 into the cortex's decision engine.
@@ -264,7 +264,7 @@ but observer events don't flow IN."
 
 The user's project-native vocabulary maps cleanly:
 
-| User's biology     | Maturana analog               | ARCHWINDOWS locus                                  |
+| User's biology     | Maturana analog               | ARCHIMATION locus                                  |
 |--------------------|-------------------------------|----------------------------------------------------|
 | Cell               | Autopoietic unity             | A running subject (process + trust subject record) |
 | Plasma membrane    | Self-maintained boundary      | `trust.ko` gating `/dev/trust`                     |
@@ -279,14 +279,14 @@ The user's biology is the *interior* framework. Maturana is the
 agree on almost everything: the cell is the paradigm autopoietic
 unity for Maturana precisely because it produces its own membrane,
 ribosomes, and metabolism -- which is exactly the structure the user
-has already encoded in ARCHWINDOWS's nomenclature.
+has already encoded in ARCHIMATION's nomenclature.
 
 The one place Maturana forces a sharper question than the biological
 metaphor alone does: **operational closure**. The biology metaphor
 can tolerate "signals flow in, responses flow out" as long as the
 cell keeps functioning. Maturana demands that the cognitive loop
 *itself* be closed -- that the system's model of itself is produced
-by the same dynamics that produce its components. ARCHWINDOWS has
+by the same dynamics that produce its components. ARCHIMATION has
 the components (observer events, cortex decisions, trust subjects)
 but they are not wired into a loop. That is the exploit.
 
@@ -412,12 +412,12 @@ Beyond operational-closure correctness, the exploit unlocks:
 - **Sense-making** (Di Paolo 2023): observer events acquire meaning
   as perturbations to a cortex-maintained identity, not as raw
   ioctl returns.
-- **Cybernetic viability** (Beer's VSM): ARCHWINDOWS's System 4
+- **Cybernetic viability** (Beer's VSM): ARCHIMATION's System 4
   (cortex) finally has the "outside-and-future" feedback loop Beer
   required for viability.
 - **Differentiation from Wine/Proton stacks**: Wine is
   aggressively allopoietic -- nothing in Wine produces Wine. An
-  operationally-closed ARCHWINDOWS is categorically different.
+  operationally-closed ARCHIMATION is categorically different.
   This is what the user pointed at in S64 ("we don't want wine")
   even before having the Maturanian vocabulary for it.
 
@@ -425,7 +425,7 @@ Beyond operational-closure correctness, the exploit unlocks:
 
 ## 6. Alternative Exploits (rejected)
 
-**Alt-A: Autopoietic image rebuild.** Make ARCHWINDOWS rebuild its
+**Alt-A: Autopoietic image rebuild.** Make ARCHIMATION rebuild its
 own bootc image from inside a running system, then `bootc upgrade`
 to it. This is the most direct self-production loop. Rejected
 because (a) container build requires ~10 GB of scratch space and
@@ -455,7 +455,7 @@ Maturanian bar.
 
 ## 7. Summary
 
-ARCHWINDOWS scores: **boundary ✓, self/environment ✓, self-production
+ARCHIMATION scores: **boundary ✓, self/environment ✓, self-production
 partial, operational closure BROKEN**. Three autopoietic islands
 exist (trust subject pool, Markov NLP, behavioral model) but do not
 compose into whole-system closure. The specific break is that

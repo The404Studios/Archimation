@@ -1,4 +1,4 @@
-# ARCHWINDOWS Architecture v2 — Canonical Specification
+# ARCHIMATION Architecture v2 — Canonical Specification
 
 **Document status:** synthesizer-architect deliverable, S74 post-research.
 **Authors:** synthesized from the 10-agent S74 research dispatch (reports A-J
@@ -17,7 +17,7 @@ event bus; this doc is the layered-architecture + invariants update).
 
 ## §0. Executive thesis
 
-**One sentence.** ARCHWINDOWS is a **Linux-native Windows-compatibility
+**One sentence.** ARCHIMATION is a **Linux-native Windows-compatibility
 distribution whose authority is rooted in an in-kernel dynamic capability
 machine whose proofs are cryptographically self-consuming and whose state is
 biologically patterned** — a design class with no exact precedent; the closest
@@ -36,8 +36,8 @@ pure capability system** like seL4 — the primitives are dynamic (decaying
 trust scores, self-consuming proofs, chromosomal inheritance), not static.
 The class that fits — a *dynamic cybernetic-kernel authority machine* — has
 no canonical academic name. The paper's chosen name is **Root of Authority
-(RoA)**; the product's name is **ARCHWINDOWS**. We recommend **retaining
-both**: RoA names the primitive; ARCHWINDOWS names the distribution built on
+(RoA)**; the product's name is **ARCHIMATION**. We recommend **retaining
+both**: RoA names the primitive; ARCHIMATION names the distribution built on
 top. See `docs/architecture-name-decision.md` for the full justification.
 
 ---
@@ -728,12 +728,12 @@ We arrive at **three legitimate naming options**. See
 here:
 
 **Option 1 (recommended): Retain "Root of Authority (RoA)" for the primitive
-+ "ARCHWINDOWS" for the distribution.**
++ "ARCHIMATION" for the distribution.**
 
 - RoA names the mathematical object (APE + chromosome + ISA + TRC +
   morphogen + quorum + algedonic + attest + invariants). The paper already
   uses this name.
-- ARCHWINDOWS names the product (Arch Linux ISO + bootc image + PE runtime
+- ARCHIMATION names the product (Arch Linux ISO + bootc image + PE runtime
   + AI daemon + desktop).
 - No prior art collision confirmed (RJ §5 did not flag either).
 

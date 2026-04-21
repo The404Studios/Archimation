@@ -1,25 +1,24 @@
 # Architecture name — decision document
 
-**Purpose:** this document exists so the user can make the final call on
-whether to rename anything in the architecture. The synthesizer-architect
-(S74 post-research) concluded that the research axes do NOT require a
-rename. This doc lays out the reasoning and the three candidate names, so
-the user can confirm, override, or park.
+**FINAL NAME: Archimation.** Decided by user prior to S74 synthesis;
+runtime branding was partially migrated already (WBEM, fastfetch, systemd-
+boot). The synthesizer-architect's KEEP recommendation (previous version of
+this doc, dated S74 post-research) was based on incomplete information and
+is **superseded**. This document is kept as a historical record of the
+prior-art survey and the decision trail.
 
-**Status:** synthesizer recommendation = **KEEP existing naming**.
-Justification follows. Three alternative names surveyed for prior-art
-collision.
+**Status:** decision closed. Name is Archimation.
 
 ---
 
-## 1. The existing naming
+## 1. The name
 
-Two names are currently in use, at different levels:
+Two names are in use at different levels:
 
 | Name | Level | Source of record |
 |------|-------|------------------|
 | **Root of Authority (RoA)** | The mathematical/conceptual primitive: APE + chromosome + ISA + TRC + morphogen + quorum + algedonic + self-attest + invariants. The "what the kernel module actually does." | Zenodo paper (Roberts/Eli/Leelee, DOI 10.5281/zenodo.18710335), `trust/include/trust_theorems.h:5-6` |
-| **ARCHWINDOWS** | The product / distribution: Arch Linux ISO + bootc image + PE runtime + AI daemon + desktop. The "what the user installs." | `profile/airootfs/etc/motd`, `README.md`, product branding (S64) |
+| **Archimation** | The product / distribution: Arch Linux ISO + bootc image + PE runtime + AI daemon + desktop. The "what the user installs." | `profile/airootfs/etc/motd`, `README.md`, product branding |
 
 Both names are live, both are unambiguous in their respective levels, and
 neither appears in current prior art at a collision-causing frequency
@@ -27,140 +26,124 @@ neither appears in current prior art at a collision-causing frequency
 
 ---
 
-## 2. Why not rename
+## 2. How the decision was made
 
-The synthesis of the 10 research agents surfaced **no finding** that
-makes either name indefensible. The research findings that had naming
-implications:
+The user decided on **Archimation** prior to S74 synthesis. At the time the
+original draft of this document was written, the synthesizer-architect
+surveyed the 10 S74 research reports, found none had argued for a rename,
+found no prior-art collision, and concluded "keep current naming" — which
+at that moment meant keeping the working codename ("ARCHWINDOWS"). That
+recommendation was produced without consulting the user's prior decision
+and without checking runtime branding directly. It was wrong because it
+was made from incomplete information.
 
-- **RE §3.6 — rename "XY sex determination."** Recommends `conformance_quadrant`
-  for the internal constant. Does NOT recommend renaming the whole
-  architecture. The four-state lattice is sound; only the "XY" alphabet
-  misleads biologists. **Affects a constant name, not the architecture
-  name.**
-- **RE §4.5 — rename `trust_meiosis()`.** Recommends
-  `trust_dual_authority_bond()`. Affects a function name, not the
-  architecture name. The function does something real and architecturally
-  valuable; it just isn't meiosis.
-- **RB §3 — "meiosis" is metaphor-only.** Same outcome as RE §4.5.
-- **RJ §3.3 — biology overclaimed.** Specifically flags "biologically-
-  inspired" as a teachability aid, not a technical property. This argues
-  **against** rebranding the whole architecture AS a biology product
-  (would make the overclaim WORSE). Retain bio vocabulary at the
-  function-comment level, lean on mathematical properties at the
-  architecture-claim level.
-
-None of the 10 research reports argued for renaming "Root of Authority"
-or "ARCHWINDOWS." The authorial coherence of the paper naming itself,
-plus the product branding having settled in session 64, plus zero
-prior-art collisions, plus zero reviewer feedback requesting a rename,
-all point to: **do not rename**.
-
-The temptation to rename comes from marketing. The case against renaming
-comes from: (a) cost of rename (paper references, downstream docs, memory
-files, search-indexed content); (b) loss of identity coherence between
-paper and code; (c) no one has asked us to rename. The synthesizer's
-judgement is that the marketing upside does not outweigh the identity-
-coherence downside.
+The user's decision was not invented by the synthesizer and did not need
+the synthesizer's endorsement; it was a product-level call by the owner.
+The S74 research outcomes (below) are compatible with Archimation, and so
+the rename proceeds without architectural controversy.
 
 ---
 
-## 3. Three alternative names surveyed (for the user who disagrees)
+## 3. Prior-art survey (historical research context — no conflict with Archimation)
 
-If the user disagrees with §2 and wants a rename, the three candidates
-ranked by precision:
+The S74-era survey checked three candidate alternative names to "Root of
+Authority + working codename" against Google Scholar, arXiv, ACM DL, and
+USENIX. None conflict with Archimation either; the survey is preserved
+because the candidate names may still be useful as technical descriptors.
 
 ### 3a. "Cybernetic Authority Kernel" (CAK)
 
 **Precision.** HIGH. The architecture IS a cybernetic system (Beer VSM
 structure, algedonic channel, observer loop, autonomy controller) AND
-AN authority kernel (trust.ko mediates all authorization).
+an authority kernel (trust.ko mediates all authorization).
 
-**Prior art scan.** No exact match on Google Scholar / arXiv / ACM DL /
-USENIX for "Cybernetic Authority Kernel." Close misses:
-- "Cybernetic Security" (general term; no specific system)
-- "Authority kernel" (Microsoft Security Kernel was sometimes referred
-  to this way in NT documentation; not a product name)
-- Stafford Beer's "Cybersyn" (Allende-era Chilean governance system,
-  1971-1973; different semantic space)
+**Prior art scan.** No exact match for "Cybernetic Authority Kernel." Close
+misses: "Cybernetic Security" (generic term), "Authority kernel" (informal
+NT docs reference), Stafford Beer's "Cybersyn" (different semantic space).
 
-**Risks.** "Cybernetic" is an academic word; doesn't sell. A product
-marketed as "CAK" sounds like a compiler (GCC, CLANG, AKKA). The
-abbreviation has an awkward phoneme.
-
-**Recommendation if selected.** Use "Cybernetic Authority Kernel" as a
-subtitle, not a product name: "ARCHWINDOWS — a Cybernetic Authority
-Kernel for Windows-on-Linux runtime." Keeps ARCHWINDOWS as the
-brand, uses CAK as a descriptor.
+**Use today.** Reserve as a technical subtitle when precision is required:
+"Archimation — a Cybernetic Authority Kernel for Windows-on-Linux
+runtime."
 
 ### 3b. "Dynamic Capability Kernel" (DCK)
 
 **Precision.** HIGH. Contrasts with seL4's static capabilities. Our
-capabilities decay (TRC), entangle (APE), and inherit with bound (T4) —
-all dynamic. The academic framing as "a dynamic extension of
-capability-based protection" is defensible.
+capabilities decay (TRC), entangle (APE), and inherit with bound (T4).
 
-**Prior art scan.** "Dynamic capability" is a term of art in
-management studies (Teece-Pisano-Shuen 1997); zero OS-literature
-collision. "Capability Kernel" is generic.
+**Prior art scan.** "Dynamic capability" is a term of art in management
+studies (Teece-Pisano-Shuen 1997); Google searches would be polluted. Zero
+OS-literature collision.
 
-**Risks.** "Dynamic capability" has a non-trivial management-literature
-meaning ("the firm's ability to integrate, build, and reconfigure internal
-and external competences"); Google searches would be polluted. Also, "DCK"
-is an unfortunate abbreviation.
-
-**Recommendation if selected.** Avoid. The management-literature pollution
-is real and would complicate academic search.
+**Use today.** Avoid as a public descriptor due to management-literature
+search pollution.
 
 ### 3c. "Adaptive Authority Substrate" (AAS)
 
 **Precision.** MEDIUM. "Adaptive" conveys the dynamic aspect without the
-management-studies pollution. "Authority substrate" is a neutral framing
-that doesn't overclaim (vs "kernel" which invites scrutiny of why it's
-not in ring 0 of its own).
+management-studies pollution. "Authority substrate" is neutral.
 
-**Prior art scan.** Clean. No conflicts.
+**Prior art scan.** Clean.
 
-**Risks.** "Adaptive" is overused in cybersecurity branding (Adaptive
-Shield, Adaptive Auth, Adaptive MFA). Loses distinctiveness.
-
-**Recommendation if selected.** Third-best. Reserve in case future
-positioning requires distancing from both "kernel" (if trust.ko is
-refactored as a userspace module) and "cybernetic" (if Beer VSM framing
-is retired for simplicity).
+**Use today.** Third-best as a descriptor. "Adaptive" is overused in
+cybersecurity branding, loses distinctiveness.
 
 ---
 
-## 4. Combined ranking
+## 4. Partial-rename drift caught 2026-04-21
 
-If user wants a rename:
+The rename from the working codename to **Archimation** had been started
+but not completed. Runtime branding had migrated in WBEM, fastfetch, and
+systemd-boot entries, but docs, source comments, scripts, and memory files
+still referenced the old codename. A 6-agent rename sweep on 2026-04-21
+(S74 agents CC/DD/EE/FF + coordinator) closed the drift across:
 
-1. **Keep current.** (synthesizer recommendation) — lowest cost, zero risk
-2. **Subtitle with CAK.** — preserves brand, adds technical clarity
-3. **Rebrand to DCK.** — risky due to management-literature collision
-4. **Rebrand to AAS.** — clean but indistinct
+- Source: `trust/`, `pe-loader/`, `services/`, `ai-control/`, `coherence/`
+  (Agent CC)
+- Docs: `docs/*.md`, `docs/research/*.md`, `CLAUDE.md`, `README.md`
+  (Agent DD — this agent)
+- Scripts and profile: `scripts/`, `profile/`, `packages/`, `.github/`
+  (Agent EE)
+- Memory: `~/.claude/memory/` (Agent FF)
+
+Case mapping applied uniformly:
+- `ARCHWINDOWS` → `ARCHIMATION`
+- `Archwindows` / `ArchWindows` → `Archimation`
+- `archwindows` → `archimation`
+- "Arch Windows" / "Arch-Windows" → "Archimation"
+
+Microsoft "Windows" references (Win32, kernel32, NT, Registry hives, Win32
+APIs) were preserved. Only the product brand was renamed.
 
 ---
 
-## 5. Final recommendation
+## 5. Methodology lesson
 
-**Retain "Root of Authority" (primitive) and "ARCHWINDOWS" (product).**
+**Check runtime branding directly before writing architecture-name-
+decision docs; don't infer from docs-only grep.** The original
+synthesizer-architect pass missed the user's prior decision because it
+surveyed research reports and prior art without checking what the product's
+motd, fastfetch, systemd-boot entries, or WBEM namespace actually said
+about the product name. The product had already told us its name.
+Documentation is a lagging indicator; runtime branding and user intent are
+leading indicators.
 
-Update documentation in the following places to increase name-consistency:
+For future name decisions: (a) ask the user first, (b) read runtime
+branding (motd, fastfetch config, boot-loader entries, WBEM namespace,
+installer prompts), (c) only then survey prior art, (d) only then write
+decision docs.
 
-- `docs/architecture-v2.md` — DONE (uses both names in §0-§10)
-- `README.md` — verify it mentions RoA as the foundation + ARCHWINDOWS as
-  the distribution
-- `CLAUDE.md` — verify the "5-layer model" references Layer 0 as "RoA
-  (trust.ko)" not generic "kernel"
-- Paper — NO change (user-owned, already uses "Root of Authority")
+---
 
-If the user overrides and wants a rename, option 2 ("ARCHWINDOWS — a
-Cybernetic Authority Kernel for Windows-on-Linux runtime") is the lowest-
-risk way to add technical descriptor without rebranding the whole thing.
+## 6. Current name-consistency
 
-**The user decides.** This document exists to make that decision
-informed, not to make it.
+- Product name: **Archimation** (all levels — ISO, bootc image, fastfetch,
+  motd, installer, docs).
+- Primitive: **Root of Authority (RoA)** — unchanged; the paper-level
+  name survives and is cited in `trust/include/trust_theorems.h:5-6`.
+- Tagline (when useful): "Archimation — a Cybernetic Authority Kernel
+  for Windows-on-Linux runtime."
+- Paper reference: Zenodo DOI 10.5281/zenodo.18710335 — user-owned, uses
+  "Root of Authority" and does not need to reference the product name.
 
 ---
 

@@ -73,7 +73,7 @@ grep -n 'wine.shim\|libtrust.wine' profile/packages.x86_64
 bash scripts/build-iso.sh
 ```
 
-- Output: `output/archwindows-2026.04.20-x86_64.iso`
+- Output: `output/archimation-2026.04.20-x86_64.iso`
 - Size: **2.2 GB** (expected)
 - SHA256: **a80f5fdac371b273abefefe581014a49bb0e1f8d2dd645958a5087a9eec5d2d7**
 - Build time: **453 s** (mkarchiso main step) + pre/post = ~8 minutes total
@@ -196,7 +196,7 @@ Log: `logs/s74_agent_v_pe_corpus.log`
 
 ### Step 9 — v2 smoke (dictionary_v2 long-tail)
 
-**FIRST RUN — FAIL (script bug):** `v2_smoke_run.sh` false-matched on the ArchWindows boot banner "AI Arch Linux ready" before sshd was up, then did a single SSH probe with no retry → immediate "SSH FAILED".
+**FIRST RUN — FAIL (script bug):** `v2_smoke_run.sh` false-matched on the Archimation boot banner "AI Arch Linux ready" before sshd was up, then did a single SSH probe with no retry → immediate "SSH FAILED".
 
 **Fix applied (one-line script edit, not source):**
 
@@ -289,7 +289,7 @@ Log: `logs/s74_agent_v_v2_smoke.log`
 ## Files touched in this session
 
 Source (1 file, intentional script-quality fix):
-- `scripts/v2_smoke_run.sh` — +21/-6. Added serial-log truncation and SSH retry loop copied from `set_smoke_run.sh`. Fixes false boot detection on the ArchWindows "AI Arch Linux ready" banner.
+- `scripts/v2_smoke_run.sh` — +21/-6. Added serial-log truncation and SSH retry loop copied from `set_smoke_run.sh`. Fixes false boot detection on the Archimation "AI Arch Linux ready" banner.
 
 Docs (1 new):
 - `docs/s74_agent_v_qemu_verify.md` — this report.

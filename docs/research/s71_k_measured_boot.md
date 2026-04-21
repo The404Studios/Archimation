@@ -1,12 +1,12 @@
-# S71-K — Secure Boot, Measured Boot, TPM 2.0, and Module Signing for ARCHWINDOWS
+# S71-K — Secure Boot, Measured Boot, TPM 2.0, and Module Signing for ARCHIMATION
 
 **Agent:** Research Agent K (S71 12-agent push)
 **Date:** 2026-04-20
-**Scope:** The trust kernel module (`trust.ko`) is the "Root of Authority" for the ARCHWINDOWS stack — but the kernel itself currently boots from an **unsigned GRUB 2 build** and runs an **unsigned `trust.ko` loaded on first boot via DKMS**. Everything above Layer 0 trusts the kernel; nothing proves the kernel is what we shipped. This report surveys 2024-2026 UEFI Secure Boot, measured boot, TPM 2.0 attestation, and Linux module signing, and sketches the 2-session path that makes our authority root genuinely trustworthy.
+**Scope:** The trust kernel module (`trust.ko`) is the "Root of Authority" for the ARCHIMATION stack — but the kernel itself currently boots from an **unsigned GRUB 2 build** and runs an **unsigned `trust.ko` loaded on first boot via DKMS**. Everything above Layer 0 trusts the kernel; nothing proves the kernel is what we shipped. This report surveys 2024-2026 UEFI Secure Boot, measured boot, TPM 2.0 attestation, and Linux module signing, and sketches the 2-session path that makes our authority root genuinely trustworthy.
 
 ---
 
-## 0. Ground truth: what ARCHWINDOWS ships today
+## 0. Ground truth: what ARCHIMATION ships today
 
 Absolute paths audited from the tree:
 
@@ -73,9 +73,9 @@ From [systemd TPM2_PCR_MEASUREMENTS](https://systemd.io/TPM2_PCR_MEASUREMENTS/):
 | 14   | MOK state                | shim-measured MOK + KEK + db as alternative to PCR 7               | shim                |
 | 15   | system-identity          | `/etc/machine-id`, root-fs UUID, LUKS volume keys                  | systemd-stub + init |
 
-**The PCR we care about for ARCHWINDOWS is PCR 11**, because that's where the UKI containing `vmlinuz-linux` + `initramfs-linux.img` + our kernel cmdline lands. If we ship our daemon + cortex as an addon initrd (sysext), we get a second anchor at PCR 13.
+**The PCR we care about for ARCHIMATION is PCR 11**, because that's where the UKI containing `vmlinuz-linux` + `initramfs-linux.img` + our kernel cmdline lands. If we ship our daemon + cortex as an addon initrd (sysext), we get a second anchor at PCR 13.
 
-There is no standardized "user-space daemon PCR." The PLAN comment "PCR 11 is our potential target for the ARCHWINDOWS stack (daemon hash)" is correct only if we fold the daemon into the UKI via a sysext addon — extending PCR 13 — or a credential addon. We should **not** invent a custom `tpm2_pcr_extend` of our own on top of PCRs 16-23; that's discouraged because the 16-23 range is "debug/resettable" and gets cleared under various conditions.
+There is no standardized "user-space daemon PCR." The PLAN comment "PCR 11 is our potential target for the ARCHIMATION stack (daemon hash)" is correct only if we fold the daemon into the UKI via a sysext addon — extending PCR 13 — or a credential addon. We should **not** invent a custom `tpm2_pcr_extend` of our own on top of PCRs 16-23; that's discouraged because the 16-23 range is "debug/resettable" and gets cleared under various conditions.
 
 ### 2.2 Attestation flow
 
@@ -99,7 +99,7 @@ Verifier (remote AI cortex, or local health-daemon)
     └───── pass → issue session token; fail → contain + alert
 ```
 
-For ARCHWINDOWS, step 3e-f is the interesting one: our cortex/decision engine can make trust decisions based on "did PCR 10 ever include an unknown binary" and emit an SCM/trust event. This is the bridge from hardware measurement to the software trust model.
+For ARCHIMATION, step 3e-f is the interesting one: our cortex/decision engine can make trust decisions based on "did PCR 10 ever include an unknown binary" and emit an SCM/trust event. This is the bridge from hardware measurement to the software trust model.
 
 ---
 
@@ -159,7 +159,7 @@ post_install() {
         openssl req -new -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
             -outform DER -keyout /var/lib/dkms/mok.key \
             -out /var/lib/dkms/mok.pub \
-            -subj "/CN=ARCHWINDOWS trust-dkms MOK/"
+            -subj "/CN=ARCHIMATION trust-dkms MOK/"
         chmod 600 /var/lib/dkms/mok.key
         echo ">>> Generated MOK at /var/lib/dkms/mok.pub"
         echo ">>> Enroll with: mokutil --import /var/lib/dkms/mok.pub"
@@ -183,7 +183,7 @@ DKMS will then sign on every rebuild automatically (uses `scripts/sign-file` fro
 
 ---
 
-## 5. UKI adoption for ARCHWINDOWS — the recommended direction
+## 5. UKI adoption for ARCHIMATION — the recommended direction
 
 ### 5.1 Why UKI
 
@@ -199,9 +199,9 @@ UKI solves this by packaging kernel + initramfs + stub + cmdline into **one PE b
 ### 5.2 Concrete UKI build path on Arch
 
 ```bash
-# /etc/mkinitcpio.d/archwindows.preset
+# /etc/mkinitcpio.d/archimation.preset
 PRESETS=('default')
-default_uki="/efi/EFI/Linux/archwindows-$(uname -r).efi"
+default_uki="/efi/EFI/Linux/archimation-$(uname -r).efi"
 default_options="--splash /usr/share/systemd/bootctl/splash-arch.bmp"
 
 # kernel-install then calls ukify with:
@@ -226,9 +226,9 @@ pacman -S linux
     │
     ├─▶ mkinitcpio hook generates /boot/initramfs-linux.img
     │
-    ├─▶ kernel-install hook runs ukify → /efi/EFI/Linux/archwindows-*.efi
+    ├─▶ kernel-install hook runs ukify → /efi/EFI/Linux/archimation-*.efi
     │
-    └─▶ sbctl hook runs `sbctl sign -s /efi/EFI/Linux/archwindows-*.efi`
+    └─▶ sbctl hook runs `sbctl sign -s /efi/EFI/Linux/archimation-*.efi`
 ```
 
 sbctl's pacman hook (`80-secureboot.hook`) is already shipped upstream; it auto-signs any file in its database. We'd add UKI paths to the db at install time. ([sbctl GitHub](https://github.com/Foxboron/sbctl))
@@ -240,8 +240,8 @@ sbctl's pacman hook (`80-secureboot.hook`) is already shipped upstream; it auto-
 ```
 systemd-cryptenroll --tpm2-device=auto \
                     --tpm2-pcrs=7+11+12 \
-                    --tpm2-public-key=/etc/archwindows/pcrlock.pub \
-                    --tpm2-signature=/etc/archwindows/pcrlock.sig \
+                    --tpm2-public-key=/etc/archimation/pcrlock.pub \
+                    --tpm2-signature=/etc/archimation/pcrlock.sig \
                     /dev/nvme0n1p3
 ```
 
@@ -284,7 +284,7 @@ Honest message to user: **"Without TPM 2.0 the authority root is firmware-streng
    - Generate `/var/lib/dkms/mok.{key,pub}` on first install (4-line openssl invocation).
    - Drop `/etc/dkms/framework.conf.d/trust.conf` that points DKMS at the MOK key.
    - On post-install, `echo ">>> trust.ko signed with local MOK. Enroll with: mokutil --import /var/lib/dkms/mok.pub"`.
-3. Add a `/usr/bin/archwindows-secureboot-setup` helper (60 LOC bash) that wraps: `sbctl create-keys → sbctl enroll-keys --microsoft → mokutil --import dkms/mok.pub` and gives one-screen instructions.
+3. Add a `/usr/bin/archimation-secureboot-setup` helper (60 LOC bash) that wraps: `sbctl create-keys → sbctl enroll-keys --microsoft → mokutil --import dkms/mok.pub` and gives one-screen instructions.
 4. Add a build-time `verify_modules_signable()` in `scripts/build-packages.sh` asserting the shipped kernel has `CONFIG_MODULE_SIG=y` (same style as S67's `verify_trust_dkms_manifest()`).
 5. Scripts-only; no ISO rebake required.
 
@@ -295,10 +295,10 @@ Honest message to user: **"Without TPM 2.0 the authority root is firmware-streng
 1. Switch `profile/packages.x86_64` from `grub` to `systemd-boot-efi` + `systemd-ukify`.
 2. Replace `profile/grub/grub.cfg` with:
    - `profile/airootfs/etc/kernel/cmdline` (single source of truth for cmdline).
-   - `profile/airootfs/etc/mkinitcpio.d/archwindows.preset` (UKI preset).
+   - `profile/airootfs/etc/mkinitcpio.d/archimation.preset` (UKI preset).
    - `profile/airootfs/etc/kernel/install.conf` with `layout=uki`.
 3. archiso hooks emit the UKI directly into `archisobasedir/EFI/Linux/`.
-4. Add `profile/airootfs/etc/archwindows/pcrlock.d/` with pre-signed PCR 11 policies for the shipped UKI.
+4. Add `profile/airootfs/etc/archimation/pcrlock.d/` with pre-signed PCR 11 policies for the shipped UKI.
 5. Installer (`ai-install-to-disk`) at end of install:
    - Runs `sbctl setup --auto-enroll` (if user opted in to SB).
    - Runs `systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7+11 /dev/<root>` (if user opted in to TPM auto-unlock + keeping passphrase slot).
@@ -318,13 +318,13 @@ Honest message to user: **"Without TPM 2.0 the authority root is firmware-streng
 
 ## 10. Summary (400 words)
 
-The ARCHWINDOWS trust model has a strong software crypto core (APE, trust kernel module, dictionary-routed Markov validators) but currently boots from an unsigned GRUB 2 and loads an unsigned `trust.ko` via DKMS on first boot. Every authority claim above Layer 0 therefore rests on a kernel that nothing proved was the one we shipped. The 2024-2026 Linux stack has crystallized a clean way to fix this: UEFI Secure Boot with sbctl-managed per-install keys enrolled via Microsoft's shim, a Unified Kernel Image (systemd-stub + kernel + initrd + signed cmdline) replacing the GRUB boot path, TPM 2.0 PCR 11 measuring the UKI and PCR 7 pinning the SB state, and `systemd-cryptenroll --tpm2-device=auto` sealing the LUKS key to a signed PCR policy so disk auto-unlocks on any UKI we signed but nothing else. sbctl 0.18 ships with an Arch pacman hook that re-signs on every linux/systemd/systemd-boot update; systemd-measure signs expected PCR 11 values at image build; Lockdown LSM + CONFIG_MODULE_SIG_FORCE makes unsigned module loading a compile error rather than a policy choice.
+The ARCHIMATION trust model has a strong software crypto core (APE, trust kernel module, dictionary-routed Markov validators) but currently boots from an unsigned GRUB 2 and loads an unsigned `trust.ko` via DKMS on first boot. Every authority claim above Layer 0 therefore rests on a kernel that nothing proved was the one we shipped. The 2024-2026 Linux stack has crystallized a clean way to fix this: UEFI Secure Boot with sbctl-managed per-install keys enrolled via Microsoft's shim, a Unified Kernel Image (systemd-stub + kernel + initrd + signed cmdline) replacing the GRUB boot path, TPM 2.0 PCR 11 measuring the UKI and PCR 7 pinning the SB state, and `systemd-cryptenroll --tpm2-device=auto` sealing the LUKS key to a signed PCR policy so disk auto-unlocks on any UKI we signed but nothing else. sbctl 0.18 ships with an Arch pacman hook that re-signs on every linux/systemd/systemd-boot update; systemd-measure signs expected PCR 11 values at image build; Lockdown LSM + CONFIG_MODULE_SIG_FORCE makes unsigned module loading a compile error rather than a policy choice.
 
 For `trust.ko` the DKMS-signing pattern is solved: generate a per-install MOK key in `post_install`, wire `/etc/dkms/framework.conf.d/trust.conf` at `mok_signing_key` + `mok_certificate`, and DKMS will invoke `scripts/sign-file` on every rebuild. User runs `mokutil --import` once, reboots through shim's MokManager, and every future kernel update is silently re-signed. akmods/Fedora and Ubuntu's `shim-signed` both use this identical pattern.
 
 Old hardware without TPM 2.0 degrades gracefully to firmware-strength SB + signed modules without attestation; trust.ko still runs, the Authority Proof Engine still issues software proofs, but the "root" is now the user's MOK rather than the TPM EK cert. New hardware (Windows-11-mandated TPM 2.0, ubiquitous on 2022+ consumer laptops) unlocks the full stack including password-free boot on a trusted configuration, cold-boot/bus-sniff caveats documented.
 
-Recommendation: a **2-session sprint**. Session A (low risk) adds sbctl + MOK + DKMS module signing and ships without an ISO rebake. Session B (larger scope) migrates archiso from GRUB to systemd-boot + UKI + ukify, adds swtpm to QEMU smoke tests, and wires `systemd-cryptenroll` into `ai-install-to-disk` so the installed system auto-unlocks on trusted boot. Together they move ARCHWINDOWS's trust root from "the kernel trusts us it's Tuesday" to "the hardware quoted PCRs chain back to a cert we can verify."
+Recommendation: a **2-session sprint**. Session A (low risk) adds sbctl + MOK + DKMS module signing and ships without an ISO rebake. Session B (larger scope) migrates archiso from GRUB to systemd-boot + UKI + ukify, adds swtpm to QEMU smoke tests, and wires `systemd-cryptenroll` into `ai-install-to-disk` so the installed system auto-unlocks on trusted boot. Together they move ARCHIMATION's trust root from "the kernel trusts us it's Tuesday" to "the hardware quoted PCRs chain back to a cert we can verify."
 
 ---
 

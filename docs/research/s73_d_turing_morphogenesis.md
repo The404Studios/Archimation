@@ -12,7 +12,7 @@ coupled diffusing species with short-range activation and long-range
 inhibition, leading to spontaneous spatial-pattern emergence from a
 spatially uniform steady state.
 
-**Verdict:** ARCHWINDOWS currently has zero spatial structure. The
+**Verdict:** ARCHIMATION currently has zero spatial structure. The
 Chromosomal Authority model already gives each subject 23 segment pairs
 of "DNA," and `trust_subject_pool.c` holds a bounded population — but
 the population is **flat**, there are no neighborhood relationships,
@@ -579,7 +579,7 @@ subsystem invariant is violated.
    species (`proof-chain-health`) for richer patterns. Kept out of
    v1 to limit blast radius.
 
-3. **Cross-node RD for cluster:** if ARCHWINDOWS ever clusters
+3. **Cross-node RD for cluster:** if ARCHIMATION ever clusters
    (multiple nodes cooperating), does the morphogen field become a
    gossip protocol? Yes — rumor-spreading is already known to be
    RD-like (Rudge 2020). Future work.
@@ -594,7 +594,7 @@ subsystem invariant is violated.
 
 ## 10. Summary for the next agent
 
-ARCHWINDOWS today has rich cellular state (`trust_subject_t` is a
+ARCHIMATION today has rich cellular state (`trust_subject_t` is a
 fully-featured cell) and rich cellular timing (`trust_decay_timer_fn`
 is a mitotic clock). **It has no tissue.** This doc proposes a ~300
 LOC kernel module (`trust/kernel/trust_morphogen.c`) that adds a 2D

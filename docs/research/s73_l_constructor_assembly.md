@@ -3,7 +3,7 @@
 **Agent:** Agent L (Session 73, 12-agent parallel framework audit)
 **Date:** 2026-04-20
 **Framework:** Deutsch 2013 *Constructor Theory of Information* + Marletto 2017 *Constructor theory of probability* + Marletto 2021 *The Science of Can and Can't* + Marletto & Deutsch 2024 *Constructor theory of thermodynamics* + Walker & Cronin 2017 *The algorithmic origins of life* (JR Soc Interface) + Marshall, Murray & Cronin 2021 *A probabilistic framework for identifying biosignatures using Pathway Complexity* + Marshall et al. 2021 *Identifying molecules as biosignatures with assembly theory and mass spectrometry* (Nature Communications 12:3033) + Sharma, Czégel, Lachmann, Kempes, Walker & Cronin 2023 *Assembly theory explains and quantifies selection and evolution* (Nature 622:321–328) + Hazen, Burns, Cleaves, Downs, Krivovichev, Wong 2023 *Lumping or splitting: Towards a taxonomy of mineral and aggregate kind complexity* (critique of assembly theory) + Cronin & Walker 2024 response.
-**Scope:** Only Constructor Theory (CT) and Assembly Theory (AT). Other S73 agents cover autopoiesis, Shannon/Kolmogorov, Gács–Von Neumann, cybernetics, free-energy, category theory, etc. CT and AT share a surface ("what is possible / how much selection built this?") but differ philosophically (CT: substrate-independent counterfactuals; AT: operational, measurable in a mass spec). We keep them paired because ARCHWINDOWS needs *both* questions answered at the trust gate: "is this task allowed?" (CT) and "was this artefact built, or is it noise?" (AT).
+**Scope:** Only Constructor Theory (CT) and Assembly Theory (AT). Other S73 agents cover autopoiesis, Shannon/Kolmogorov, Gács–Von Neumann, cybernetics, free-energy, category theory, etc. CT and AT share a surface ("what is possible / how much selection built this?") but differ philosophically (CT: substrate-independent counterfactuals; AT: operational, measurable in a mass spec). We keep them paired because ARCHIMATION needs *both* questions answered at the trust gate: "is this task allowed?" (CT) and "was this artefact built, or is it noise?" (AT).
 
 **Files surveyed as evidence:**
 - `trust/kernel/trust_internal.h` (`TRUST_ACTION_*` enum at line ~190–240, cited as `TI:line`)
@@ -22,11 +22,11 @@
 
 ## 0. Why these two frameworks, and why paired
 
-Constructor Theory (CT) and Assembly Theory (AT) are independent research programs that, viewed through the ARCHWINDOWS lens, answer complementary questions at the *same* gate:
+Constructor Theory (CT) and Assembly Theory (AT) are independent research programs that, viewed through the ARCHIMATION lens, answer complementary questions at the *same* gate:
 
 - **CT asks:** *Is this transformation a possible task in this universe of constructors?* CT re-founds physics on the counterfactual distinction between tasks that *can* be performed with arbitrary accuracy under some constructor, versus tasks that *cannot*. The **trust kernel is, operationally, a constructor**: it takes input states (subjects, requests) and produces output states (granted / denied / degraded), claiming to do so repeatably. A *CT-correct* trust kernel enumerates `Σ_possible`, the set of tasks it is a constructor for; everything else is `Σ_impossible` by construction, not by enforcement. This is a *much* stronger posture than "deny-list + default allow" or "allow-list + default deny", because it makes the deny *structural*: no code path exists.
 
-- **AT asks:** *How much selection went into this artefact?* AT gives a scalar, the **assembly index** `a(x)`, equal to the minimum number of recursive concatenation steps needed to build object `x` from elementary parts, given that already-built substructures can be reused. Combined with the object's **abundance** `n(x)` (copy number in the sample) and summed as `A = Σ e^{a(x)} · (n(x) − 1) / N`, AT claims to distinguish **biotic / designed / selected** matter from **random / prebiotic** matter with a threshold (`a ≈ 15` for small molecules detected by MS/MS, with the threshold re-derived per modality). When applied to **byte sequences — PE `.text`, syscall traces, shell scripts —** the same question becomes: "was this binary compiled, or is it a compressed random blob / pure packer stub / one-shot dropper?" AT's **abundance** term matters especially on ARCHWINDOWS, because the *adversary's* shortcuts (packers, generated shellcode, repeated identical XOR stubs) produce exactly the low-`a`/high-`n` signature that AT was designed to flag in prebiotic chemistry.
+- **AT asks:** *How much selection went into this artefact?* AT gives a scalar, the **assembly index** `a(x)`, equal to the minimum number of recursive concatenation steps needed to build object `x` from elementary parts, given that already-built substructures can be reused. Combined with the object's **abundance** `n(x)` (copy number in the sample) and summed as `A = Σ e^{a(x)} · (n(x) − 1) / N`, AT claims to distinguish **biotic / designed / selected** matter from **random / prebiotic** matter with a threshold (`a ≈ 15` for small molecules detected by MS/MS, with the threshold re-derived per modality). When applied to **byte sequences — PE `.text`, syscall traces, shell scripts —** the same question becomes: "was this binary compiled, or is it a compressed random blob / pure packer stub / one-shot dropper?" AT's **abundance** term matters especially on ARCHIMATION, because the *adversary's* shortcuts (packers, generated shellcode, repeated identical XOR stubs) produce exactly the low-`a`/high-`n` signature that AT was designed to flag in prebiotic chemistry.
 
 Every other framework in the S73 audit is either distance-from-baseline (Markov, chi-square, divergence) or information-theoretic (Shannon, Kolmogorov, Bennett). **Neither class answers "is this a possible task at all?" and neither class answers "how much construction does this object contain in absolute, substrate-independent units?"** CT+AT fill exactly those two gaps.
 
@@ -108,7 +108,7 @@ Marshall et al. 2021 (Nature Communications) showed that mass-spectrometry fragm
 
 Hazen, Burns, Cleaves, Downs, Krivovichev & Wong 2023 argued that AT's Earth-biosignature claim is confounded by non-biological mineral complexity (some inorganic crystal structures have non-trivial `a`), and that AT has not yet made predictions that distinguish it from Shannon-entropy arguments already in the astrobiology literature. Cronin & Walker 2024 responded: (i) AT's combinatorial accounting *does* differ from Shannon because it accumulates reuse, not surprise; (ii) the threshold is operational (MS-measurable), not universal; (iii) the sign of the claim — *presence of high `a` at high `n`* — is the biosignature, not complexity per se.
 
-For ARCHWINDOWS the critique is operationally irrelevant, because we are not claiming "biological origin". We are claiming "**constructed (i.e., compiled/assembled/designed) rather than random or trivially-generated**". The sign of the signal we want is **exactly** the sign AT was built for: designed artefacts accumulate high-`a` motifs at high abundance.
+For ARCHIMATION the critique is operationally irrelevant, because we are not claiming "biological origin". We are claiming "**constructed (i.e., compiled/assembled/designed) rather than random or trivially-generated**". The sign of the signal we want is **exactly** the sign AT was built for: designed artefacts accumulate high-`a` motifs at high abundance.
 
 ### 2.4 Does AT work on bytes?
 
@@ -138,7 +138,7 @@ A `monitoring.assembly_index_trace(pid)` handler returning `{"a": …, "n_unique
 
 ---
 
-## 3. Applying CT to ARCHWINDOWS — specific audit points
+## 3. Applying CT to ARCHIMATION — specific audit points
 
 ### 3.1 Σ_possible for trust.ko
 
@@ -172,7 +172,7 @@ The CT posture makes these differences *visible in review*, rather than relying 
 
 ### 3.3 CT-style specification of band transitions
 
-Marletto's 2021 book emphasises that constructor-legal transitions compose. For ARCHWINDOWS:
+Marletto's 2021 book emphasises that constructor-legal transitions compose. For ARCHIMATION:
 
 ```
 (band=UNTRUSTED) →[proof_consume]→ (band=USER)
@@ -204,7 +204,7 @@ This moves the decision from implicit "we got here" to explicit task-possibility
 
 ---
 
-## 4. Applying AT to ARCHWINDOWS — specific modules
+## 4. Applying AT to ARCHIMATION — specific modules
 
 ### 4.1 Static AT on PE binaries
 
@@ -260,7 +260,7 @@ APE proofs are hash-chained. An attacker who captures and replays proofs (which 
 ## 5. Concrete module spec — `ai-control/daemon/assembly_index.py`
 
 ```python
-"""Assembly Theory index computation for ARCHWINDOWS trust gating.
+"""Assembly Theory index computation for ARCHIMATION trust gating.
 
 Implements a simplified, operational assembly index a(x) per Sharma et al.
 2023 (Nature). Designed for PE .text sections, shell scripts, syscall

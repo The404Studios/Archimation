@@ -1,4 +1,4 @@
-# S73-B: Cybernetics / VSM Mapping of ARCHWINDOWS
+# S73-B: Cybernetics / VSM Mapping of ARCHIMATION
 
 **Framework**: Wiener cybernetics (1948) + Beer's Viable System Model (1972, 1979) + Ashby's Law of Requisite Variety (1956)
 **Agent**: B (of 12). Framework-exclusive; no drift into Von Neumann (A), CA (H), autopoiesis (E), or FEP (I).
@@ -48,7 +48,7 @@ Two crucial theorems:
 ### 1.4 Recent work (2020-2026)
 
 - **IBM Research (Feb 2025), "Agentic AI Needs a Systems Theory"** (arXiv 2503.00237) explicitly proposes VSM as the missing frame for agentic systems. Core claim: per-model capability metrics systematically underestimate emergent multi-agent risks because they lack S3/S4/S5 -- a single agent is only S1+S2 at best.
-- **Kellogg (2026), "Viable Systems: How To Build a Fully Autonomous Agent"** and follow-up "Levels of Agentic Coding" use VSM recursion as the ladder for progressive autonomy handover: agent operator + agent = one VSM; team of agents = next-level VSM at S2; etc. Directly relevant to ARCHWINDOWS' autonomy levels (OBSERVE/ADVISE/ACT_REPORT/AUTONOMOUS in `ai-control/cortex/autonomy.py:32-43`).
+- **Kellogg (2026), "Viable Systems: How To Build a Fully Autonomous Agent"** and follow-up "Levels of Agentic Coding" use VSM recursion as the ladder for progressive autonomy handover: agent operator + agent = one VSM; team of agents = next-level VSM at S2; etc. Directly relevant to ARCHIMATION' autonomy levels (OBSERVE/ADVISE/ACT_REPORT/AUTONOMOUS in `ai-control/cortex/autonomy.py:32-43`).
 - **Cariani's 2024 ASC talk** on bio-electric cybernetics reframed Ashby's Law as a statement about distinguishability of environmental states by a regulator's sensor alphabet -- directly applicable to the question "does the trust ISA's 96-op alphabet have requisite variety?"
 - **Bratton's *The Stack* (2016, accelerationist follow-ups)** proposes a 6-layer planetary computation stack (Earth, Cloud, City, Address, Interface, User) that is explicitly *not* VSM-isomorphic: Bratton's layers are substrates, not Beer's functional subsystems. We should not conflate them. Bratton's useful export is the *algedonic-scale* observation that distributed control at planetary scale requires direct-to-top alarm channels; this was the lesson of failed Soviet cybernetics and Cybersyn.
 - **Metaphorum Foundation + `viable-systems` GitHub org (2023-2026)** maintain modular VSM implementations in Elixir with first-class algedonic channels. Our project is a *kernel*-level analogue that currently lacks this primitive.
@@ -63,17 +63,17 @@ The cybernetics literature is blunt about how purposive systems die:
 4. **Algedonic starvation.** When S5 has no bypass channel, surprises propagate through S2/S3/S4 at management timescale and kill the organism before it can react. This is the specific failure that destroyed Cybersyn when Allende's government fell -- not the software, but the lack of a high-bandwidth alarm path that didn't run through normal chain-of-command.
 5. **Loss of recursion invariant.** If some level's S1 is not itself a viable system (e.g. lacks its own S5), variance absorption inverts: the higher-level system must spend its own variety managing the sub-unit, and Ashby bankrupts the whole stack.
 
-These are the five pathologies we need to check ARCHWINDOWS against.
+These are the five pathologies we need to check ARCHIMATION against.
 
 ---
 
-## Part 2 -- Mapping ARCHWINDOWS to Beer's VSM
+## Part 2 -- Mapping ARCHIMATION to Beer's VSM
 
 ### 2.1 L0-L4 Claimed-isomorphism, with mismatches
 
 CLAUDE.md presents 5 layers with the statement "commands flow down, events flow up. No layer calls upward." A naive read is: L0=S1, L1=S2, L2=S3, L3=S4, L4=S5. This is **structurally wrong** for four independent reasons.
 
-| ARCHWINDOWS Layer | CLAUDE.md Description | VSM Match | Actual Role |
+| ARCHIMATION Layer | CLAUDE.md Description | VSM Match | Actual Role |
 |---|---|---|---|
 | L0 -- Kernel | `trust.ko` (authority root), binfmt_pe, Linux | **S5** (Beer's sense -- policy / identity / recursion root) | Closes the recursion: the trust kernel is *the* policy-setter, not the operator. `trust/kernel/trust_isa.h:176` defines the ISA families; `trust/kernel/trust_authz.c` applies them. Policy lives here. |
 | L1 -- Object Broker | `pe-objectd`: named objects, registry hive, device namespace, session manager | **S3** (control) | Allocates resources to S1s; runs Windows-ism namespaces. Not S2 because it is not merely anti-oscillatory; it holds the name bindings. |
@@ -154,7 +154,7 @@ The concerning specific gap: **the trust ISA has no opcode family for "respond t
 
 Per the user's biological mapping (cells/subjects, mitochondria/PE loader, RNA/shared libs, ROS/IPC signals, cofactors/resources, microbiome/containers):
 
-| Bio entity | ARCHWINDOWS | VSM role |
+| Bio entity | ARCHIMATION | VSM role |
 |---|---|---|
 | Cell (with nucleus = trust subject) | `trust_subject_t` in ring 0 | S1 (an operation-producing unit) |
 | Mitochondrion | PE loader + DLL stubs mapped into the process | S1-nested-VSM (foreign integrated; the mitochondrion *is* a once-separate bacterium, like the PE binary *is* a once-foreign-OS process) |
@@ -164,13 +164,13 @@ Per the user's biological mapping (cells/subjects, mitochondria/PE loader, RNA/s
 | Nervous system | Cortex + coherence daemon | S4 + S5 (intelligence + identity) |
 | Immune system | Anti-cheat detection + trust denial + emergency-stop | Algedonic channel (but currently missing the direct-to-S5 wire) |
 
-The bio metaphor is strongly consistent with Beer's recursion theorem: every PE subject is a cell containing mitochondria (Windows DLLs doing foreign work), and the cell itself is inside a tissue (the SCM service fabric) inside an organism (the ARCHWINDOWS boot).
+The bio metaphor is strongly consistent with Beer's recursion theorem: every PE subject is a cell containing mitochondria (Windows DLLs doing foreign work), and the cell itself is inside a tissue (the SCM service fabric) inside an organism (the ARCHIMATION boot).
 
 ---
 
 ## Part 3 -- Applying the Classical Failure Modes
 
-Running the five cybernetic pathologies (Section 1.5) against ARCHWINDOWS:
+Running the five cybernetic pathologies (Section 1.5) against ARCHIMATION:
 
 ### 3.1 Homeostasis breakdown (positive-feedback runaway)
 
@@ -203,7 +203,7 @@ This is the single biggest variety-gap in the system. The S4 intelligence is *ge
 
 ### 3.4 Algedonic starvation
 
-**ARCHWINDOWS has no algedonic channel.** All events flow up through the event bus at uniform priority. `ai-control/cortex/event_bus.py:52-57` SourceLayer tags each event with KERNEL(0)/BROKER(1)/RUNTIME(2)/SCM(3)/CORTEX(4) but priority is not a first-class field in the event header; urgent events are delivered by the same queue as routine ones.
+**ARCHIMATION has no algedonic channel.** All events flow up through the event bus at uniform priority. `ai-control/cortex/event_bus.py:52-57` SourceLayer tags each event with KERNEL(0)/BROKER(1)/RUNTIME(2)/SCM(3)/CORTEX(4) but priority is not a first-class field in the event header; urgent events are delivered by the same queue as routine ones.
 
 Concretely, if an L2 PE runtime detects a critical anomaly (say, a JIT'd code page escaped W^X), that event must:
 
@@ -223,7 +223,7 @@ Does every S1 contain a complete S1-S5 at the next level down? Let's check:
 
 - PE subject (L2 S1): has a `trust_subject_t` (S5 policy, kernel-enforced), `trust_ape` (S4 intelligence, self-consuming proofs), `trust_trc` (S3 control, fixed-point cost multiplier), `trust_risc` (S2 coordination, instruction dispatch), and its actual code (S1 operations). **Yes, recursively viable.**
 - Coherenced (sub-unit of kernel subsystem): S1+S2 only (sensor+actuator+state-machine arbiter); no S3/S4/S5 of its own. **Not recursively viable**, relies on cortex for S4/S5. Flagged in 2.2.
-- The cortex itself: has S3 (handler dispatch), S4 (decision engine), and S5 (autonomy controller), but **no S1 of its own** -- the cortex does not itself perform value-producing operations; it arbitrates over L2 S1s. This is actually *correct* for an S5 in Beer's terms (S5 is not an operator), but it means the cortex is an incomplete VSM viewed standalone. This is fine because the complete VSM is ARCHWINDOWS as a whole, not the cortex alone.
+- The cortex itself: has S3 (handler dispatch), S4 (decision engine), and S5 (autonomy controller), but **no S1 of its own** -- the cortex does not itself perform value-producing operations; it arbitrates over L2 S1s. This is actually *correct* for an S5 in Beer's terms (S5 is not an operator), but it means the cortex is an incomplete VSM viewed standalone. This is fine because the complete VSM is ARCHIMATION as a whole, not the cortex alone.
 
 Verdict: **the recursion invariant holds at the trust-subject level but breaks at the coherence-daemon level.** Coherenced is a soft-failure point because if cortex goes offline, coherenced runs forever on its last setpoint (good in the short term, dangerous in a changing environment where the old setpoint is no longer fit).
 
@@ -237,7 +237,7 @@ The single highest-leverage move is:
 
 Why this specifically:
 
-1. **It is the one Beer primitive ARCHWINDOWS is completely missing.** Every other VSM primitive has at least a partial implementation (S1-S5, recursion, hysteresis-for-oscillation, veto-only S5). The algedonic channel is architecturally absent.
+1. **It is the one Beer primitive ARCHIMATION is completely missing.** Every other VSM primitive has at least a partial implementation (S1-S5, recursion, hysteresis-for-oscillation, veto-only S5). The algedonic channel is architecturally absent.
 2. **It is the classical failure mode we are closest to (§3.4).** Any alarm that must wait for event-bus aggregation to arrive at cortex is, per Ashby, *by construction* slower than an adversary who can time their move. Ashby's Law guarantees this is eventually exploited.
 3. **It closes the variety loop of §2.4 / §3.3.** The reason S4 intelligence currently cannot reach into a running PE's trust subject is because there is no fast lane. An algedonic wire from `trust.ko` (immediate-level detector) straight to cortex (arbiter) means the detector does not need to encode its alarm in the ISA; it just raises the flag, and cortex decides.
 4. **It is cheap, ~200 LOC total.** Specifics below.
@@ -261,12 +261,12 @@ Total: **~215 LOC, 2 new files, 1 char device.**
 
 1. **Sub-millisecond S1 -> S5 alarm** instead of event-bus latency (which under load is 10-100 ms).
 2. **Variety amplification on the defender side.** The algedonic record format is 7-15 bytes and can encode a large number of urgency-distinct alarm types; this is regulator variety that directly maps to adversary-action variety.
-3. **Correct Beer topology for the first time.** ARCHWINDOWS becomes a textbook viable system rather than an approximation.
+3. **Correct Beer topology for the first time.** ARCHIMATION becomes a textbook viable system rather than an approximation.
 4. **Observability win.** The algedonic stream is the one you show operators first in an incident ("what's currently screaming?") rather than digging through the event bus.
 
 ### Corollary exploit (stacks on top of the primary)
 
-Also add the matching **S3\* audit wire**: cortex-initiated unannounced probes of running PE subjects via a new `TRUST_OP_AUDIT_PROBE` opcode in the META family. This closes the `scm-daemon` lie vector (Session 64/65) at the trust-ISA level: the cortex can verify SCM's claims by probing the actual trust_subject_t state rather than trusting SCM's self-report. Another ~100 LOC. Together with the algedonic channel, these are the two Beer primitives that move ARCHWINDOWS from "VSM-approximate" to "VSM-complete."
+Also add the matching **S3\* audit wire**: cortex-initiated unannounced probes of running PE subjects via a new `TRUST_OP_AUDIT_PROBE` opcode in the META family. This closes the `scm-daemon` lie vector (Session 64/65) at the trust-ISA level: the cortex can verify SCM's claims by probing the actual trust_subject_t state rather than trusting SCM's self-report. Another ~100 LOC. Together with the algedonic channel, these are the two Beer primitives that move ARCHIMATION from "VSM-approximate" to "VSM-complete."
 
 ---
 
@@ -300,4 +300,4 @@ Eight+ citations:
 
 ## One-line exploit
 
-**Add a dedicated kernel-to-cortex algedonic channel (~215 LOC across `trust/kernel/trust_algedonic.c`, a new `/dev/trust_algedonic` char device, and `ai-control/cortex/algedonic_listener.py`) so urgent L1 alarms bypass the event-bus aggregation and reach S5 in sub-millisecond time; this closes the one Beer primitive ARCHWINDOWS is completely missing and eliminates the requisite-variety gap that Ashby's Law guarantees is eventually exploitable.**
+**Add a dedicated kernel-to-cortex algedonic channel (~215 LOC across `trust/kernel/trust_algedonic.c`, a new `/dev/trust_algedonic` char device, and `ai-control/cortex/algedonic_listener.py`) so urgent L1 alarms bypass the event-bus aggregation and reach S5 in sub-millisecond time; this closes the one Beer primitive ARCHIMATION is completely missing and eliminates the requisite-variety gap that Ashby's Law guarantees is eventually exploitable.**

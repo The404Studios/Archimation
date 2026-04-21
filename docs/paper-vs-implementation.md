@@ -247,7 +247,7 @@ nobody else in the Linux-security space has.
 ### §2.T-wdm: wdm_host.ko maturity disclaimer
 
 **Statement.** Per research J §3.3 and the tier-audit memo (apps 80% /
-services 75% / **drivers 30-40%**), the claim "ARCHWINDOWS runs Windows
+services 75% / **drivers 30-40%**), the claim "ARCHIMATION runs Windows
 drivers under hardware-rooted authority" is a tier-3 marketing claim,
 not defensible in an academic paper. `wdm_host.ko` has an IAT walker +
 27 ntoskrnl symbols + Authenticode shape check, but hundreds of WDM/WDF

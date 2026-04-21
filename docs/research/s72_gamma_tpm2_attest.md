@@ -2,7 +2,7 @@
 
 **Agent:** Agent γ (Session 72, 5-agent bootc Phase 1 kickoff)
 **Date:** 2026-04-20
-**Scope:** How and why `trust.ko` — the single module that grounds the entire five-layer ARCHWINDOWS authority stack — refuses to initialize if the userspace above it has been tampered, degrades gracefully on old hardware that lacks a TPM 2.0, and never silently claims hardware-grounded authority when only software-level assurance is available.
+**Scope:** How and why `trust.ko` — the single module that grounds the entire five-layer ARCHIMATION authority stack — refuses to initialize if the userspace above it has been tampered, degrades gracefully on old hardware that lacks a TPM 2.0, and never silently claims hardware-grounded authority when only software-level assurance is available.
 
 **Ownership:**
 - `trust/kernel/trust_attest.h` (API)
@@ -59,11 +59,11 @@ These APIs are stable and documented. No ioctl hackery, no out-of-tree patches r
 | **11** | **systemd-stub** | **Unified Kernel Image content (kernel + initrd + cmdline + os-release + splash + dtb + pcrsig + pcrpkey)** |
 | 12 | systemd-stub | boot phase transitions (enter-initrd, leave-initrd, sysinit, ready, shutdown, final) |
 | 14 | systemd | Machine ID |
-| 15 | **local distro use** | free-for-all — ARCHWINDOWS could anchor authority-specific measurements here in a future iteration |
+| 15 | **local distro use** | free-for-all — ARCHIMATION could anchor authority-specific measurements here in a future iteration |
 
 **PCR 11 is the right PCR for "is our userspace what we shipped?"** because the UKI contains the kernel, the initrd, and (for bootc deployments) a signature over the immutable `/usr` tree. If an attacker modifies anything inside the UKI, the systemd-stub measurement bumps PCR 11 to a different digest, and our memcmp detects it.
 
-PCR 15 is attractive for extending with our own measurements later (e.g. hashing `/etc/archwindows/*` at user-space enrollment time and extending it into PCR 15). S72 scope is PCR 11 only; PCR 15 is a handoff to S73+.
+PCR 15 is attractive for extending with our own measurements later (e.g. hashing `/etc/archimation/*` at user-space enrollment time and extending it into PCR 15). S72 scope is PCR 11 only; PCR 15 is a handoff to S73+.
 
 ---
 
@@ -112,7 +112,7 @@ PCR 15 is attractive for extending with our own measurements later (e.g. hashing
                          │   │           return -
                          │   │           ENOTSUPP.
                          │   ▼
-                         │   read /etc/archwindows/expected-pcr-11
+                         │   read /etc/archimation/expected-pcr-11
                          │   │
                          │   ┌─────┴──────┐
                          │   ok         fail
@@ -192,9 +192,9 @@ trust_attest: to force software-only mode, reboot with trust.attest=skip on kern
 trust: attestation FAILED — module refusing to initialize (rc=-13)
 ```
 
-The `expected` and `measured` digests are printed verbatim so an admin can compute whether the drift is "I just updated the image" vs "something has tampered with my system". Both are recoverable: rebuild the bootc image (which re-provisions `/etc/archwindows/expected-pcr-11`), or reboot with `trust.attest=skip` to force SOFTWARE mode while investigating.
+The `expected` and `measured` digests are printed verbatim so an admin can compute whether the drift is "I just updated the image" vs "something has tampered with my system". Both are recoverable: rebuild the bootc image (which re-provisions `/etc/archimation/expected-pcr-11`), or reboot with `trust.attest=skip` to force SOFTWARE mode while investigating.
 
-No `panic()`. No WARN_ON. We don't brick the kernel — the rest of Linux boots fine; only our module refuses to attach. That's a deliberate choice: hard-panicking on PCR mismatch is a security posture some distros take, but for ARCHWINDOWS the usability cost of bricking a laptop whose user just ran `pacman -Syu` outweighs the authority benefit.
+No `panic()`. No WARN_ON. We don't brick the kernel — the rest of Linux boots fine; only our module refuses to attach. That's a deliberate choice: hard-panicking on PCR mismatch is a security posture some distros take, but for ARCHIMATION the usability cost of bricking a laptop whose user just ran `pacman -Syu` outweighs the authority benefit.
 
 ---
 
@@ -202,7 +202,7 @@ No `panic()`. No WARN_ON. We don't brick the kernel — the rest of Linux boots 
 
 This is the case we must get right. Scenarios:
 
-1. **Legacy BIOS (no UEFI)**: no systemd-stub UKI, no PCR 11 measurement happening at boot — but `tpm_chip_find_get` may still return a chip if firmware exposes one. Outcome: read of `/etc/archwindows/expected-pcr-11` succeeds (it's just a file), PCR 11 read returns the BIOS chip's value (meaningless for UKI), memcmp fails → FAILED mode. **This would brick BIOS-only installs.** Mitigation: bootc image build MUST write `0000...0000` as the expected PCR for non-UKI deployment paths, OR the install scripts MUST drop `trust.attest=software` into the kernel cmdline. Agent α (bootc orchestrator) is responsible for picking the right path based on the install target's firmware mode.
+1. **Legacy BIOS (no UEFI)**: no systemd-stub UKI, no PCR 11 measurement happening at boot — but `tpm_chip_find_get` may still return a chip if firmware exposes one. Outcome: read of `/etc/archimation/expected-pcr-11` succeeds (it's just a file), PCR 11 read returns the BIOS chip's value (meaningless for UKI), memcmp fails → FAILED mode. **This would brick BIOS-only installs.** Mitigation: bootc image build MUST write `0000...0000` as the expected PCR for non-UKI deployment paths, OR the install scripts MUST drop `trust.attest=software` into the kernel cmdline. Agent α (bootc orchestrator) is responsible for picking the right path based on the install target's firmware mode.
 
 2. **TPM disabled in firmware**: `tpm_chip_find_get` returns `NULL`, we go to SOFTWARE mode with pr_warn. Fine.
 
@@ -240,7 +240,7 @@ In FAILED mode, the main module never creates `/sys/kernel/trust/` — but `/sys
 
 ## 6. Handoffs to S73+ and other agents
 
-- **Agent α (bootc orchestrator)**: consume `bootc/systemd-measure.conf`; run the `systemd-measure calculate` + `systemd-measure sign` sequence at image build; stage the resulting 64-hex-char digest at `/etc/archwindows/expected-pcr-11` with `0444 root:root` perms.
+- **Agent α (bootc orchestrator)**: consume `bootc/systemd-measure.conf`; run the `systemd-measure calculate` + `systemd-measure sign` sequence at image build; stage the resulting 64-hex-char digest at `/etc/archimation/expected-pcr-11` with `0444 root:root` perms.
 - **Agent β (packaging)**: ensure the `trust-dkms` PKGBUILD ships `trust_attest.c` and `trust_attest.h` (check Kbuild sources list is covered — the S59 drift fix already does this pattern).
 - **Agent δ (keys)**: generate `bootc/trust-keys/uki-pcr.{pub,priv}.pem` for systemd-measure signing. Rotation policy: new keypair per major image release.
 - **Agent ε (daemon)**: read `/sys/kernel/trust_attest/mode` at daemon startup; emit `attestation_mode` field in `GET /health`; downgrade cortex confidence when mode == "software".
@@ -279,4 +279,4 @@ In FAILED mode, the main module never creates `/sys/kernel/trust/` — but `/sys
 
 The old-hardware graceful path is designed-in, not bolted-on: TPM absence, TPM 1.2, firmware-disabled TPM, and missing expected-PCR files all route to SOFTWARE mode with a `pr_warn`. The daemon mirrors the mode in `/health` so desktop UX can surface it honestly.
 
-The single file of trust between build time and run time is `/etc/archwindows/expected-pcr-11`. Agent α's bootc orchestrator stages it; `trust_attest.c` consumes it; systemd-measure produces it. Everything else is mechanism.
+The single file of trust between build time and run time is `/etc/archimation/expected-pcr-11`. Agent α's bootc orchestrator stages it; `trust_attest.c` consumes it; systemd-measure produces it. Everything else is mechanism.

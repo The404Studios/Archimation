@@ -62,9 +62,9 @@ Future Agent K ISO-rebake should add any new Agent-K-produced pkgs on top. If co
 ## Existing ISOs in `output/`
 
 ```
-2.2G  2026-04-19 22:38  archwindows-2026.04.19-x86_64.iso
+2.2G  2026-04-19 22:38  archimation-2026.04.19-x86_64.iso
 2.2G  2026-04-20 08:18  archimation-2026.04.20-x86_64.iso
-2.2G  2026-04-20 13:03  archwindows-2026.04.20-x86_64.iso   <-- most recent
+2.2G  2026-04-20 13:03  archimation-2026.04.20-x86_64.iso   <-- most recent
 ```
 
 The 13:03 ISO is after the git HEAD cutover and may already reflect some Agent-K+L work. Future QEMU verify agent should decide whether to re-bake or test the existing 13:03 ISO first for a quick signal.

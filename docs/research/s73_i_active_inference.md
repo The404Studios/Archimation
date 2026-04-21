@@ -523,7 +523,7 @@ theorems 2/3/5/7 have Markov-chain interpretations." That's true, but it
 is the *what*, not the *why*. After active inference lands, the narrative
 upgrades to:
 
-> ARCHWINDOWS's cortex implements a minimal active-inference agent.
+> ARCHIMATION's cortex implements a minimal active-inference agent.
 > The eight Markov chains are the factored generative model; the free
 > energy principle is the loss function; the trust kernel's `/dev/trust`
 > blanket is the Markov blanket separating the agent from its environment.

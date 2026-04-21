@@ -1,7 +1,7 @@
-# Session 71 / Research Agent G — Atomic Updates for ARCHWINDOWS
+# Session 71 / Research Agent G — Atomic Updates for ARCHIMATION
 
 **Date:** 2026-04-20
-**Question:** Should ARCHWINDOWS adopt atomic / image-based updates (OSTree, BTRFS snapshots, bcachefs, A/B partitions) — and if so, which path?
+**Question:** Should ARCHIMATION adopt atomic / image-based updates (OSTree, BTRFS snapshots, bcachefs, A/B partitions) — and if so, which path?
 **Context:** S69 just fixed pacman post-install via HTTPS + `file://` fallback. The question now is whether to go further and make updates *reversible* and *atomic* by construction.
 
 ---
@@ -11,10 +11,10 @@
 **Two-track proposal:**
 
 1. **Session 72 (1 session, low risk, high ROI):**
-   Add a `--fs {ext4,btrfs}` flag to `ai-install-to-disk`. On BTRFS, create the Ubuntu-style flat subvolume layout (`@`, `@home`, `@var`, `@log`, `@pkg`, `@snapshots`), install `snapper` + `snap-pac` + `grub-btrfs`, and configure pacman to auto-snapshot before every transaction. Default: **ext4 on disks <64 GB, BTRFS on disks ≥64 GB**. This gives ARCHWINDOWS the single biggest practical win of the "immutable distro" trend (*pre-transaction rollback, one-click recovery on bad update*) without leaving pacman or requiring a distro re-architecture.
+   Add a `--fs {ext4,btrfs}` flag to `ai-install-to-disk`. On BTRFS, create the Ubuntu-style flat subvolume layout (`@`, `@home`, `@var`, `@log`, `@pkg`, `@snapshots`), install `snapper` + `snap-pac` + `grub-btrfs`, and configure pacman to auto-snapshot before every transaction. Default: **ext4 on disks <64 GB, BTRFS on disks ≥64 GB**. This gives ARCHIMATION the single biggest practical win of the "immutable distro" trend (*pre-transaction rollback, one-click recovery on bad update*) without leaving pacman or requiring a distro re-architecture.
 
 2. **Long-horizon track (5–10 sessions, separate effort, not S72):**
-   An OSTree-backed `archwindows-atomic` variant. Keeps the trust kernel, AI daemon, and PE loader, but delivers `/usr` as an OSTree deployment. Build pipeline becomes "container image → ostree commit". This is Silverblue/Kinoite's architecture, retrofitted to Arch + our stack. Useful ceiling, not a S72 task.
+   An OSTree-backed `archimation-atomic` variant. Keeps the trust kernel, AI daemon, and PE loader, but delivers `/usr` as an OSTree deployment. Build pipeline becomes "container image → ostree commit". This is Silverblue/Kinoite's architecture, retrofitted to Arch + our stack. Useful ceiling, not a S72 task.
 
 The S72 BTRFS-snapper path is the correct next step: it converts 80% of the user-facing value of atomic distros (**"a bad update never bricks the machine"**) into *roughly one new installer flag and three new PKGBUILD dependencies*. The OSTree path buys the remaining 20% but is a distro-architecture rewrite.
 
@@ -34,7 +34,7 @@ The S72 BTRFS-snapper path is the correct next step: it converts 80% of the user
 * **What it is:** Bluefin ships a Fedora Silverblue base as an **OCI container image** (not an RPM repo snapshot). Updates = `podman pull` of a new image tag, reboot, system switches to it ([Bluefin][bluefin], [Red Hat on bootc][bootc-rh]).
 * **2025 refactor:** Bluefin split into modular OCI configuration containers (`bluefin`, `bluefin-lts` on CentOS, `bluefin-distroless` on GNOME OS). The whole OS is now authored the same way you author a containerized microservice: `Containerfile` + CI → tagged image ([Bluefin 2025 wrap-up][bluefin-wrap]).
 * **bootc (CNCF Sandbox, Jan 2025):** The underlying technology. `bootc switch <image>` swaps the running OS to a different container image *in place*; atomic update + rollback for free. RHEL Image Mode, Rocky Image Mode, Fedora Atomic — all now bootc-based ([bootc-dev][bootc-gh]).
-* **Relevance to us:** ARCHWINDOWS-as-container would let a user `bootc switch ghcr.io/fourzerofour/archwindows:latest` and get our full OS. Attractive long-term, but it assumes an OSTree-bootc-capable base. Not an Arch-native path yet.
+* **Relevance to us:** ARCHIMATION-as-container would let a user `bootc switch ghcr.io/fourzerofour/archimation:latest` and get our full OS. Attractive long-term, but it assumes an OSTree-bootc-capable base. Not an Arch-native path yet.
 
 ### openSUSE MicroOS / Aeon / Leap Micro (transactional-update + BTRFS)
 
@@ -78,7 +78,7 @@ The good news: **everything we need already exists in `extra/`.**
 
 ### Pattern (snap-pac + grub-btrfs + snapper)
 
-1. Install ArchWindows onto BTRFS with the Ubuntu-style flat layout: `@`, `@home`, `@var`, `@log`, `@pkg` (for `/var/cache/pacman/pkg`), `@snapshots`.
+1. Install Archimation onto BTRFS with the Ubuntu-style flat layout: `@`, `@home`, `@var`, `@log`, `@pkg` (for `/var/cache/pacman/pkg`), `@snapshots`.
 2. `pacman -S snapper snap-pac grub-btrfs`.
 3. `snapper -c root create-config /` creates a snapper config for `/`.
 4. Enable `snapper-timeline.timer` and `snapper-cleanup.timer` — the former takes hourly rolling snapshots, the latter prunes them.
@@ -94,14 +94,14 @@ The good news: **everything we need already exists in `extra/`.**
 ### What it does **not** buy us
 
 * **The OS is still mutable between transactions.** A rogue process with root can modify `/usr/bin/python` between snapshots and snap-pac won't see it (it only fires on pacman events).
-* **Not image-based.** Two ArchWindows installs running the same `pacman -Syu` can still diverge (timing of AUR builds, mirror fallbacks, etc.).
-* **Not container-deliverable.** We can't ship ARCHWINDOWS as an OCI tag.
+* **Not image-based.** Two Archimation installs running the same `pacman -Syu` can still diverge (timing of AUR builds, mirror fallbacks, etc.).
+* **Not container-deliverable.** We can't ship ARCHIMATION as an OCI tag.
 
 These are fine trade-offs for S72. The OSTree path (§4) buys these if and when we want them.
 
 ---
 
-## 4. Aspirational: OSTree-backed ARCHWINDOWS (high effort)
+## 4. Aspirational: OSTree-backed ARCHIMATION (high effort)
 
 **Estimate: 5–10 sessions.** Not S72. Listed for posterity.
 
@@ -109,8 +109,8 @@ These are fine trade-offs for S72. The OSTree path (§4) buys these if and when 
 
 Arch is fundamentally a **mutable, rolling, package-centric distro**. OSTree is **immutable, versioned, tree-centric**. The retrofit means:
 
-1. **Build pipeline change.** Instead of `scripts/build-packages.sh` → `pkg.tar.zst`, we'd need `scripts/build-ostree.sh` → OSTree commit on a branch like `archwindows/stable/x86_64`. A commit is a hashed filesystem tree; we'd compose it by running a minimal pacstrap into `/var/tmp/rootfs`, then `ostree commit --repo=... --branch=...`.
-2. **Boot sequence change.** Bootloader must know about `/ostree/deploy/archwindows/deploy/<checksum>/root` and kernel-command-line `ostree=/ostree/boot.1/archwindows/<csum>/0`. mkinitcpio needs an OSTree hook (dracut has one upstream; mkinitcpio doesn't yet have a first-class equivalent, though `mkinitcpio-ostree` exists as a community project).
+1. **Build pipeline change.** Instead of `scripts/build-packages.sh` → `pkg.tar.zst`, we'd need `scripts/build-ostree.sh` → OSTree commit on a branch like `archimation/stable/x86_64`. A commit is a hashed filesystem tree; we'd compose it by running a minimal pacstrap into `/var/tmp/rootfs`, then `ostree commit --repo=... --branch=...`.
+2. **Boot sequence change.** Bootloader must know about `/ostree/deploy/archimation/deploy/<checksum>/root` and kernel-command-line `ostree=/ostree/boot.1/archimation/<csum>/0`. mkinitcpio needs an OSTree hook (dracut has one upstream; mkinitcpio doesn't yet have a first-class equivalent, though `mkinitcpio-ostree` exists as a community project).
 3. **Package installation change.** Users who want to `pacman -S foo` get layered packages (Silverblue-style): every rebase replays the layer. Our choices:
     * (a) Force all apps to Flatpak / AppImage; pacman frozen at base image, no layering.
     * (b) Implement pacman-on-OSTree layering: `archw-ostree install` wraps `pacman -S` into an OSTree-aware transaction. This is real work (think 1000–2000 LOC).
@@ -125,7 +125,7 @@ Arch is fundamentally a **mutable, rolling, package-centric distro**. OSTree is 
 4. Session X+3: DKMS at image-build time; trust.ko shipped pre-built inside the tree.
 5. Session X+4: rollout plan, A/B test matrix, rebase between channels.
 
-**bootc alternative:** Instead of OSTree native, go **bootc** route (container image as OS). We'd author a `Containerfile` that `FROM archlinux:base`, adds our pkgs, and ships as `ghcr.io/fourzerofour/archwindows:latest`. Users run `bootc switch ghcr.io/fourzerofour/archwindows:latest` after a minimal bootc base is installed. Currently no *Arch* bootc base exists; Fedora/CentOS/Rocky do. Adding one is non-trivial but modern and aligns with the 2025 trajectory.
+**bootc alternative:** Instead of OSTree native, go **bootc** route (container image as OS). We'd author a `Containerfile` that `FROM archlinux:base`, adds our pkgs, and ships as `ghcr.io/fourzerofour/archimation:latest`. Users run `bootc switch ghcr.io/fourzerofour/archimation:latest` after a minimal bootc base is installed. Currently no *Arch* bootc base exists; Fedora/CentOS/Rocky do. Adding one is non-trivial but modern and aligns with the 2025 trajectory.
 
 ---
 
@@ -134,9 +134,9 @@ Arch is fundamentally a **mutable, rolling, package-centric distro**. OSTree is 
 | Filesystem | Snapshots | CoW | Compression | Arch support | Mainline | Recommend for |
 |---|---|---|---|---|---|---|
 | **ext4** | No (only file-level `cp --reflink` via `-O orphan_file`) | No | No | 100% — default everywhere | Yes | **Disks <64 GB, old hardware, minimal install**. Simple, fast, robust, no metadata overhead. Falls back to timeshift-over-rsync for snapshots (file-level, slow, space-expensive). |
-| **BTRFS** | Yes, first-class | Yes | zstd:1–15 | 100% via `btrfs-progs` | Yes (mature as of 2024) | **Default for ARCHWINDOWS on disks ≥64 GB.** Real atomic snapshots, compressed by default (zstd:3 = 55% more write / 133% more read than uncompressed per [Phoronix 2025][phoronix-btrfs]), snap-pac integration. |
-| **bcachefs** | Yes (nascent) | Yes | Yes | AUR `bcachefs-tools` | **REMOVED** from mainline in kernel 6.17 (Aug 2025), ships as DKMS only ([LWN 6.17 removal][lwn-bcachefs], [Phoronix][phoronix-bcachefs]) | **Do not use for ARCHWINDOWS in 2026.** DKMS-only means the filesystem driver must compile against every kernel update; kernel panic recovery becomes harder; root-on-bcachefs across kernel-ABI breaks is a bad time. Reconsider in ~2027 if upstream relationship stabilizes. |
-| **ZFS** | Yes | Yes | lz4/zstd | AUR `zfs-dkms` | No (CDDL/GPL incompat, out-of-tree) | Server / NAS, not desktop. License friction, DKMS cost. Not recommended for ArchWindows. |
+| **BTRFS** | Yes, first-class | Yes | zstd:1–15 | 100% via `btrfs-progs` | Yes (mature as of 2024) | **Default for ARCHIMATION on disks ≥64 GB.** Real atomic snapshots, compressed by default (zstd:3 = 55% more write / 133% more read than uncompressed per [Phoronix 2025][phoronix-btrfs]), snap-pac integration. |
+| **bcachefs** | Yes (nascent) | Yes | Yes | AUR `bcachefs-tools` | **REMOVED** from mainline in kernel 6.17 (Aug 2025), ships as DKMS only ([LWN 6.17 removal][lwn-bcachefs], [Phoronix][phoronix-bcachefs]) | **Do not use for ARCHIMATION in 2026.** DKMS-only means the filesystem driver must compile against every kernel update; kernel panic recovery becomes harder; root-on-bcachefs across kernel-ABI breaks is a bad time. Reconsider in ~2027 if upstream relationship stabilizes. |
+| **ZFS** | Yes | Yes | lz4/zstd | AUR `zfs-dkms` | No (CDDL/GPL incompat, out-of-tree) | Server / NAS, not desktop. License friction, DKMS cost. Not recommended for Archimation. |
 | **XFS** | `xfs_reflink` for files only; no subvolume snapshots | Reflinks only | No | 100% | Yes | Fast on large files, but no snapshot-of-a-tree concept. Not useful for our snapshot goal. |
 
 ### Takeaway
@@ -169,11 +169,11 @@ Around line 259 (`log "Creating filesystems"`):
 ```bash
 case "$FS_CHOICE" in
     ext4)
-        mkfs.ext4 -F -L ArchWindows -m 1 "$ROOT_PART"
+        mkfs.ext4 -F -L Archimation -m 1 "$ROOT_PART"
         mount "$ROOT_PART" "$MOUNT"
         ;;
     btrfs)
-        mkfs.btrfs -f -L ArchWindows "$ROOT_PART"
+        mkfs.btrfs -f -L Archimation "$ROOT_PART"
         mount -o compress=zstd:3,noatime "$ROOT_PART" "$MOUNT"
         for sv in @ @home @var @log @pkg @snapshots; do
             btrfs subvolume create "$MOUNT/$sv"
@@ -326,8 +326,8 @@ async def handle_system_rollback_last_update(args):
 ### What we give up vs OSTree/bootc
 
 * The OS is mutable between transactions (a rogue `rm -rf /usr/lib/whatever` won't auto-recover).
-* Two ArchWindows installs of the same version can diverge over time (mirror timing, AUR states).
-* No "rebase to a new channel" UX — no `archwindows-stable` / `archwindows-testing` / `archwindows-nightly` rails.
+* Two Archimation installs of the same version can diverge over time (mirror timing, AUR states).
+* No "rebase to a new channel" UX — no `archimation-stable` / `archimation-testing` / `archimation-nightly` rails.
 
 These are exactly the gaps the **long-horizon OSTree/bootc track** would close. They're not S72.
 

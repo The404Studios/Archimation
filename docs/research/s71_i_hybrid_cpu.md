@@ -1,15 +1,15 @@
-# S71-I: Hybrid-CPU-Aware Scheduling for ARCHWINDOWS
+# S71-I: Hybrid-CPU-Aware Scheduling for ARCHIMATION
 
 **Research agent:** I (of 12).
 **Date:** 2026-04-20.
-**Scope:** How Linux schedules on hybrid / heterogeneous CPUs (Intel P+E, AMD chiplet+X3D, ARM big.LITTLE / DynamIQ, Apple M-series) in 2024-2026, and how ARCHWINDOWS should exploit the kernel surface *without* inventing a scheduler we can't maintain.
-**Verdict:** **Stand on the mainline stack (EEVDF + amd-pstate/intel-pstate + EAS + cache-aware load-balancing) on every tier. On NEW hardware add a single sched_ext BPF scheduler (`scx_lavd` first; a custom `scx_archwindows` layered variant later) attached to `pe-compat.slice`. On OLD hardware attach nothing. Raise latency sensitivity for the AI daemon via `latency_nice`; use `AllowedCPUs` for IRQ/game isolation (already done). No CPU affinity for the cortex — it is an E-core consumer by design.**
+**Scope:** How Linux schedules on hybrid / heterogeneous CPUs (Intel P+E, AMD chiplet+X3D, ARM big.LITTLE / DynamIQ, Apple M-series) in 2024-2026, and how ARCHIMATION should exploit the kernel surface *without* inventing a scheduler we can't maintain.
+**Verdict:** **Stand on the mainline stack (EEVDF + amd-pstate/intel-pstate + EAS + cache-aware load-balancing) on every tier. On NEW hardware add a single sched_ext BPF scheduler (`scx_lavd` first; a custom `scx_archimation` layered variant later) attached to `pe-compat.slice`. On OLD hardware attach nothing. Raise latency sensitivity for the AI daemon via `latency_nice`; use `AllowedCPUs` for IRQ/game isolation (already done). No CPU affinity for the cortex — it is an E-core consumer by design.**
 
 ---
 
-## 0. Why this research matters for ARCHWINDOWS
+## 0. Why this research matters for ARCHIMATION
 
-ARCHWINDOWS runs four very different workloads on a single machine:
+ARCHIMATION runs four very different workloads on a single machine:
 
 | Workload | Latency class | Runtime shape | Right CPU tier |
 |---|---|---|---|
@@ -18,7 +18,7 @@ ARCHWINDOWS runs four very different workloads on a single machine:
 | **AI cortex** (decision loop, Markov chains, optional LLM inference) | Bulk (seconds) | Periodic batch | **E-core tier** — this is the textbook E-core use case |
 | **Trust kernel gating** | Hard but rare (`trust.ko` ISA per-syscall check) | Runnable ~microseconds | Wherever the gated process already is |
 
-A single static policy cannot serve all four. Historically ARCHWINDOWS had only `CPUWeight` + `AllowedCPUs` + NUMA-pin helpers (see `slice-apply.sh:231-275` and `game.slice:40-100`) — perfectly good but tier-blind. Hybrid-CPU hardware has shifted the frontier: the cheapest lever now is to hand the kernel the right *hints* and let mainline do its job, not to write our own scheduler.
+A single static policy cannot serve all four. Historically ARCHIMATION had only `CPUWeight` + `AllowedCPUs` + NUMA-pin helpers (see `slice-apply.sh:231-275` and `game.slice:40-100`) — perfectly good but tier-blind. Hybrid-CPU hardware has shifted the frontier: the cheapest lever now is to hand the kernel the right *hints* and let mainline do its job, not to write our own scheduler.
 
 The mainline kernel has absorbed more scheduler improvements in the last 30 months than the prior decade. This report is the inventory of what ships, what we can use today, and the one specific experiment worth S72.
 
@@ -61,7 +61,7 @@ ARM's "Energy Aware Scheduling" has been mainline for years ([kernel.org Energy 
 
 ### 1.4 Old hardware
 
-The overwhelming majority of the hardware ARCHWINDOWS supports (Sandy/Ivy Bridge 2-core laptops, Core 2 Quad desktops, single-core 2005 P4s) is **homogeneous**. No Thread Director, no cluster scheduling value, no preferred core, no EAS (no asymmetric capacity to model).
+The overwhelming majority of the hardware ARCHIMATION supports (Sandy/Ivy Bridge 2-core laptops, Core 2 Quad desktops, single-core 2005 P4s) is **homogeneous**. No Thread Director, no cluster scheduling value, no preferred core, no EAS (no asymmetric capacity to model).
 
 Mainline EEVDF in 6.6+ is the right scheduler for every OLD machine we'll ever see. No tuning required, no hybrid logic firing. `hw-detect.sh` already sets `ondemand` governor and `bfq` I/O scheduler on OLD; we add nothing CPU-scheduler-wise.
 
@@ -121,7 +121,7 @@ The opportunity for us is real. Every SCX scheduler has a **declarative config f
 
 ---
 
-## 4. Priority policy for ARCHWINDOWS
+## 4. Priority policy for ARCHIMATION
 
 The policy below restates the slice topology as CPU-tier placement rules. Implementation is always "describe cgroups / slices, let mainline or SCX decide the physical cores."
 
@@ -148,7 +148,7 @@ The Asahi Linux M2 MacBook Air result ([Phoronix Asahi Jan 2024](https://www.pho
 
 From the survey of `profile/airootfs/etc/systemd/system/`:
 
-- **5 slice units** covering the L0–L4 hierarchy (`trust.slice` 1000, `pe-compat.slice` 900, `game.slice` 10000, `ai-daemon.slice` 200, `observer.slice` 10). Matches the ARCHWINDOWS 5-layer architecture one-for-one.
+- **5 slice units** covering the L0–L4 hierarchy (`trust.slice` 1000, `pe-compat.slice` 900, `game.slice` 10000, `ai-daemon.slice` 200, `observer.slice` 10). Matches the ARCHIMATION 5-layer architecture one-for-one.
 - `AllowedCPUs` generated per HW tier by `slice-apply.sh` with NUMA detection — already carves reserved CPUs for observer on OLD/MID/NEW classes.
 - `Nice=-5`, `IOSchedulingClass=best-effort`, `OOMScoreAdjust=-100` drop-in for the daemon.
 - Governor and I/O scheduler set per HW tier in `hw-detect.sh` (ondemand+bfq for OLD, schedutil+none for NEW NVMe).
@@ -211,7 +211,7 @@ Then `slice-apply.sh` writes a new drop-in `/run/systemd/system/ai-cortex.slice.
 
 ## 6. Old hardware: EEVDF default is fine
 
-Every OLD-tier ARCHWINDOWS install gets:
+Every OLD-tier ARCHIMATION install gets:
 
 - EEVDF (kernel ≥ 6.6) — no user knobs need tuning.
 - `ondemand` governor (`hw-detect.sh:141`).
@@ -228,7 +228,7 @@ No sched_ext: sched_ext requires `CONFIG_SCHED_CLASS_EXT=y` + BPF + BTF + 6.12 k
 
 The opportunity side of the hybrid-CPU story:
 
-| Hardware | Right default for ARCHWINDOWS |
+| Hardware | Right default for ARCHIMATION |
 |---|---|
 | **Intel Arrow/Lunar Lake** (8P+16E or 4P+4LP-E) | EEVDF + cluster sched + HFI (all mainline). Optional `scx_lavd` on `pe-compat.slice`. |
 | **AMD Strix Halo** (16-core Zen 5 + RDNA 3.5) | EEVDF + `amd_prefcore` + cache-aware sched (6.18+). No SCX needed — topology is flat enough. |
@@ -254,7 +254,7 @@ Rollout gates:
 - **Stage 1**: `scx_lavd` system-wide (default behavior on Fedora/CachyOS). Fastest to test but affects everything.
 - **Stage 2**: `scx_layered` restricted to `pe-compat.slice`, everything else stays on EEVDF. This is the targeted shape — matches our slice architecture, zero risk to cortex / trust / observer. **This is the real goal.**
 
-If successful, **S73** can explore a custom `scx_archwindows` built from `scx_layered`'s template:
+If successful, **S73** can explore a custom `scx_archimation` built from `scx_layered`'s template:
 - Layer 1: `trust.slice` — tight latency, P-core priority.
 - Layer 2: `game.slice` — LAVD-style virtual deadlines, P-core preference, shortest time-slice.
 - Layer 3: `pe-compat.slice` (non-game PE apps) — bpfland-style cache affinity.
@@ -288,4 +288,4 @@ That is "a scheduler tuned specifically for our workload" the research brief ask
 
 ## 10. 400-word summary
 
-Hybrid CPUs are now universal: Intel has run P+E topologies since 2021 (Alder Lake) and shipped three generations of Thread Director / HFI; AMD 9950X3D welds a 3D-V-Cache CCD next to a non-cached one; Apple M-series is 4-12 P-cores plus 4 E-cores; ARM DynamIQ is ubiquitous in phones and Snapdragon X Elite laptops. Windows addressed these with per-vendor scheduler patches; Linux's 2022 hybrid support lagged noticeably and was flagged openly in LWN 909611. Between 2023 and 2026 the kernel caught up and in some cases overtook Windows: EEVDF replaced CFS in 6.6 (Stoica 1995 virtual-deadline algorithm, mergequoting Peter Zijlstra), completed the transition in 6.12; Intel cluster scheduling re-enabled in 6.6 and stabilized for Arrow/Lunar Lake in 6.10-6.12; `amd_prefcore` shipped 6.9; AMD cache-aware load-balancing v4 is queued for 6.18 and shows 5-12% wins on 9950X3D cache-sensitive workloads. Asahi Linux ported Energy-Aware Scheduling to Apple M2 in 2024 and turned 6 hours of battery into 8-15. **sched_ext (SCX) merged in 6.12** (Tejun Heo / David Vernet, LKML 2024/5/1/564) and is now in Meta production running `scx_lavd` — Igalia's Steam Deck scheduler — across messaging tiers; the LAVD design shows 5.2% FPS wins on Baldur's Gate 3. For ARCHWINDOWS this means: **standing on mainline EEVDF + intel/amd-pstate + EAS + cache-aware balancing is the entire story on OLD hardware**; NEW hardware gets three free wins if we just hand the kernel the right hints (preferred core, HFI, cluster info) and one more if we enable SCX. Our existing 5-slice architecture (`trust`, `pe-compat`, `game`, `ai-daemon`, `observer`) already maps one-for-one onto `scx_layered`'s declarative input. The right S72 experiment is to attach `scx_lavd` to `pe-compat.slice` behind a feature flag on NEW-tier hosts and measure 1%-low FPS on three representative PE titles against Phoronix-style baselines, with EEVDF always reachable via SCX's automatic fallback. We also split `ai-cortex.slice` out of `ai-daemon.slice` and add `AllowedCPUs=<E_CORE_CPUS>` on hybrid — the cortex is exactly the kind of batch workload E-cores exist to serve. We do not write a custom scheduler in S72; we validate that sched_ext is the right venue for one in S73. Old hardware gets EEVDF and nothing else — which, given EEVDF's tail-latency wins over CFS, is already a silent free upgrade.
+Hybrid CPUs are now universal: Intel has run P+E topologies since 2021 (Alder Lake) and shipped three generations of Thread Director / HFI; AMD 9950X3D welds a 3D-V-Cache CCD next to a non-cached one; Apple M-series is 4-12 P-cores plus 4 E-cores; ARM DynamIQ is ubiquitous in phones and Snapdragon X Elite laptops. Windows addressed these with per-vendor scheduler patches; Linux's 2022 hybrid support lagged noticeably and was flagged openly in LWN 909611. Between 2023 and 2026 the kernel caught up and in some cases overtook Windows: EEVDF replaced CFS in 6.6 (Stoica 1995 virtual-deadline algorithm, mergequoting Peter Zijlstra), completed the transition in 6.12; Intel cluster scheduling re-enabled in 6.6 and stabilized for Arrow/Lunar Lake in 6.10-6.12; `amd_prefcore` shipped 6.9; AMD cache-aware load-balancing v4 is queued for 6.18 and shows 5-12% wins on 9950X3D cache-sensitive workloads. Asahi Linux ported Energy-Aware Scheduling to Apple M2 in 2024 and turned 6 hours of battery into 8-15. **sched_ext (SCX) merged in 6.12** (Tejun Heo / David Vernet, LKML 2024/5/1/564) and is now in Meta production running `scx_lavd` — Igalia's Steam Deck scheduler — across messaging tiers; the LAVD design shows 5.2% FPS wins on Baldur's Gate 3. For ARCHIMATION this means: **standing on mainline EEVDF + intel/amd-pstate + EAS + cache-aware balancing is the entire story on OLD hardware**; NEW hardware gets three free wins if we just hand the kernel the right hints (preferred core, HFI, cluster info) and one more if we enable SCX. Our existing 5-slice architecture (`trust`, `pe-compat`, `game`, `ai-daemon`, `observer`) already maps one-for-one onto `scx_layered`'s declarative input. The right S72 experiment is to attach `scx_lavd` to `pe-compat.slice` behind a feature flag on NEW-tier hosts and measure 1%-low FPS on three representative PE titles against Phoronix-style baselines, with EEVDF always reachable via SCX's automatic fallback. We also split `ai-cortex.slice` out of `ai-daemon.slice` and add `AllowedCPUs=<E_CORE_CPUS>` on hybrid — the cortex is exactly the kind of batch workload E-cores exist to serve. We do not write a custom scheduler in S72; we validate that sched_ext is the right venue for one in S73. Old hardware gets EEVDF and nothing else — which, given EEVDF's tail-latency wins over CFS, is already a silent free upgrade.

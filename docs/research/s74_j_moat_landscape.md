@@ -9,7 +9,7 @@
 
 ## 0. TL;DR — The honest one-paragraph synthesis
 
-ARCHWINDOWS occupies a genuinely unoccupied quadrant in the 2026 secure-OS
+ARCHIMATION occupies a genuinely unoccupied quadrant in the 2026 secure-OS
 landscape: **Linux-native (not NT like ReactOS) + runs Windows binaries
 user-mode AND attempts kernel-mode (not VM-isolated like Qubes, not
 user-only like Wine/Proton/SteamOS) + kernel-rooted authority model (not
@@ -33,9 +33,9 @@ ISA) and explicitly stand on giants for everything else.
 ## 1. The 14 comparators — technical table
 
 One row per system; six columns per the prompt. Ordering by increasing
-architectural distance from ARCHWINDOWS.
+architectural distance from ARCHIMATION.
 
-| # | System                                         | Year / latest         | Problem solved                                            | Threat model                                                              | Authority model lives in                                           | Relation to ARCHWINDOWS                            |
+| # | System                                         | Year / latest         | Problem solved                                            | Threat model                                                              | Authority model lives in                                           | Relation to ARCHIMATION                            |
 |---|------------------------------------------------|-----------------------|-----------------------------------------------------------|---------------------------------------------------------------------------|--------------------------------------------------------------------|----------------------------------------------------|
 | 1 | **Wine + Proton + DXVK + VKD3D**               | Wine 11.0 (Jan 2026); Proton 11 (Apr 2026); DXVK 2.78; VKD3D-Proton fork  | Run Windows user-mode apps/games on Linux without VM                      | Buggy-binary accidental misuse (NOT malicious code; Wine explicitly **does not sandbox**)  | **None.** Wine is a compat layer; trust lives in the host Linux kernel (DAC/LSM/namespace). | **Overlaps** tier 1. **Complement** — we can (and should, per S74 Agent 1) hand PE32 binaries to a Wine shim instead of reimplementing. |
 | 2 | **SteamOS 3 (Valve, Arch-based)**              | 3.7 series (2026; kernel 6.14+)   | Gaming console UX on read-only Arch; Proton preloaded     | Accidental filesystem corruption, rollback of bad updates; NOT adversarial local code | **None beyond UEFI SB + btrfs A/B overlay + cgroups**. Proton runs as unprivileged user process. | **Overlaps** tier 1 delivery (ISO + ready-to-game). **Does not compete** on tier 2 (services) or tier 3 (drivers) or authority model. |
@@ -45,8 +45,8 @@ architectural distance from ARCHWINDOWS.
 | 6 | **Secure Boot + TPM2 + measured boot (UEFI Forum / TCG)**        | UEFI 2.10 (2024); TCG PCCP 1.06; systemd-measure in sd 254+ | Boot-chain integrity; PCR attestation; **static** boot-time guarantee | Evil-maid, rootkits in pre-boot, ROM tampering (limited)                 | Platform firmware + shim + SBAT + dm-verity + UKI signed artifact measured into PCR 11 | **Prerequisite.** S72 Agent γ's trust_attest.c **already reads** PCR 11 and refuses init on mismatch. This is upstream-standard and we ride on top. |
 | 7 | **systemd-integrity / dm-verity / fs-verity**  | fs-verity merged 5.4; dm-verity since 3.4; systemd-repart integrity since sd 253 | Block/file-level read-time integrity                       | Offline tampering of installed binaries and config                       | Filesystem-layer Merkle-tree root hash, signed by MOK/PK             | **Complement.** A composefs+fs-verity rootfs + our trust.ko gate = each binary is content-addressed (fs-verity) AND its execution is rate-metered (TRC) AND its authority is self-consuming (APE). No contradiction. S72 Containerfile already plans composefs. |
 | 8 | **Linux LSMs: SELinux / AppArmor / Landlock / TOMOYO / Smack / Yama / IPE / LoadPin / SafeSetID / BPF-LSM** | Kernel 6.15+ stack; IPE merged 6.12 (Dec 2024); Landlock ABI 7 (6.15, audit) | Mandatory access control via policy at 158 kernel hooks   | Confused-deputy, policy-enforceable deny lists, unprivileged sandboxing  | A `struct security_hook_list` registered via `security_add_hooks()` at module init; policy in separate language (TE, AppArmor profile, BPF prog) | **Ground-truth check:** `grep -r 'register_security\|security_hook\|DEFINE_LSM' trust/kernel/` returns **zero**. trust.ko is **not an LSM**. It uses kprobes + /dev/trust ioctl RPC. This is a **refactor opportunity** (S71 Agent B found it first; still open as of S74). Landlock + BPF-LSM do what our `TRUST_ACTION_FILE_*` / `NET_*` denials do, better and cheaper. |
-| 9 | **Microsoft Pluton**                           | 2022 launch; 2024+ AMD Ryzen Pro 6000+, Intel Core Ultra, Copilot+ PCs mandatory | Hardware root of trust inside CPU SoC die; TPM 2.0 compliant; firmware updated via Windows Update | Hardware attacker with bus access; firmware rollback; unofficial OS replacement (in some configs) | Microsoft-signed firmware inside Pluton core; the CPU vendor controls the silicon substrate. Some AMD Ryzen Pro skus refuse non-Microsoft bootloaders in certain firmware configs. | **Threat + opportunity.** Threat: Pluton-mandatory-locked SKUs refuse our shim/MOK chain → ARCHWINDOWS can't boot. Opportunity: where Pluton exposes TPM2 API, our trust_attest.c reads PCR 11 through it the same as discrete TPM. Mitigation path: AMD Ryzen non-Pro / Intel non-Core-Ultra / arm64 / RISC-V FPGA. |
-| 10 | **Intel TDX / AMD SEV-SNP** (confidential computing)     | TDX production GA 2024; SEV-SNP since Milan 2021; 2025 ACM SIGMETRICS empirical study published | Protect VM from the hypervisor, host OS, other tenants, and physical memory attack  | Malicious cloud operator; compromised hypervisor; cold-boot on DIMMs   | CPU-enforced memory encryption (AES-XTS multi-key) + reverse map table (SNP) / TDX-module; attestation via SGX/TDX quotes  | **Compose, don't compete.** Running ARCHWINDOWS **inside** a TDX or SNP guest is coherent — their attestation proves the kernel memory is confidential; our APE proves in-guest actions are authoritatively ordered. Our S72 trust_attest.c reading PCR 11 is one layer; TDX quote would be an additional layer below. |
+| 9 | **Microsoft Pluton**                           | 2022 launch; 2024+ AMD Ryzen Pro 6000+, Intel Core Ultra, Copilot+ PCs mandatory | Hardware root of trust inside CPU SoC die; TPM 2.0 compliant; firmware updated via Windows Update | Hardware attacker with bus access; firmware rollback; unofficial OS replacement (in some configs) | Microsoft-signed firmware inside Pluton core; the CPU vendor controls the silicon substrate. Some AMD Ryzen Pro skus refuse non-Microsoft bootloaders in certain firmware configs. | **Threat + opportunity.** Threat: Pluton-mandatory-locked SKUs refuse our shim/MOK chain → ARCHIMATION can't boot. Opportunity: where Pluton exposes TPM2 API, our trust_attest.c reads PCR 11 through it the same as discrete TPM. Mitigation path: AMD Ryzen non-Pro / Intel non-Core-Ultra / arm64 / RISC-V FPGA. |
+| 10 | **Intel TDX / AMD SEV-SNP** (confidential computing)     | TDX production GA 2024; SEV-SNP since Milan 2021; 2025 ACM SIGMETRICS empirical study published | Protect VM from the hypervisor, host OS, other tenants, and physical memory attack  | Malicious cloud operator; compromised hypervisor; cold-boot on DIMMs   | CPU-enforced memory encryption (AES-XTS multi-key) + reverse map table (SNP) / TDX-module; attestation via SGX/TDX quotes  | **Compose, don't compete.** Running ARCHIMATION **inside** a TDX or SNP guest is coherent — their attestation proves the kernel memory is confidential; our APE proves in-guest actions are authoritatively ordered. Our S72 trust_attest.c reading PCR 11 is one layer; TDX quote would be an additional layer below. |
 | 11 | **CHERI / Arm Morello**                        | Morello boards shipped 2022; CHERI-in-CHERI-Morello-Cerise proof-of-encapsulation accepted POPL 2025 (DOI 10.1145/3729329); VeriCHERI RTL proof ICCAD '24; ASPLOS 2024 formalisation of CHERI-C | Pointer-provenance + fine-grained memory capabilities at the hardware level  | Use-after-free, bounds violation, confused-deputy at the C-language level | CPU-enforced capabilities encoded as fat pointers; no software policy language at all | **Potentially our target substrate.** Our trust ISA's capability_mask is a software emulation of what CHERI does in hardware. If Morello consumer boards ship, a CHERI backend for trust_risc.c would make T4 (bounded inheritance) hardware-enforced for free. Parallel to the RISC-V FPGA plan. |
 | 12 | **Android Verified Boot 2.0 + Titan M2**       | AVB 2.0 baseline since Android 8; Titan M2 in Pixel 6+ (2021), Pixel 10 (2025) | Chain-of-trust from ROM to system + vendor + /data integrity; rollback protection; StrongBox KM   | Persistent malware surviving factory-reset; bootloader tampering; attacker with physical access | ROM-fused keys in Titan M2 → bootloader → vbmeta → Merkle tree per partition via dm-verity | **Different device class**, same conceptual stack. Useful as *design precedent*: rollback-index + VBMeta is what our S72 bootc+TPM-PCR11 signed UKI is becoming. "Titan M2 for PC" is basically what Pluton is trying to be. |
 | 13 | **Windows 11 VBS / HVCI / Credential Guard / Device Guard / HyperGuard** | Default-on since Win11 22H2 and Windows Server 2025  | Move kernel-mode-code-integrity enforcement **out of** the NT kernel **into** the Hyper-V root  | NT kernel is assumed compromised; isolate secrets (LSASS NTLM/Kerberos) + CI in VTL1 | The Hyper-V hypervisor (VTL0 = NT kernel, VTL1 = "SecureKernel"); credentials in isolated VSM memory encrypted by hypervisor; 5-15% perf tax | **Architectural mirror.** Microsoft's answer to "can we trust the kernel?" is "no, move root of trust up one level into the hypervisor." Our answer is "yes, if we build a kernel module whose state is self-consuming and whose every action is proof-entangled." These are **philosophically opposite** approaches to the same gap. VBS+HVCI is more deployed; trust.ko is more novel. |
@@ -56,7 +56,7 @@ architectural distance from ARCHWINDOWS.
 
 ## 2. The unoccupied quadrant — is it actually unoccupied?
 
-Claim to defend: *"ARCHWINDOWS is genuinely positioned to be the only Linux
+Claim to defend: *"ARCHIMATION is genuinely positioned to be the only Linux
 distro targeting all three Windows runtime tiers with a coherent authority
 model."*
 
@@ -225,7 +225,7 @@ The **defensible moat** is:
 - **Trust story**: None. Wine does not sandbox; documentation explicitly
   says don't run unsigned Windows binaries you wouldn't run on Windows.
 
-**Implications for ARCHWINDOWS:**
+**Implications for ARCHIMATION:**
 - Reimplementing user-mode Win32 is tilting at a 9M-LOC windmill with
   25 years of developer-years behind it. **S74 Agent 1 (Wine PE32 shim)
   is the correct call.** We should pass through PE32+ compatibility to
@@ -272,7 +272,7 @@ The **defensible moat** is:
 
 **Implications:**
 - **Non-overlapping product.** A CISO choosing between Qubes and
-  ARCHWINDOWS is evaluating "how do I contain a breach" (Qubes) vs "how
+  ARCHIMATION is evaluating "how do I contain a breach" (Qubes) vs "how
   do I prevent the action" (us). Both are valid; both are defensible.
 - Qubes runs Windows only as HVM (slow, disposable, currently security-broken).
   We run Windows as native Linux process under kernel gate (fast, on the
@@ -295,7 +295,7 @@ The **defensible moat** is:
   document supported hardware list; offer arm64 path; FPGA RISC-V path
   for fully open substrate.
 - **Philosophically**: Pluton is Microsoft's answer to "can you trust the
-  root?" → "only if we made the root." ARCHWINDOWS's answer: "yes, if the
+  root?" → "only if we made the root." ARCHIMATION's answer: "yes, if the
   root is an open-source self-consuming proof chain whose .text is
   hashed into every proof (S73-F). No vendor secret required."
 
@@ -477,7 +477,7 @@ theorem proving = 20 person-years). Instead: adversarial harness
 credibility at 5% of the cost.
 
 ### Reject: "Own hypervisor / own microkernel"
-The "ARCHWINDOWS-on-seL4" long game is valuable as a 5-10 year R&D
+The "ARCHIMATION-on-seL4" long game is valuable as a 5-10 year R&D
 path, but building our own hypervisor (a la VBS) or microkernel (a la
 seL4/Genode) in-session-scale is not reasonable. We'd reinvent 15 years
 of upstream at quarter-quality. Instead: **cooperate with TDX/SNP guests
@@ -555,13 +555,13 @@ separate papers or product white-papers.
 
 The literal S73 statement is:
 
-> "ARCHWINDOWS is genuinely positioned to be the only Linux distro
+> "ARCHIMATION is genuinely positioned to be the only Linux distro
 > targeting all three Windows runtime tiers with a coherent authority
 > model."
 
 Audited version:
 
-> ARCHWINDOWS is the only Linux distro that *attempts* all three Windows
+> ARCHIMATION is the only Linux distro that *attempts* all three Windows
 > runtime tiers (apps via PE loader + DLL stubs + Mono, services via SCM,
 > drivers via wdm_host.ko skeleton) under a dynamic authority model whose
 > novel primitives — Authority Proof Engine with self-consuming proofs,

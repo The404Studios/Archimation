@@ -98,8 +98,8 @@ breaking that property is a far worse sin than refusing to install.
 
 We probe with a short-timeout ping to 1.1.1.1 / 8.8.8.8 and a DNS
 resolve for ghcr.io. If network is absent *and* no local image cache
-exists (neither `containers-storage:localhost/archwindows-bootc:latest`
-nor `/var/lib/archwindows/bootc-image.tar`), the installer hard-fails
+exists (neither `containers-storage:localhost/archimation-bootc:latest`
+nor `/var/lib/archimation/bootc-image.tar`), the installer hard-fails
 with a direct suggestion to retry with `--image-ref`.
 
 ---
@@ -110,7 +110,7 @@ with a direct suggestion to retry with `--image-ref`.
 
 ```
 /dev/sdX1   512 MiB   FAT32   EFI System Partition
-/dev/sdX2   rest      btrfs   ArchWindows (subvols: @ @home @var @log)
+/dev/sdX2   rest      btrfs   Archimation (subvols: @ @home @var @log)
 ```
 
 btrfs is the default because it aligns naturally with atomic patterns —
@@ -138,7 +138,7 @@ users who don't want btrfs.
 
 ```
 /dev/sdX1   513 MiB   ext4    /boot (boot flag on)
-/dev/sdX2   rest      ext4    ArchWindows /
+/dev/sdX2   rest      ext4    Archimation /
 ```
 
 BIOS path keeps things boring. No composefs (GRUB BIOS + composefs is
@@ -150,11 +150,11 @@ degraded to manual GRUB generation selection.
 
 ## 4. MOK enrollment UX walkthrough
 
-If `/etc/archwindows/keys/mok.der` exists in the deployed image (Agent β's
+If `/etc/archimation/keys/mok.der` exists in the deployed image (Agent β's
 machine-owner key for signed `trust.ko` and `wdm_host.ko`), the installer
 does the following:
 
-1. Runs `mokutil --import /etc/archwindows/keys/mok.der` inside the target
+1. Runs `mokutil --import /etc/archimation/keys/mok.der` inside the target
    — this writes the import request to EFI vars, persistent across reboot.
 2. Generates a one-time random 12-character password, prints it to the
    console in yellow, and writes it to
@@ -200,7 +200,7 @@ root-kits.
     Will install MBR + BIOS GRUB.  NO Secure Boot, NO measured boot.
 ```
 
-The user installs a fully-functional ArchWindows but the boot chain
+The user installs a fully-functional Archimation but the boot chain
 has no measurement. This is explicit — we don't pretend the system is
 attested.
 
@@ -210,7 +210,7 @@ The installer *refuses* to proceed and names its alternatives:
 
 ```
 [ai-install-bootc] FATAL: no image source resolvable: no local storage,
-no /var/lib/archwindows/bootc-image.tar, and no network for GHCR.
+no /var/lib/archimation/bootc-image.tar, and no network for GHCR.
 Provide --image-ref <ref>.
 ```
 
@@ -231,14 +231,14 @@ Points at a working alternative rather than failing hard.
 ## 6. Image source resolution order
 
 1. `--image-ref <ref>` if passed explicitly.
-2. `containers-storage:localhost/archwindows-bootc:latest` — what
+2. `containers-storage:localhost/archimation-bootc:latest` — what
    `podman build` or `buildah build` leaves in the host's storage. On
    the live ISO this is pre-populated by `bootc/build-bootc.sh` during
    ISO bake.
-3. `oci-archive:/var/lib/archwindows/bootc-image.tar` — a tarball
+3. `oci-archive:/var/lib/archimation/bootc-image.tar` — a tarball
    shipped on the live ISO for fully-offline installs. S73 TODO:
    wire `build-bootc.sh` to emit this tarball.
-4. `docker://ghcr.io/fourzerofour/archwindows-bootc:latest` — network
+4. `docker://ghcr.io/fourzerofour/archimation-bootc:latest` — network
    fallback. CI will push here (aspirational as of S72).
 
 Each step prints which source is being used before launching bootc,
@@ -321,9 +321,9 @@ heredoc body — two new buttons, same install flow, same marker file.
 ## 11. Handoffs for future sessions
 
 - **S73:** wire `bootc/build-bootc.sh` to emit an `oci-archive:` tarball
-  at `/var/lib/archwindows/bootc-image.tar` so fully-offline installs
+  at `/var/lib/archimation/bootc-image.tar` so fully-offline installs
   work without network *and* without pre-populating container storage.
-- **S73:** CI push to `ghcr.io/fourzerofour/archwindows-bootc:latest`
+- **S73:** CI push to `ghcr.io/fourzerofour/archimation-bootc:latest`
   so the network fallback is actually usable.
 - **S74:** `bootc install to-existing-root` path — upgrade an
   archiso-installed system to bootc mode in-place. Needs safe snapshot

@@ -509,7 +509,7 @@ CORTEX_DECISION, CORTEX_AUTONOMY_CHANGE, CORTEX_HUMAN_OVERRIDE, CORTEX_POLICY_UP
 ```
 1. BIOS/UEFI → GRUB (3s timeout)
 2. Linux kernel loads
-3. initramfs: plymouth splash (archwindows theme)
+3. initramfs: plymouth splash (archimation theme)
 4. trust.ko loads → /dev/trust created
 5. systemd reaches multi-user.target
 6. pe-objectd.service starts (Layer 1)

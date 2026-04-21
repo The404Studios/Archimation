@@ -432,7 +432,7 @@ If user requests ISO bake:
 wsl.exe -d Arch -- bash -c 'cd /mnt/c/Users/wilde/Downloads/arch-linux-with-full-ai-control && bash scripts/build-iso.sh'
 ```
 
-Artifact: `output/archlinux-archwindows-<ts>-x86_64.iso`.
+Artifact: `output/archlinux-archimation-<ts>-x86_64.iso`.
 
 ### Task 6g — set_smoke live test (optional — requires QEMU)
 

@@ -6,8 +6,17 @@ Description=AI Arch hardware profiler (old vs new HW detection)
 # After=swap.target ensures zram (if enabled) is up before sysctl-tune.sh
 # probes /proc/swaps for zram-aware swappiness.
 After=systemd-modules-load.service local-fs.target swap.target
+# S80: REMOVED `Before=basic.target`. That created an ordering cycle on
+# real-hardware boot: swap.target is a sysinit.target dependency, and the
+# implicit `After=sysinit.target` (DefaultDependencies=yes) combined with
+# `Before=basic.target` forced this unit between sysinit and basic, but
+# ai-low-ram-services/ai-irq-balance transitively depend on local-fs
+# (which basic pulls). systemd broke the cycle by skipping this service
+# → display-manager saw no /run/ai-arch-hw-profile → XFCE/lightdm hung.
+# Services that genuinely depend on the profile (display-manager, lightdm,
+# ai-control) already carry their own explicit After= on this unit.
 Before=display-manager.service ai-control.service lightdm.service \
-       ai-low-ram-services.service basic.target
+       ai-low-ram-services.service
 Documentation=file:///usr/lib/ai-arch/hw-detect.sh
 
 [Service]

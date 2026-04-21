@@ -360,11 +360,15 @@ fi
 # DeviceScale=1 (consistent rendering). plymouth-set-default-theme only
 # sets the Theme= line; we need the other settings for seamless boot.
 mkdir -p /etc/plymouth
+# S80 FIX (Agent P): DeviceTimeout=8 (was 5) — matches the overlay
+# plymouthd.conf and gives real-hardware DRM/KMS longer to come up
+# before falling back to the text renderer. Old laptops (NVS 3100M,
+# older Intel/AMD iGPU) regularly need 6+ seconds to reach modeset.
 cat > /etc/plymouth/plymouthd.conf <<'PLYCFG'
 [Daemon]
 Theme=archimation
 ShowDelay=0
-DeviceTimeout=5
+DeviceTimeout=8
 DeviceScale=1
 PLYCFG
 if command -v plymouth-set-default-theme &>/dev/null; then
@@ -644,7 +648,9 @@ for f in \
     /usr/bin/pe-status \
     /usr/lib/systemd/system-generators/ai-safe-mode-generator \
     /root/setup-users.sh \
-    /root/setup-services.sh; do
+    /root/setup-services.sh \
+    /etc/lightdm/Xsession \
+    /etc/lightdm/display-setup.sh; do
     [ -f "$f" ] && chmod 755 "$f"
 done
 

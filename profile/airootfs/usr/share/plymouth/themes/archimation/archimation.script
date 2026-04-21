@@ -84,21 +84,40 @@ accent_sprite.SetOpacity(0);
 # Spinner: 8 dots orbiting in a circle (Windows 11 style)
 # Each dot trails behind the lead with decreasing opacity
 # ──────────────────────────────────────────────────────────────
+# S80 FIX (Agent P): was allocating Image.Text per dot PER FRAME —
+# on real DRM/KMS this collapses frame rate (~40 text allocations ×
+# 60 fps = 2400 alloc/s). Cache the dot images once at setup; the
+# refresh loop now only moves sprites and adjusts opacity. Precompute
+# 8 colour-interpolated images indexed by trail position (i).
 global.num_dots    = 8;
 global.dot_radius  = 22;
 global.dot_sprites = [];
+global.dot_images  = [];
 global.dot_y       = center_y + 55;
 
 for (i = 0; i < global.num_dots; i++) {
     global.dot_sprites[i] = Sprite();
     global.dot_sprites[i].SetZ(12);
+
+    # Precompute per-index colour (accent -> glow gradient along the trail)
+    trail_frac_i = i / global.num_dots;
+    r_i = 0.478 + trail_frac_i * (0.733 - 0.478);
+    g_i = 0.635 + trail_frac_i * (0.604 - 0.635);
+    b_i = 0.969;
+    global.dot_images[i] = Image.Text("o", r_i, g_i, b_i, 1, "Sans Bold 10");
+    global.dot_sprites[i].SetImage(global.dot_images[i]);
 }
 
 # ──────────────────────────────────────────────────────────────
 # Glow ring: pulsing circle behind spinner dots
 # ──────────────────────────────────────────────────────────────
+# S80 FIX: cache the glow image once. Pulsing is done via SetOpacity only.
 global.glow_sprite = Sprite();
 global.glow_sprite.SetZ(8);  # Behind dots (dots are Z=12)
+global.glow_image  = Image.Text("O", 0.478, 0.635, 0.969, 1, "Sans 60");
+global.glow_sprite.SetImage(global.glow_image);
+global.glow_sprite.SetX(center_x - global.glow_image.GetWidth() / 2);
+global.glow_sprite.SetY(global.dot_y - global.glow_image.GetHeight() / 2 + 5);
 
 # ──────────────────────────────────────────────────────────────
 # Progress bar: thin accent-colored bar near bottom
@@ -122,11 +141,30 @@ bar_bg_sprite.SetZ(9);
 bar_bg_sprite.SetOpacity(0);
 
 # Create segment sprites for progress fill
+# S80 FIX: cache per-segment image once with its gradient colour;
+# the refresh loop now only moves/opacity-tweaks, not re-allocates.
+global.seg_images = [];
+global.seg_width  = Math.Int(global.bar_width / global.num_segs);
 for (i = 0; i < global.num_segs; i++) {
     global.seg_sprites[i] = Sprite();
     global.seg_sprites[i].SetZ(11);
     global.seg_sprites[i].SetOpacity(0);
+
+    # Gradient: left segments slightly purple, right segments blue
+    seg_frac = i / global.num_segs;
+    seg_r = 0.478 + (1 - seg_frac) * 0.15;
+    seg_g = 0.635 - (1 - seg_frac) * 0.05;
+    seg_b = 0.969;
+    global.seg_images[i] = Image.Text("|", seg_r, seg_g, seg_b, 1, "Sans Bold 6");
+    global.seg_sprites[i].SetImage(global.seg_images[i]);
+    global.seg_sprites[i].SetX(global.bar_x + i * global.seg_width);
+    global.seg_sprites[i].SetY(global.bar_y);
 }
+
+# Percent-text cache: regenerate only when the integer percentage changes,
+# not every frame. Covers 0..100 lazily.
+global.pct_images   = [];
+global.pct_last_val = -1;
 
 # ──────────────────────────────────────────────────────────────
 # Progress percentage text
@@ -195,82 +233,61 @@ fun refresh_callback() {
     bar_bg_sprite.SetOpacity(0.15 * master_alpha);
 
     # ── Spinner dots: trailing opacity ring ───────────────────
+    # S80 FIX: no Image.Text in the loop — reuse global.dot_images[i].
+    # Only movement + opacity change each frame.
     spin_speed = 2.4;
     base_angle = global.time * spin_speed;
 
     for (i = 0; i < global.num_dots; i++) {
-        # Each dot is evenly spaced, trailing behind the lead
         trail_frac = i / global.num_dots;       # 0.0 = lead, 1.0 = last
         angle = base_angle - trail_frac * 2.0;  # staggered behind leader
 
         dx = Math.Int(Math.Sin(angle) * global.dot_radius);
-        dy = Math.Int(Math.Cos(angle) * global.dot_radius * 0.40);  # elliptical
+        dy = Math.Int(Math.Cos(angle) * global.dot_radius * 0.40);
 
-        # Opacity: lead dot = 1.0, trailing dots fade out
         dot_op = 1.0 - trail_frac * 0.85;
         if (dot_op < 0.12)
             dot_op = 0.12;
 
-        # Blend accent and glow color based on trail position
-        r = 0.478 + trail_frac * (0.733 - 0.478);  # accent -> glow
-        g = 0.635 + trail_frac * (0.604 - 0.635);
-        b = 0.969;
-
-        dot_img = Image.Text("o", r, g, b, 1, "Sans Bold 10");
-        global.dot_sprites[i].SetImage(dot_img);
-        global.dot_sprites[i].SetX(center_x + dx - dot_img.GetWidth() / 2);
-        global.dot_sprites[i].SetY(global.dot_y + dy - dot_img.GetHeight() / 2);
+        dot_img_w = global.dot_images[i].GetWidth();
+        dot_img_h = global.dot_images[i].GetHeight();
+        global.dot_sprites[i].SetX(center_x + dx - dot_img_w / 2);
+        global.dot_sprites[i].SetY(global.dot_y + dy - dot_img_h / 2);
         global.dot_sprites[i].SetOpacity(dot_op * master_alpha);
     }
 
     # ── Glow ring: subtle pulsing circle around spinner ───────
+    # S80 FIX: position fixed at init; only opacity pulses here.
     glow_pulse = Math.Sin(global.time * 1.2);
     glow_op = 0.08 + 0.06 * ((glow_pulse + 1.0) / 2.0);
-    glow_scale = 1.0 + 0.05 * ((glow_pulse + 1.0) / 2.0);
-
-    glow_img = Image.Text("O", 0.478, 0.635, 0.969, 1, "Sans 60");
-    global.glow_sprite.SetImage(glow_img);
-    global.glow_sprite.SetX(center_x - glow_img.GetWidth() / 2);
-    global.glow_sprite.SetY(global.dot_y - glow_img.GetHeight() / 2 + 5);
     global.glow_sprite.SetOpacity(glow_op * master_alpha);
 
     # ── Progress bar segments ─────────────────────────────────
+    # S80 FIX: segment images are pre-cached; we toggle opacity only.
+    # Shimmer-on-leading-edge is dropped (it required per-frame image
+    # recolouring — too expensive on real DRM for marginal polish).
     if (global.boot_progress > 0) {
         filled_count = Math.Int(global.boot_progress * global.num_segs);
-        seg_width = Math.Int(global.bar_width / global.num_segs);
 
         for (j = 0; j < global.num_segs; j++) {
             if (j < filled_count) {
-                # Gradient: left segments slightly purple, right segments blue
                 frac = j / global.num_segs;
-                seg_r = 0.478 + (1 - frac) * 0.15;
-                seg_g = 0.635 - (1 - frac) * 0.05;
-                seg_b = 0.969;
-
-                # Shimmer effect on the leading edge
-                shimmer = 0;
-                if (j == filled_count - 1) {
-                    shimmer = Math.Sin(global.time * 6.0);
-                    shimmer = 0.15 * ((shimmer + 1.0) / 2.0);
-                }
-
-                seg_img = Image.Text("|", seg_r + shimmer, seg_g + shimmer, seg_b, 1, "Sans Bold 6");
-                global.seg_sprites[j].SetImage(seg_img);
-                global.seg_sprites[j].SetX(global.bar_x + j * seg_width);
-                global.seg_sprites[j].SetY(global.bar_y);
                 global.seg_sprites[j].SetOpacity((0.7 + frac * 0.3) * master_alpha);
             } else {
                 global.seg_sprites[j].SetOpacity(0);
             }
         }
 
-        # Percentage text
+        # Percentage text — only regenerate when the integer % actually changes
         pct_val = Math.Int(global.boot_progress * 100);
-        pct_str = "" + pct_val + "%";
-        pct_img = Image.Text(pct_str, 0.337, 0.373, 0.537, 1, "Sans 11");
-        global.pct_sprite.SetImage(pct_img);
-        global.pct_sprite.SetX(center_x - pct_img.GetWidth() / 2);
-        global.pct_sprite.SetY(global.bar_y + 14);
+        if (pct_val != global.pct_last_val) {
+            global.pct_last_val = pct_val;
+            pct_str = "" + pct_val + "%";
+            pct_img = Image.Text(pct_str, 0.337, 0.373, 0.537, 1, "Sans 11");
+            global.pct_sprite.SetImage(pct_img);
+            global.pct_sprite.SetX(center_x - pct_img.GetWidth() / 2);
+            global.pct_sprite.SetY(global.bar_y + 14);
+        }
         global.pct_sprite.SetOpacity(0.5 * master_alpha);
     }
 

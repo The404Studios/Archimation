@@ -9,7 +9,10 @@
 
 pkgname=libtrust-wine-shim
 pkgver=0.1.0
-pkgrel=1
+# pkgrel=2: S74 recovery — Makefile CFLAGS ?= → += so makepkg's CFLAGS
+# (which lack -fPIC) are preserved and our flags appended; -fPIC also
+# placed directly on the compile line.
+pkgrel=2
 pkgdesc="LD_PRELOAD trust-gate shim for the Wine PE32 handoff path"
 arch=('x86_64')
 url="https://github.com/ai-arch-linux/archwindows"

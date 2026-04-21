@@ -339,16 +339,17 @@ def mock_llm_app(fake_cortex, monkeypatch, tmp_path):
     import auth as _auth
     secret_path = tmp_path / "auth_secret"
     monkeypatch.setattr(_auth, "_SECRET_PATH", str(secret_path), raising=True)
-    # starlette TestClient sets request.client.host="testclient", which is
-    # NOT in _LOOPBACK_ADDRS. Without this patch, every unauthed call
-    # increments the rate-limit counter and after 10 failures EVERY test
-    # gets 429 instead of the expected 401/403/200. Clear the failure log
-    # AND extend the loopback set so testclient is treated like 127.0.0.1.
-    monkeypatch.setattr(
-        _auth, "_LOOPBACK_ADDRS",
-        frozenset(("127.0.0.1", "::1", "localhost", "testclient")),
-        raising=True,
-    )
+    # starlette TestClient sets request.client.host="testclient", which
+    # is NOT in the auth module's loopback tuple (hardcoded in
+    # check_auth at auth.py line ~628). Without an exemption, every
+    # unauthed call increments the rate-limit counter and after 10
+    # failures EVERY test gets 429 instead of the expected 401/403/200.
+    # The _LOOPBACK_ADDRS module-level frozenset was removed; the
+    # loopback check is now inline against a literal tuple. We can't
+    # monkeypatch a literal, so we just clear the failure log before
+    # each test and rely on rate-limit window reset. Tests that hit
+    # unauthed-then-authed sequences must not exceed 10 failures per
+    # 60s window (see _RATE_LIMIT_MAX_FAILURES).
     _auth._failure_log.clear()
     # Also flush the verify_token LRU so a stale token from a prior test
     # signed with a different secret cannot accidentally validate.
@@ -404,29 +405,30 @@ def test_client(mock_llm_app):
 
 @pytest.fixture
 def auth_token(mock_llm_app, tmp_path):
-    """Mint a TRUST_INTERACT (200) bearer token signed with the test secret.
+    """Mint a trust-200 ("interact") bearer token signed with the test secret.
 
     Same path the daemon's /auth/token uses, but called in-process so we
-    don't have to bootstrap through the network. TRUST_INTERACT is the
-    band gating /contusion/ai and /ai/plan.
+    don't have to bootstrap through the network. Trust >= 200 is the band
+    gating /contusion/ai and /ai/plan (POST /keyboard/* etc.); see the
+    endpoint trust-map in auth.py.
     """
     import auth as _auth
     return _auth.create_token(
         subject_id=4242,
         name="ai-commands-test",
-        trust_level=_auth.TRUST_INTERACT,
+        trust_level=200,
         ttl=600,
     )
 
 
 @pytest.fixture
 def admin_token(mock_llm_app, tmp_path):
-    """TRUST_ADMIN (600) token for endpoints that need higher trust."""
+    """Trust-600 ("admin") token for endpoints that need higher trust."""
     import auth as _auth
     return _auth.create_token(
         subject_id=4243,
         name="ai-commands-admin",
-        trust_level=_auth.TRUST_ADMIN,
+        trust_level=600,
         ttl=600,
     )
 

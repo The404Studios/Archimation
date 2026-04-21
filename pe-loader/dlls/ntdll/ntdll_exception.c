@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include "common/dll_common.h"
+#include "eventbus/pe_event.h"
 
 /* ----------------------------------------------------------------
  * Windows exception constants
@@ -497,6 +498,35 @@ static void exception_signal_handler(int sig, siginfo_t *info, void *ucontext_ra
     EXCEPTION_POINTERS ep;
     ep.ExceptionRecord = &rec;
     ep.ContextRecord = &ctx;
+
+    /*
+     * Emit PE_EVT_EXCEPTION to the AI Cortex (fire-and-forget telemetry).
+     * Payload is a compact fixed-size struct: exception code, faulting RIP,
+     * faulting data address (for access violations), and the delivering
+     * signal. The cortex uses this to detect crash patterns and per-PID
+     * instability without parsing stdout/stderr. Emitted BEFORE dispatch
+     * so the cortex hears about exceptions even if a handler swallows them.
+     */
+    {
+        struct __attribute__((packed)) pe_evt_exception {
+            uint32_t exception_code;     /* EXCEPTION_ACCESS_VIOLATION etc. */
+            uint32_t signo;              /* Delivering POSIX signal */
+            uint64_t exception_address;  /* Faulting RIP */
+            uint64_t fault_address;      /* si_addr (for SIGSEGV/SIGBUS) */
+            uint32_t flags;              /* EXCEPTION_NONCONTINUABLE etc. */
+            uint32_t num_parameters;
+        } evt;
+        memset(&evt, 0, sizeof(evt));
+        evt.exception_code    = rec.ExceptionCode;
+        evt.signo             = (uint32_t)sig;
+        evt.exception_address = (uint64_t)(uintptr_t)rec.ExceptionAddress;
+        evt.fault_address     = (rec.NumberParameters >= 2)
+                                ? (uint64_t)rec.ExceptionInformation[1]
+                                : 0;
+        evt.flags             = rec.ExceptionFlags;
+        evt.num_parameters    = rec.NumberParameters;
+        pe_event_emit(PE_EVT_EXCEPTION, &evt, sizeof(evt));
+    }
 
     /* Dispatch through handler chain */
     LONG result = dispatch_exception(&ep);

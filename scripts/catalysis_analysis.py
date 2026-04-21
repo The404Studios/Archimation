@@ -310,12 +310,92 @@ def emit_dot(graph: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def _baseline_payload(summary: dict[str, Any]) -> dict[str, Any]:
+    """Condense a summary into the keys we store in the baseline file."""
+    top_catalysts = [{"name": n, "callers": c} for n, c in summary["top_catalysts"]]
+    max_callers = max((c["callers"] for c in top_catalysts), default=0)
+    return {
+        "k_avg": summary["nk"]["K_avg"],
+        "N": summary["nk"]["N"],
+        "regime": summary["nk"]["regime"],
+        "top_catalysts": top_catalysts,
+        "max_caller_count": max_callers,
+        "handler_to_handler_edges": summary["nk"]["handler_to_handler_edges"],
+    }
+
+
+def _run_ci_gate(summary: dict[str, Any], baseline_path: Path,
+                 out_path: Path | None) -> int:
+    """Compare current summary against baseline. Return exit code."""
+    current = _baseline_payload(summary)
+    try:
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        print(f"error: baseline not found: {baseline_path}", file=sys.stderr)
+        return 2
+    except json.JSONDecodeError as e:
+        print(f"error: baseline is not valid JSON: {e}", file=sys.stderr)
+        return 2
+    if "k_avg" not in baseline or "max_caller_count" not in baseline:
+        print(f"error: malformed baseline {baseline_path}: missing k_avg or "
+              f"max_caller_count keys", file=sys.stderr)
+        return 2
+
+    base_k = float(baseline["k_avg"])
+    base_max = int(baseline["max_caller_count"])
+    cur_k = float(current["k_avg"])
+    cur_max = int(current["max_caller_count"])
+
+    k_ceiling = base_k * 1.5 if base_k > 0 else 0.5
+    max_ceiling = base_max * 1.5 if base_max > 0 else 1
+
+    reasons: list[str] = []
+    if cur_k > 0.5:
+        reasons.append(f"K_avg={cur_k} exceeds absolute chaotic ceiling 0.5 (Kauffman Class-3)")
+    if cur_k > k_ceiling:
+        reasons.append(f"K_avg={cur_k} exceeds 1.5x baseline ({base_k} -> {k_ceiling:.3f})")
+    if cur_max > max_ceiling:
+        reasons.append(f"max keystone callers={cur_max} exceeds 1.5x baseline ({base_max} -> {max_ceiling:.1f})")
+
+    report = {
+        "k_avg": cur_k,
+        "keystones": current["top_catalysts"][:10],
+        "delta_vs_baseline": {
+            "k_avg_current": cur_k,
+            "k_avg_baseline": base_k,
+            "k_avg_ceiling": round(k_ceiling, 3),
+            "max_callers_current": cur_max,
+            "max_callers_baseline": base_max,
+            "max_callers_ceiling": round(max_ceiling, 3),
+        },
+        "failure_reasons": reasons,
+        "status": "fail" if reasons else "pass",
+    }
+    if out_path is not None:
+        out_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    if reasons:
+        print("catalysis-gate: FAIL", file=sys.stderr)
+        for r in reasons:
+            print(f"  - {r}", file=sys.stderr)
+        return 1
+    print(f"catalysis-gate: PASS  K_avg={cur_k} (baseline {base_k}, ceiling {k_ceiling:.3f})")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     ap.add_argument("--dot", action="store_true", help="emit graphviz DOT")
     ap.add_argument("--source", default=str(DAEMON / "contusion_handlers.py"),
                     help="path to contusion_handlers.py")
+    ap.add_argument("--ci", action="store_true",
+                    help="CI gate mode: compare against baseline, exit nonzero on regression")
+    ap.add_argument("--baseline", default=str(HERE / "catalysis_baseline.json"),
+                    help="baseline JSON path for --ci mode")
+    ap.add_argument("--out", default=None, help="write JSON report to this path (--ci mode)")
+    ap.add_argument("--write-baseline", default=None,
+                    help="record current analysis as a new baseline JSON at this path")
     args = ap.parse_args()
 
     src_path = Path(args.source)
@@ -326,6 +406,17 @@ def main() -> int:
     data = _parse_handlers(src_path)
     graph = build_graph(data)
     summary = summarize(graph)
+
+    if args.write_baseline:
+        payload = _baseline_payload(summary)
+        Path(args.write_baseline).write_text(
+            json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        print(f"wrote baseline: {args.write_baseline}")
+        return 0
+
+    if args.ci:
+        out_path = Path(args.out) if args.out else None
+        return _run_ci_gate(summary, Path(args.baseline), out_path)
 
     if args.dot:
         print(emit_dot(graph))

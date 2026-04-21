@@ -442,12 +442,24 @@ int scm_parallel_auto_start(void)
             }
 
             fprintf(stderr, "[scm_dep]   Starting: %s\n", g_nodes[i].name);
+            int delayed_ms = 0;
             {
                 service_entry_t *svc = scm_db_find(g_nodes[i].name);
                 if (svc) {
                     svc->restart_count = 0;
                     svc->manually_stopped = 0;
+                    delayed_ms = svc->delayed_start_ms;
                 }
+            }
+            /* S74: delayed auto-start.  Instead of starting immediately,
+             * arm a detached timer; the service will fire after delay_ms
+             * (default 120s, matching Windows DELAYED_AUTO_START). */
+            if (delayed_ms > 0) {
+                fprintf(stderr, "[scm_dep]   Deferring '%s' by %dms (delayed auto-start)\n",
+                        g_nodes[i].name, delayed_ms);
+                scm_schedule_delayed_start(g_nodes[i].name, delayed_ms);
+                batch_count++;
+                continue;
             }
             int ret = scm_start_service(g_nodes[i].name);
             if (ret < 0) {

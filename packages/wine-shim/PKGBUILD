@@ -1,0 +1,46 @@
+# Maintainer: AI Arch Linux Project
+# PKGBUILD for libtrust-wine-shim - LD_PRELOAD trust gate for Wine handoff
+#
+# Session 74 Agent 1.  Paired with pe-loader's PE32 handoff branch
+# (see pe-loader/loader/main.c), which execve()s /usr/bin/wine with
+# LD_PRELOAD=/usr/lib/libtrust_wine_shim.so for 32-bit PE binaries.
+# The shim funnels open/openat/execve through TRUST_IOC_CHECK_CAP
+# before calling the real glibc function.
+
+pkgname=libtrust-wine-shim
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="LD_PRELOAD trust-gate shim for the Wine PE32 handoff path"
+arch=('x86_64')
+url="https://github.com/ai-arch-linux/archwindows"
+license=('GPL-3.0-or-later')
+options=('!debug')
+depends=('glibc' 'trust-system')
+makedepends=('gcc' 'make')
+optdepends=(
+    'wine: runtime target for the PE32 handoff path'
+    'pe-loader: invokes the shim via execve+LD_PRELOAD'
+)
+provides=('libtrust-wine-shim')
+source=()
+
+_srcdir="${startdir}"
+
+build() {
+    cd "$_srcdir"
+    make clean
+    make ${MAKEFLAGS:-}
+}
+
+package() {
+    cd "$_srcdir"
+
+    # LD_PRELOAD target.  Path must match pe-loader/loader/main.c default
+    # (AICONTROL_WINE_SHIM env overrides it for testing).
+    install -Dm755 libtrust_wine_shim.so \
+        "$pkgdir/usr/lib/libtrust_wine_shim.so"
+
+    # Documentation.
+    install -Dm644 README.md \
+        "$pkgdir/usr/share/doc/${pkgname}/README.md"
+}

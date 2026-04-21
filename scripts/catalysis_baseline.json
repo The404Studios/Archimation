@@ -1,0 +1,57 @@
+{
+  "k_avg": 0.093,
+  "N": 150,
+  "regime": "Class-1 smooth (largely independent handlers; refactoring safe)",
+  "top_catalysts": [
+    {
+      "name": "_exec",
+      "callers": 80
+    },
+    {
+      "name": "_missing",
+      "callers": 59
+    },
+    {
+      "name": "_with_error",
+      "callers": 42
+    },
+    {
+      "name": "_bad_arg",
+      "callers": 31
+    },
+    {
+      "name": "_envelope",
+      "callers": 31
+    },
+    {
+      "name": "_no_session",
+      "callers": 26
+    },
+    {
+      "name": "_compositor_status",
+      "callers": 26
+    },
+    {
+      "name": "_q_exec",
+      "callers": 13
+    },
+    {
+      "name": "_pctl",
+      "callers": 9
+    },
+    {
+      "name": "_systemctl",
+      "callers": 8
+    },
+    {
+      "name": "_tile",
+      "callers": 4
+    },
+    {
+      "name": "_pe_resolve_path",
+      "callers": 3
+    }
+  ],
+  "max_caller_count": 80,
+  "handler_to_handler_edges": 14
+}

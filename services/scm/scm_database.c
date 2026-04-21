@@ -156,6 +156,28 @@ static int parse_service_file(const char *filepath, service_entry_t *svc)
             svc->restart_delay_ms = atoi(val);
         else if (strcmp(key, "max_restarts") == 0)
             svc->max_restarts = atoi(val);
+        /* S74: delayed-auto-start + failure actions.  All parse keys
+         * default to 0 (feature-off) so a .svc without them keeps the
+         * classic restart_policy semantics. */
+        else if (strcmp(key, "delayed_start_ms") == 0)
+            svc->delayed_start_ms = atoi(val);
+        else if (strcmp(key, "fail_reset_period_sec") == 0)
+            svc->fail_reset_period_sec = atoi(val);
+        else if (strcmp(key, "fail_cooldown_ms") == 0)
+            svc->fail_cooldown_ms = atoi(val);
+        else if (strcmp(key, "fail_command") == 0)
+            strncpy(svc->fail_command, val, sizeof(svc->fail_command) - 1);
+        else if (strncmp(key, "fail_action", 11) == 0 && key[11] >= '0' && key[11] <= '9') {
+            /* Format: "fail_action<N>=<type>:<delay_ms>" — N is 0..2. */
+            int idx = key[11] - '0';
+            if (idx >= 0 && idx < SCM_FAIL_ACTION_COUNT) {
+                int type = 0, delay = 0;
+                if (sscanf(val, "%d:%d", &type, &delay) >= 1) {
+                    svc->fail_actions[idx].type = type;
+                    svc->fail_actions[idx].delay_ms = delay;
+                }
+            }
+        }
     }
 
     /* Apply defaults for restart policy if not set */
@@ -251,6 +273,23 @@ int scm_db_save_service(const service_entry_t *svc)
         fprintf(f, "restart_delay_ms=%d\n", svc->restart_delay_ms);
     if (svc->max_restarts != DEFAULT_MAX_RESTARTS)
         fprintf(f, "max_restarts=%d\n", svc->max_restarts);
+    /* S74: only persist the new fields when they differ from zero so
+     * a regular service doesn't gain noise in its .svc file. */
+    if (svc->delayed_start_ms > 0)
+        fprintf(f, "delayed_start_ms=%d\n", svc->delayed_start_ms);
+    if (svc->fail_reset_period_sec > 0)
+        fprintf(f, "fail_reset_period_sec=%d\n", svc->fail_reset_period_sec);
+    if (svc->fail_cooldown_ms > 0)
+        fprintf(f, "fail_cooldown_ms=%d\n", svc->fail_cooldown_ms);
+    if (svc->fail_command[0])
+        fprintf(f, "fail_command=%s\n", svc->fail_command);
+    for (int a = 0; a < SCM_FAIL_ACTION_COUNT; a++) {
+        if (svc->fail_actions[a].type != SC_ACTION_NONE) {
+            fprintf(f, "fail_action%d=%d:%d\n", a,
+                    svc->fail_actions[a].type,
+                    svc->fail_actions[a].delay_ms);
+        }
+    }
 
     int write_err = ferror(f);
     int close_rc = fclose(f);

@@ -1,0 +1,21 @@
+name: catalysis-gate
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+jobs:
+  catalysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Run catalysis gate
+        run: python3 scripts/catalysis_analysis.py --ci --baseline scripts/catalysis_baseline.json --out /tmp/catalysis-report.json
+      - name: Show report on failure
+        if: failure()
+        run: cat /tmp/catalysis-report.json || true
+      - name: Annotate
+        if: failure()
+        run: echo "::error file=catalysis::K_avg or keystone regression detected -- see report"

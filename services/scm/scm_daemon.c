@@ -135,6 +135,7 @@ static void handle_service_crash(service_entry_t *svc, int exit_code,
 
     svc->state = SERVICE_STOPPED;
     svc->pid = 0;
+    scm_notify_fanout(svc->name, SERVICE_STOPPED);
 
     /* Clear the on-disk status file so `sc query` reflects reality
      * instead of stale RUNNING with a defunct pid. */
@@ -143,6 +144,34 @@ static void handle_service_crash(service_entry_t *svc, int exit_code,
         snprintf(status_path, sizeof(status_path),
                  "%s/%s.status", SCM_RUN_PATH, svc->name);
         unlink(status_path);
+    }
+
+    /* S74: if the service has per-service Windows failure_actions
+     * configured, honor them first.  They take precedence over the
+     * legacy restart_policy because they're more expressive (ordered
+     * action list, reset-period, cooldown, run-command, reboot). */
+    {
+        int want = scm_run_failure_actions(svc, exit_code, restart_name,
+                                           restart_sz, delay_ms_out);
+        if (want) {
+            scm_event_emit(SVC_EVT_RESTART, 0, svc->name,
+                           (int32_t)exit_code,
+                           (uint32_t)svc->restart_count);
+            return;
+        }
+        /* Also: if fail_actions are configured but picked NONE/RUN_COMMAND/
+         * REBOOT (no restart), skip the legacy restart_policy fallback so
+         * we don't double-handle the crash. */
+        for (int fa = 0; fa < SCM_FAIL_ACTION_COUNT; fa++) {
+            if (svc->fail_actions[fa].type != SC_ACTION_NONE) {
+                scm_event_emit(SVC_EVT_STOP, 0, svc->name,
+                               (int32_t)exit_code,
+                               (uint32_t)svc->restart_count);
+                /* Preserve manually_stopped semantics. */
+                if (svc->manually_stopped) svc->manually_stopped = 0;
+                return;
+            }
+        }
     }
 
     /* Check restart policy */
@@ -554,8 +583,14 @@ static int format_response(char *buf, size_t bufsz, const char *status,
 /*
  * Process a command and write the response into resp_buf.
  * Commands are newline-delimited text: "action name [extra...]"
+ *
+ * client_fd_for_response is the originating AF_UNIX fd; new-in-S74
+ * "notify_subscribe" dups it into the subscription registry so the
+ * event stream is delivered on the same socket the command came in on.
+ * Callers that don't support subscription may pass -1.
  */
-static int process_command(const char *cmd, char *resp_buf, size_t resp_sz)
+static int process_command(const char *cmd, char *resp_buf, size_t resp_sz,
+                           int client_fd_for_response)
 {
     char action[64], name[256], extra[1024];
     memset(extra, 0, sizeof(extra));
@@ -727,6 +762,97 @@ static int process_command(const char *cmd, char *resp_buf, size_t resp_sz)
             }
         }
 
+    } else if (strcmp(action, "set_fail_actions") == 0 && n >= 3) {
+        /* Wire: "set_fail_actions <name> t0:d0 t1:d1 t2:d2 reset=<sec> cooldown=<ms> cmd=<str>"
+         * Any subset of the action slots may be omitted (missing → NONE). */
+        scm_fail_action_t acts[SCM_FAIL_ACTION_COUNT];
+        memset(acts, 0, sizeof(acts));
+        int reset_sec = 0, cooldown_ms = 0;
+        char run_cmd[1024] = {0};
+        char *saveptr = NULL;
+        char extra_copy[1024];
+        strncpy(extra_copy, extra, sizeof(extra_copy) - 1);
+        extra_copy[sizeof(extra_copy) - 1] = '\0';
+        char *tok = strtok_r(extra_copy, " \t", &saveptr);
+        int slot = 0;
+        while (tok) {
+            if (strncmp(tok, "reset=", 6) == 0) {
+                reset_sec = atoi(tok + 6);
+            } else if (strncmp(tok, "cooldown=", 9) == 0) {
+                cooldown_ms = atoi(tok + 9);
+            } else if (strncmp(tok, "cmd=", 4) == 0) {
+                strncpy(run_cmd, tok + 4, sizeof(run_cmd) - 1);
+            } else if (slot < SCM_FAIL_ACTION_COUNT) {
+                int t = 0, d = 0;
+                if (sscanf(tok, "%d:%d", &t, &d) >= 1) {
+                    acts[slot].type = t;
+                    acts[slot].delay_ms = d;
+                }
+                slot++;
+            }
+            tok = strtok_r(NULL, " \t", &saveptr);
+        }
+        int rc = scm_set_failure_actions(name, acts, reset_sec, cooldown_ms,
+                                         run_cmd[0] ? run_cmd : NULL);
+        len = format_response(resp_buf, resp_sz,
+                              rc == 0 ? "ok" : "error",
+                              rc == 0 ? "failure actions set"
+                                      : "service not found or save failed");
+
+    } else if (strcmp(action, "get_fail_actions") == 0 && n >= 2) {
+        scm_fail_action_t acts[SCM_FAIL_ACTION_COUNT];
+        int reset_sec = 0, cooldown_ms = 0;
+        char run_cmd[1024] = {0};
+        if (scm_get_failure_actions(name, acts, &reset_sec, &cooldown_ms,
+                                    run_cmd, sizeof(run_cmd)) != 0) {
+            len = format_response(resp_buf, resp_sz, "error",
+                                  "service not found");
+        } else {
+            char esc_cmd[1024];
+            json_escape(run_cmd, esc_cmd, sizeof(esc_cmd));
+            len = snprintf(resp_buf, resp_sz,
+                           "{\"status\":\"ok\",\"service\":\"%s\","
+                           "\"actions\":[[%d,%d],[%d,%d],[%d,%d]],"
+                           "\"reset_period_sec\":%d,\"cooldown_ms\":%d,"
+                           "\"run_command\":\"%s\"}\n",
+                           name,
+                           acts[0].type, acts[0].delay_ms,
+                           acts[1].type, acts[1].delay_ms,
+                           acts[2].type, acts[2].delay_ms,
+                           reset_sec, cooldown_ms, esc_cmd);
+            if (len < 0) len = 0;
+            if ((size_t)len >= resp_sz) len = (int)resp_sz - 1;
+        }
+
+    } else if (strcmp(action, "notify_subscribe") == 0 && n >= 2) {
+        /* Wire: "notify_subscribe <name-or-'*'> <mask_hex>"
+         * The client fd itself receives the event stream (one line per
+         * transition).  mask=0 → SVC_NOTIFY_ALL.  Client is expected to
+         * keep the socket open; closing the socket implicitly unsubscribes
+         * via the next fanout's write-failure reap. */
+        uint32_t mask = 0;
+        if (extra[0]) mask = (uint32_t)strtoul(extra, NULL, 0);
+        int sub_id = scm_notify_subscribe(strcmp(name, "*") == 0 ? "" : name,
+                                          mask, client_fd_for_response);
+        if (sub_id < 0) {
+            len = format_response(resp_buf, resp_sz, "error",
+                                  "subscribe failed");
+        } else {
+            len = snprintf(resp_buf, resp_sz,
+                           "{\"status\":\"ok\",\"subscription_id\":%d}\n",
+                           sub_id);
+            if (len < 0) len = 0;
+            if ((size_t)len >= resp_sz) len = (int)resp_sz - 1;
+        }
+
+    } else if (strcmp(action, "notify_unsubscribe") == 0 && n >= 2) {
+        int sub_id = atoi(name);
+        int rc = scm_notify_unsubscribe(sub_id);
+        len = format_response(resp_buf, resp_sz,
+                              rc == 0 ? "ok" : "error",
+                              rc == 0 ? "unsubscribed"
+                                      : "no such subscription");
+
     } else if (strcmp(action, "ping") == 0) {
         len = format_response(resp_buf, resp_sz, "ok", "pong");
 
@@ -829,7 +955,7 @@ static void handle_client(int client_fd)
         buf[--n] = '\0';
 
     char resp[CMD_BUFSIZE * 2];
-    int resp_len = process_command(buf, resp, sizeof(resp));
+    int resp_len = process_command(buf, resp, sizeof(resp), client_fd);
 
     if (resp_len > 0) {
         ssize_t total = 0;

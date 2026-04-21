@@ -29,6 +29,7 @@
 #include "../include/trust_ioctl.h"
 #include "trust_internal.h"
 #include "trust_isa.h"
+#include "trust_morphogen.h"  /* S74 Agent 5: tissue-field perturbation */
 
 /* --- Session 32 wire-format constants mirrored from trust/include/trust_isa.h
  *
@@ -2102,6 +2103,17 @@ int trust_cmd_submit(const trust_ioc_cmd_submit_t __user *arg)
 						subj.capabilities);
 			}
 		}
+
+		/* S74 Agent 5: Perturb tissue field at the subject's cell.
+		 * Non-blocking; silently drops for unplaced subjects. Maps
+		 * dispatch success/failure to activator/inhibitor deltas so
+		 * the 32x32 morphogen grid retains short-term memory of
+		 * where stress recently landed — read by the cortex via
+		 * /sys/kernel/morphogen/dump. */
+		trust_morphogen_perturb(cmd_get_subject(&entry, 0),
+					prev_status < 0 ? TRUST_MORPHOGEN_EVENT_AUTHZ_DENY
+							: TRUST_MORPHOGEN_EVENT_AUTHZ_ALLOW,
+					1U);
 	}
 
 		trust_stats_record_dispatch_time(ktime_get_ns() - t_start_ns);

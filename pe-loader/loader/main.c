@@ -21,6 +21,8 @@
 #include <dlfcn.h>
 #include <strings.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include "pe/pe_header.h"
 #include "pe/pe_import.h"
@@ -333,12 +335,88 @@ int main(int argc, char **argv)
         printf("[peloader] Sections: %u\n", image.num_sections);
     }
 
-    /* PE32 (32-bit) executables cannot run in our 64-bit process */
+    /* PE32 (32-bit) executables cannot run in our 64-bit process.
+     *
+     * S74 A1 Wine handoff shim: rather than hard-refuse, execve() Wine and
+     * LD_PRELOAD a tiny shim (libtrust_wine_shim.so) that funnels open/openat/
+     * execve syscalls through /dev/trust TRUST_IOC_CHECK_CAP before the
+     * underlying glibc call.  This restores Steam + older game compatibility
+     * while preserving trust gating end-to-end.  Set AICONTROL_NO_WINE=1 to
+     * opt out and keep the legacy rejection behaviour.
+     */
     if (!image.is_pe32plus) {
         const char *basename = strrchr(exe_path, '/');
         if (!basename) basename = strrchr(exe_path, '\\');
         basename = basename ? basename + 1 : exe_path;
 
+        const char *no_wine = getenv("AICONTROL_NO_WINE");
+        const char *wine_bin = getenv("AICONTROL_WINE_BIN");
+        if (!wine_bin || !*wine_bin) wine_bin = "/usr/bin/wine";
+
+        struct stat wst;
+        int wine_usable = (!no_wine || !*no_wine) && stat(wine_bin, &wst) == 0 &&
+                          (wst.st_mode & S_IXUSR);
+
+        if (wine_usable) {
+            if (verbose) {
+                fprintf(stderr, "[peloader] PE32 detected (%s) -> Wine handoff via %s\n",
+                        basename, wine_bin);
+            }
+
+            /* Free parser resources before execve (execve replaces the process
+             * image, so strictly leaks are harmless, but be polite on any
+             * error-return path below). */
+            pe_image_free(&image);
+            preloader_release();
+
+            /* Build argv: [wine, exe_path, <original args>...]  Forward any
+             * remaining positional args (argv[optind+1] onward) to the PE. */
+            int forward_argc = (argc > optind + 1) ? (argc - optind - 1) : 0;
+            char **wargv = (char **)calloc((size_t)forward_argc + 3, sizeof(char *));
+            if (!wargv) {
+                fprintf(stderr, "[peloader] calloc failed for Wine argv\n");
+                return 1;
+            }
+            wargv[0] = (char *)wine_bin;
+            wargv[1] = (char *)exe_path;
+            for (int i = 0; i < forward_argc; i++) {
+                wargv[2 + i] = argv[optind + 1 + i];
+            }
+            wargv[2 + forward_argc] = NULL;
+
+            /* Advertise the caller pid so the shim can register the Wine
+             * process as the same trust subject that the loader speaks for. */
+            char pidbuf[32];
+            snprintf(pidbuf, sizeof(pidbuf), "%d", (int)getpid());
+            setenv("TRUST_SHIM_PID", pidbuf, 1);
+
+            /* LD_PRELOAD the trust shim.  Prepend to any existing value so we
+             * don't clobber user-supplied preloads. */
+            const char *shim_path = getenv("AICONTROL_WINE_SHIM");
+            if (!shim_path || !*shim_path)
+                shim_path = "/usr/lib/libtrust_wine_shim.so";
+            const char *cur_preload = getenv("LD_PRELOAD");
+            if (cur_preload && *cur_preload) {
+                size_t need = strlen(shim_path) + 1 + strlen(cur_preload) + 1;
+                char *merged = (char *)malloc(need);
+                if (merged) {
+                    snprintf(merged, need, "%s:%s", shim_path, cur_preload);
+                    setenv("LD_PRELOAD", merged, 1);
+                    free(merged);
+                }
+            } else {
+                setenv("LD_PRELOAD", shim_path, 1);
+            }
+
+            execv(wine_bin, wargv);
+            /* execv only returns on failure. */
+            fprintf(stderr, "[peloader] execv(%s) failed: %s\n",
+                    wine_bin, strerror(errno));
+            free(wargv);
+            return 1;
+        }
+
+        /* Wine unavailable or explicitly disabled: legacy hard-refusal. */
         fprintf(stderr, "\n");
         fprintf(stderr, "Error: %s is a 32-bit (PE32) executable.\n", basename);
         fprintf(stderr, "This loader only supports 64-bit (PE32+/AMD64) executables.\n");
@@ -348,6 +426,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "  Need:   0x20B (PE32+ / AMD64)\n");
         fprintf(stderr, "\n");
         fprintf(stderr, "Alternatives:\n");
+        fprintf(stderr, "  - Install wine + libtrust-wine-shim for trust-gated Wine handoff.\n");
         fprintf(stderr, "  - Try running this through Wine:  wine %s\n", basename);
         fprintf(stderr, "  - Download the 64-bit (x64) version of this program if available.\n");
         fprintf(stderr, "  - Use --diag to analyze import coverage without execution.\n");

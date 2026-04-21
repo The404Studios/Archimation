@@ -37,6 +37,71 @@
 #include "wdm_host_internal.h"
 #include "wdm_host_imports.h"
 
+/* Session 74 Tier-3 additions: HAL + driver-facing IRP + HID class. These
+ * are built with plain ABI in their own translation units (for userland
+ * preflight); the thunks below re-wrap each one with MS_ABI so the bsearch
+ * table can hand a correctly-attributed pointer to the IAT patcher.
+ *
+ * Forward declarations (avoid pulling the full headers here because some
+ * of their types conflict with kernel headers - e.g. stdint.h). */
+extern void     WdmKeStallExecutionProcessor(uint32_t microseconds);
+extern uint64_t WdmKeQuerySystemTime(void);
+extern uint64_t WdmKeQueryPerformanceCounter(uint64_t *freq_out);
+extern uint8_t  WdmReadPortUchar(uint16_t port);
+extern uint16_t WdmReadPortUshort(uint16_t port);
+extern uint32_t WdmReadPortUlong(uint16_t port);
+extern void     WdmWritePortUchar(uint16_t port, uint8_t value);
+extern void     WdmWritePortUshort(uint16_t port, uint16_t value);
+extern void     WdmWritePortUlong(uint16_t port, uint32_t value);
+extern void    *WdmHalGetAdapter(void *dd, uint32_t *nmr);
+extern int32_t  WdmHalAllocateAdapterChannel(void *a, void *d, uint32_t n,
+					     void *ex, void *ctx);
+
+struct wdm_irp_hdr;
+struct wdm_driver_object;
+extern struct wdm_irp_hdr *WdmIoAllocateIrp(uint8_t sz, int quota);
+extern void               WdmIoFreeIrp(struct wdm_irp_hdr *irp);
+extern void              *WdmIoGetCurrentIrpStackLocation(struct wdm_irp_hdr *irp);
+extern void              *WdmIoGetNextIrpStackLocation(struct wdm_irp_hdr *irp);
+
+extern int32_t WdmHidRegisterMinidriver(void *reg);
+extern int     WdmHidAttachDevice(const char *name, uint16_t v, uint16_t p);
+extern void    WdmHidDetachDevice(int h);
+extern int     WdmHidSetReportDescriptor(int h, const uint8_t *d, size_t l);
+extern int     WdmHidSubmitInputReport(int h, const uint8_t *r, size_t l);
+
+/* ---- MS_ABI thunks for HAL ---- */
+MS_ABI static void Wdm_KeStallExecutionProcessorShim(unsigned long us)
+{ WdmKeStallExecutionProcessor((uint32_t)us); }
+MS_ABI static u64 Wdm_KeQuerySystemTimeShim(u64 *out)
+{ u64 t = WdmKeQuerySystemTime(); if (out) *out = t; return t; }
+MS_ABI static u8 Wdm_ReadPortUcharShim(u16 p)  { return WdmReadPortUchar(p);  }
+MS_ABI static u16 Wdm_ReadPortUshortShim(u16 p){ return WdmReadPortUshort(p); }
+MS_ABI static u32 Wdm_ReadPortUlongShim(u16 p) { return WdmReadPortUlong(p);  }
+MS_ABI static void Wdm_WritePortUcharShim(u16 p, u8 v)  { WdmWritePortUchar(p, v);  }
+MS_ABI static void Wdm_WritePortUshortShim(u16 p, u16 v){ WdmWritePortUshort(p, v); }
+MS_ABI static void Wdm_WritePortUlongShim(u16 p, u32 v) { WdmWritePortUlong(p, v);  }
+MS_ABI static void *Wdm_HalGetAdapterShim(void *d, u32 *n)
+{ return WdmHalGetAdapter(d, n); }
+MS_ABI static long Wdm_HalAllocateAdapterChannelShim(void *a, void *d,
+						    unsigned long n,
+						    void *ex, void *c)
+{ return (long)WdmHalAllocateAdapterChannel(a, d, (uint32_t)n, ex, c); }
+
+/* ---- MS_ABI thunks for IRP driver API ---- */
+MS_ABI static void *Wdm_IoAllocateIrpShim(unsigned char sz, int quota)
+{ return WdmIoAllocateIrp((uint8_t)sz, quota); }
+MS_ABI static void  Wdm_IoFreeIrpShim(void *irp)
+{ WdmIoFreeIrp((struct wdm_irp_hdr *)irp); }
+MS_ABI static void *Wdm_IoGetCurrentIrpStackLocationShim(void *irp)
+{ return WdmIoGetCurrentIrpStackLocation((struct wdm_irp_hdr *)irp); }
+MS_ABI static void *Wdm_IoGetNextIrpStackLocationShim(void *irp)
+{ return WdmIoGetNextIrpStackLocation((struct wdm_irp_hdr *)irp); }
+
+/* ---- MS_ABI thunks for HID class ---- */
+MS_ABI static long Wdm_HidRegisterMinidriverShim(void *reg)
+{ return (long)WdmHidRegisterMinidriver(reg); }
+
 /* MS x64 ABI on x86_64 only. On other arches we still define the symbols
  * (so the table compiles) but without the attribute - kernel CI builds
  * for x86_64 and our PE loader is x86_64-only anyway. */
@@ -411,12 +476,26 @@ const struct wdm_kernel_export wdm_kernel_exports[] = {
 	{ "ExAllocatePoolWithTag",     (void *)Wdm_ExAllocatePoolWithTag,     0 },
 	{ "ExFreePool",                (void *)Wdm_ExFreePool,                0 },
 	{ "ExFreePoolWithTag",         (void *)Wdm_ExFreePoolWithTag,         0 },
+	/* Session 74: HAL DMA shims. */
+	{ "HalAllocateAdapterChannel", (void *)Wdm_HalAllocateAdapterChannelShim, 0 },
+	{ "HalGetAdapter",             (void *)Wdm_HalGetAdapterShim,         0 },
+	/* Session 74: HID class. */
+	{ "HidRegisterMinidriver",     (void *)Wdm_HidRegisterMinidriverShim, 0 },
+	/* Session 74: IRP driver API. */
+	{ "IoAllocateIrp",             (void *)Wdm_IoAllocateIrpShim,         0 },
 	{ "IoCallDriver",              (void *)Wdm_IoCallDriver,              0 },
 	{ "IoCompleteRequest",         (void *)Wdm_IoCompleteRequest,         0 },
 	{ "IoCreateDevice",            (void *)Wdm_IoCreateDevice,            0 },
 	{ "IoDeleteDevice",            (void *)Wdm_IoDeleteDevice,            0 },
-	{ "IofCompleteRequest",        (void *)Wdm_IofCompleteRequest,        0 },
+	/* Session 74: IoFreeIrp. */
+	{ "IoFreeIrp",                 (void *)Wdm_IoFreeIrpShim,             0 },
+	/* Session 74: stack-location navigation.
+	 * Uppercase 'G' (0x47) < lowercase 'f' (0x66) in ASCII, so these
+	 * sort BEFORE IofCompleteRequest. */
+	{ "IoGetCurrentIrpStackLocation", (void *)Wdm_IoGetCurrentIrpStackLocationShim, 0 },
 	{ "IoGetCurrentProcess",       (void *)Wdm_IoGetCurrentProcess,       0 },
+	{ "IoGetNextIrpStackLocation", (void *)Wdm_IoGetNextIrpStackLocationShim, 0 },
+	{ "IofCompleteRequest",        (void *)Wdm_IofCompleteRequest,        0 },
 	{ "KeAcquireSpinLock",         (void *)Wdm_KeAcquireSpinLock,         0 },
 	{ "KeBugCheckEx",              (void *)Wdm_KeBugCheckEx,              0 },
 	{ "KeGetCurrentIrql",          (void *)Wdm_KeGetCurrentIrql,          0 },
@@ -424,16 +503,27 @@ const struct wdm_kernel_export wdm_kernel_exports[] = {
 	{ "KeLowerIrql",               (void *)Wdm_KeLowerIrql,               0 },
 	{ "KeQueryActiveProcessorCount", (void *)Wdm_KeQueryActiveProcessorCount, 0 },
 	{ "KeQueryPerformanceCounter", (void *)Wdm_KeQueryPerformanceCounter, 0 },
+	/* Session 74: KeQuerySystemTime. */
+	{ "KeQuerySystemTime",         (void *)Wdm_KeQuerySystemTimeShim,     0 },
 	{ "KeRaiseIrql",               (void *)Wdm_KeRaiseIrql,               0 },
 	{ "KeReleaseSpinLock",         (void *)Wdm_KeReleaseSpinLock,         0 },
+	/* Session 74: KeStallExecutionProcessor. */
+	{ "KeStallExecutionProcessor", (void *)Wdm_KeStallExecutionProcessorShim, 0 },
 	{ "KeWaitForSingleObject",     (void *)Wdm_KeWaitForSingleObject,     0 },
 	{ "MmAllocateContiguousMemory", (void *)Wdm_MmAllocateContiguousMemory, 0 },
 	{ "MmFreeContiguousMemory",    (void *)Wdm_MmFreeContiguousMemory,    0 },
 	{ "MmGetSystemRoutineAddress", (void *)Wdm_MmGetSystemRoutineAddress, 0 },
+	/* Session 74: port I/O shims (HAL). */
+	{ "READ_PORT_UCHAR",           (void *)Wdm_ReadPortUcharShim,         0 },
+	{ "READ_PORT_ULONG",           (void *)Wdm_ReadPortUlongShim,         0 },
+	{ "READ_PORT_USHORT",          (void *)Wdm_ReadPortUshortShim,        0 },
 	{ "RtlCompareMemory",          (void *)Wdm_RtlCompareMemory,          0 },
 	{ "RtlCopyMemory",             (void *)Wdm_RtlCopyMemory,             0 },
 	{ "RtlInitUnicodeString",      (void *)Wdm_RtlInitUnicodeString,      0 },
 	{ "RtlZeroMemory",             (void *)Wdm_RtlZeroMemory,             0 },
+	{ "WRITE_PORT_UCHAR",          (void *)Wdm_WritePortUcharShim,        0 },
+	{ "WRITE_PORT_ULONG",          (void *)Wdm_WritePortUlongShim,        0 },
+	{ "WRITE_PORT_USHORT",         (void *)Wdm_WritePortUshortShim,       0 },
 };
 
 const size_t wdm_kernel_exports_count =

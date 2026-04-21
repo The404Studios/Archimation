@@ -16,11 +16,301 @@
 #include <fcntl.h>
 #include <spawn.h>
 #include <errno.h>
+#include <time.h>
+#include <pthread.h>
 
 #include "scm.h"
 #include "scm_event.h"
 
 extern char **environ;
+
+/* ========================================================================
+ * S74: SERVICE_NOTIFY subscription registry
+ * ------------------------------------------------------------------------
+ * Singly-linked list guarded by g_lock (callers already hold it at every
+ * state-transition tap site).  Each node owns a dup'd fd that receives
+ * one "state=<n> name=<svc>\n" line per matching transition.  We never
+ * block on the fd: EAGAIN/EPIPE mean the client is dead and the node is
+ * reaped on the next fanout pass.  This keeps SCM's hot path bounded.
+ * ======================================================================== */
+typedef struct scm_notify_sub {
+    int                       id;
+    int                       fd;         /* dup'd writable fd */
+    uint32_t                  mask;       /* OR of SVC_NOTIFY_* */
+    char                      service[256]; /* empty == wildcard */
+    int                       dead;       /* 1 once write() has failed */
+    struct scm_notify_sub    *next;
+} scm_notify_sub_t;
+
+static scm_notify_sub_t *g_notify_head = NULL;
+static int               g_notify_next_id = 1;
+
+static uint32_t state_to_notify_mask(int state)
+{
+    switch (state) {
+    case SERVICE_STOPPED:       return SVC_NOTIFY_STOPPED;
+    case SERVICE_START_PENDING: return SVC_NOTIFY_START_PENDING;
+    case SERVICE_STOP_PENDING:  return SVC_NOTIFY_STOP_PENDING;
+    case SERVICE_RUNNING:       return SVC_NOTIFY_RUNNING;
+    case SERVICE_PAUSED:        return SVC_NOTIFY_PAUSED;
+    default:                    return 0;
+    }
+}
+
+int scm_notify_subscribe(const char *service_name, uint32_t mask, int fd)
+{
+    if (fd < 0) return -1;
+    int dup_fd = dup(fd);
+    if (dup_fd < 0) return -1;
+    /* Non-blocking so a stuck reader can't wedge the SCM main loop. */
+    int fl = fcntl(dup_fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(dup_fd, F_SETFL, fl | O_NONBLOCK);
+    fcntl(dup_fd, F_SETFD, FD_CLOEXEC);
+
+    scm_notify_sub_t *sub = calloc(1, sizeof(*sub));
+    if (!sub) { close(dup_fd); return -1; }
+    sub->id   = g_notify_next_id++;
+    sub->fd   = dup_fd;
+    sub->mask = mask ? mask : SVC_NOTIFY_ALL;
+    if (service_name && service_name[0])
+        strncpy(sub->service, service_name, sizeof(sub->service) - 1);
+    sub->next = g_notify_head;
+    g_notify_head = sub;
+    return sub->id;
+}
+
+int scm_notify_unsubscribe(int sub_id)
+{
+    scm_notify_sub_t **pp = &g_notify_head;
+    while (*pp) {
+        if ((*pp)->id == sub_id) {
+            scm_notify_sub_t *dead = *pp;
+            *pp = dead->next;
+            if (dead->fd >= 0) close(dead->fd);
+            free(dead);
+            return 0;
+        }
+        pp = &(*pp)->next;
+    }
+    return -1;
+}
+
+void scm_notify_fanout(const char *service_name, int new_state)
+{
+    uint32_t bit = state_to_notify_mask(new_state);
+    if (!bit || !service_name) return;
+    char line[320];
+    int  n = snprintf(line, sizeof(line), "state=%d name=%s\n",
+                      new_state, service_name);
+    if (n <= 0) return;
+
+    scm_notify_sub_t **pp = &g_notify_head;
+    while (*pp) {
+        scm_notify_sub_t *s = *pp;
+        int interested = (s->mask & bit) &&
+                         (s->service[0] == '\0' ||
+                          strcmp(s->service, service_name) == 0);
+        if (interested && !s->dead) {
+            ssize_t w = write(s->fd, line, (size_t)n);
+            if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                errno != EINTR) {
+                s->dead = 1;
+            }
+        }
+        if (s->dead) {
+            *pp = s->next;
+            if (s->fd >= 0) close(s->fd);
+            free(s);
+        } else {
+            pp = &s->next;
+        }
+    }
+}
+
+/* --- S74 helper: set/get failure actions ------------------------------- */
+int scm_set_failure_actions(const char *name,
+                            const scm_fail_action_t actions[SCM_FAIL_ACTION_COUNT],
+                            int reset_period_sec, int cooldown_ms,
+                            const char *run_command)
+{
+    service_entry_t *svc = scm_db_find(name);
+    if (!svc) return -1;
+    for (int i = 0; i < SCM_FAIL_ACTION_COUNT; i++)
+        svc->fail_actions[i] = actions[i];
+    svc->fail_reset_period_sec = reset_period_sec;
+    svc->fail_cooldown_ms = cooldown_ms;
+    if (run_command) {
+        strncpy(svc->fail_command, run_command, sizeof(svc->fail_command) - 1);
+        svc->fail_command[sizeof(svc->fail_command) - 1] = '\0';
+    } else {
+        svc->fail_command[0] = '\0';
+    }
+    return scm_db_save_service(svc);
+}
+
+int scm_get_failure_actions(const char *name,
+                            scm_fail_action_t actions_out[SCM_FAIL_ACTION_COUNT],
+                            int *reset_period_sec, int *cooldown_ms,
+                            char *run_command_out, size_t run_command_sz)
+{
+    service_entry_t *svc = scm_db_find(name);
+    if (!svc) return -1;
+    for (int i = 0; i < SCM_FAIL_ACTION_COUNT; i++)
+        actions_out[i] = svc->fail_actions[i];
+    if (reset_period_sec) *reset_period_sec = svc->fail_reset_period_sec;
+    if (cooldown_ms)      *cooldown_ms      = svc->fail_cooldown_ms;
+    if (run_command_out && run_command_sz > 0) {
+        strncpy(run_command_out, svc->fail_command, run_command_sz - 1);
+        run_command_out[run_command_sz - 1] = '\0';
+    }
+    return 0;
+}
+
+/* --- S74 helper: honor per-service failure actions on crash ------------ */
+int scm_run_failure_actions(service_entry_t *svc, int exit_code,
+                            char *restart_name, size_t restart_sz,
+                            int *delay_ms_out)
+{
+    (void)exit_code;
+    if (!svc || !restart_name || !delay_ms_out) return 0;
+    /* No actions configured → defer to legacy restart_policy path. */
+    int configured = 0;
+    for (int i = 0; i < SCM_FAIL_ACTION_COUNT; i++)
+        if (svc->fail_actions[i].type != SC_ACTION_NONE) configured = 1;
+    if (!configured) return 0;
+
+    time_t now = time(NULL);
+
+    /* Reset-period: if enough uneventful time elapsed, zero the counter. */
+    if (svc->fail_reset_period_sec > 0 && svc->last_failure_time > 0 &&
+        (now - svc->last_failure_time) >= svc->fail_reset_period_sec) {
+        svc->restart_count = 0;
+    }
+
+    /* Cooldown-between-failures: ignore rapid-fire crashes below the gap. */
+    if (svc->fail_cooldown_ms > 0 && svc->last_action_time > 0 &&
+        ((now - svc->last_action_time) * 1000) < svc->fail_cooldown_ms) {
+        fprintf(stderr, "[scm_api] fail-action cooldown active for '%s'\n",
+                svc->name);
+        return 0;
+    }
+
+    /* Pick the Nth action, where N = restart_count (clamped to last slot). */
+    int slot = svc->restart_count;
+    if (slot >= SCM_FAIL_ACTION_COUNT) slot = SCM_FAIL_ACTION_COUNT - 1;
+    scm_fail_action_t *act = &svc->fail_actions[slot];
+
+    svc->last_failure_time = now;
+    svc->last_action_time  = now;
+
+    switch (act->type) {
+    case SC_ACTION_RESTART:
+        svc->restart_count++;
+        strncpy(restart_name, svc->name, restart_sz - 1);
+        restart_name[restart_sz - 1] = '\0';
+        *delay_ms_out = act->delay_ms > 0 ? act->delay_ms : DEFAULT_RESTART_DELAY_MS;
+        fprintf(stderr, "[scm_api] fail-action[%d]=RESTART for '%s' in %dms\n",
+                slot, svc->name, *delay_ms_out);
+        return 1;
+
+    case SC_ACTION_RUN_COMMAND:
+        if (svc->fail_command[0]) {
+            fprintf(stderr, "[scm_api] fail-action[%d]=RUN_COMMAND for '%s': %s\n",
+                    slot, svc->name, svc->fail_command);
+            /* Fire and forget via /bin/sh -c.  Executed in a double-fork
+             * so we don't leave zombies that racing SIGCHLD might reap
+             * before we update restart_count. */
+            pid_t p = fork();
+            if (p == 0) {
+                pid_t g = fork();
+                if (g == 0) {
+                    execl("/bin/sh", "sh", "-c", svc->fail_command, (char*)NULL);
+                    _exit(127);
+                }
+                _exit(0);
+            } else if (p > 0) {
+                int st; waitpid(p, &st, 0);
+            }
+        }
+        return 0;
+
+    case SC_ACTION_REBOOT:
+        fprintf(stderr, "[scm_api] fail-action[%d]=REBOOT requested by '%s' "
+                "(honored via systemctl reboot)\n", slot, svc->name);
+        /* Defer one second so the notification fanout finishes first. */
+        if (fork() == 0) {
+            sleep(1);
+            execl("/bin/systemctl", "systemctl", "reboot", (char*)NULL);
+            _exit(127);
+        }
+        return 0;
+
+    case SC_ACTION_NONE:
+    default:
+        fprintf(stderr, "[scm_api] fail-action[%d]=NONE for '%s'\n",
+                slot, svc->name);
+        return 0;
+    }
+}
+
+/* --- S74 helper: delayed auto-start timer thread ----------------------- */
+typedef struct {
+    char name[256];
+    int  delay_ms;
+} scm_delayed_ctx_t;
+
+static void *scm_delayed_start_thread(void *arg)
+{
+    scm_delayed_ctx_t *ctx = (scm_delayed_ctx_t *)arg;
+    int secs = ctx->delay_ms / 1000;
+    int us   = (ctx->delay_ms % 1000) * 1000;
+    for (int s = 0; s < secs; s++) sleep(1);
+    if (us > 0) usleep((useconds_t)us);
+
+    /* After delay: re-check under lock that the service still wants to
+     * start (wasn't manually disabled in the meantime). */
+    extern pthread_mutex_t g_lock;
+    pthread_mutex_lock(&g_lock);
+    service_entry_t *svc = scm_db_find(ctx->name);
+    if (svc && !svc->manually_stopped &&
+        svc->state == SERVICE_STOPPED &&
+        svc->delayed_start_pending) {
+        svc->delayed_start_pending = 0;
+        fprintf(stderr, "[scm_api] delayed-auto-start firing for '%s' "
+                "(after %dms)\n", ctx->name, ctx->delay_ms);
+        scm_start_service(ctx->name);
+    }
+    pthread_mutex_unlock(&g_lock);
+    free(ctx);
+    return NULL;
+}
+
+void scm_schedule_delayed_start(const char *service_name, int delay_ms)
+{
+    if (!service_name || delay_ms <= 0) return;
+    service_entry_t *svc = scm_db_find(service_name);
+    if (!svc) return;
+    if (svc->delayed_start_pending) return;  /* already armed */
+    svc->delayed_start_pending = 1;
+
+    scm_delayed_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) { svc->delayed_start_pending = 0; return; }
+    strncpy(ctx->name, service_name, sizeof(ctx->name) - 1);
+    ctx->delay_ms = delay_ms;
+
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    int rc = pthread_create(&tid, &attr, scm_delayed_start_thread, ctx);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {
+        svc->delayed_start_pending = 0;
+        free(ctx);
+        fprintf(stderr, "[scm_api] pthread_create(delayed_start) failed: %s\n",
+                strerror(rc));
+    }
+}
 
 static void ensure_run_dir(void)
 {
@@ -82,6 +372,7 @@ int scm_start_service(const char *name)
     }
 
     svc->state = SERVICE_START_PENDING;
+    scm_notify_fanout(svc->name, SERVICE_START_PENDING);
     svc->crash_handled = 0;  /* Reset so next crash can be handled */
     /* Do NOT zero svc->restart_count here: the SIGCHLD-triggered restart
      * path reaches this function too, and handle_service_crash has already
@@ -113,6 +404,7 @@ int scm_start_service(const char *name)
         svc->state = SERVICE_RUNNING;
         svc->pid = 0;
         write_status_file(name, SERVICE_RUNNING, 0);
+        scm_notify_fanout(svc->name, SERVICE_RUNNING);
         return 0;
     }
 
@@ -209,6 +501,7 @@ int scm_start_service(const char *name)
     svc->pid = pid;
     svc->state = SERVICE_RUNNING;
     write_status_file(name, SERVICE_RUNNING, pid);
+    scm_notify_fanout(svc->name, SERVICE_RUNNING);
 
     scm_event_emit(SVC_EVT_START, (uint32_t)pid, name, 0, 0);
     fprintf(stderr, "[scm_api] Service started: %s (pid=%d)\n", name, pid);
@@ -242,6 +535,7 @@ int scm_stop_service(const char *name)
     }
 
     svc->state = SERVICE_STOP_PENDING;
+    scm_notify_fanout(svc->name, SERVICE_STOP_PENDING);
     svc->manually_stopped = 1;  /* Suppress restart policy */
     svc->crash_handled = 1;     /* Prevent SIGCHLD handler from restarting while unlocked */
     pid_t pid = svc->pid;
@@ -291,6 +585,7 @@ int scm_stop_service(const char *name)
     svc->state = SERVICE_STOPPED;
     svc->pid = 0;
     remove_status_file(name);
+    scm_notify_fanout(svc->name, SERVICE_STOPPED);
 
     scm_event_emit(SVC_EVT_STOP, 0, name, 0, 0);
     fprintf(stderr, "[scm_api] Service stopped: %s\n", name);
@@ -312,6 +607,7 @@ int scm_query_service(const char *name, int *state, int *pid)
             svc->state = SERVICE_STOPPED;
             svc->pid = 0;
             remove_status_file(name);
+            scm_notify_fanout(svc->name, SERVICE_STOPPED);
         }
     }
 

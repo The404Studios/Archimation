@@ -110,7 +110,7 @@ bash "$SCRIPT_DIR/test-bootc-build.sh" 2>&1 | sed 's/^/[build] /' \
 bootc-image-builder build \
     --type qcow2 \
     --output "$QCOW" \
-    localhost/archwindows-bootc:test \
+    localhost/archimation-bootc:test \
     2>&1 | sed 's/^/[bib] /' \
     || fail "bootc-image-builder failed" 4
 

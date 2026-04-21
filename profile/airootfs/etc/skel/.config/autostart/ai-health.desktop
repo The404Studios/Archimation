@@ -10,7 +10,7 @@
 # Agent Q's USER-MANUAL.md explains how to enable this at first boot.
 Type=Application
 Name=AI Health Check
-Comment=Run ai-health once at login (ARCHWINDOWS)
+Comment=Run ai-health once at login (ARCHIMATION)
 Exec=sh -c 'sleep 5; ai-health --brief 2>&1 | head -20 | xmessage -file - -timeout 10 || true'
 Icon=utilities-system-monitor
 Hidden=true

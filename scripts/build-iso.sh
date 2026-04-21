@@ -79,7 +79,7 @@ fi
 
 # Generate GRUB theme assets (fonts + background + selection highlight).
 # These are idempotent: skip when already up to date to save 5-10s per rebuild.
-THEME_DIR="$PROFILE_DIR/grub/themes/archwindows"
+THEME_DIR="$PROFILE_DIR/grub/themes/archimation"
 if [ -d "$THEME_DIR" ]; then
     _step_start "Generating GRUB theme assets"
     DEJAVU_TTF="/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"

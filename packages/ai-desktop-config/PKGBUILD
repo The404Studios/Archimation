@@ -374,11 +374,11 @@ TERMINAL
 PANEL
 
     # ==========================================================================
-    # CUSTOM ARCHWINDOWS LOGO ICON (Windows 4-pane style in accent colors)
+    # CUSTOM ARCHIMATION LOGO ICON (Windows 4-pane style in accent colors)
     # ==========================================================================
     install -d "$pkgdir/usr/share/icons/hicolor/scalable/apps"
     install -d "$pkgdir/usr/share/pixmaps"
-    cat > "$pkgdir/usr/share/icons/hicolor/scalable/apps/archwindows-logo.svg" <<'LOGO_SVG'
+    cat > "$pkgdir/usr/share/icons/hicolor/scalable/apps/archimation-logo.svg" <<'LOGO_SVG'
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   <rect x="4" y="4" width="26" height="26" rx="3" fill="#7aa2f7"/>
@@ -388,7 +388,7 @@ PANEL
 </svg>
 LOGO_SVG
     # Symlink into pixmaps so whisker menu button-icon path resolves
-    ln -sf /usr/share/icons/hicolor/scalable/apps/archwindows-logo.svg         "$pkgdir/usr/share/pixmaps/archwindows-logo.svg"
+    ln -sf /usr/share/icons/hicolor/scalable/apps/archimation-logo.svg         "$pkgdir/usr/share/pixmaps/archimation-logo.svg"
 
     # --- AI Control Panel icon (SVG) ---
     cat > "$pkgdir/usr/share/icons/hicolor/scalable/apps/ai-control-panel.svg" <<'AIPANEL_ICON'
@@ -2009,7 +2009,7 @@ FIRSTRUN
     # ==========================================================================
     install -Dm755 /dev/stdin "$pkgdir/usr/bin/ai-pkg-install" <<'PKGINSTALL'
 #!/bin/bash
-# ai-pkg-install - Universal package installer for ArchWindows
+# ai-pkg-install - Universal package installer for Archimation
 set -euo pipefail
 
 FILE="${1:?Usage: ai-pkg-install <package-file>}"
@@ -2643,7 +2643,7 @@ fi
 sleep 5
 
 # 5. Welcome notification (10 seconds, shown once)
-ICON=/usr/share/icons/hicolor/scalable/apps/archwindows-logo.svg
+ICON=/usr/share/icons/hicolor/scalable/apps/archimation-logo.svg
 [ -f "$ICON" ] || ICON=computer
 notify-send -i "$ICON" -t 10000 \
     "Welcome to AI Arch Linux" \
@@ -3765,7 +3765,7 @@ view-mode=0
 # Button appearance: custom AI icon, "Start" label
 show-button-title=true
 button-title=Start
-button-icon=/usr/share/pixmaps/archwindows-logo.svg
+button-icon=/usr/share/pixmaps/archimation-logo.svg
 button-icon-visible=true
 button-single-row=false
 
@@ -10422,7 +10422,7 @@ class InstallerApp(Adw.Application):
         self._swap_size_gb = min(get_ram_gb(), 8)
         self._username = "arch"
         self._password = ""
-        self._hostname = "archwindows"
+        self._hostname = "archimation"
         self._timezone = "America/New_York"
         self._enable_ai = True
         self._install_thread = None
@@ -11057,7 +11057,7 @@ class InstallerApp(Adw.Application):
         # System settings
         sys_group = Adw.PreferencesGroup(title="System")
         self._hostname_entry = Adw.EntryRow(title="Hostname")
-        self._hostname_entry.set_text("archwindows")
+        self._hostname_entry.set_text("archimation")
         sys_group.add(self._hostname_entry)
 
         # Timezone dropdown
@@ -11922,7 +11922,7 @@ class InstallerApp(Adw.Application):
             os.makedirs(repo_dst, exist_ok=True)
 
             # Set Plymouth theme
-            self._chroot("plymouth-set-default-theme archwindows || true", check=False)
+            self._chroot("plymouth-set-default-theme archimation || true", check=False)
 
             # Configure LightDM for the installed system
             lightdm_conf = f"{MOUNT_ROOT}/etc/lightdm/lightdm.conf"

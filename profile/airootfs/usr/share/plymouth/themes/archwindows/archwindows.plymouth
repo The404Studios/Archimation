@@ -1,8 +1,0 @@
-[Plymouth Theme]
-Name=ArchWindows
-Description=ArchWindows AI-Powered Linux Boot Splash
-ModuleName=script
-
-[script]
-ImageDir=/usr/share/plymouth/themes/archwindows
-ScriptFile=/usr/share/plymouth/themes/archwindows/archwindows.script

@@ -136,7 +136,7 @@ _maybe_generate_install_mok() {
     _log "generating per-install MOK at /var/lib/dkms/mok.{key,pub}"
     openssl req -new -x509 -nodes \
         -newkey rsa:4096 -sha256 -days 3650 \
-        -subj "/CN=ARCHWINDOWS trust-dkms per-install MOK/O=ARCHWINDOWS/" \
+        -subj "/CN=ARCHIMATION trust-dkms per-install MOK/O=ARCHIMATION/" \
         -keyout /var/lib/dkms/mok.key \
         -outform DER -out /var/lib/dkms/mok.pub \
         2>/dev/null || { _warn "openssl req failed; continuing unsigned"; return 1; }

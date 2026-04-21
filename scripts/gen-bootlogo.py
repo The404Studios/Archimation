@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate the ArchWindows GRUB bootloader splash image.
+Generate the Archimation GRUB bootloader splash image.
 Modified by fourzerofour
 
 Outputs a 1024x768 PNG suitable for GRUB background_image.
@@ -81,7 +81,7 @@ def draw_windows_logo(draw, cx, cy, size, colors):
     )
 
 def draw_combined_logo(draw, cx, cy):
-    """Draw the combined ArchWindows hybrid logo."""
+    """Draw the combined Archimation hybrid logo."""
     # Windows panes in Arch blue tones
     win_colors = [
         (233, 69, 96),    # Red-pink (top-left)
@@ -111,7 +111,7 @@ def load_font(name, size, fallback_size=None):
     return ImageFont.load_default()
 
 def main():
-    outpath = sys.argv[1] if len(sys.argv) > 1 else "archwindows.png"
+    outpath = sys.argv[1] if len(sys.argv) > 1 else "archimation.png"
 
     img = Image.new('RGB', (WIDTH, HEIGHT))
     draw = ImageDraw.Draw(img)
@@ -191,8 +191,8 @@ def main():
 
     title_y = logo_cy + pane_h + gap//2 + 30
 
-    # "ArchWindows" in gradient-like two-tone
-    title = "ArchWindows"
+    # "Archimation" in gradient-like two-tone
+    title = "Archimation"
     bbox = draw.textbbox((0, 0), title, font=font_title)
     tw = bbox[2] - bbox[0]
 
@@ -254,7 +254,7 @@ def main():
     draw.line([(WIDTH-20, HEIGHT-20), (WIDTH-50, HEIGHT-20)], fill=accent_color, width=2)
 
     img.save(outpath)
-    print(f"ArchWindows boot logo saved to: {outpath}")
+    print(f"Archimation boot logo saved to: {outpath}")
     print(f"  Size: {WIDTH}x{HEIGHT}")
     print(f"  Modified by fourzerofour")
 

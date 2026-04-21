@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034
 
-iso_name="archwindows"
-iso_label="ARCHWIN_$(date +%Y%m)"
-iso_publisher="ArchWindows - modified by fourzerofour"
-iso_application="ArchWindows Live/Install"
+iso_name="archimation"
+iso_label="ARCHIM_$(date +%Y%m)"
+iso_publisher="Archimation - modified by fourzerofour"
+iso_application="Archimation Live/Install"
 iso_version="$(date +%Y.%m.%d)"
 install_dir="arch"
 buildmodes=('iso')

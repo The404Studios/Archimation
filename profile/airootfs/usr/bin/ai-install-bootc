@@ -1,8 +1,8 @@
 #!/bin/bash
-# ai-install-bootc — bootc-mode installer for ArchWindows (AI Arch Linux).
+# ai-install-bootc — bootc-mode installer for Archimation (AI Arch Linux).
 #
 # Session 72 / Agent δ.  Parallel to `ai-install-to-disk` (the archiso/pacstrap
-# path).  Deploys the ArchWindows OCI image via `bootc install to-filesystem`.
+# path).  Deploys the Archimation OCI image via `bootc install to-filesystem`.
 #
 # What this does (top-to-bottom):
 #   1. Pre-flight: root + live-ISO + bootc CLI present.
@@ -48,7 +48,7 @@ fi
 # Defaults (overridden by flags or prompts)
 # ---------------------------------------------------------------------------
 TARGET=""
-HOSTNAME_DEF="archwindows"
+HOSTNAME_DEF="archimation"
 USERNAME_DEF="archw"
 TIMEZONE_DEF=""
 FS="btrfs"                                   # btrfs | xfs | ext4
@@ -63,9 +63,9 @@ MOUNT="/mnt"
 LOG="/var/log/ai-install-bootc.log"
 
 # Well-known image refs (search order)
-IMGREF_LOCAL_STORE="containers-storage:localhost/archwindows-bootc:latest"
-IMGREF_LIVE_ARCHIVE="oci-archive:/var/lib/archwindows/bootc-image.tar"
-IMGREF_GHCR="docker://ghcr.io/fourzerofour/archwindows-bootc:latest"
+IMGREF_LOCAL_STORE="containers-storage:localhost/archimation-bootc:latest"
+IMGREF_LIVE_ARCHIVE="oci-archive:/var/lib/archimation/bootc-image.tar"
+IMGREF_GHCR="docker://ghcr.io/fourzerofour/archimation-bootc:latest"
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -93,7 +93,7 @@ usage() {
     cat <<EOF
 Usage: ai-install-bootc [OPTIONS]
 
-Install ArchWindows onto a disk via bootc (OCI-image deploy mode).
+Install Archimation onto a disk via bootc (OCI-image deploy mode).
 
 This is the recommended installer when 'bootc' is available — gives you
 atomic upgrades (\`bootc upgrade\`) and rollbacks (\`bootc rollback\`) on the
@@ -121,7 +121,7 @@ Environment:
 
 Examples:
   sudo ai-install-bootc
-  sudo ai-install-bootc --target /dev/sda --image-ref containers-storage:localhost/archwindows-bootc:latest
+  sudo ai-install-bootc --target /dev/sda --image-ref containers-storage:localhost/archimation-bootc:latest
   AI_INSTALL_PASSWORD=hunter2 sudo ai-install-bootc --target /dev/sda --user me --yes
 
 Capability detection is automatic.  On old hardware the installer degrades
@@ -153,7 +153,7 @@ done
 # Logfile (after --help so help-before-root works)
 # ---------------------------------------------------------------------------
 touch "$LOG" 2>/dev/null || LOG="/tmp/ai-install-bootc.log"
-log "=== ArchWindows bootc installer ==="
+log "=== Archimation bootc installer ==="
 log "CLI args captured; entering pre-flight."
 
 # ---------------------------------------------------------------------------
@@ -185,7 +185,7 @@ You have two options:
 
   (b) Use the legacy archiso installer (works without bootc):
           sudo ai-install-to-disk --mode archiso
-      This produces a working ArchWindows system but without atomic
+      This produces a working Archimation system but without atomic
       upgrade/rollback semantics.
 EOF
     exit 2
@@ -282,12 +282,12 @@ resolve_image_source() {
     fi
     # Try container storage (podman/buildah loaded it already)
     if command -v podman >/dev/null 2>&1 && \
-       podman image exists localhost/archwindows-bootc:latest 2>/dev/null; then
+       podman image exists localhost/archimation-bootc:latest 2>/dev/null; then
         IMAGE_SOURCE="$IMGREF_LOCAL_STORE"
         return
     fi
     # Try live-ISO cached tarball
-    if [ -f "/var/lib/archwindows/bootc-image.tar" ]; then
+    if [ -f "/var/lib/archimation/bootc-image.tar" ]; then
         IMAGE_SOURCE="$IMGREF_LIVE_ARCHIVE"
         return
     fi
@@ -340,7 +340,7 @@ if [ -n "$DEGRADE_NOTES" ]; then
 fi
 
 if [ -z "$IMAGE_SOURCE" ]; then
-    die "no image source resolvable: no local storage, no /var/lib/archwindows/bootc-image.tar, and no network for GHCR.  Provide --image-ref <ref>."
+    die "no image source resolvable: no local storage, no /var/lib/archimation/bootc-image.tar, and no network for GHCR.  Provide --image-ref <ref>."
 fi
 
 # ---------------------------------------------------------------------------
@@ -425,7 +425,7 @@ fi
 # Triple-confirm
 # ---------------------------------------------------------------------------
 hr
-echo "About to install ArchWindows via bootc with these settings:"
+echo "About to install Archimation via bootc with these settings:"
 cat <<EOF
   Target disk:    $TARGET ($DISK_GIB GiB)
   Hostname:       $HOSTNAME_DEF
@@ -500,13 +500,13 @@ fi
 
 case "$FS" in
     btrfs)
-        mkfs.btrfs -f -L ArchWindows "$ROOT_PART"
+        mkfs.btrfs -f -L Archimation "$ROOT_PART"
         ;;
     xfs)
-        mkfs.xfs -f -L ArchWindows "$ROOT_PART"
+        mkfs.xfs -f -L Archimation "$ROOT_PART"
         ;;
     ext4)
-        mkfs.ext4 -F -L ArchWindows -m 1 "$ROOT_PART"
+        mkfs.ext4 -F -L Archimation -m 1 "$ROOT_PART"
         ;;
 esac
 
@@ -630,7 +630,7 @@ fi
 # (trust.ko, wdm_host.ko).  If the key exists in the image, queue it for
 # enrollment at next boot via mokutil.  User will see a blue MokManager prompt
 # on first boot.
-MOK_CERT="$MOUNT/etc/archwindows/keys/mok.der"
+MOK_CERT="$MOUNT/etc/archimation/keys/mok.der"
 if [ -f "$MOK_CERT" ] && [ "$CAP_EFI" = "yes" ] && command -v mokutil >/dev/null 2>&1; then
     log "MOK certificate found — queueing enrollment for first boot"
     # mokutil --import writes to the BootCurrent EFI var, persistent across reboot.
@@ -655,14 +655,14 @@ EOF
     info "MOK enrollment password (save this): $MOK_PW"
 fi
 
-# Expected PCR-11 file — Agent γ writes /etc/archwindows/expected-pcr-11
+# Expected PCR-11 file — Agent γ writes /etc/archimation/expected-pcr-11
 # on TPM 2.0 systems so trust.ko's APE can verify measured-boot state.
 if [ "$CAP_TPM_VERSION" = "2.0" ]; then
-    mkdir -p "$MOUNT/etc/archwindows"
+    mkdir -p "$MOUNT/etc/archimation"
     # Capture current PCR-11 (UKI signature region in systemd-measure's scheme).
     # Real value filled in on first boot by systemd-pcrphase.service.  We just
     # mark the system as TPM-capable here.
-    cat > "$MOUNT/etc/archwindows/expected-pcr-11" <<EOF
+    cat > "$MOUNT/etc/archimation/expected-pcr-11" <<EOF
 # TPM 2.0 detected at install time.  First boot will populate this with the
 # measured UKI signature PCR.  Until then, trust.ko APE will treat this as
 # "enrolled but unverified" (degraded posture — see Agent γ's trust.ko).
@@ -672,8 +672,8 @@ mode=pending-first-boot-measurement
 EOF
     ok "TPM 2.0 expected-pcr-11 marker written"
 else
-    mkdir -p "$MOUNT/etc/archwindows"
-    cat > "$MOUNT/etc/archwindows/trust-mode" <<EOF
+    mkdir -p "$MOUNT/etc/archimation"
+    cat > "$MOUNT/etc/archimation/trust-mode" <<EOF
 # No TPM 2.0 detected.  trust.ko will run in software-only mode.
 installed_at=$(date -Iseconds)
 tpm_version=${CAP_TPM_VERSION:-absent}
@@ -708,7 +708,7 @@ umount -R "$MOUNT" 2>/dev/null || true
 
 hr
 echo
-printf '  %sArchWindows bootc deploy complete.%s\n' "$GRN" "$RST"
+printf '  %sArchimation bootc deploy complete.%s\n' "$GRN" "$RST"
 echo
 echo "  Target:       $TARGET"
 echo "  Image:        $IMAGE_SOURCE"

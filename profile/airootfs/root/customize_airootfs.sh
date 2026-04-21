@@ -305,7 +305,7 @@ locale-gen || true
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 
 # --- Set hostname ---
-echo "archwindows" > /etc/hostname
+echo "archimation" > /etc/hostname
 
 # --- Configure SSH for remote access ---
 mkdir -p /etc/ssh/sshd_config.d
@@ -362,13 +362,13 @@ fi
 mkdir -p /etc/plymouth
 cat > /etc/plymouth/plymouthd.conf <<'PLYCFG'
 [Daemon]
-Theme=archwindows
+Theme=archimation
 ShowDelay=0
 DeviceTimeout=5
 DeviceScale=1
 PLYCFG
 if command -v plymouth-set-default-theme &>/dev/null; then
-    plymouth-set-default-theme archwindows || true
+    plymouth-set-default-theme archimation || true
 fi
 
 # --- Plymouth-to-LightDM seamless handoff ---
@@ -1324,8 +1324,8 @@ ln -sf /usr/lib/systemd/system/graphical.target /etc/systemd/system/default.targ
 
 # --- Branding overrides ---
 cat > /usr/lib/os-release <<'OSRELEASE'
-NAME="ArchWindows"
-PRETTY_NAME="ArchWindows - AI-Powered Linux"
+NAME="Archimation"
+PRETTY_NAME="Archimation - AI-Powered Linux"
 ID=arch
 ID_LIKE=arch
 BUILD_ID=rolling
@@ -1337,10 +1337,10 @@ OSRELEASE
 printf '\e[2J\e[H\n' > /etc/issue
 printf '\e[1;38;5;111m' >> /etc/issue
 cat >> /etc/issue <<'BANNER'
-     _             _  __      ___         _
-    /_\  _ _ __| |_\ \    / (_)_ _  __| |_____ __ _____
-   / _ \| '_/ _| ' \\ \/\/ /| | ' \/ _` / _ \ V  V (_-<
-  /_/ \_\_| \__|_||_| \_/\_/ |_|_||_\__,_\___/\_/\_//__/
+     _             _       _                 _   _
+    /_\  _ _ __| |_  (_)_ __ ___   __ _| |_(_) ___  _ __
+   / _ \| '_/ _| ' \ | | '_ ` _ \ / _` | __| |/ _ \| '_ \
+  /_/ \_\_| \__|_||_||_|_| |_| |_|\__,_|\__|_|\___/|_| |_|
 BANNER
 printf '\e[0m' >> /etc/issue
 printf '\e[38;5;243m  AI-Powered Arch Linux  \e[38;5;240m//\e[38;5;243m  fourzerofour\e[0m\n' >> /etc/issue
@@ -1350,7 +1350,7 @@ printf '\e[38;5;141m  \\r\e[0m \e[38;5;243mtty\e[38;5;240m\\l\e[0m\n\n' >> /etc/
 # --- /etc/motd: shown after login ---
 cat > /etc/motd <<'MOTD'
 
-  Welcome to ArchWindows.
+  Welcome to Archimation.
   fastfetch          system overview
   peloader app.exe   run Windows PE binary
   ai-health          AI daemon status
@@ -1359,21 +1359,21 @@ cat > /etc/motd <<'MOTD'
 MOTD
 
 # --- Boot branding: oneshot service prints banner after boot ---
-cat > /usr/lib/systemd/system/archwindows-branding.service <<'BRANDING'
+cat > /usr/lib/systemd/system/archimation-branding.service <<'BRANDING'
 [Unit]
-Description=ArchWindows Boot Branding
+Description=Archimation Boot Branding
 After=multi-user.target
 DefaultDependencies=no
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/bash -c 'printf "\n\e[1;38;5;111m  ArchWindows\e[0m \e[38;5;243m-- AI Arch Linux ready.\e[0m\n\n"'
+ExecStart=/usr/bin/bash -c 'printf "\n\e[1;38;5;111m  Archimation\e[0m \e[38;5;243m-- AI Arch Linux ready.\e[0m\n\n"'
 StandardOutput=journal+console
 
 [Install]
 WantedBy=multi-user.target
 BRANDING
-ln -sf /usr/lib/systemd/system/archwindows-branding.service /etc/systemd/system/multi-user.target.wants/archwindows-branding.service
+ln -sf /usr/lib/systemd/system/archimation-branding.service /etc/systemd/system/multi-user.target.wants/archimation-branding.service
 
 # --- Console font: set terminus for clean VT rendering ---
 # vconsole.conf (in airootfs overlay) already has FONT=ter-v16n.
@@ -1536,7 +1536,7 @@ echo "Boot chime + login chime installed"
 cat > /etc/xdg/autostart/ai-autoinstall.desktop <<'AUTOINSTALL'
 [Desktop Entry]
 Type=Application
-Name=ArchWindows Auto Installer
+Name=Archimation Auto Installer
 Exec=/bin/sh -c 'grep -q ai.autoinstall=1 /proc/cmdline && sleep 2 && pkexec /usr/bin/ai-installer || true'
 X-XFCE-Autostart=true
 NoDisplay=true
@@ -1727,13 +1727,13 @@ echo "[+] Pruned Python __pycache__ + test dirs (${_before:-?} MB -> ${_after:-?
 # ai-desktop-config ships its own wallpapers; distro defaults are redundant.
 if [ -d /usr/share/backgrounds ]; then
     _before=$(du -sm /usr/share/backgrounds 2>/dev/null | awk '{print $1}')
-    # Keep the ai-arch / archwindows backgrounds if any, drop everything else
+    # Keep the ai-arch / archimation backgrounds if any, drop everything else
     (
         cd /usr/share/backgrounds || exit 0
         for d in */; do
             d="${d%/}"
             case "$d" in
-                ai-arch|archwindows|xfce)
+                ai-arch|archimation|xfce)
                     continue
                     ;;
                 *)
@@ -1755,7 +1755,7 @@ if [ -d /usr/share/icons ]; then
         for d in */; do
             d="${d%/}"
             case "$d" in
-                Papirus-Dark|Papirus|hicolor|default|ai-arch|archwindows)
+                Papirus-Dark|Papirus|hicolor|default|ai-arch|archimation)
                     continue
                     ;;
                 Adwaita)

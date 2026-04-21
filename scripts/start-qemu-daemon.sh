@@ -2,7 +2,7 @@
 # start-qemu-daemon.sh - Start QEMU in daemon mode for testing
 set -euo pipefail
 
-ISO_FILE="$(ls /tmp/iso-output/archwindows*.iso 2>/dev/null | head -1)"
+ISO_FILE="$(ls /tmp/iso-output/archimation*.iso 2>/dev/null | head -1)"
 EXTRACT_DIR="/tmp/iso-extract"
 SERIAL_LOG="/tmp/qemu-serial.log"
 

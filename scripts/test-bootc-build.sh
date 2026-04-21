@@ -2,7 +2,7 @@
 # scripts/test-bootc-build.sh — Agent ε / S72 Phase 1
 #
 # Orchestrator: drives Agent α's `bootc/build-bootc.sh` to produce the
-# archwindows-bootc OCI image, then smoke-tests the image via podman.
+# archimation-bootc OCI image, then smoke-tests the image via podman.
 #
 # Exit codes:
 #   0  image built + all required packages present
@@ -15,7 +15,7 @@
 # overwritten on each run.
 #
 # Env overrides:
-#   IMAGE_TAG        default localhost/archwindows-bootc:test
+#   IMAGE_TAG        default localhost/archimation-bootc:test
 #   OUT_DIR          default /tmp/bootc-test
 #   BOOTC_SCRIPT     default $REPO_ROOT/bootc/build-bootc.sh
 #   SKIP_BUILD       "1" to skip the build step and only smoke-test an
@@ -33,7 +33,7 @@ fail() { log "FAIL: $*"; exit "${2:-1}"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
-IMAGE_TAG="${IMAGE_TAG:-localhost/archwindows-bootc:test}"
+IMAGE_TAG="${IMAGE_TAG:-localhost/archimation-bootc:test}"
 OUT_DIR="${OUT_DIR:-/tmp/bootc-test}"
 OUT_TAR="$OUT_DIR/image.tar"
 BOOTC_SCRIPT="${BOOTC_SCRIPT:-$REPO_ROOT/bootc/build-bootc.sh}"
@@ -58,7 +58,7 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
             fail "podman pull archlinux:latest failed; no network?" 3
         fi
         podman tag docker.io/archlinux:latest "$IMAGE_TAG"
-        log "STUB tagged: $IMAGE_TAG (no ARCHWINDOWS packages inside)"
+        log "STUB tagged: $IMAGE_TAG (no ARCHIMATION packages inside)"
         # Flag downstream that this is a stub build
         echo "STUB" > "$OUT_DIR/build-mode"
     else
@@ -82,7 +82,7 @@ INSPECT_JSON="$OUT_DIR/inspect.json"
 podman image inspect "$IMAGE_TAG" > "$INSPECT_JSON" \
     || fail "podman image inspect failed" 2
 
-# Size check (archwindows-bootc should be >500MB real; stub ~150MB)
+# Size check (archimation-bootc should be >500MB real; stub ~150MB)
 SIZE_BYTES="$(podman image inspect --format '{{.Size}}' "$IMAGE_TAG" 2>/dev/null || echo 0)"
 log "image size: $SIZE_BYTES bytes"
 
@@ -93,7 +93,7 @@ log "layer count: $LAYER_COUNT"
 # ─── Smoke test: verify required packages installed ──────────────────
 BUILD_MODE="$(cat "$OUT_DIR/build-mode" 2>/dev/null || echo UNKNOWN)"
 if [ "$BUILD_MODE" = "STUB" ]; then
-    log "SKIP: package verify (stub build has no ARCHWINDOWS packages)"
+    log "SKIP: package verify (stub build has no ARCHIMATION packages)"
     log "STUB OK: $IMAGE_TAG ready for rollback/attestation harness smoke"
     exit 0
 fi

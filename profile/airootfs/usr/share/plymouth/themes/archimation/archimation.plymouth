@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=Archimation
+Description=Archimation AI-Powered Linux Boot Splash
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/archimation
+ScriptFile=/usr/share/plymouth/themes/archimation/archimation.script

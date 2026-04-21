@@ -11,12 +11,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-ISO_FILE="$(ls /tmp/iso-output/archwindows*.iso 2>/dev/null | head -1)"
+ISO_FILE="$(ls /tmp/iso-output/archimation*.iso 2>/dev/null | head -1)"
 EXTRACT_DIR="/tmp/iso-extract"
 SERIAL_LOG="/tmp/qemu-serial.log"
 
 if [ -z "$ISO_FILE" ] || [ ! -f "$ISO_FILE" ]; then
-    echo "No ArchWindows ISO found in /tmp/iso-output/"
+    echo "No Archimation ISO found in /tmp/iso-output/"
     ls /tmp/iso-output/ 2>/dev/null || echo "  (directory doesn't exist)"
     exit 1
 fi

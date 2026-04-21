@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=ArchWindows Health Check
+Name=Archimation Health Check
 GenericName=System Health
 Comment=Show AI daemon + trust kernel + PE loader status
 Exec=xfce4-terminal -e "sh -c 'ai-health; read -n1 -p \"Press any key to close...\"'"

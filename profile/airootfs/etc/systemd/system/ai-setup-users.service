@@ -9,8 +9,8 @@
 ## Ordering: before ai-control.service so the daemon sees the final group
 ## layout when it chgrp's /run/pe-compat/events.sock.
 
-Description=ARCHWINDOWS first-boot user/group reconciliation
-Documentation=file:///usr/share/doc/ARCHWINDOWS/permissions.md
+Description=ARCHIMATION first-boot user/group reconciliation
+Documentation=file:///usr/share/doc/ARCHIMATION/permissions.md
 DefaultDependencies=yes
 After=systemd-sysusers.service local-fs.target
 Before=ai-control.service display-manager.service

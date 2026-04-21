@@ -1,5 +1,5 @@
 #!/bin/bash
-# ai-install-to-disk — One-command installer for ArchWindows (AI Arch Linux).
+# ai-install-to-disk — One-command installer for Archimation (AI Arch Linux).
 #
 # Turns a live-ISO session into a persisted install on a disk:
 #   GPT → 512M EFI (FAT32) + ext4 root → pacstrap base + custom pkgs →
@@ -87,7 +87,7 @@ esac
 # Defaults (overridden by flags or prompts)
 # ----------------------------------------------------------------------------
 TARGET=""
-HOSTNAME_DEF="archwindows"
+HOSTNAME_DEF="archimation"
 USERNAME_DEF="archw"
 LOCALE_DEF="en_US.UTF-8"
 KEYMAP_DEF="us"
@@ -116,7 +116,7 @@ usage() {
     cat <<EOF
 Usage: ai-install-to-disk [OPTIONS]
 
-Install ArchWindows onto a disk from the live ISO.
+Install Archimation onto a disk from the live ISO.
 
 Install modes (auto-selected; bootc preferred when available):
   --mode bootc         Atomic OCI-image deploy via 'bootc install to-filesystem'
@@ -171,7 +171,7 @@ done
 # Pre-flight
 # ----------------------------------------------------------------------------
 touch "$LOG" 2>/dev/null || LOG="/tmp/ai-install-to-disk.log"
-log "=== ArchWindows Installer ==="
+log "=== Archimation Installer ==="
 
 # 1) root?
 if [ "$(id -u)" -ne 0 ]; then
@@ -277,7 +277,7 @@ fi
 # Triple-confirmation before we wipe anything
 # ----------------------------------------------------------------------------
 hr
-echo "About to install ArchWindows with these settings:"
+echo "About to install Archimation with these settings:"
 cat <<EOF
   Target disk:  $TARGET
   Hostname:     $HOSTNAME_DEF
@@ -329,7 +329,7 @@ sleep 2
 # ----------------------------------------------------------------------------
 log "Creating filesystems"
 mkfs.fat  -F32 -n EFI        "$EFI_PART"
-mkfs.ext4 -F   -L ArchWindows -m 1 "$ROOT_PART"
+mkfs.ext4 -F   -L Archimation -m 1 "$ROOT_PART"
 
 log "Mounting filesystems under $MOUNT"
 mountpoint -q "$MOUNT" && umount -R "$MOUNT" 2>/dev/null || true
@@ -359,9 +359,9 @@ pacstrap -K --noconfirm --config "$PACMAN_CONF" "$MOUNT" $BASE_PKGS
 # If the repo isn't reachable (developer builds without the live URL up yet),
 # soft-fail with a warning — the core system is still bootable.
 CUSTOM_PKGS="pe-loader trust-system trust-dkms windows-services ai-firewall ai-control-daemon ai-desktop-config ai-first-boot-wizard"
-log "pacstrap — ArchWindows packages"
+log "pacstrap — Archimation packages"
 if ! pacstrap --noconfirm --config "$PACMAN_CONF" "$MOUNT" $CUSTOM_PKGS; then
-    warn "some ArchWindows packages failed to install (repo reachable? network?)"
+    warn "some Archimation packages failed to install (repo reachable? network?)"
     warn "you can retry post-boot with: sudo pacman -S $CUSTOM_PKGS"
 fi
 
@@ -430,7 +430,7 @@ arch-chroot "$MOUNT" mkinitcpio -P 2>/dev/null || warn "mkinitcpio -P had warnin
 # Bootloader
 if [ "$BOOTLOADER" = "grub" ]; then
     log "Installing GRUB (UEFI)"
-    arch-chroot "$MOUNT" grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ArchWindows --removable
+    arch-chroot "$MOUNT" grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Archimation --removable
     arch-chroot "$MOUNT" grub-mkconfig -o /boot/grub/grub.cfg
 else
     log "Installing systemd-boot"
@@ -438,12 +438,12 @@ else
     ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
     mkdir -p "$MOUNT/boot/efi/loader/entries"
     cat > "$MOUNT/boot/efi/loader/loader.conf" <<EOF
-default archwindows
+default archimation
 timeout 3
 console-mode max
 EOF
-    cat > "$MOUNT/boot/efi/loader/entries/archwindows.conf" <<EOF
-title   ArchWindows
+    cat > "$MOUNT/boot/efi/loader/entries/archimation.conf" <<EOF
+title   Archimation
 linux   /vmlinuz-linux
 initrd  /initramfs-linux.img
 options root=UUID=${ROOT_UUID} rw
@@ -480,7 +480,7 @@ umount -R "$MOUNT" 2>/dev/null || true
 
 hr
 echo
-echo "  ArchWindows installed successfully."
+echo "  Archimation installed successfully."
 echo
 echo "  Target:    $TARGET"
 echo "  Hostname:  $HOSTNAME_DEF"

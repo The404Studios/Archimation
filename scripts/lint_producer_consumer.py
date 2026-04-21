@@ -363,7 +363,7 @@ def analyse() -> dict[str, Any]:
 def _format_report(summary: dict[str, Any]) -> str:
     lines: list[str] = []
     c = summary["counts"]
-    lines.append("ARCHWINDOWS producer-consumer lint (I-6)")
+    lines.append("ARCHIMATION producer-consumer lint (I-6)")
     lines.append("=" * 60)
     lines.append(f"producers scanned: {c['total']}  "
                  f"ok={c['ok']}  exempt={c['exempt']}  "

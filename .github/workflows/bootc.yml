@@ -79,7 +79,7 @@ jobs:
       - name: Run test-bootc-build.sh
         id: build
         env:
-          IMAGE_TAG: localhost/archwindows-bootc:ci
+          IMAGE_TAG: localhost/archimation-bootc:ci
           OUT_DIR: /tmp/bootc-test
         run: |
           set -uo pipefail
@@ -163,7 +163,7 @@ jobs:
           set -euxo pipefail
           sudo podman load -i /tmp/bootc-test/image.tar
           sudo podman image tag $(sudo podman images -q | head -1) \
-               localhost/archwindows-bootc:test
+               localhost/archimation-bootc:test
 
       - name: Run rollback smoke
         id: rollback
@@ -239,7 +239,7 @@ jobs:
           set -euxo pipefail
           sudo podman load -i /tmp/bootc-test/image.tar
           sudo podman image tag $(sudo podman images -q | head -1) \
-               localhost/archwindows-bootc:test
+               localhost/archimation-bootc:test
 
       - name: Run attestation / tamper smoke
         id: attest
@@ -301,11 +301,11 @@ jobs:
         run: |
           sudo podman load -i /tmp/bootc-test/image.tar
           sudo podman image tag $(sudo podman images -q | head -1) \
-               localhost/archwindows-bootc:test
+               localhost/archimation-bootc:test
 
       - name: Run pytest lifecycle gate
         env:
-          IMAGE_TAG: localhost/archwindows-bootc:test
+          IMAGE_TAG: localhost/archimation-bootc:test
           SKIP_BUILD: "1"
         run: |
           python3 -m pytest tests/integration/test_bootc_lifecycle.py \

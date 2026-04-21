@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ai-health -- human-readable ArchWindows subsystem health summary.
+# ai-health -- human-readable Archimation subsystem health summary.
 # Flags: --json, --brief.  Exit 0 if green/yellow, 1 if any red.
 # Degrades gracefully when a subsystem isn't installed.
 set -euo pipefail
@@ -18,7 +18,7 @@ for arg in "${@:-}"; do
         --brief) mode="brief" ;;
         -h|--help)
             cat <<'EOF'
-ai-health -- ArchWindows subsystem health summary
+ai-health -- Archimation subsystem health summary
 
 Usage:
   ai-health          human-readable output
@@ -199,7 +199,7 @@ EOF
 fi
 
 # pretty
-printf "%sArchWindows system health @ %s%s\n" "$C_BOLD" "$TS" "$C_OFF"
+printf "%sArchimation system health @ %s%s\n" "$C_BOLD" "$TS" "$C_OFF"
 echo   "=============================="
 printf "AI daemon (ai-control.service):  [%s]\n" "$(dot "$AID_COLOR")"
 printf "  status:  %s\n" "$AID_STATUS"

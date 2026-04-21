@@ -425,7 +425,7 @@ def main() -> int:
         print(json.dumps({"graph": graph, "summary": summary}, indent=2))
         return 0
 
-    print("ARCHWINDOWS handler catalysis analysis")
+    print("ARCHIMATION handler catalysis analysis")
     print("=" * 60)
     c = summary["counts"]
     print(f"handlers: {c['handlers']}  catalysts: {c['catalysts']}  "

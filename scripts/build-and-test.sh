@@ -11,7 +11,7 @@ REPO_DIR="${NATIVE_PROJECT}/repo/x86_64"
 ISO_OUTPUT="/tmp/iso-output"
 
 echo "============================================"
-echo "  ArchWindows - Full Build & Test Pipeline"
+echo "  Archimation - Full Build & Test Pipeline"
 echo "============================================"
 echo ""
 

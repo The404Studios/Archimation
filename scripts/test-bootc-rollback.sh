@@ -134,7 +134,7 @@ stage 1 "build deployment-A OCI image (delegating to test-bootc-build.sh)"
 if ! bash "$SCRIPT_DIR/test-bootc-build.sh" 2>&1 | sed 's/^/[A-build] /'; then
     fail "deployment-A build failed" 4
 fi
-log "deployment-A image built (tag localhost/archwindows-bootc:test)"
+log "deployment-A image built (tag localhost/archimation-bootc:test)"
 
 # ─── STAGE 2: convert OCI -> qcow2 via bootc-image-builder ──────────
 stage 2 "convert image A to qcow2"
@@ -142,7 +142,7 @@ if [ "$HAVE_BIB" = "0" ]; then
     log "STUB: bootc-image-builder not present"
     log "      would run: bootc-image-builder build --type qcow2 \\"
     log "                 --output $QCOW_A \\"
-    log "                 localhost/archwindows-bootc:test"
+    log "                 localhost/archimation-bootc:test"
     log "      then: qemu-img info $QCOW_A should report ~6-8 GB virtual"
     if [ "$ALLOW_STUB_BUILDER" = "1" ]; then
         stub "bootc-image-builder absent"
@@ -154,7 +154,7 @@ fi
 bootc-image-builder build \
     --type qcow2 \
     --output "$QCOW_A" \
-    localhost/archwindows-bootc:test \
+    localhost/archimation-bootc:test \
     2>&1 | sed 's/^/[bib-A] /' \
     || fail "bootc-image-builder failed for deployment A" 4
 
@@ -265,19 +265,19 @@ log "bump: $BUMP_FILE"
 
 # ─── STAGE 8: build deployment B ─────────────────────────────────────
 stage 8 "build deployment B OCI image"
-IMAGE_TAG=localhost/archwindows-bootc:test-B \
+IMAGE_TAG=localhost/archimation-bootc:test-B \
   bash "$SCRIPT_DIR/test-bootc-build.sh" 2>&1 | sed 's/^/[B-build] /' \
   || fail "deployment-B build failed" 4
 
 # ─── STAGE 9: simulate `bootc upgrade` inside VM ─────────────────────
 stage 9 "stage deployment B inside running VM"
 # Canonical: copy B tar into VM, `podman load`, `bootc switch` or
-# `bootc upgrade localhost/archwindows-bootc:test-B`.  For now stub.
+# `bootc upgrade localhost/archimation-bootc:test-B`.  For now stub.
 if [ "$HAVE_BIB" = "0" ] || ! ssh $SSH_OPTS -p "$SSH_PORT" arch@localhost -- command -v bootc >/dev/null 2>&1; then
     log "STUB: bootc CLI not present inside deployment A"
     log "      would: scp /tmp/bootc-test/image.tar arch@:/tmp/"
     log "             ssh arch@ sudo podman load -i /tmp/image.tar"
-    log "             ssh arch@ sudo bootc switch --transport containers-storage localhost/archwindows-bootc:test-B"
+    log "             ssh arch@ sudo bootc switch --transport containers-storage localhost/archimation-bootc:test-B"
     log "             ssh arch@ sudo systemctl reboot"
     log "      (then re-poll SSH, run ai-health, confirm rootfs sha changed)"
     exit 2   # partial: got to booted A but couldn't stage B
@@ -287,7 +287,7 @@ fi
 scp -P "$SSH_PORT" $SSH_OPTS /tmp/bootc-test/image.tar arch@localhost:/tmp/image.tar \
     || fail "scp of image.tar failed" 2
 ssh $SSH_OPTS -p "$SSH_PORT" arch@localhost -- \
-    'sudo podman load -i /tmp/image.tar && sudo bootc switch --transport containers-storage localhost/archwindows-bootc:test-B' \
+    'sudo podman load -i /tmp/image.tar && sudo bootc switch --transport containers-storage localhost/archimation-bootc:test-B' \
     || fail "bootc switch failed" 2
 ssh $SSH_OPTS -p "$SSH_PORT" arch@localhost -- 'sudo systemctl reboot' || true
 sleep 10

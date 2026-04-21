@@ -1,4 +1,4 @@
-# ArchWindows Plymouth Boot Splash Script
+# Archimation Plymouth Boot Splash Script
 # Premium dark boot experience with Tokyo Night palette
 #
 # Palette:
@@ -45,10 +45,10 @@ global.msg_target    = 0;
 global.msg_text      = "";
 
 # ──────────────────────────────────────────────────────────────
-# Title: "ArchWindows"
+# Title: "Archimation"
 # Large, bright, Tokyo Night text color
 # ──────────────────────────────────────────────────────────────
-title_image  = Image.Text("ArchWindows", 0.753, 0.792, 0.961, 1, "Sans Bold 52");
+title_image  = Image.Text("Archimation", 0.753, 0.792, 0.961, 1, "Sans Bold 52");
 title_sprite = Sprite(title_image);
 title_sprite.SetX(center_x - title_image.GetWidth() / 2);
 title_sprite.SetY(center_y - 80);
@@ -145,7 +145,7 @@ global.message_sprite.SetOpacity(0);
 # ──────────────────────────────────────────────────────────────
 # Copyright / branding at very bottom
 # ──────────────────────────────────────────────────────────────
-brand_image  = Image.Text("archwindows", 0.337, 0.373, 0.537, 0.4, "Sans 10");
+brand_image  = Image.Text("archimation", 0.337, 0.373, 0.537, 0.4, "Sans 10");
 brand_sprite = Sprite(brand_image);
 brand_sprite.SetX(center_x - brand_image.GetWidth() / 2);
 brand_sprite.SetY(screen_height - 40);
@@ -312,7 +312,7 @@ fun boot_progress_callback(duration, progress) {
     else if (progress < 0.95)
         message_callback("Almost ready...");
     else
-        message_callback("Welcome to ArchWindows");
+        message_callback("Welcome to Archimation");
 }
 
 Plymouth.SetBootProgressFunction(boot_progress_callback);

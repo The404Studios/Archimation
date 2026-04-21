@@ -5,7 +5,7 @@
 # don't hide early failures in diagnostic output.
 set -euo pipefail
 
-ISO="/mnt/c/Users/wilde/Downloads/arch-linux-with-full-ai-control/output/archwindows-2026.04.12-x86_64.iso"
+ISO="/mnt/c/Users/wilde/Downloads/arch-linux-with-full-ai-control/output/archimation-2026.04.12-x86_64.iso"
 SERIAL="/tmp/qemu-real-boot.log"
 
 rm -f "$SERIAL"

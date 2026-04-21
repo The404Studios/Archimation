@@ -509,6 +509,21 @@ def create_app(config: dict):
         _cortex_dir = str(_P(__file__).resolve().parent.parent / "cortex")
         if _cortex_dir not in _sys.path:
             _sys.path.insert(0, _cortex_dir)
+
+        # S75 follow-up: register library_census BEFORE active_inference so the
+        # cortex has the ecosystem census handle from start (BeliefState reads
+        # library_census.snapshot() on every observation).
+        try:
+            from library_census import register_with_daemon as _reg_lc
+            _library_census = _reg_lc(
+                app, _daemon_event_sink, memory_observer=_memory_observer,
+                poll_interval=config.get("library_census_poll_interval", 5.0),
+            )
+            logger.info("library_census registered with daemon")
+        except Exception as e:
+            logger.error("Failed to register library_census: %s", e)
+            _library_census = None
+
         from active_inference import register_with_daemon as _reg_ai
         _active_inference = _reg_ai(
             app,
@@ -516,6 +531,7 @@ def create_app(config: dict):
                 "trust_observer": _trust_observer,
                 "memory_observer": _memory_observer,
                 "event_bus": _daemon_event_sink,
+                "library_census": _library_census,
             },
         )
         logger.info("active_inference registered with daemon")
@@ -532,21 +548,6 @@ def create_app(config: dict):
     except Exception as e:
         logger.error("Failed to register algedonic_reader: %s", e)
         _algedonic_reader = None
-
-    # S75 Agent B: library_census -- cross-PID DLL histogram exposed at
-    # /metrics/ecosystem. Closes Maturana-Varela Criterion 1 by giving
-    # the cortex a library-keyed population census to pair with the
-    # existing immune/risk/sex census in trust_observer.get_anomaly_status.
-    try:
-        from library_census import register_with_daemon as _reg_lc
-        _library_census = _reg_lc(
-            app, _daemon_event_sink, memory_observer=_memory_observer,
-            poll_interval=config.get("library_census_poll_interval", 5.0),
-        )
-        logger.info("library_census registered with daemon")
-    except Exception as e:
-        logger.error("Failed to register library_census: %s", e)
-        _library_census = None
 
     # S75 Agent C: Monte-Carlo cortex.  Installs shared samplers
     # (ConfidenceSampler / RolloutSearch / FaultInjector /

@@ -395,6 +395,43 @@ class CortexHandlers:
         self._record_event(event, "recorded")
         logger.warning("PE exception: pid=%d subject=%d", event.pid, event.subject_id)
 
+    def handle_pe_trust_escalate(self, event: Event) -> None:
+        """PE process is requesting an authority escalation through a trust gate.
+
+        S75 follow-up: closes the producer-without-consumer gap on
+        PE_EVT_TRUST_ESCALATE (declared at pe-loader/include/eventbus/pe_event.h:50,
+        previously orphaned). Semantics: this is the *opposite* of trust_deny —
+        the runtime is asking the cortex to evaluate whether the requested
+        elevation should be granted. Decision-engine-first; if no engine verdict,
+        fall back to autonomy.create_decision so a human can rubber-stamp."""
+        engine_result = self._check_decision_engine(event)
+        if engine_result is not None and self._apply_engine_verdict(event, engine_result):
+            return
+
+        decision = self._autonomy.create_decision(
+            Domain.SECURITY, "trust_escalate_request",
+            f"Trust escalate request for pid={event.pid}",
+        )
+
+        action = "observed"
+        if decision.approved:
+            # Granted: log as approved escalation; the kernel side will
+            # consult the granted authority via its own ioctl path.
+            payload = getattr(event, "payload", {}) or {}
+            api = payload.get("api_name", "?")
+            from_s = payload.get("from_score", -1)
+            to_s = payload.get("to_score", -1)
+            logger.info(
+                "Trust escalate APPROVED: pid=%d api=%s score %d->%d",
+                event.pid, api, from_s, to_s,
+            )
+            action = "escalation_approved"
+        else:
+            # Refused: leave the requesting process at its current authority
+            # band. No quarantine — refusal is the safe default and not punitive.
+            action = "escalation_refused"
+        self._record_event(event, action)
+
     def handle_pe_trust_deny(self, event: Event) -> None:
         """PE process was denied a trust-gated operation."""
         # Decision engine pre-check (heuristic: privilege escalation probe detection)
@@ -893,6 +930,7 @@ def register_handlers(bus: EventBus, handlers: CortexHandlers) -> None:
     bus.on(SourceLayer.RUNTIME, PeEventType.EXIT, handlers.handle_pe_exit)
     bus.on(SourceLayer.RUNTIME, PeEventType.EXCEPTION, handlers.handle_pe_exception)
     bus.on(SourceLayer.RUNTIME, PeEventType.TRUST_DENY, handlers.handle_pe_trust_deny)
+    bus.on(SourceLayer.RUNTIME, PeEventType.TRUST_ESCALATE, handlers.handle_pe_trust_escalate)
 
     # Trust kernel events
     bus.on(SourceLayer.KERNEL, TrustEventType.IMMUNE_ALERT, handlers.handle_trust_alert)

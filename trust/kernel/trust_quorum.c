@@ -43,6 +43,7 @@
 
 #include <trust_types.h>
 #include <trust_quorum.h>
+#include "../include/trust_quorum_hmac.h"   /* S75 follow-up: verdict integrity tag */
 
 /* --- Counters (exported via sysfs) ------------------------------------ */
 
@@ -50,6 +51,13 @@ static atomic64_t q_total_votes = ATOMIC64_INIT(0);
 static atomic64_t q_consistent  = ATOMIC64_INIT(0);
 static atomic64_t q_discrepant  = ATOMIC64_INIT(0);
 static atomic64_t q_divergent   = ATOMIC64_INIT(0);
+
+/* S75 follow-up: HMAC over the most recent verdict payload, exposed via
+ * /sys/kernel/trust/quorum/last_hmac. seqlock-style rolling buffer is
+ * unnecessary — readers tolerate torn reads; the byte stream is a hash. */
+static u8 g_last_verdict_hmac[TRUST_QUORUM_HMAC_LEN];
+static atomic64_t q_hmac_computed = ATOMIC64_INIT(0);
+static atomic64_t q_hmac_failed   = ATOMIC64_INIT(0);
 
 /* --- Voting core ------------------------------------------------------ */
 
@@ -125,6 +133,31 @@ enum trust_quorum_verdict trust_quorum_vote(const trust_subject_t *s,
         v = TRUST_QUORUM_DIVERGENT;
         atomic64_inc(&q_divergent);
     }
+
+    /* S75 follow-up: tag the verdict with HMAC-SHA256 over a packed
+     * payload. A bit-flip adversary that forges sysfs counter rollback
+     * cannot also forge the matching HMAC without the kernel-derived
+     * key. Failure is non-fatal — verdict still returns; tag stays stale. */
+    {
+        struct {
+            u32 subject_id;
+            u32 field_id;
+            u32 verdict;
+            u32 agree;
+        } __packed payload = {
+            .subject_id = s->subject_id,
+            .field_id   = field_id,
+            .verdict    = (u32)v,
+            .agree      = agree,
+        };
+        u8 tag[TRUST_QUORUM_HMAC_LEN];
+        if (trust_quorum_hmac_compute(&payload, sizeof(payload), tag) == 0) {
+            memcpy(g_last_verdict_hmac, tag, TRUST_QUORUM_HMAC_LEN);
+            atomic64_inc(&q_hmac_computed);
+        } else {
+            atomic64_inc(&q_hmac_failed);
+        }
+    }
     return v;
 }
 EXPORT_SYMBOL_GPL(trust_quorum_vote);
@@ -173,6 +206,35 @@ static ssize_t divergent_show(struct kobject *k,
                       (long long)atomic64_read(&q_divergent));
 }
 
+static ssize_t last_hmac_show(struct kobject *k, struct kobj_attribute *a,
+                              char *buf)
+{
+    /* S75 follow-up: hex-encode the rolling HMAC tag for the most recent
+     * verdict. Read does not lock — readers tolerate torn snapshots; the
+     * byte stream is a hash so a partial read is just a different hash. */
+    int i;
+    ssize_t n = 0;
+    (void)k; (void)a;
+    for (i = 0; i < TRUST_QUORUM_HMAC_LEN; i++)
+        n += sysfs_emit_at(buf, n, "%02x", g_last_verdict_hmac[i]);
+    n += sysfs_emit_at(buf, n, "\n");
+    return n;
+}
+static ssize_t hmac_computed_show(struct kobject *k, struct kobj_attribute *a,
+                                  char *buf)
+{
+    (void)k; (void)a;
+    return sysfs_emit(buf, "%lld\n",
+                      (long long)atomic64_read(&q_hmac_computed));
+}
+static ssize_t hmac_failed_show(struct kobject *k, struct kobj_attribute *a,
+                                char *buf)
+{
+    (void)k; (void)a;
+    return sysfs_emit(buf, "%lld\n",
+                      (long long)atomic64_read(&q_hmac_failed));
+}
+
 static struct kobj_attribute attr_total_votes =
     __ATTR(total_votes, 0444, total_votes_show, NULL);
 static struct kobj_attribute attr_consistent =
@@ -181,12 +243,21 @@ static struct kobj_attribute attr_discrepant =
     __ATTR(discrepant, 0444, discrepant_show, NULL);
 static struct kobj_attribute attr_divergent =
     __ATTR(divergent, 0444, divergent_show, NULL);
+static struct kobj_attribute attr_last_hmac =
+    __ATTR(last_hmac, 0444, last_hmac_show, NULL);
+static struct kobj_attribute attr_hmac_computed =
+    __ATTR(hmac_computed, 0444, hmac_computed_show, NULL);
+static struct kobj_attribute attr_hmac_failed =
+    __ATTR(hmac_failed, 0444, hmac_failed_show, NULL);
 
 static struct attribute *quorum_attrs[] = {
     &attr_total_votes.attr,
     &attr_consistent.attr,
     &attr_discrepant.attr,
     &attr_divergent.attr,
+    &attr_last_hmac.attr,
+    &attr_hmac_computed.attr,
+    &attr_hmac_failed.attr,
     NULL,
 };
 

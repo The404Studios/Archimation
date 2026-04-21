@@ -277,6 +277,24 @@ def parse_pe_trust_deny_payload(data: bytes) -> dict:
     }
 
 
+def parse_pe_trust_escalate_payload(data: bytes) -> dict:
+    """Parse pe_evt_trust_escalate_t: char[128] api_name, uint32 from_score,
+    uint32 to_score, uint32 reason. Mirrors trust_deny payload shape; the
+    semantic difference is the cortex *grants* (or refuses) the escalation
+    instead of merely auditing the deny. Pre-S76 the C-side emit may be
+    absent — this parser is here so any future emit lands on a real consumer."""
+    if len(data) < 140:
+        return {"raw_len": len(data)}
+    api_name = _decode_cstr(data[:128])
+    from_score, to_score, reason = struct.unpack_from("<III", data, 128)
+    return {
+        "api_name": api_name,
+        "from_score": from_score,
+        "to_score": to_score,
+        "reason": reason,
+    }
+
+
 def parse_memory_map_payload(data: bytes) -> dict:
     """Parse memory map event: uint64 va, uint32 size, uint32 prot_flags,
     char[256] source_path, char[32] tag."""
@@ -351,6 +369,7 @@ _PAYLOAD_PARSERS: Dict[tuple, Callable[[bytes], dict]] = {
     (SourceLayer.RUNTIME, PeEventType.UNIMPLEMENTED_API): parse_pe_unimplemented_payload,
     (SourceLayer.RUNTIME, PeEventType.EXIT): parse_pe_exit_payload,
     (SourceLayer.RUNTIME, PeEventType.TRUST_DENY): parse_pe_trust_deny_payload,
+    (SourceLayer.RUNTIME, PeEventType.TRUST_ESCALATE): parse_pe_trust_escalate_payload,
     (SourceLayer.RUNTIME, PeEventType.MEMORY_MAP): parse_memory_map_payload,
     (SourceLayer.RUNTIME, PeEventType.MEMORY_PROTECT): parse_memory_protect_payload,
     (SourceLayer.RUNTIME, PeEventType.MEMORY_PATTERN): parse_memory_pattern_payload,

@@ -281,6 +281,9 @@ class BeliefState:
     memory_tracked: str = "empty"        # # processes tracked
     memory_anomaly: str = "zero"         # #memory anomalies
 
+    # Ecosystem-side (LibraryCensus.snapshot()) — S75 Agent B contract
+    library_distribution: str = "none"   # bucketed unique_library_ratio
+
     def token(self) -> str:
         """Deterministic short string.  Order is load-bearing."""
         return (
@@ -294,13 +297,15 @@ class BeliefState:
             f"|cr:{self.critical_frac}"
             f"|me:{self.memory_tracked}"
             f"|mo:{self.memory_anomaly}"
+            f"|lb:{self.library_distribution}"
         )
 
     # ---- builders ----------------------------------------------------------
 
     @classmethod
     def from_observers(cls, trust_observer: Any = None,
-                       memory_observer: Any = None) -> "BeliefState":
+                       memory_observer: Any = None,
+                       library_census: Any = None) -> "BeliefState":
         """Snapshot current ecosystem state.  Missing observers => defaults."""
         b = cls()
         if trust_observer is not None:
@@ -330,6 +335,26 @@ class BeliefState:
                     int(mstats.get("anomalies_total", 0)))
             except Exception:
                 logger.debug("BeliefState: memory_observer introspection failed",
+                             exc_info=True)
+        if library_census is not None:
+            # S75 Agent B contract: bucket unique_library_ratio so the token
+            # remains a small categorical (none/low/mid/high/saturated). Reads
+            # are non-fatal — a missing snapshot leaves the default "none".
+            try:
+                snap = library_census.snapshot() or {}
+                ratio = float(snap.get("unique_library_ratio", 0.0))
+                if ratio < 0.1:
+                    b.library_distribution = "none"
+                elif ratio < 0.3:
+                    b.library_distribution = "low"
+                elif ratio < 0.5:
+                    b.library_distribution = "mid"
+                elif ratio < 0.7:
+                    b.library_distribution = "high"
+                else:
+                    b.library_distribution = "saturated"
+            except Exception:
+                logger.debug("BeliefState: library_census introspection failed",
                              exc_info=True)
         return b
 
@@ -395,16 +420,19 @@ class ActiveInferenceAgent:
                  action_candidates: Optional[Iterable[str]] = None,
                  bootstrap: int = BOOTSTRAP_OBSERVATIONS,
                  monte_carlo_posterior: bool = False,
-                 mc_seed: Optional[int] = None) -> None:
+                 mc_seed: Optional[int] = None,
+                 library_census: Any = None) -> None:
         # Support both explicit kwargs and a bundle dict (api_server pattern).
         if observer_handles:
             trust_observer = trust_observer or observer_handles.get("trust_observer")
             memory_observer = memory_observer or observer_handles.get("memory_observer")
             event_bus = event_bus or observer_handles.get("event_bus")
+            library_census = library_census or observer_handles.get("library_census")
 
         self.event_bus = event_bus
         self.trust_observer = trust_observer
         self.memory_observer = memory_observer
+        self.library_census = library_census   # S75 follow-up: ecosystem-side
         self.model = GenerativeModel()
         self.candidates: tuple[str, ...] = tuple(
             action_candidates or DEFAULT_ACTION_CANDIDATES)
@@ -450,7 +478,7 @@ class ActiveInferenceAgent:
         # Seed prev_state from a snapshot so the first real event has a valid
         # (s, a, s') triple to update on.
         self._prev_state = BeliefState.from_observers(
-            self.trust_observer, self.memory_observer).token()
+            self.trust_observer, self.memory_observer, self.library_census).token()
         logger.info("ActiveInferenceAgent started (bootstrap=%d, |A|=%d)",
                     self.bootstrap, len(self.candidates))
 
@@ -497,7 +525,8 @@ class ActiveInferenceAgent:
             self._event_log.append((time.time(), evt.get("type", "?")))
 
             new_state = BeliefState.from_observers(
-                self.trust_observer, self.memory_observer).token()
+                self.trust_observer, self.memory_observer,
+                self.library_census).token()
 
             prev = self._prev_state or new_state
             # Update only on actual state transitions; self-loops are fine
@@ -544,7 +573,8 @@ class ActiveInferenceAgent:
 
         with self._lock:
             state = self._prev_state or BeliefState.from_observers(
-                self.trust_observer, self.memory_observer).token()
+                self.trust_observer, self.memory_observer,
+                self.library_census).token()
 
         best: Optional[ActionSelection] = None
         for a in cand:
@@ -688,6 +718,7 @@ def register_with_daemon(app: Any, observer_bundle: dict[str, Any]) -> ActiveInf
         event_bus=observer_bundle.get("event_bus"),
         trust_observer=observer_bundle.get("trust_observer"),
         memory_observer=observer_bundle.get("memory_observer"),
+        library_census=observer_bundle.get("library_census"),
     )
     agent.start()
     _active_agent = agent

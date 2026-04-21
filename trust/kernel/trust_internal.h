@@ -191,6 +191,19 @@ typedef struct {
 /* --- Authority Proof Engine (APE) --- */
 #define TRUST_APE_MAX_ENTITIES  1024
 
+/*
+ * 0xFFFFFFFFU is reserved: trust_ape.c uses it as APE_TOMBSTONE to mark
+ * destroyed slots, and ape_find() short-circuits to NULL on a match to
+ * skip the hash lookup.  Accepting a caller subject_id of 0xFFFFFFFFU
+ * would therefore make every proof op silently fail.  Register paths
+ * reject this value up front with -EINVAL.
+ *
+ * S74 Agent X: restored alongside trust_ape.c bring-back from dangling
+ * commit 9b04ca1 (lost in pre-S74 squash).  Referenced by trust_meiosis.c
+ * at parent-id validation time; previously dangling as implicit-int.
+ */
+#define TRUST_SUBJECT_ID_RESERVED_MAX  0xFFFFFFFFU
+
 typedef struct {
     u32                  subject_id;
     trust_proof_state_t  state;

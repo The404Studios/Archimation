@@ -10,9 +10,13 @@ Wants=ai-hw-detect.service
 # startup to remember the baseline.
 Before=ai-control.service display-manager.service lightdm.service
 
-# Only meaningful on systems that actually have cpufreq sysfs entries.
-# If the kernel lacks cpufreq support (very unusual) we silently skip.
-ConditionPathExists=/sys/devices/system/cpu/cpu0/cpufreq
+# S82+A: removed `ConditionPathExists=/sys/devices/system/cpu/cpu0/cpufreq`.
+# This unit has Before=lightdm.service (critical path). A silent skip on
+# a missing cpufreq path would leave ai-control without a baseline and
+# would not produce any journal signal. The ExecStart script is already
+# failsafe (SuccessExitStatus=0 1 2) and short-circuits to a no-op when
+# the sysfs is absent — better to see that no-op in the journal than to
+# have the whole unit vanish.
 
 [Service]
 Type=oneshot

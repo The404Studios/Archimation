@@ -8,7 +8,12 @@ Documentation=man:modules-load.d(5)
 After=systemd-modules-load.service
 # Ensure cortex sees the loaded modules before deciding workload classes.
 Before=ai-control.service ai-cortex.service
-ConditionPathExists=/usr/bin/ai-load-drivers.sh
+# S82+A: removed `ConditionPathExists=/usr/bin/ai-load-drivers.sh`.
+# Lesson from the lightdm-drop-in incident: a failed Condition causes
+# silent SKIP (no journal error, no audit trail). If the script is
+# absent ExecStart will now fail loudly with an ENOENT in the journal,
+# which is the correct signal. The script is shipped by this same
+# airootfs so its absence would be a packaging bug worth hearing about.
 # StartLimit lives in [Unit] (systemd >= 230) — placement in [Service]
 # would parse but emit a deprecation warning under systemd-analyze verify.
 StartLimitIntervalSec=60

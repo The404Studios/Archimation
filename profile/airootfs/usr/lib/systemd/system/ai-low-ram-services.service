@@ -3,12 +3,22 @@ Description=Disable RAM-heavy services on low-memory systems
 After=ai-hw-detect.service
 Wants=ai-hw-detect.service
 Before=display-manager.service lightdm.service
-ConditionPathExists=/run/ai-arch-hw-profile
+# S82+A: removed `ConditionPathExists=/run/ai-arch-hw-profile`.
+# Same class of bug as the lightdm drop-ins: this unit is Before=
+# display-manager, and a silent skip would leave RAM-heavy services
+# enabled on a low-mem box, OOM-storming during the compositor boot.
+# The script now self-guards: if the hw profile is missing it logs
+# and exits 0, which is visible in the journal. Loud > silent.
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# Self-guard: the script exits 0 after logging if the hw profile
+# is absent, so we still don't block boot on a missing profile —
+# but the SKIP is now visible in `journalctl -u ai-low-ram-services`.
+ExecStartPre=/bin/sh -c '[ -f /run/ai-arch-hw-profile ] || { echo "ai-low-ram-services: /run/ai-arch-hw-profile missing; no-op (hw-detect skipped?)" >&2; exit 0; }'
 ExecStart=/usr/lib/ai-arch/low-ram-services.sh
+SuccessExitStatus=0
 TimeoutStartSec=15
 
 [Install]

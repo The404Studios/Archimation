@@ -57,7 +57,7 @@
         {
             "type": "command",
             "key": "Dict v2 ",
-            "text": "test -f /usr/share/ai-control/dictionary_v2.pkl.zst && stat -c '%s bytes' /usr/share/ai-control/dictionary_v2.pkl.zst || echo 'absent (degraded to static dict)'"
+            "text": "test -f /var/cache/ai-control/dictionary_v2.pkl.zst && stat -c '%s bytes' /var/cache/ai-control/dictionary_v2.pkl.zst || echo 'absent (degraded to static dict)'"
         },
         {
             "type": "command",

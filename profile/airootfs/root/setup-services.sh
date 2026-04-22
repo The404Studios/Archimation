@@ -153,6 +153,19 @@ fi
 #         "$SYSINIT_WANTS/dkms-first-boot.service"
 # fi
 
+# Session 82+1: Archimation trust-dkms first-boot builder.
+# Complements the package-level post_install hook, which runs inside the
+# pacstrap chroot where $(uname -r) is the BUILD HOST's kernel, not the
+# ISO's.  This unit runs on first real-hardware boot with the correct
+# kernel version and builds trust.ko + pe_compat.ko into
+# /usr/lib/modules/$(uname -r)/extra/.  Idempotent via ExecCondition: if
+# the module is already on disk, the unit skips without running dkms.
+# Ordered Before=ai-control.service so the daemon finds /dev/trust ready.
+if [ -f /etc/systemd/system/archimation-trust-dkms-firstboot.service ]; then
+    ln -sf /etc/systemd/system/archimation-trust-dkms-firstboot.service \
+        "$WANTS_DIR/archimation-trust-dkms-firstboot.service"
+fi
+
 # First-boot wizard — runs via XDG autostart in XFCE session, NOT as a
 # systemd service (which hangs on graphical systems due to symlink detection).
 # Users on headless systems can run: ai-first-boot-wizard --headless

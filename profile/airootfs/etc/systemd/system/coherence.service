@@ -13,11 +13,15 @@ Wants=ai-hw-detect.service
 # steering cpufreq + IRQ affinity when the compositor spins up.
 Before=graphical.target display-manager.service lightdm.service
 
-# Degrade gracefully on minimal kernels. If the cpufreq sysfs is absent
-# the actuation stage will ENOENT its writes and the loop still runs in
-# observe mode — but we skip starting at all when literally nothing is
-# available.
-ConditionPathExists=/sys/devices/system/cpu
+# S82+A: removed `ConditionPathExists=/sys/devices/system/cpu`.
+# This unit has Before=lightdm.service (critical path). The condition
+# was effectively tautological on every real Linux kernel — /sys/.../cpu
+# is always present when sysfs is mounted — which means the only time
+# it could fire was the catastrophic case of sysfs not mounted, in
+# which case a silent skip is the worst possible response (we want a
+# journal entry, not a vanished service). The actuation code already
+# ENOENTs its sysfs writes gracefully and the loop stays in observe
+# mode if nothing is tunable. Loud > silent.
 
 # Back off if we crash-loop — coherence is not critical for basic boot.
 # (StartLimit* keys must live in [Unit], not [Service].)

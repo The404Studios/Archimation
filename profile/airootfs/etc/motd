@@ -22,7 +22,7 @@
     /usr/share/doc/archimation/                    Product docs
     /usr/share/doc/ai-control/ai-cli.md            AI CLI manual
     /etc/ai-control/scripts.d/                     Operator-installable scripts
-    /usr/share/ai-control/dictionary_v2.pkl.zst    NL dictionary (~7000 phrases)
+    /var/cache/ai-control/dictionary_v2.pkl.zst    NL dictionary (~45000 phrases)
 
   # Run `ai-health` for a system-status summary, or `man ai-help` for the user manual.
 

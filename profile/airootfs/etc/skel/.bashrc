@@ -40,3 +40,19 @@ alias grep='grep --color=auto'
 #   /usr/share/doc/ARCHIMATION/permissions.md     -- group/permission model
 #
 # The first time you log in, `ai-health` is a good smoke test.
+
+# --- S82+C: per-shell user-level trust token --------------------------
+# Mint a trust=400 (user) token so raw `curl http://127.0.0.1:8420/...`
+# calls don't return {"error":"forbidden","reason":"missing_token"}.
+# The daemon's localhost-bootstrap exemption on POST /auth/token (see
+# auth.py:626) lets this work without prior credentials. Silently skips
+# if the daemon isn't up yet (~2s timeout). Exported into shell process
+# tree only — not persisted, not shared cross-user.
+if [ -z "${AI_CONTROL_TOKEN:-}" ] && command -v curl >/dev/null 2>&1; then
+    _aict=$(curl -s -m 2 -X POST -H 'Content-Type: application/json' \
+        -d '{"trust_level":400,"identity":"'"$USER"'","ttl_seconds":86400}' \
+        http://127.0.0.1:8420/auth/token 2>/dev/null \
+        | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+    [ -n "$_aict" ] && export AI_CONTROL_TOKEN="$_aict"
+    unset _aict
+fi

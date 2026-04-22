@@ -474,6 +474,20 @@ ENDPOINT_TRUST = {
     "/input/uhid/status": 200,
     "/input/uhid/enable": 400,
     "/input/uhid/inject": 600,
+    # S82: Observer & Monte-Carlo metric endpoints.  These are registered
+    # by the library_census / depth_observer / differential_observer /
+    # cortex.monte_carlo routers; without explicit entries they fell
+    # through to the fail-secure 600 default and returned missing_token
+    # for every local probe (QEMU live-debug, ai-health, contusion).
+    # They expose aggregate counters only (no per-process, no paths);
+    # tier at 200 alongside the other /trust, /metrics, /cortex reads.
+    "/metrics/ecosystem": 200,
+    "/metrics/depth": 200,
+    "/metrics/deltas": 200,
+    # Monte-Carlo rollout is compute-bounded by the caller's payload; it's
+    # read-like (doesn't mutate state) but expensive, so keep it at 300
+    # to match /ai/query and other CPU-heavy inference surfaces.
+    "/cortex/monte_carlo/rollout": 300,
 }
 
 

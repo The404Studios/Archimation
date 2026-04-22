@@ -91,7 +91,7 @@ echo "TOKEN length: ${#TOKEN}"
 # Verify v2 artifact present
 echo ""
 echo "=== checking v2 artifact in VM ==="
-"${SSH_BASE[@]}" "ls -la /usr/share/ai-control/dictionary_v2.pkl.zst 2>&1"
+"${SSH_BASE[@]}" "ls -la /var/cache/ai-control/dictionary_v2.pkl.zst 2>&1"
 
 # scp + run
 sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \

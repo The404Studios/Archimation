@@ -67,8 +67,13 @@ Before=ai-cortex.service scm-daemon.service
 # local-fs for /var/lib/pe-compat/services state, network for unix socket
 # bind (doesn't wait for connectivity, just for loopback to be up).
 After=network.target local-fs.target systemd-modules-load.service
-# Skip if binary was not installed (build failure, etc.)
-ConditionPathExists=/usr/bin/pe-objectd
+# S82+E: ConditionPathExists= removed.  pe-objectd is L1 critical-path
+# (broker for L3 SCM + L4 cortex).  A silent Condition= skip would start
+# downstream units against a missing broker and show as "skipped" in the
+# journal rather than an error.  If the binary is absent, let ExecStart
+# fail loudly so the real problem surfaces.  The binary is installed by
+# this very package (line 55), so the only way it's missing is a partial
+# pacstrap — which we want to see, not paper over.
 StartLimitIntervalSec=60
 StartLimitBurst=3
 
@@ -112,8 +117,10 @@ Documentation=https://github.com/ai-arch-linux/windows-services
 # broker (only reports error when a client actually needs a named object).
 After=network.target pe-objectd.service local-fs.target
 Wants=pe-objectd.service
-# Skip if binary was not installed (build failure, etc.)
-ConditionPathExists=/usr/bin/scm_daemon
+# S82+E: ConditionPathExists= removed.  scm_daemon is L3 critical-path
+# (Windows service lifecycle).  Silent-skip hides install breakage; let
+# ExecStart fail loudly instead.  Binary is installed by this package
+# (line 35).
 StartLimitIntervalSec=60
 StartLimitBurst=3
 

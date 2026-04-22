@@ -5,8 +5,9 @@ Compiles ~80 intent templates into ~10K phrase mappings, ships as zstd-compresse
 pickle, provides O(1) runtime lookup. Stdlib-only (Python 3.14 compression.zstd
 preferred; gzip fallback for older runtimes).
 
-Build (called at package time):
-    python3 -m dictionary_v2 --build /usr/share/ai-control/dictionary_v2.pkl.zst
+Build (called at package time — PKGBUILD writes to /var/cache/ai-control/;
+runtime search also probes /usr/share/ai-control/ for backwards compat):
+    python3 -m dictionary_v2 --build /var/cache/ai-control/dictionary_v2.pkl.zst
 
 Runtime (called from contusion.py — Agent A2 owns the wiring):
     from dictionary_v2 import lookup

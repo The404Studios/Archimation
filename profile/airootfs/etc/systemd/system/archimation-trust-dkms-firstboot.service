@@ -1,0 +1,83 @@
+[Unit]
+## archimation-trust-dkms-firstboot.service — build trust.ko + pe_compat.ko on first boot
+##
+## Session 82+1 (Agent S82+1).  The live ISO ships the trust-dkms and
+## pe-compat-dkms source packages plus linux-headers, but the modules are
+## NOT pre-built into /usr/lib/modules/$(uname -r)/extra/ for two reasons:
+##
+##   1. During pacstrap (ISO bake) the build host's kernel != the ISO's
+##      kernel, so `dkms autoinstall -k $(uname -r)` inside the chroot
+##      either builds against the wrong kernel or no-ops.
+##   2. The existing trust-dkms.install post_install hook DOES try to
+##      build, but it runs inside archiso-mkarchiso chroot where kernel
+##      headers may not match, so it typically logs "build failed (no
+##      kernel headers?)" and moves on.  That's why the user reports
+##      "Trust kernel module not loaded" on real-hardware first boot.
+##
+## This unit fixes the timing: it runs AFTER local-fs.target when the
+## installed kernel + headers + /usr/src/trust-0.1.0 are all on-disk and
+## `uname -r` reports the kernel that is actually running.
+##
+## ── Idempotency ────────────────────────────────────────────────────────
+## The unit is oneshot + RemainAfterExit=yes + guarded by ExecCondition.
+## ExecCondition exits with status 1 (= "skip") if
+## /usr/lib/modules/$(uname -r)/extra/trust.ko already exists, so
+## subsequent boots never rebuild.  This is the robust equivalent of
+## ConditionPathExistsGlob — the glob variant can be quirky with the
+## negation-vs-substitution combination for the running kernel path.
+##
+## ── Ordering ───────────────────────────────────────────────────────────
+## Before=ai-control.service ai-cortex.service so when either daemon
+## starts it can open /sys/kernel/trust/* and /dev/trust with the module
+## already loaded.  After=systemd-modules-load.service so we don't race
+## the -trust line in /etc/modules-load.d/trust.conf (the dash prefix
+## there means "don't fail boot if absent" — this unit is what makes it
+## present on boot #2 onwards).
+##
+## ── Operator commands ──────────────────────────────────────────────────
+## Post-boot status:
+##   systemctl status archimation-trust-dkms-firstboot.service
+## Force a rebuild (e.g. after a trust-system upgrade):
+##   sudo rm /usr/lib/modules/$(uname -r)/extra/trust.ko
+##   sudo systemctl start archimation-trust-dkms-firstboot.service
+## Inspect DKMS state:
+##   dkms status
+## Inspect build log:
+##   journalctl -u archimation-trust-dkms-firstboot.service -b
+## Manual one-shot (equivalent):
+##   sudo dkms autoinstall -k "$(uname -r)" && sudo modprobe trust
+
+Description=Build trust.ko + pe-compat.ko on first boot (Archimation DKMS)
+Documentation=file:///usr/share/doc/archimation/trust-dkms-firstboot.md
+DefaultDependencies=yes
+After=systemd-modules-load.service local-fs.target
+Before=ai-control.service ai-cortex.service
+# Skip the unit entirely if trust-dkms source is not installed.  Keeps
+# stripped-down ISO variants (which might drop trust-dkms) from failing.
+ConditionPathExists=/usr/src/trust-0.1.0/dkms.conf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# DKMS builds can be slow on low-end hardware (3-5 min on an Atom N270);
+# give ourselves plenty of headroom so we don't get SIGTERM'd mid-compile.
+TimeoutStartSec=300
+# ExecCondition: return 1 => condition fails => unit is skipped silently.
+# Return 0 => condition holds => the ExecStart block runs.
+# We skip when the module is already on disk for the running kernel.
+ExecCondition=/bin/sh -c '[ -f "/usr/lib/modules/$(uname -r)/extra/trust.ko" ] && exit 1 || exit 0'
+# Build for the running kernel.  `dkms autoinstall` handles add/build/install
+# for every DKMS-registered package (trust, pe_compat) in one shot and is
+# the official idempotent entry-point.
+ExecStart=/bin/sh -c 'exec /usr/bin/dkms autoinstall -k "$(uname -r)"'
+# depmod so modprobe can resolve the freshly installed .ko.
+ExecStartPost=/bin/sh -c 'exec /usr/sbin/depmod -a "$(uname -r)" || true'
+# Try to load each module.  `|| true` so a missing pe_compat package (when
+# only trust-dkms is installed) does not fail the whole unit.
+ExecStartPost=/sbin/modprobe trust
+ExecStartPost=-/sbin/modprobe pe_compat
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

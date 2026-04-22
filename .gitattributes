@@ -13,6 +13,13 @@ profiledef.sh  text eol=lf
 Makefile       text eol=lf
 Kbuild         text eol=lf
 
+# Plymouth theme files — the script parser rejects CRLF with
+# "Unparsed characters at end of file" on the first post-comment line.
+# S81 Agent 1: user's S80 ISO bricked because Windows git checkout
+# auto-CRLF'd the .script file and Plymouth silently died at initrd.
+*.script       text eol=lf
+*.plymouth     text eol=lf
+
 # Python / C / kernel sources — LF (POSIX convention)
 *.py text eol=lf
 *.c  text eol=lf

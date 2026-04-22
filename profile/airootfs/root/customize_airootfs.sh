@@ -371,8 +371,40 @@ ShowDelay=0
 DeviceTimeout=8
 DeviceScale=1
 PLYCFG
+
+# S81 FIX (Agent 1 — brick cause): Plymouth's script parser rejects CRLF
+# with "Unparsed characters at end of file" and returns NULL. Windows git
+# checkout (core.autocrlf=true) can inject CRLF into .script/.plymouth
+# files that lacked a .gitattributes eol=lf entry before S81. If a CRLF
+# file slips through, plymouthd fails to initialize → initrd splash never
+# appears → boot can appear bricked. Belt-and-suspenders: normalize
+# line endings in all theme .script and .plymouth files at image build.
+for f in /usr/share/plymouth/themes/*/*.script \
+         /usr/share/plymouth/themes/*/*.plymouth; do
+    [ -f "$f" ] || continue
+    if grep -q $'\r' "$f" 2>/dev/null; then
+        echo "[S81] normalizing CRLF → LF in $f"
+        sed -i 's/\r$//' "$f"
+    fi
+done
+
 if command -v plymouth-set-default-theme &>/dev/null; then
     plymouth-set-default-theme archimation || true
+fi
+
+# S81 FIX (Agent 1 — safety net): if the archimation script somehow
+# still fails to parse (unknown future regression), plymouthd falls back
+# to the module-based default theme. Pin the fallback to spinner (which
+# is module-based, NOT script-based — so it can't hit the same class of
+# bug). /usr/share/plymouth/themes/spinner/spinner.plymouth is shipped
+# by the plymouth package and doesn't need a script file.
+# We only set the fallback; the real theme above still wins when healthy.
+if [ ! -f /usr/share/plymouth/themes/archimation/archimation.script ] || \
+   ! head -5 /usr/share/plymouth/themes/archimation/archimation.script 2>/dev/null | grep -q '^#'; then
+    echo "[S81] archimation script missing or malformed — falling back to spinner"
+    if command -v plymouth-set-default-theme &>/dev/null; then
+        plymouth-set-default-theme spinner || true
+    fi
 fi
 
 # --- Plymouth-to-LightDM seamless handoff ---

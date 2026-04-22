@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 # ai-safe-mode-generator -- invoked by systemd early in boot.
 #
-# If the kernel was booted with "ai.mode=safe" on /proc/cmdline, this
-# generator masks ai-control.service and ai-cortex.service by creating
-# symlinks to /dev/null in the normal generator output directory.  On a
-# normal boot (no ai.mode=safe) this script is a no-op.
+# Handles two kernel cmdline modes:
+#
+#   ai.mode=safe      mask ai-control.service + ai-cortex.service
+#                     (AI daemon suspected as crash-loop culprit)
+#
+#   ai.mode=textonly  mask lightdm.service + display-manager.service in
+#                     addition to the AI daemons
+#                     (X/lightdm suspected as crash-loop culprit; S81.5
+#                     Agent F fallback — redundant with systemd.mask= on
+#                     cmdline, but covers users who only pass the shorter
+#                     ai.mode=textonly flag)
+#
+# On a normal boot (neither flag) this script is a no-op.
 #
 # systemd invokes generators very early with three positional arguments:
 #   $1  normal-dir  (where to drop unit files / mask symlinks)
@@ -21,27 +30,43 @@ normal_dir="${1:-/run/systemd/generator}"
 # that's fine, we just do nothing.
 [ -r /proc/cmdline ] || exit 0
 
-# Match whitespace-delimited token "ai.mode=safe".  Be tolerant of trailing
-# whitespace on the cmdline.
-if ! grep -qE '(^| )ai\.mode=safe( |$)' /proc/cmdline; then
+cmdline_has_safe=0
+cmdline_has_textonly=0
+grep -qE '(^| )ai\.mode=safe( |$)'     /proc/cmdline && cmdline_has_safe=1     || true
+grep -qE '(^| )ai\.mode=textonly( |$)' /proc/cmdline && cmdline_has_textonly=1 || true
+
+# Fast path: neither flag → nothing to do.
+if [ "$cmdline_has_safe" -eq 0 ] && [ "$cmdline_has_textonly" -eq 0 ]; then
     exit 0
 fi
 
 mkdir -p "$normal_dir"
 
-# Mask both AI services by pointing the unit name at /dev/null.  This is the
-# systemd-sanctioned way to force a unit off for a single boot without
-# writing to disk.
+# In either mode, AI daemons are masked (they're the noisiest source of
+# boot-time trouble and a text-console user rarely wants them anyway).
 for unit in ai-control.service ai-cortex.service; do
     ln -sf /dev/null "$normal_dir/$unit"
 done
 
-# Leave a breadcrumb in the journal so the user can see why their daemon
-# isn't running.  `logger` may not be available this early, so write to
-# /run instead.
+# Text-only mode additionally masks the display manager stack.  This is
+# redundant with `systemd.mask=lightdm.service systemd.mask=display-manager.service`
+# that the Text Console boot entries already pass, but it's a cheap
+# fallback for users who type `ai.mode=textonly` by hand onto a different
+# boot entry.
+if [ "$cmdline_has_textonly" -eq 1 ]; then
+    for unit in lightdm.service display-manager.service; do
+        ln -sf /dev/null "$normal_dir/$unit"
+    done
+fi
+
+# Leave a breadcrumb in /run so the user can see why their daemon /
+# desktop isn't running.  `logger` may not be available this early.
 mkdir -p /run/ai-control
-printf 'ai.mode=safe detected on kernel cmdline at %s -- masked ai-control.service + ai-cortex.service\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)" \
-    > /run/ai-control/safe-mode.stamp 2>/dev/null || true
+{
+    printf 'ai-safe-mode-generator stamp @ %s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+    [ "$cmdline_has_safe"     -eq 1 ] && printf '  ai.mode=safe     -> masked ai-control + ai-cortex\n'
+    [ "$cmdline_has_textonly" -eq 1 ] && printf '  ai.mode=textonly -> masked ai-control + ai-cortex + lightdm + display-manager\n'
+} > /run/ai-control/safe-mode.stamp 2>/dev/null || true
 
 exit 0

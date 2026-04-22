@@ -1,0 +1,27 @@
+#
+# 90-prune-docs.hook -- Auto-prune docs/man/info/gtk-doc after any
+# pacman install or upgrade.  Present on both the live ISO and every
+# system the installer pacstraps (ai-desktop-config copies this hook
+# into the installed system via its own postinstall step).
+#
+# This hook fires a single shell command that rm's the noise and swallows
+# errors with `|| true` so that a stale cache never aborts a transaction.
+#
+# Keep /usr/share/licenses intact -- some packages legally require the
+# license file to be present on disk.
+#
+
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = usr/share/doc/*
+Target = usr/share/man/*
+Target = usr/share/info/*
+Target = usr/share/gtk-doc/*
+Target = usr/share/help/*
+
+[Action]
+Description = Pruning docs/man/info (AI Arch Linux live slim)
+When = PostTransaction
+Exec = /usr/bin/sh -c 'rm -rf /usr/share/doc/* /usr/share/info/* /usr/share/gtk-doc/* /usr/share/help/* /usr/share/man/?? /usr/share/man/??_* 2>/dev/null || true'

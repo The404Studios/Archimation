@@ -1,0 +1,54 @@
+# /dev/dri permissions + naming for AI Arch Linux.
+#
+# Arch's default rules (upstream xorg-server) ship 70-input.rules and
+# 60-gpu.rules, but they:
+#   (a) grant /dev/dri/card* to the 'video' group with 0660 --- fine.
+#   (b) grant /dev/dri/renderD* to the 'render' group with 0666 --- too loose.
+#       We tighten to 0660 so only the render group can open a render node.
+#
+# This rule file runs AFTER upstream 60-gpu.rules but before any ACL tools,
+# so systemd-logind still applies uaccess tags to console-owner seats.
+
+# --- /dev/dri/card* ------------------------------------------------------
+# Primary DRM nodes: used by the display server / compositor.
+# Keep the uaccess tag so logind can hand ACL bits to the console user.
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", GROUP="video", MODE="0660", TAG+="uaccess"
+
+# --- /dev/dri/renderD* ---------------------------------------------------
+# Render-only nodes: used by GBM, Vulkan, OpenCL, DXVK, PRIME clients.
+# 0660 (down from upstream 0666) keeps out untrusted userspace.
+SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", GROUP="render", MODE="0660", TAG+="uaccess"
+
+# --- Symlink convenience names ------------------------------------------
+# /dev/dri/by-path/pci-*-card -> card* -- upstream already provides these.
+# We add two AI-friendly symlinks:
+#     /dev/dri/ai-primary    -> the boot_vga device (first one with boot_vga=1)
+#     /dev/dri/ai-render     -> first non-boot_vga device (or primary if single)
+#
+# These can't be selected with a single rule because boot_vga is a sysfs attr
+# on the parent PCI device, not directly exposed to udev rules on the DRM
+# subsystem event.  We resolve it via ATTRS{boot_vga}:
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{boot_vga}=="1", \
+    SYMLINK+="dri/ai-primary"
+
+# Non-boot_vga cards get ai-render (first-match wins via udev priority).
+# If only one GPU exists, the above rule creates ai-primary and this one
+# does nothing --- gpu-select.sh then aliases render to primary.
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{boot_vga}=="0", \
+    SYMLINK+="dri/ai-render"
+
+# --- Vendor-tagging for the AI daemon ------------------------------------
+# Expose vendor as a udev ENV so downstream rules (or daemon-side udev
+# monitors) can filter without re-parsing sysfs.
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{vendor}=="0x10de", ENV{AI_GPU_VENDOR}="nvidia"
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{vendor}=="0x1002", ENV{AI_GPU_VENDOR}="amd"
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{vendor}=="0x8086", ENV{AI_GPU_VENDOR}="intel"
+
+# --- Runtime power management hints --------------------------------------
+# For hybrid laptops: let the dGPU auto-suspend when idle (saves 10-20 W).
+# This matches upstream nvidia-drm and amd-pm rules but is more aggressive.
+# boot_vga=0 filter so we never touch the primary display GPU.
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030000", \
+    ATTR{boot_vga}=="0", ATTR{power/control}="auto"
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x1002", ATTR{class}=="0x030000", \
+    ATTR{boot_vga}=="0", ATTR{power/control}="auto"

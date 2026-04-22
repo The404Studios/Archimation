@@ -1,0 +1,110 @@
+# Game controllers -- pass-through with input group + uaccess
+#
+# Steam, Lutris, Wine, gamescope, and Bottles all expect controllers to
+# appear under /dev/input/event* and /dev/hidraw* with mode 0660 and
+# group=input.  The default udev rules from the kernel package only set
+# permissions for keyboards / mice; gamepads need explicit allowlisting
+# to avoid "controller not detected" issues at first plug-in.
+#
+# We use TAG+="uaccess" so logind grants the active session ACL on the
+# device node — required for Steam Input on Wayland (no SUID, no group
+# add-on-the-fly).  GROUP="input" is a fallback for non-logind sessions.
+#
+# Vendor / product IDs sourced from upstream lists in:
+#   - https://github.com/ValveSoftware/steam-devices/blob/master/60-steam-input.rules
+#   - https://github.com/atar-axis/xpadneo (Xbox)
+#   - https://github.com/torvalds/linux/blob/master/drivers/hid/hid-playstation.c (DualShock/DualSense)
+#
+# Reload after install:  udevadm control --reload && udevadm trigger
+
+ACTION!="add|change", GOTO="ai_gamectrl_end"
+KERNEL!="hidraw*|js*|event*", GOTO="ai_gamectrl_end"
+
+# ---------------------------------------------------------------------------
+# Valve Steam Controller / Steam Deck dock
+# ---------------------------------------------------------------------------
+# Steam Controller (wired)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1102", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+# Steam Controller (wireless dongle)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1142", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+# Steam Deck built-in controller
+SUBSYSTEM=="usb", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1205", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+# Steam Virtual Gamepad (used by Steam Input remap)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="11ff", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+
+# ---------------------------------------------------------------------------
+# Microsoft Xbox controllers
+# ---------------------------------------------------------------------------
+# Xbox 360 wired
+SUBSYSTEM=="usb", ATTRS{idVendor}=="045e", ATTRS{idProduct}=="028e", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+# Xbox 360 wireless receiver
+SUBSYSTEM=="usb", ATTRS{idVendor}=="045e", ATTRS{idProduct}=="0719", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+# Xbox One / Series X|S (wired + dongle)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="045e", ATTRS{idProduct}=="02d1", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="045e", ATTRS{idProduct}=="02dd", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="045e", ATTRS{idProduct}=="02e3", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="045e", ATTRS{idProduct}=="02ea", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="045e", ATTRS{idProduct}=="02fd", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="045e", ATTRS{idProduct}=="0b00", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="045e", ATTRS{idProduct}=="0b12", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="045e", ATTRS{idProduct}=="0b13", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+# Xbox elite series 2
+SUBSYSTEM=="usb", ATTRS{idVendor}=="045e", ATTRS{idProduct}=="0b05", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+
+# ---------------------------------------------------------------------------
+# Sony PlayStation controllers
+# ---------------------------------------------------------------------------
+# DualShock 3 (PS3)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0268", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+# DualShock 4 (PS4) - 1st + 2nd gen + USB receiver
+SUBSYSTEM=="usb", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="05c4", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="09cc", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0ba0", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+# DualSense (PS5)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0ce6", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+# DualSense Edge (PS5)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0df2", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+
+# ---------------------------------------------------------------------------
+# Nintendo Switch Pro / Joy-Con
+# ---------------------------------------------------------------------------
+SUBSYSTEM=="usb", ATTRS{idVendor}=="057e", ATTRS{idProduct}=="2009", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="057e", ATTRS{idProduct}=="2006", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="057e", ATTRS{idProduct}=="2007", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+
+# ---------------------------------------------------------------------------
+# Generic HID joysticks / fight sticks (all js* and matching event* nodes)
+# ---------------------------------------------------------------------------
+KERNEL=="js[0-9]*", MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="input", ENV{ID_INPUT_JOYSTICK}=="1", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+
+# Bluetooth gamepads — match by class
+SUBSYSTEM=="bluetooth", ATTRS{class}=="0x002508", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+
+LABEL="ai_gamectrl_end"

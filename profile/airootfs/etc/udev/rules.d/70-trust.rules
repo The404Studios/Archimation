@@ -1,0 +1,14 @@
+# /dev/trust -- Root of Authority kernel module device node.
+#
+# MODE=0660 + GROUP=trust restricts TRUST_IOC_QUARANTINE (and every other
+# trust ioctl) to processes whose real or supplementary GID is in the
+# "trust" group. Without this, any UID could ioctl(/dev/trust) to
+# quarantine an arbitrary PID -- the kernel module defers authorization
+# to Linux FS permissions on the device node.
+#
+# This file takes precedence over packages/trust-dkms/PKGBUILD's
+# 99-trust.rules (group=wheel) because udev applies rules in sort
+# order; 70- < 99-.
+#
+# Session 41 agent 3: authority enforcement hardening.
+KERNEL=="trust", MODE="0660", GROUP="trust"

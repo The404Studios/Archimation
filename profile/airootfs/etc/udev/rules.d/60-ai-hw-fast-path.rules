@@ -1,0 +1,50 @@
+# Fast-path udev rules for AI Arch Linux.
+#
+# Rule philosophy: do not re-run ACTION=="add" work on ACTION=="change" or
+# "bind" events.  Skip heavy handlers for device classes we know we don't
+# need at boot.  The default upstream rules are conservative and trigger
+# modprobe / systemd-udev-settle fan-out on events that don't warrant it.
+
+# --- USB: accept default handling but skip spurious "change" events ---
+# USB hubs and some external storage emit a "change" on every activity
+# transition; the stock 60-persistent-storage.rules re-walks partitions
+# each time.  Filter to ACTION=="add|remove" only for persistent naming.
+SUBSYSTEM=="block", ACTION=="change", ENV{DM_UDEV_DISABLE_DISK_RULES_FLAG}="1"
+
+# --- Don't wait for USB to settle before claiming device nodes ---
+# systemd-udev-settle timeout is 30 seconds; the default USB 3.0 enumeration
+# takes 1-2 seconds.  Hint that we're finished as soon as the kernel says
+# the block device is ready.
+SUBSYSTEM=="block", KERNEL=="sd[a-z]*", ACTION=="add", TAG+="systemd"
+SUBSYSTEM=="block", KERNEL=="nvme[0-9]*n[0-9]*", ACTION=="add", TAG+="systemd"
+
+# --- Skip input subsystem re-probe on keyboard-only events ---
+# Gaming keyboards with macro wheels fire many "add" events at boot; the
+# stock rules re-open each to query capabilities.  Just trust the kernel's
+# modalias for the common HID path.
+SUBSYSTEM=="input", ATTRS{bInterfaceClass}=="03", ATTRS{bInterfaceSubClass}=="00", \
+    ACTION=="add", ENV{ID_INPUT}="1", ENV{ID_INPUT_KEYBOARD}="1"
+
+# --- Power button and lid events: bind to ACPI subsystem only ---
+# Some Lenovo BIOSes emit power/lid events through hid-generic AND acpi
+# simultaneously; one source is enough for logind to see them.
+SUBSYSTEM=="input", ATTRS{name}=="Power Button", ENV{ID_INPUT_KEY}="1", TAG+="power-switch"
+SUBSYSTEM=="input", ATTRS{name}=="Lid Switch", ENV{ID_INPUT_SWITCH}="1", TAG+="power-switch"
+
+# --- Modern NVMe: tell the I/O scheduler to not bother ---
+# NVMe multi-queue is faster than any software scheduler; force "none".
+# Overridden by ai-hw-detect.sh if user explicitly configures a different
+# scheduler.
+ACTION=="add|change", KERNEL=="nvme[0-9]*n[0-9]*", ATTR{queue/scheduler}="none"
+
+# --- Old SATA HDDs: use bfq for latency-fair scheduling ---
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="1", \
+    ATTR{queue/scheduler}="bfq"
+
+# --- SSDs (non-NVMe SATA): mq-deadline for predictable tail latency ---
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", \
+    ATTR{queue/scheduler}="mq-deadline"
+
+# --- CPU hot-add / hot-remove on VMs: don't stall boot ---
+# QEMU can emit spurious CPU add events when count=max; ignore them.
+SUBSYSTEM=="cpu", ACTION=="change", ENV{SYSTEMD_READY}="1"

@@ -1,0 +1,44 @@
+# uhid + evdev permissions for AI Arch Linux.
+#
+# The existing 99-ai-input.rules covers uinput (classic synthesis path) and
+# /dev/input/event* (read path).  This file adds:
+#
+#   - /dev/uhid:   userspace HID bus, letting a daemon CREATE a full HID
+#                  device (keyboard, mouse, gamepad, HOTAS) that appears to
+#                  the kernel input stack as if from a physical device.
+#                  Requires the uhid kernel module (auto-loaded via
+#                  /etc/modules-load.d/uhid.conf).
+#   - /dev/hidraw*: raw HID report path for reading directly from physical
+#                   devices (bypassing evdev's report-to-event translation).
+#                   Lower latency + full access to vendor-specific reports.
+#
+# NOTE: 75- runs AFTER the default 73-seat-late.rules so logind uaccess tags
+# (added by the default rules) still apply on seat0.
+
+# --- /dev/uhid -----------------------------------------------------------
+# Userspace HID driver -- daemon opens it to inject synthetic input below
+# evdev.  0660 + input group so ai-control-daemon (added to input via
+# setup-services.sh) can write to it.
+KERNEL=="uhid", SUBSYSTEM=="misc", MODE="0660", GROUP="input", TAG+="uaccess"
+
+# --- /dev/input/event* ---------------------------------------------------
+# The existing 99-ai-input.rules already sets 0660+input, but we re-state it
+# here with the uaccess tag so logind-controlled seats keep ACL access for
+# the console user (important for Wayland compositors that use libinput).
+SUBSYSTEM=="input", KERNEL=="event[0-9]*", MODE="0660", GROUP="input", TAG+="uaccess"
+
+# --- /dev/hidraw* --------------------------------------------------------
+# Raw HID access for vendor-specific protocols (e.g. custom gaming mice with
+# DPI switching).  Historically 0600 root:root; widen to input group with
+# 0660.  Keep uaccess so consent-based access works on desktops.
+KERNEL=="hidraw[0-9]*", SUBSYSTEM=="hidraw", MODE="0660", GROUP="input", TAG+="uaccess"
+
+# --- Specific ID-VENDOR tagging for controllers --------------------------
+# Tag well-known game controllers so the input aggregator (input.py) can
+# disambiguate "keyboard" vs "gamepad" without an expensive ioctl probe.
+# The EV bits come from stock rules; we just add an identity string.
+SUBSYSTEM=="input", ATTRS{idVendor}=="054c", ENV{AI_INPUT_CLASS}="gamepad"  # Sony
+SUBSYSTEM=="input", ATTRS{idVendor}=="045e", ENV{AI_INPUT_CLASS}="gamepad"  # Microsoft XInput
+SUBSYSTEM=="input", ATTRS{idVendor}=="057e", ENV{AI_INPUT_CLASS}="gamepad"  # Nintendo
+SUBSYSTEM=="input", ATTRS{idVendor}=="0738", ENV{AI_INPUT_CLASS}="gamepad"  # Mad Catz
+SUBSYSTEM=="input", ATTRS{idVendor}=="28de", ENV{AI_INPUT_CLASS}="gamepad"  # Valve (Steam Deck / controller)
